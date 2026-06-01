@@ -17,6 +17,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(OPENMOQ_BUILD_TESTS "Build OpenMOQ publisher tests" ON)
 option(OPENMOQ_ENABLE_PICOQUIC "Enable picoquic transport integration when picoquic is available" ON)
 option(OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS "Build and run picoquic loopback smoke tests" OFF)
+option(OPENMOQ_ENABLE_SRT "Enable libsrt ingest support when libsrt is available" ON)
+
+set(OPENMOQ_HAS_SRT OFF)
+if(OPENMOQ_ENABLE_SRT)
+    find_path(OPENMOQ_SRT_INCLUDE_DIR NAMES srt/srt.h)
+    find_library(OPENMOQ_SRT_LIBRARY NAMES srt)
+    if(OPENMOQ_SRT_INCLUDE_DIR AND OPENMOQ_SRT_LIBRARY)
+        set(OPENMOQ_HAS_SRT ON)
+    else()
+        message(STATUS "libsrt not found; building without SRT ingest runtime")
+    endif()
+endif()
 
 set(_OPENMOQ_THIRDPARTY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 if(NOT EXISTS "${_OPENMOQ_THIRDPARTY_ROOT}")
@@ -134,6 +146,8 @@ add_library(openmoq_publisher_lib
     src/cli_options.cpp
     src/cmaf_segmenter.cpp
     src/cmsf_packager.cpp
+    src/live_srt_ingest.cpp
+    src/live_srt_config.cpp
     src/moq_draft.cpp
     src/mp4_box.cpp
     src/publisher_api.cpp
@@ -169,6 +183,12 @@ if(OPENMOQ_HAS_PICOQUIC)
     endif()
 endif()
 
+if(OPENMOQ_HAS_SRT)
+    target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_HAS_SRT=1)
+    target_include_directories(openmoq_publisher_lib PRIVATE ${OPENMOQ_SRT_INCLUDE_DIR})
+    target_link_libraries(openmoq_publisher_lib PRIVATE ${OPENMOQ_SRT_LIBRARY})
+endif()
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(openmoq_publisher_lib PRIVATE -Wall -Wextra -Wpedantic)
 elseif(MSVC)
@@ -197,6 +217,12 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-cli-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-cli-tests COMMAND openmoq-publisher-cli-tests)
+
+    add_executable(openmoq-publisher-live-srt-config-tests
+        tests/live_srt_config_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-live-srt-config-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-live-srt-config-tests COMMAND openmoq-publisher-live-srt-config-tests)
 
     add_executable(openmoq-publisher-transport-tests
         tests/moqt_session_test.cpp

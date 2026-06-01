@@ -20,8 +20,16 @@ struct InputSource {
     std::filesystem::path path;
 };
 
+enum class LiveSourceKind {
+    kAuto,
+    kStdin,
+    kSrt,
+};
+
 struct CliOptions {
     InputSource input_source;
+    LiveSourceKind live_source = LiveSourceKind::kAuto;
+    std::optional<std::filesystem::path> srt_config_path;
     std::optional<std::filesystem::path> emit_dir;
     std::optional<transport::EndpointConfig> endpoint;
     transport::TransportKind transport = transport::TransportKind::kRawQuic;

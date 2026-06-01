@@ -26,6 +26,7 @@ struct MediaFragment {
     std::uint64_t earliest_presentation_time_us = 0;
     std::uint8_t sap_type = 0;
     bool is_video_keyframe = false;  // True if this is a video track IDR/keyframe fragment
+    std::uint64_t creation_time_us = 0;  // Wall-clock time when fragment was created (for queue delay measurement)
     PayloadBuffer payload;
 };
 

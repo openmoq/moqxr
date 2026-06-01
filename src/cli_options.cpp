@@ -103,6 +103,22 @@ std::chrono::seconds parse_timeout(std::string_view value) {
     return std::chrono::seconds(timeout);
 }
 
+LiveSourceKind parse_live_source(std::string_view value) {
+    if (value == "auto") {
+        return LiveSourceKind::kAuto;
+    }
+    if (value == "stdin") {
+        return LiveSourceKind::kStdin;
+    }
+    if (value == "srt") {
+        return LiveSourceKind::kSrt;
+    }
+    if (value == "both") {
+        throw std::runtime_error("--live-source 'both' is not supported; use either 'stdin' or 'srt'");
+    }
+    throw std::runtime_error("unsupported --live-source value: expected auto, stdin, or srt");
+}
+
 }  // namespace
 
 CliOptions parse_cli_options(int argc, char** argv) {
@@ -121,6 +137,10 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
         if (argument == "--input") {
             options.input_source = parse_input_source(require_value("--input"));
+        } else if (argument == "--live-source") {
+            options.live_source = parse_live_source(require_value("--live-source"));
+        } else if (argument == "--srt-config") {
+            options.srt_config_path = std::filesystem::path(require_value("--srt-config"));
         } else if (argument == "--transport") {
             options.transport = parse_transport_kind(require_value("--transport"));
         } else if (argument == "--endpoint") {
@@ -175,8 +195,25 @@ CliOptions parse_cli_options(int argc, char** argv) {
         }
     }
 
-    if (options.input_source.kind == InputSourceKind::kFile && options.input_source.path.empty()) {
+    const bool live_source_uses_stdin =
+        options.live_source == LiveSourceKind::kAuto ||
+        options.live_source == LiveSourceKind::kStdin;
+    if (live_source_uses_stdin &&
+        options.input_source.kind == InputSourceKind::kFile &&
+        options.input_source.path.empty()) {
         throw std::runtime_error("missing required --input argument");
+    }
+
+    const bool live_source_uses_srt =
+        options.live_source == LiveSourceKind::kSrt;
+    if (live_source_uses_srt && !options.srt_config_path.has_value()) {
+        throw std::runtime_error("--live-source srt requires --srt-config");
+    }
+    if (live_source_uses_srt && !options.endpoint.has_value()) {
+        throw std::runtime_error("--live-source srt requires --endpoint");
+    }
+    if (!live_source_uses_srt && options.srt_config_path.has_value()) {
+        throw std::runtime_error("--srt-config requires --live-source srt");
     }
 
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
@@ -202,7 +239,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
 std::string build_usage(const char* argv0) {
     return std::string("Usage: ") + argv0 +
-           " --input <mp4|-> [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
+           " --input <mp4|-> [--live-source auto|stdin|srt] [--srt-config <path>]"
+           " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";

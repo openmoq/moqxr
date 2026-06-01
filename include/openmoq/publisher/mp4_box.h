@@ -39,6 +39,7 @@ struct TrackDescription {
     std::uint32_t channel_count = 0;
     std::uint32_t sample_rate = 0;
     double frame_rate = 0.0;
+    std::vector<std::uint8_t> codec_private;  // avcC, hvcC, or esds box bytes (including box header)
 };
 
 struct ParsedMp4 {
