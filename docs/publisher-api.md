@@ -14,7 +14,23 @@ Key types:
 - `openmoq::publisher::Publisher`
 - `openmoq::publisher::PreparedPublish`
 
-## 2. Configure the Publisher
+## 2. Link the Library
+
+The local build and release archives provide the public headers under `include/openmoq/publisher` and a static publisher library:
+
+- Linux/macOS: `libopenmoq_publisher.a`
+- Windows: `openmoq_publisher.lib`
+
+If your project includes this repository with CMake, link the `openmoq_publisher_lib` target so CMake carries the include path, C++20 requirement, and transport dependencies:
+
+```cmake
+add_subdirectory(path/to/moqxr)
+target_link_libraries(your_app PRIVATE openmoq_publisher_lib)
+```
+
+If you link the raw archive from a release package, add the package `include/` directory to your include path and link the same transport dependencies used to build the archive. Builds with picoquic transport support require picoquic, picotls, OpenSSL, and platform socket libraries in addition to the publisher archive.
+
+## 3. Configure the Publisher
 
 Create a `PublisherConfig` once and pass it to `Publisher`.
 
@@ -36,7 +52,7 @@ config.subscriber_timeout = std::chrono::seconds(30);
 openmoq::publisher::Publisher publisher(config);
 ```
 
-## 3. Prepare Media Once (Batch Mode)
+## 4. Prepare Media Once (Batch Mode)
 
 For file or buffered stream workflows, prepare media first:
 
@@ -62,7 +78,7 @@ This is useful for larger apps that want to:
 - store plan state
 - publish the same prepared asset to multiple endpoints
 
-## 4. Optional: Inspect or Emit the Plan
+## 5. Optional: Inspect or Emit the Plan
 
 Render the plan for logging/debug:
 
@@ -76,7 +92,7 @@ Emit generated catalog and media objects to disk:
 publisher.emit_objects(prepared, "out");
 ```
 
-## 5. Configure Endpoint and TLS
+## 6. Configure Endpoint and TLS
 
 Build `EndpointConfig` and optional `TlsConfig`.
 
@@ -110,7 +126,7 @@ tls.insecure_skip_verify = false;
 // tls.private_key_path = "...";
 ```
 
-## 6. Publish Prepared Content
+## 7. Publish Prepared Content
 
 Use prepared content plus endpoint:
 
@@ -133,7 +149,7 @@ Convenience helpers:
 - `publish_file(path, endpoint, tls)`
 - `publish_stream(input, source_name, endpoint, tls)`
 
-## 7. Live Input Publish (Incremental stdin/stream)
+## 8. Live Input Publish (Incremental stdin/stream)
 
 The default live path expects fragmented MP4, which matches ffmpeg/CMAF
 pipelines:
@@ -152,7 +168,7 @@ if (!status.ok) {
 
 `publish_live(...)` uses incremental parsing and live publish flow instead of buffering to EOF.
 
-## 8. Arbitrary Live Object Publish
+## 9. Arbitrary Live Object Publish
 
 Applications that already produce MoQ objects directly can bypass fragmented MP4
 ingest with `publish_live_objects(...)`.
@@ -184,7 +200,7 @@ Each `LiveObject` supplies the target track, group/object IDs, optional media
 timing, and the payload bytes to send. The fragmented MP4 `publish_live(...)`
 API remains the default live publishing path.
 
-## 9. ALPN Override Behavior
+## 10. ALPN Override Behavior
 
 By default, the API applies transport-appropriate ALPN:
 
@@ -213,7 +229,7 @@ The same override flag exists on:
 - `publish_live(...)`
 - `publish_live_objects(...)`
 
-## 10. Error Handling Pattern
+## 11. Error Handling Pattern
 
 All API publish calls return `TransportStatus`:
 
@@ -235,7 +251,7 @@ if (!status.ok) {
 }
 ```
 
-## 11. Integration Pattern for Larger Applications
+## 12. Integration Pattern for Larger Applications
 
 For service-style integration:
 
@@ -247,7 +263,7 @@ For service-style integration:
 6. For direct object producers, provide a `LiveObjectSource` and call `publish_live_objects(...)`.
 7. Use `TransportStatus` messages for metrics and retry decisions.
 
-## 12. Publish Summary (`stats`)
+## 13. Publish Summary (`stats`)
 
 The publisher API is blocking: `publish(...)`, `publish_file(...)`,
 `publish_stream(...)`, and `publish_live(...)` run the session on the calling
@@ -316,7 +332,7 @@ Example:
 }
 ```
 
-## 12. Complete Example
+## 14. Complete Example
 
 ```cpp
 #include "openmoq/publisher/publisher_api.h"
@@ -362,7 +378,7 @@ int main() {
 }
 ```
 
-## 13. Live Publish with Audio/Video Encoders on Other Threads
+## 15. Live Publish with Audio/Video Encoders on Other Threads
 
 `publish_live(...)` consumes one MP4 byte stream.  
 For multi-track live publishing, the common pattern is:

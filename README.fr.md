@@ -27,6 +27,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+Le build par défaut crée à la fois l'exécutable `openmoq-publisher` et la bibliothèque statique publisher : `build/libopenmoq_publisher.a` sous Linux/macOS, ou `build\<config>\openmoq_publisher.lib` avec les générateurs Visual Studio sous Windows.
+
 Inspecter un plan de publication :
 
 ```bash
@@ -74,12 +76,12 @@ Les guides localisés de l'API Publisher sont disponibles en [espagnol](docs/pub
 ## Structure du Dépôt
 
 - `include/openmoq/publisher` : headers publics
-- `src` : implémentation bibliothèque et CLI
+- `src` : implémentation bibliothèque statique et CLI
 - `tests` : couverture basée sur CTest
 - `docs` : notes de protocole, guides d'intégration et références de conception
 - `examples` : exemples d'intégrations publisher
 - `.github/workflows/ci.yml` : CI Linux, macOS et Windows
-- `.github/workflows/release.yml` : builds d'artefacts de release
+- `.github/workflows/release.yml` : builds d'artefacts de release pour la CLI, les headers et la bibliothèque statique
 
 ## État Actuel
 

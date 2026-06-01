@@ -22,6 +22,13 @@ ctest --preset default
 
 On Windows with the Visual Studio generator, the binary lands in `build\Release\` or `build\Debug\` depending on the config passed to `--build`.
 
+The build also produces the reusable publisher API static library:
+
+- Linux/macOS single-config builds: `build/libopenmoq_publisher.a`
+- Visual Studio multi-config builds: `build\<config>\openmoq_publisher.lib`
+
+The CMake target remains `openmoq_publisher_lib`, so projects that include this repository with `add_subdirectory(...)` should link that target. Projects that consume the raw archive directly should add `include/` to their include path and link the same transport dependencies used by the build, especially picoquic, picotls, OpenSSL, and platform socket libraries when picoquic transport support is enabled.
+
 ## Build with Local Picoquic and Picotls
 
 By default, CMake looks for:
@@ -82,7 +89,8 @@ GitHub Actions publishes release archives for Linux, macOS, and Windows:
 - running the `Release Builds` workflow manually uploads the same archives as workflow artifacts
 - manual runs can also publish a GitHub Release when you provide a `release_tag` such as `v0.1.0`
 - both CI and release workflows check out `private-octopus/picoquic` plus `private-octopus/picotls`, so published binaries include the picoquic transport path
-- Linux and macOS archives are `.tar.gz`; Windows archives are `.zip` and contain `openmoq-publisher.exe`
+- Linux and macOS archives are `.tar.gz` and contain `openmoq-publisher`, `libopenmoq_publisher.a`, `include/`, `docs/`, `README.md`, and `LICENSE`
+- Windows archives are `.zip` and contain `openmoq-publisher.exe`, `openmoq_publisher.lib`, `include/`, `docs/`, `README.md`, and `LICENSE`
 
 ## CI
 
@@ -92,4 +100,4 @@ GitHub Actions builds and tests the project on:
 - `macos-latest`
 - `windows-latest`
 
-The workflow runs the same CMake configure, build, and CTest steps on all three platforms.
+The workflow runs the same CMake configure, build, static-library existence check, and CTest steps on all three platforms.

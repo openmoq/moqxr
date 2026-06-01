@@ -27,6 +27,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+El build predeterminado crea tanto el ejecutable `openmoq-publisher` como la biblioteca estática del publisher: `build/libopenmoq_publisher.a` en Linux/macOS, o `build\<config>\openmoq_publisher.lib` con generadores de Visual Studio en Windows.
+
 Inspeccionar un plan de publicación:
 
 ```bash
@@ -74,12 +76,12 @@ Las guías localizadas de la API Publisher están disponibles en [español](docs
 ## Estructura del Repositorio
 
 - `include/openmoq/publisher`: headers públicos
-- `src`: implementación de la biblioteca y CLI
+- `src`: implementación de la biblioteca estática y CLI
 - `tests`: cobertura basada en CTest
 - `docs`: notas de protocolo, guías de integración y referencias de diseño
 - `examples`: integraciones de publisher de ejemplo
 - `.github/workflows/ci.yml`: CI para Linux, macOS y Windows
-- `.github/workflows/release.yml`: builds de artefactos de release
+- `.github/workflows/release.yml`: builds de artefactos de release para la CLI, headers y biblioteca estática
 
 ## Estado Actual
 

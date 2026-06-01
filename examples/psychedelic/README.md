@@ -57,5 +57,6 @@ Expected output includes:
 
 ## Notes
 
-- This target links against `openmoq_publisher_lib` and uses public API headers from `include/openmoq/publisher`.
+- This target links against the CMake target `openmoq_publisher_lib`, which emits the packaged static archive as `libopenmoq_publisher.a` on Linux/macOS or `openmoq_publisher.lib` on Windows.
+- The example uses the same public API headers shipped under `include/openmoq/publisher`.
 - For local testing, the example sets `insecure_skip_verify=true`.

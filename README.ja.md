@@ -27,6 +27,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+デフォルトのビルドでは、`openmoq-publisher` 実行ファイルと publisher の静的ライブラリの両方が生成されます。Linux/macOS では `build/libopenmoq_publisher.a`、Windows の Visual Studio generator では `build\<config>\openmoq_publisher.lib` です。
+
 publish plan を検査:
 
 ```bash
@@ -74,12 +76,12 @@ Windows では、`./build/openmoq-publisher` を `build\Release\openmoq-publishe
 ## リポジトリ構成
 
 - `include/openmoq/publisher`: public header
-- `src`: library と CLI の実装
+- `src`: static library と CLI の実装
 - `tests`: CTest ベースの test coverage
 - `docs`: protocol notes、integration guide、design reference
 - `examples`: publisher integration example
 - `.github/workflows/ci.yml`: Linux、macOS、Windows CI
-- `.github/workflows/release.yml`: release artifact build
+- `.github/workflows/release.yml`: CLI、header、static library の release artifact build
 
 ## 現在の状態
 

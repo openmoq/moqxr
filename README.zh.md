@@ -27,6 +27,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+默认构建会同时生成 `openmoq-publisher` 可执行文件和 publisher 静态库：Linux/macOS 上为 `build/libopenmoq_publisher.a`，Windows Visual Studio generator 上为 `build\<config>\openmoq_publisher.lib`。
+
 检查发布计划：
 
 ```bash
@@ -74,12 +76,12 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
 ## 仓库结构
 
 - `include/openmoq/publisher`：公共头文件
-- `src`：库和 CLI 实现
+- `src`：静态库和 CLI 实现
 - `tests`：基于 CTest 的测试覆盖
 - `docs`：协议说明、集成指南和设计参考
 - `examples`：publisher 集成示例
 - `.github/workflows/ci.yml`：Linux、macOS 和 Windows CI
-- `.github/workflows/release.yml`：release artifact 构建
+- `.github/workflows/release.yml`：CLI、头文件和静态库的 release artifact 构建
 
 ## 当前状态
 
