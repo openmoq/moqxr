@@ -111,24 +111,45 @@ jobs:
           fi
 
           package_root="openmoq-publisher-${version}-${RUNNER_OS}"
-          mkdir -p "${package_root}"
+          mkdir -p "${package_root}/lib"
 
+          # Stage every static library needed to link openmoq_publisher
+          # standalone: the publisher archive plus its picoquic/picotls/picohttp
+          # transitive dependencies (whose symbols are otherwise undefined in
+          # libopenmoq_publisher.a). OpenSSL stays a system dependency the
+          # consumer provides. The build tree differs by generator: single-config
+          # on Linux/macOS, a Release/ subdir on MSVC, so the deps are located
+          # recursively rather than by fixed path.
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            # MSVC multi-config generator places the binary under build/Release/
             cp build/Release/openmoq-publisher.exe "${package_root}/"
-            cp build/Release/openmoq_publisher.lib "${package_root}/"
-            cp -R include "${package_root}/include"
-            cp README.md LICENSE "${package_root}/"
-            cp -R docs "${package_root}/docs"
+            cp build/Release/openmoq_publisher.lib "${package_root}/lib/"
+            find build -type f \( -name 'picoquic*.lib' -o -name 'picohttp*.lib' \
+              -o -name 'picotls*.lib' \) -exec cp {} "${package_root}/lib/" \;
             archive="${package_root}.zip"
-            7z a "${archive}" "${package_root}"
           else
             cp build/openmoq-publisher "${package_root}/"
-            cp build/libopenmoq_publisher.a "${package_root}/"
-            cp -R include "${package_root}/include"
-            cp README.md LICENSE "${package_root}/"
-            cp -R docs "${package_root}/docs"
+            cp build/libopenmoq_publisher.a "${package_root}/lib/"
+            find build -type f \( -name 'libpicoquic*.a' -o -name 'libpicohttp*.a' \
+              -o -name 'libpicotls*.a' \) -exec cp {} "${package_root}/lib/" \;
             archive="${package_root}.tar.gz"
+          fi
+
+          cp -R include "${package_root}/include"
+          cp README.md LICENSE "${package_root}/"
+          cp -R docs "${package_root}/docs"
+
+          # Fail the release if the dependency static libs did not get staged,
+          # rather than shipping an SDK that cannot link.
+          echo "Staged libraries:"; ls -1 "${package_root}/lib/"
+          lib_count="$(find "${package_root}/lib" -type f \( -name '*.a' -o -name '*.lib' \) | wc -l)"
+          if [[ "${lib_count}" -lt 5 ]]; then
+            echo "ERROR: expected the openmoq library plus picoquic/picotls deps in lib/, found ${lib_count}" >&2
+            exit 1
+          fi
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            7z a "${archive}" "${package_root}"
+          else
             tar -czf "${archive}" "${package_root}"
           fi
 
