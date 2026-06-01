@@ -3331,15 +3331,15 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         alias_by_track.emplace(track.track_name, next_alias++);
     }
 
+    // Map PUBLISH request_ids to track names so we can handle PUBLISH_OK from
+    // relays that accept tracks via PUBLISH_OK without forwarding SUBSCRIBE.
+    std::map<std::uint64_t, std::string> publish_request_id_to_track;
+
     // Preannounce media tracks so relay implementations that need explicit
     // PUBLISH before subscribing can discover them. Do not wait for PUBLISH_OK
     // here: some relays first send SUBSCRIBE or stay idle until a subscriber
     // appears, and live await-subscribe mode must keep draining control bytes.
-    // NOTE: Skip for draft-14/16/18
-    if (draft_version != openmoq::publisher::DraftVersion::kDraft14 &&
-        draft_version != openmoq::publisher::DraftVersion::kDraft16 &&
-        draft_version != openmoq::publisher::DraftVersion::kDraft18 &&
-        !auto_forward_) {
+    if (!uses_request_streams(draft_version) && !auto_forward_) {
         std::uint64_t pub_req_id = 2;
         for (const auto& track : tracks) {
             const TrackMessage track_msg{
@@ -3358,6 +3358,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             std::cerr << "[moqt-session] live: PUBLISH track=" << track.track_name
                       << " request_id=" << pub_req_id << '\n';
+            publish_request_id_to_track.emplace(pub_req_id, track.track_name);
             pub_req_id += 2;
         }
     }
@@ -3869,6 +3870,21 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         encode_subscribe_namespace_ok_message(draft_version, subscribe_namespace.request_id), false);
                     if (!ws.ok) {
                         return {ws, 0};
+                    }
+                }
+            } else if (message_type == 0x1e) {  // PUBLISH_OK
+                // Relay accepted a PUBLISHed track. Some relays (e.g. moqx) do not
+                // forward SUBSCRIBE after PUBLISH_OK; they expect the publisher to
+                // start sending data once the track is accepted. Mark the track as
+                // subscribed so drain_queue will forward fragments.
+                PublishOk publish_ok_msg;
+                if (decode_publish_ok(message_bytes, draft_version, publish_ok_msg)) {
+                    const auto it = publish_request_id_to_track.find(publish_ok_msg.request_id);
+                    if (it != publish_request_id_to_track.end()) {
+                        subscribed_tracks.insert(it->second);
+                        ++new_subs;
+                        std::cerr << "[moqt-session] live: PUBLISH_OK track=" << it->second
+                                  << " request_id=" << publish_ok_msg.request_id << '\n';
                     }
                 }
             }
