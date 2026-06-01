@@ -95,6 +95,15 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      - name: Verify static library
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            test -f build/Debug/openmoq_publisher.lib
+          else
+            test -f build/libopenmoq_publisher.a
+          fi
+
       - name: Test
         shell: bash
         run: |

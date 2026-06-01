@@ -130,7 +130,7 @@ if(OPENMOQ_ENABLE_PICOQUIC AND EXISTS "${OPENMOQ_PICOQUIC_SOURCE_DIR}/CMakeLists
     endif()
 endif()
 
-add_library(openmoq_publisher_lib
+add_library(openmoq_publisher_lib STATIC
     src/cli_options.cpp
     src/cmaf_segmenter.cpp
     src/cmsf_packager.cpp
@@ -142,6 +142,10 @@ add_library(openmoq_publisher_lib
     src/transport/picoquic_client.cpp
     src/transport/publisher_transport.cpp
     src/transport/webtransport_client.cpp
+)
+
+set_target_properties(openmoq_publisher_lib PROPERTIES
+    OUTPUT_NAME openmoq_publisher
 )
 
 target_include_directories(openmoq_publisher_lib

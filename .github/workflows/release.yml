@@ -116,12 +116,16 @@ jobs:
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             # MSVC multi-config generator places the binary under build/Release/
             cp build/Release/openmoq-publisher.exe "${package_root}/"
+            cp build/Release/openmoq_publisher.lib "${package_root}/"
+            cp -R include "${package_root}/include"
             cp README.md LICENSE "${package_root}/"
             cp -R docs "${package_root}/docs"
             archive="${package_root}.zip"
             7z a "${archive}" "${package_root}"
           else
             cp build/openmoq-publisher "${package_root}/"
+            cp build/libopenmoq_publisher.a "${package_root}/"
+            cp -R include "${package_root}/include"
             cp README.md LICENSE "${package_root}/"
             cp -R docs "${package_root}/docs"
             archive="${package_root}.tar.gz"
