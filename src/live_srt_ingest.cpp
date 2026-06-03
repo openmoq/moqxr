@@ -388,6 +388,10 @@ std::vector<std::uint8_t> annexb_to_avcc(std::span<const std::uint8_t> payload) 
             next = payload.size();
         }
         const std::size_t nal_size = next - start;
+        if (nal_size == 0) {
+            i = next;
+            continue;
+        }
         append_be32(out, static_cast<std::uint32_t>(nal_size));
         out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(start),
                    payload.begin() + static_cast<std::ptrdiff_t>(start + nal_size));
@@ -1441,6 +1445,9 @@ MediaFragment build_fragment_from_sample(const LiveSrtCallerRuntimeConfig& confi
     fragment.earliest_presentation_time_us = pts_us;
     fragment.sap_type = sample.is_video ? (sample.keyframe ? 1 : 2) : 1;
     fragment.is_video_keyframe = sample.is_video && sample.keyframe;
+    fragment.creation_time_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     fragment.payload.owned_bytes.reserve(moof.size() + mdat.size());
     fragment.payload.owned_bytes.insert(fragment.payload.owned_bytes.end(), moof.begin(), moof.end());
     fragment.payload.owned_bytes.insert(fragment.payload.owned_bytes.end(), mdat.begin(), mdat.end());

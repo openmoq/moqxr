@@ -3211,16 +3211,16 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         srt_join_thread.join();
     }
 
-    if (!status.ok) {
-        return status;
-    }
-
     for (auto& [track_name, sender] : sender_by_track) {
-        status = sender.finish_group(transport_);
-        if (!status.ok) {
-            return status;
+        TransportStatus finish_status = sender.finish_group(transport_);
+        if (!finish_status.ok && status.ok) {
+            status = finish_status;
         }
         static_cast<void>(track_name);
+    }
+
+    if (!status.ok) {
+        return status;
     }
 
     for (const auto& [request_id, subscribe] : active_subscriptions) {
