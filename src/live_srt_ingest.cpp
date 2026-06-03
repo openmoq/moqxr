@@ -384,6 +384,9 @@ std::vector<std::uint8_t> annexb_to_avcc(std::span<const std::uint8_t> payload) 
             }
             ++next;
         }
+        if (next + 3 >= payload.size()) {
+            next = payload.size();
+        }
         const std::size_t nal_size = next - start;
         append_be32(out, static_cast<std::uint32_t>(nal_size));
         out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(start),
@@ -588,6 +591,195 @@ HevcParamSets extract_hevc_param_sets(std::span<const std::uint8_t> payload) {
     return params;
 }
 
+// Minimal RBSP bitstream reader used only for SPS dimension extraction.
+class RbspBitReader {
+public:
+    RbspBitReader(const std::uint8_t* data, std::size_t size) : data_(data), size_(size) {}
+
+    bool read_bit(std::uint8_t& out) {
+        if (byte_pos_ >= size_) return false;
+        out = static_cast<std::uint8_t>((data_[byte_pos_] >> (7U - bit_pos_)) & 0x01U);
+        if (++bit_pos_ == 8U) { bit_pos_ = 0; ++byte_pos_; }
+        return true;
+    }
+
+    bool skip_bits(std::size_t count) {
+        for (std::size_t k = 0; k < count; ++k) {
+            std::uint8_t b = 0;
+            if (!read_bit(b)) return false;
+        }
+        return true;
+    }
+
+    bool read_ue(std::uint32_t& out) {
+        int zeros = 0;
+        std::uint8_t bit = 0;
+        while (zeros < 32) {
+            if (!read_bit(bit)) return false;
+            if (bit != 0) break;
+            ++zeros;
+        }
+        if (zeros == 32) return false;
+        std::uint32_t suffix = 0;
+        for (int k = 0; k < zeros; ++k) {
+            if (!read_bit(bit)) return false;
+            suffix = (suffix << 1U) | bit;
+        }
+        out = (1U << zeros) - 1U + suffix;
+        return true;
+    }
+
+    bool skip_ue() { std::uint32_t v = 0; return read_ue(v); }
+
+    bool read_se(std::int32_t& out) {
+        std::uint32_t ue = 0;
+        if (!read_ue(ue)) return false;
+        out = (ue % 2U == 0U) ? -static_cast<std::int32_t>(ue / 2U)
+                               : static_cast<std::int32_t>((ue + 1U) / 2U);
+        return true;
+    }
+
+    bool skip_se() { std::int32_t v = 0; return read_se(v); }
+
+private:
+    const std::uint8_t* data_;
+    std::size_t size_;
+    std::size_t byte_pos_ = 0;
+    std::uint8_t bit_pos_ = 0;
+};
+
+// Parse {width, height} from a raw H.264 SPS NAL unit (includes 1-byte NAL header).
+// Returns {0, 0} on any parse failure.
+std::pair<std::uint32_t, std::uint32_t>
+parse_h264_dimensions(const std::vector<std::uint8_t>& sps_nal) {
+    if (sps_nal.size() < 5) return {0, 0};
+    const std::uint8_t profile_idc = sps_nal[1];
+    RbspBitReader r(sps_nal.data() + 4, sps_nal.size() - 4);
+
+    if (!r.skip_ue()) return {0, 0};  // seq_parameter_set_id
+
+    std::uint32_t chroma_format_idc = 1;
+    static constexpr std::uint8_t kHighProfiles[] = {
+        100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135
+    };
+    for (std::uint8_t hp : kHighProfiles) {
+        if (profile_idc != hp) continue;
+        if (!r.read_ue(chroma_format_idc)) return {0, 0};
+        if (chroma_format_idc == 3 && !r.skip_bits(1)) return {0, 0};
+        if (!r.skip_ue()) return {0, 0};  // bit_depth_luma_minus8
+        if (!r.skip_ue()) return {0, 0};  // bit_depth_chroma_minus8
+        if (!r.skip_bits(1)) return {0, 0};  // qpprime_y_zero_transform_bypass_flag
+        std::uint8_t ssmf = 0;
+        if (!r.read_bit(ssmf)) return {0, 0};
+        if (ssmf) {
+            const int n_lists = (chroma_format_idc != 3) ? 8 : 12;
+            for (int j = 0; j < n_lists; ++j) {
+                std::uint8_t present = 0;
+                if (!r.read_bit(present)) return {0, 0};
+                if (present) {
+                    const int sl_size = (j < 6) ? 16 : 64;
+                    int last = 8, next = 8;
+                    for (int k = 0; k < sl_size; ++k) {
+                        if (next != 0) {
+                            std::int32_t delta = 0;
+                            if (!r.read_se(delta)) return {0, 0};
+                            next = (last + delta + 256) % 256;
+                        }
+                        last = (next == 0) ? last : next;
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    if (!r.skip_ue()) return {0, 0};  // log2_max_frame_num_minus4
+    std::uint32_t poc_type = 0;
+    if (!r.read_ue(poc_type)) return {0, 0};
+    if (poc_type == 0) {
+        if (!r.skip_ue()) return {0, 0};
+    } else if (poc_type == 1) {
+        if (!r.skip_bits(1) || !r.skip_se() || !r.skip_se()) return {0, 0};
+        std::uint32_t num_ref = 0;
+        if (!r.read_ue(num_ref)) return {0, 0};
+        for (std::uint32_t k = 0; k < num_ref; ++k) {
+            if (!r.skip_se()) return {0, 0};
+        }
+    }
+    if (!r.skip_ue()) return {0, 0};  // max_num_ref_frames
+    if (!r.skip_bits(1)) return {0, 0};  // gaps_in_frame_num_value_allowed_flag
+
+    std::uint32_t pic_w = 0, pic_h = 0;
+    if (!r.read_ue(pic_w) || !r.read_ue(pic_h)) return {0, 0};
+    std::uint8_t frame_mbs_only = 0;
+    if (!r.read_bit(frame_mbs_only)) return {0, 0};
+    const std::uint32_t width = (pic_w + 1U) * 16U;
+    std::uint32_t height = (pic_h + 1U) * 16U * (2U - frame_mbs_only);
+
+    if (!frame_mbs_only && !r.skip_bits(1)) return {width, height};
+    if (!r.skip_bits(1)) return {width, height};  // direct_8x8_inference_flag
+    std::uint8_t crop = 0;
+    if (!r.read_bit(crop)) return {width, height};
+    if (crop) {
+        const std::uint32_t cux = (chroma_format_idc == 0) ? 1U : 2U;
+        const std::uint32_t cuy = (chroma_format_idc == 0) ? (2U - frame_mbs_only)
+                                                            : (2U * (2U - frame_mbs_only));
+        std::uint32_t cl = 0, cr = 0, ct = 0, cb = 0;
+        if (!r.read_ue(cl) || !r.read_ue(cr) || !r.read_ue(ct) || !r.read_ue(cb)) {
+            return {width, height};
+        }
+        return {width - (cl + cr) * cux, height - (ct + cb) * cuy};
+    }
+    return {width, height};
+}
+
+// Parse {width, height} from a raw HEVC SPS NAL unit (includes 2-byte NAL header).
+// Returns {0, 0} on any parse failure.
+std::pair<std::uint32_t, std::uint32_t>
+parse_hevc_dimensions(const std::vector<std::uint8_t>& sps_nal) {
+    if (sps_nal.size() < 16) return {0, 0};
+    const std::uint8_t max_sub_layers_minus1 = static_cast<std::uint8_t>((sps_nal[2] >> 1U) & 0x07U);
+    RbspBitReader r(sps_nal.data() + 2, sps_nal.size() - 2);
+    if (!r.skip_bits(8)) return {0, 0};   // vps_id(4)+max_sub_layers(3)+temporal_nesting(1)
+    if (!r.skip_bits(96)) return {0, 0};  // profile_tier_level general_* (12 bytes)
+
+    bool sub_profile[8] = {}, sub_level[8] = {};
+    for (int j = 0; j < static_cast<int>(max_sub_layers_minus1); ++j) {
+        std::uint8_t b = 0;
+        if (!r.read_bit(b)) return {0, 0};
+        sub_profile[j] = (b != 0);
+        if (!r.read_bit(b)) return {0, 0};
+        sub_level[j] = (b != 0);
+    }
+    if (max_sub_layers_minus1 < 8 && !r.skip_bits(2U * (8U - max_sub_layers_minus1))) return {0, 0};
+    for (int j = 0; j < static_cast<int>(max_sub_layers_minus1); ++j) {
+        if (sub_profile[j] && !r.skip_bits(88)) return {0, 0};
+        if (sub_level[j]   && !r.skip_bits(8))  return {0, 0};
+    }
+
+    if (!r.skip_ue()) return {0, 0};  // sps_seq_parameter_set_id
+    std::uint32_t chroma_format_idc = 0;
+    if (!r.read_ue(chroma_format_idc)) return {0, 0};
+    if (chroma_format_idc == 3 && !r.skip_bits(1)) return {0, 0};
+
+    std::uint32_t width = 0, height = 0;
+    if (!r.read_ue(width) || !r.read_ue(height)) return {0, 0};
+
+    std::uint8_t conf_win = 0;
+    if (!r.read_bit(conf_win)) return {width, height};
+    if (conf_win) {
+        const std::uint32_t swc = (chroma_format_idc == 1 || chroma_format_idc == 2) ? 2U : 1U;
+        const std::uint32_t shc = (chroma_format_idc == 1) ? 2U : 1U;
+        std::uint32_t cl = 0, cr = 0, ct = 0, cb = 0;
+        if (!r.read_ue(cl) || !r.read_ue(cr) || !r.read_ue(ct) || !r.read_ue(cb)) {
+            return {width, height};
+        }
+        width  -= (cl + cr) * swc;
+        height -= (ct + cb) * shc;
+    }
+    return {width, height};
+}
+
 // Build an hvcC box (HEVCDecoderConfigurationRecord) from VPS, SPS, PPS.
 std::vector<std::uint8_t> build_hvcc_box(const HevcParamSets& params) {
     if (params.vps.empty() || params.sps.size() < 2 || params.pps.empty()) {
@@ -598,7 +790,7 @@ std::vector<std::uint8_t> build_hvcc_box(const HevcParamSets& params) {
     // SPS: nal_header(2) + sps_video_parameter_set_id(4b) + sps_max_sub_layers_minus1(3b) + temporal_id_nesting(1b) + profile_tier_level(...)
     const std::uint8_t* sps_data = params.sps.data() + 2;  // skip 2-byte NAL header
     const std::size_t sps_payload_size = params.sps.size() - 2;
-    if (sps_payload_size < 12) {
+    if (sps_payload_size < 13) {
         return {};
     }
 
@@ -1271,8 +1463,8 @@ TrackDescription make_track(std::uint32_t track_id,
     track.packaging = "cmaf";
     track.mime_type = is_video ? "video/mp4" : "audio/mp4";
     track.timescale = is_video ? 90000 : 48000;
-    track.width = is_video ? 1920 : 0;
-    track.height = is_video ? 1080 : 0;
+    track.width = 0;
+    track.height = 0;
     track.channel_count = is_video ? 0 : 2;
     track.sample_rate = is_video ? 0 : 48000;
     track.frame_rate = is_video ? 30.0 : 0.0;
@@ -1445,9 +1637,11 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                                         !discovery->phase_done.load(std::memory_order_acquire)) {
                                         std::vector<std::uint8_t> codec_priv;
                                         std::string codec_str_update;
+                                        std::pair<std::uint32_t, std::uint32_t> dim_update{0, 0};
                                         if (state.video_codec == VideoCodec::kHevc) {
                                             auto params = extract_hevc_param_sets(sample.payload);
                                             codec_priv = build_hvcc_box(params);
+                                            dim_update = parse_hevc_dimensions(params.sps);
                                             if (!codec_priv.empty() && params.sps.size() > 12) {
                                                 // Build codec string: hvc1.<profile>.<compat>.<tier><level>
                                                 const std::uint8_t* s = params.sps.data() + 2;
@@ -1466,6 +1660,7 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                                         } else {
                                             auto [sps, pps] = extract_h264_sps_pps(sample.payload);
                                             codec_priv = build_avcc_box(sps, pps);
+                                            dim_update = parse_h264_dimensions(sps);
                                             if (!codec_priv.empty() && sps.size() >= 4) {
                                                 char buf[32];
                                                 std::snprintf(buf, sizeof(buf), "avc1.%02X%02X%02X",
@@ -1482,6 +1677,10 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                                                     bootstrap_.tracks[video_index].codec_private = std::move(codec_priv);
                                                     if (!codec_str_update.empty()) {
                                                         bootstrap_.tracks[video_index].codec = codec_str_update;
+                                                    }
+                                                    if (dim_update.first > 0 && dim_update.second > 0) {
+                                                        bootstrap_.tracks[video_index].width = dim_update.first;
+                                                        bootstrap_.tracks[video_index].height = dim_update.second;
                                                     }
                                                     discovery->video_private_ready[i] = true;
                                                     std::cout << "[SRT] Video "
