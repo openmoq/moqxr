@@ -1400,11 +1400,19 @@ MediaFragment build_fragment_from_sample(const LiveSrtCallerRuntimeConfig& confi
         state.base_pts90k = sample.pts90k;
     }
 
-    // Compute base_decode_time from PTS relative to shared origin, converted
-    // to the track's timescale. This keeps audio and video in sync.
+    // Compute PTS offset from origin. Two cases where sample.pts90k < base_pts90k:
+    //   Small underflow (audio pre-roll / jitter): clamp to 0 — one or two
+    //   frames at t=0 is harmless.
+    //   Large backward jump (>2^32 ticks, ~13 h): 33-bit PTS rollover or
+    //   encoder restart — reset the origin so subsequent base_decode_time
+    //   values stay non-zero and monotonically increasing.
     const std::uint32_t timescale = sample.is_video ? state.video_timescale : state.audio_timescale;
-    const std::uint64_t pts_offset90k = sample.pts90k >= *state.base_pts90k
-        ? sample.pts90k - *state.base_pts90k : 0;
+    std::uint64_t pts_offset90k = 0;
+    if (sample.pts90k >= *state.base_pts90k) {
+        pts_offset90k = sample.pts90k - *state.base_pts90k;
+    } else if (*state.base_pts90k - sample.pts90k > (1ULL << 32)) {
+        state.base_pts90k = sample.pts90k;
+    }
     const std::uint64_t base_decode_time = (pts_offset90k * timescale + 45000ULL) / 90000ULL;
 
     // AAC audio: always use exactly 1024 samples per frame in the audio timescale.
