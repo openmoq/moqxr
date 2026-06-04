@@ -267,11 +267,12 @@ mdat
 ```
 **Timing model:**
 
-- `base_decode_time` is derived from the sample's PTS relative to a shared origin (`base_pts90k`), converted to the track's timescale. This preserves A/V alignment.
+- `base_decode_time` is **accumulation-based**: each sample's `tfdt` value = previous sample's value + previous `sample_duration`. This guarantees strict monotonicity regardless of PTS jitter from SRT transport, preventing MSE "overlapping payload" drops on the player.
 - Audio `sample_duration` is always exactly **1024** (in the audio timescale) — the fixed AAC frame size.
 - Video `sample_duration` is computed from PTS deltas: `(current_pts_us - last_pts_us) × timescale / 1,000,000`
 - Timescale: 90000 for video, actual sample rate (e.g. 48000) for audio
 - tfdt uses version 1 (64-bit) to avoid overflow during long streams
+- Per-track decode time is tracked in `decode_time_by_track` map (initialized to 0, incremented by each sample's duration)
 
 **trun flags = 0x000F01:**
 
@@ -363,7 +364,7 @@ Aspect | SRT Path | Stdin (fragmented MP4) Path
 **Demuxing** | Full TS demux: PAT→PMT→PES→ES | MP4 box parser: reads top-level `moof` and `mdat` boxes
 **Codec conversion** | Annex-B → length-prefixed; ADTS → raw AAC | None needed (already in MP4 format)
 **Granularity** | Always 1 sample per moof+mdat | Depends on ffmpeg fragmentation settings (could be N samples per moof)
-**Timing** | Derived from PTS relative to shared origin | Preserved from ffmpeg's trun entries
+**Timing** | Accumulation-based (per-track running sum of sample_duration) | Preserved from ffmpeg's trun entries
 **group_id** | Incremented on video keyframe | Incremented on video keyframe
 **object_id** | Per-track, reset each group | Per-track, reset each group
 
@@ -401,8 +402,8 @@ CallerTrackState (per SRT connection):
 ├── first_video_keyframe_seen
 ├── object_id_by_track (reset per group)
 ├── last_pts_by_track (for duration calculation)
-├── base_pts90k (shared PTS origin for A/V timeline alignment)
-├── last_duration_us_by_track (fallback for non-monotonic PTS)
+├── decode_time_by_track (per-track running tfdt, guarantees monotonicity)
+├── last_duration_us_by_track (for computing video sample_duration from PTS deltas)
 ├── moof_sequence (globally incrementing per connection)
 └── video_codec (H264 or HEVC)
 ```

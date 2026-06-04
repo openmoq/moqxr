@@ -436,6 +436,7 @@ struct CallerTrackState {
     std::map<std::string, std::size_t> object_id_by_track;
     std::map<std::string, std::uint64_t> last_pts_by_track;
     std::map<std::string, std::uint64_t> last_duration_us_by_track;
+    std::map<std::string, std::uint64_t> decode_time_by_track;
     std::uint32_t moof_sequence = 1;
     VideoCodec video_codec = VideoCodec::kUnknown;
     // Shared PTS origin (90 kHz) for A/V timeline alignment.
@@ -1399,31 +1400,20 @@ MediaFragment build_fragment_from_sample(const LiveSrtCallerRuntimeConfig& confi
         sample_bytes = std::move(sample.payload);
     }
 
-    // Establish shared PTS origin on first sample (video or audio).
-    if (!state.base_pts90k.has_value()) {
-        state.base_pts90k = sample.pts90k;
-    }
-
-    // Compute PTS offset from origin. Two cases where sample.pts90k < base_pts90k:
-    //   Small underflow (audio pre-roll / jitter): clamp to 0 — one or two
-    //   frames at t=0 is harmless.
-    //   Large backward jump (>2^32 ticks, ~13 h): 33-bit PTS rollover or
-    //   encoder restart — reset the origin so subsequent base_decode_time
-    //   values stay non-zero and monotonically increasing.
+    // Accumulation-based decode_time: monotonically increasing, never resets.
+    // MSE requires timestamps that never go backwards. PTS-based computation
+    // can produce non-monotonic values due to SRT jitter, causing the player
+    // to drop "overlapping" payloads.
     const std::uint32_t timescale = sample.is_video ? state.video_timescale : state.audio_timescale;
-    std::uint64_t pts_offset90k = 0;
-    if (sample.pts90k >= *state.base_pts90k) {
-        pts_offset90k = sample.pts90k - *state.base_pts90k;
-    } else if (*state.base_pts90k - sample.pts90k > (1ULL << 32)) {
-        state.base_pts90k = sample.pts90k;
-    }
-    const std::uint64_t base_decode_time = (pts_offset90k * timescale + 45000ULL) / 90000ULL;
 
     // AAC audio: always use exactly 1024 samples per frame in the audio timescale.
     // Deriving from duration_us can produce 1023 or 1025 due to rounding.
     const std::uint32_t sample_duration = !sample.is_video
         ? 1024U
         : static_cast<std::uint32_t>((duration_us * static_cast<std::uint64_t>(timescale)) / 1000000ULL);
+
+    const std::uint64_t base_decode_time = state.decode_time_by_track[track_name];
+    state.decode_time_by_track[track_name] += (sample_duration == 0 ? 1U : sample_duration);
     const std::uint32_t sample_flags = (sample.is_video && !sample.keyframe) ? 0x00010000U : 0x02000000U;
 
     auto moof = build_moof_box(state.moof_sequence++,
