@@ -53,6 +53,26 @@ struct PublisherStats {
     std::string last_error;
 };
 
+struct LiveSrtCaller {
+    std::string id;
+    std::string endpoint;
+    bool fragment_on_keyframe = true;
+    bool empty_moov = true;
+    bool default_base_moof = true;
+    bool separate_moof_per_track = true;
+    std::uint32_t target_fragment_duration_ms = 1000;
+    std::uint32_t latency_ms = 120;
+    bool auto_detect_program = true;
+    std::optional<std::uint32_t> program_number;
+    std::optional<std::uint32_t> video_pid;
+    std::optional<std::uint32_t> audio_pid;
+};
+
+struct LiveIngestConfig {
+    bool use_stdin = false;
+    std::vector<LiveSrtCaller> srt_callers;
+};
+
 class Publisher {
 public:
     using TransportFactory = std::function<std::unique_ptr<transport::PublisherTransport>(transport::TransportKind)>;
@@ -82,6 +102,11 @@ public:
                                               const transport::TlsConfig& tls = {},
                                               bool endpoint_alpn_overridden = false) const;
     transport::TransportStatus publish_live(std::istream& input,
+                                            const transport::EndpointConfig& endpoint,
+                                            const transport::TlsConfig& tls = {},
+                                            bool endpoint_alpn_overridden = false) const;
+    transport::TransportStatus publish_live(const LiveIngestConfig& ingest,
+                                            std::istream* stdin_input,
                                             const transport::EndpointConfig& endpoint,
                                             const transport::TlsConfig& tls = {},
                                             bool endpoint_alpn_overridden = false) const;

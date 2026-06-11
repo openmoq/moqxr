@@ -194,6 +194,16 @@ transport::TransportStatus Publisher::publish_live(std::istream& input,
                                                    const transport::EndpointConfig& endpoint,
                                                    const transport::TlsConfig& tls,
                                                    bool endpoint_alpn_overridden) const {
+    LiveIngestConfig ingest;
+    ingest.use_stdin = true;
+    return publish_live(ingest, &input, endpoint, tls, endpoint_alpn_overridden);
+}
+
+transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& ingest,
+                                                   std::istream* stdin_input,
+                                                   const transport::EndpointConfig& endpoint,
+                                                   const transport::TlsConfig& tls,
+                                                   bool endpoint_alpn_overridden) const {
     if (!transport_factory_) {
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
@@ -221,7 +231,30 @@ transport::TransportStatus Publisher::publish_live(std::istream& input,
         return transport::TransportStatus::failure(error);
     }
 
-    status = active->session->publish_live(input, config_.draft_version, config_.split_cmaf_chunks);
+    transport::LiveIngestOptions session_ingest;
+    session_ingest.use_stdin = ingest.use_stdin;
+    session_ingest.srt_callers.reserve(ingest.srt_callers.size());
+    for (const auto& caller : ingest.srt_callers) {
+        transport::LiveSrtCallerOptions session_caller;
+        session_caller.id = caller.id;
+        session_caller.endpoint = caller.endpoint;
+        session_caller.fragment_on_keyframe = caller.fragment_on_keyframe;
+        session_caller.empty_moov = caller.empty_moov;
+        session_caller.default_base_moof = caller.default_base_moof;
+        session_caller.separate_moof_per_track = caller.separate_moof_per_track;
+        session_caller.target_fragment_duration_ms = caller.target_fragment_duration_ms;
+        session_caller.latency_ms = caller.latency_ms;
+        session_caller.auto_detect_program = caller.auto_detect_program;
+        session_caller.program_number = caller.program_number;
+        session_caller.video_pid = caller.video_pid;
+        session_caller.audio_pid = caller.audio_pid;
+        session_ingest.srt_callers.push_back(std::move(session_caller));
+    }
+
+    status = active->session->publish_live(session_ingest,
+                                           stdin_input,
+                                           config_.draft_version,
+                                           config_.split_cmaf_chunks);
     if (!status.ok) {
         const std::string error = "transport live publish failed: " + status.message;
         static_cast<void>(active->session->close(0));

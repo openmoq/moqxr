@@ -53,6 +53,91 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
+Live ingest examples (choose one path, not both):
+
+1. SRT ingest path (`--live-source srt`)
+
+Create an SRT config file (example: `/tmp/srt_callers.json`):
+
+```json
+{
+  "srt_callers": [
+    {
+      "id": "cam1",
+      "srt": {
+        "mode": "caller",
+        "host": "127.0.0.1",
+        "port": 9000,
+        "latency_ms": 120
+      },
+      "mpegts": {
+        "auto_detect_program": true,
+        "program_number": null,
+        "video_pid": null,
+        "audio_pid": null
+      },
+      "cmaf": {
+        "fragment_on_keyframe": true,
+        "empty_moov": true,
+        "default_base_moof": true,
+        "separate_moof_per_track": true,
+        "target_fragment_duration_ms": 1000
+      }
+    }
+  ]
+}
+```
+
+Start the publisher (SRT receiver + MoQ publisher):
+
+```bash
+./build/openmoq-publisher \
+  --live-source srt \
+  --srt-config /tmp/srt_callers.json \
+  --endpoint 127.0.0.1:4443 \
+  --transport raw \
+  --namespace live \
+  --draft 16 \
+  --timeout 120 \
+  --forward 0
+```
+
+Feed MPEG-TS over SRT from ffmpeg:
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+  -i /home/ubuntu/bbb_sunflower_1080p_30fps_normal.mp4 \
+  -filter_complex "[0:v]drawtext=fontcolor=white:fontsize=36:box=1:boxcolor=black@0.45:boxborderw=8:x=w-tw-20:y=20:text='%{localtime\\:%Y-%m-%d %T}\\:%{eif\\:mod(t*1000\\,1000)\\:d\\:3}'[vclock]" \
+  -map "[vclock]" -map 0:a:0 \
+  -c:v libx265 -preset veryfast -r 30 -g 60 -keyint_min 60 -bf 0 \
+  -x265-params "keyint=60:min-keyint=60:scenecut=0:open-gop=0:repeat-headers=1" \
+  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
+```
+
+2. stdin fragmented-MP4 path (`--live-source stdin`)
+
+```bash
+ffmpeg -i /home/ubuntu/bbb_sunflower_1080p_30fps_normal.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -map_metadata -1 \
+  -sn -dn \
+  -c:v libx264 -preset medium -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+  -f mp4 - | ./build/openmoq-publisher \
+    --live-source stdin \
+    --input - \
+    --endpoint 127.0.0.1:4443 \
+    --transport raw \
+    --namespace live \
+    --draft 16 \
+    --timeout 120 \
+    --forward 0
+```
+
+`--live-source both` is intentionally not supported.
+
 On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publisher.exe` or the matching build configuration path.
 
 ## Documentation

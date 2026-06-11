@@ -16,6 +16,26 @@
 
 namespace openmoq::publisher::transport {
 
+struct LiveSrtCallerOptions {
+    std::string id;
+    std::string endpoint;
+    bool fragment_on_keyframe = true;
+    bool empty_moov = true;
+    bool default_base_moof = true;
+    bool separate_moof_per_track = true;
+    std::uint32_t target_fragment_duration_ms = 1000;
+    std::uint32_t latency_ms = 120;
+    bool auto_detect_program = true;
+    std::optional<std::uint32_t> program_number;
+    std::optional<std::uint32_t> video_pid;
+    std::optional<std::uint32_t> audio_pid;
+};
+
+struct LiveIngestOptions {
+    bool use_stdin = false;
+    std::vector<LiveSrtCallerOptions> srt_callers;
+};
+
 class MoqtSession {
 public:
     struct PublishStats {
@@ -42,6 +62,10 @@ public:
     TransportStatus connect(const EndpointConfig& endpoint, const TlsConfig& tls);
     TransportStatus publish(const openmoq::publisher::PublishPlan& plan);
     TransportStatus publish_live(std::istream& input,
+                                 openmoq::publisher::DraftVersion draft_version,
+                                 bool split_cmaf_chunks);
+    TransportStatus publish_live(const LiveIngestOptions& ingest,
+                                 std::istream* stdin_input,
                                  openmoq::publisher::DraftVersion draft_version,
                                  bool split_cmaf_chunks);
     TransportStatus publish_live_objects(const openmoq::publisher::LiveObjectSource& source,

@@ -151,5 +151,26 @@ int main() {
                      "expected stdin input source to avoid storing a file path");
     }
 
+    // --live-source srt --srt-config /tmp/foo.json
+    {
+        const CliOptions options = parse({"openmoq-publisher", "--live-source", "srt", "--srt-config", "/tmp/foo.json",
+                                          "--endpoint", "localhost:4443", "--namespace", "ns"});
+        ok &= expect(options.live_source == openmoq::publisher::LiveSourceKind::kSrt,
+                     "expected --live-source srt");
+        ok &= expect(options.srt_config_path == "/tmp/foo.json",
+                     "expected --srt-config path");
+    }
+
+    // --live-source srt without --srt-config should fail
+    {
+        bool threw = false;
+        try {
+            parse({"openmoq-publisher", "--live-source", "srt", "--namespace", "ns"});
+        } catch (...) {
+            threw = true;
+        }
+        ok &= expect(threw, "expected --live-source srt without --srt-config to fail");
+    }
+
     return ok ? 0 : 1;
 }
