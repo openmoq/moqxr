@@ -30,6 +30,7 @@ Testing/
 
 # Tooling
 compile_commands.json
+graphify-out/
 
 # Local test artifacts
 /tmp-*.mp4
