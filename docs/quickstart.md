@@ -107,6 +107,34 @@ cat sample.mp4 | ./build/openmoq-publisher \
   --insecure
 ```
 
+## CTE LL-DASH Live Ingest
+
+Start an HTTP/1.1 chunked CMAF ingest endpoint and publish the resulting live objects to a MoQ relay:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Each concurrent path below `--dash-path` is accepted independently:
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
+```
+
 ## Output Notes
 
 - default output includes the `catalog` object plus media objects

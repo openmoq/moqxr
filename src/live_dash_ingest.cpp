@@ -1,0 +1,669 @@
+#include "openmoq/publisher/live_dash_ingest.h"
+
+#include "openmoq/publisher/mp4_box.h"
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cctype>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <thread>
+#include <utility>
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+namespace openmoq::publisher {
+namespace {
+
+std::string path_slug(std::string_view path) {
+    const std::size_t slash = path.find_last_of('/');
+    std::string slug = std::string(slash == std::string_view::npos ? path : path.substr(slash + 1));
+    if (slug.empty()) {
+        slug = "dash";
+    }
+    for (char& ch : slug) {
+        const bool alpha = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+        const bool digit = ch >= '0' && ch <= '9';
+        if (!alpha && !digit) {
+            ch = '_';
+        }
+    }
+    return slug;
+}
+
+std::string json_escape(std::string_view value) {
+    std::string out;
+    for (const char ch : value) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+std::string role_for_handler(std::string_view handler_type) {
+    if (handler_type == "vide") {
+        return "video";
+    }
+    if (handler_type == "soun") {
+        return "audio";
+    }
+    return "data";
+}
+
+bool starts_with(std::string_view value, std::string_view prefix) {
+    return value.substr(0, prefix.size()) == prefix;
+}
+
+bool path_matches_prefix(std::string_view path, std::string_view prefix) {
+    if (!starts_with(path, prefix)) {
+        return false;
+    }
+    return path.size() == prefix.size() || prefix.ends_with('/') || path[prefix.size()] == '/';
+}
+
+std::string trim(std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t' ||
+                              value.back() == '\r' || value.back() == '\n')) {
+        value.remove_suffix(1);
+    }
+    return std::string(value);
+}
+
+std::string lower_ascii(std::string value) {
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+bool send_all(int fd, std::string_view bytes) {
+#if !defined(_WIN32)
+    while (!bytes.empty()) {
+        const ssize_t sent = ::send(fd, bytes.data(), bytes.size(), 0);
+        if (sent <= 0) {
+            return false;
+        }
+        bytes.remove_prefix(static_cast<std::size_t>(sent));
+    }
+    return true;
+#else
+    static_cast<void>(fd);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+void close_fd(int fd) {
+#if !defined(_WIN32)
+    if (fd >= 0) {
+        static_cast<void>(::close(fd));
+    }
+#else
+    static_cast<void>(fd);
+#endif
+}
+
+struct ParsedRequest {
+    std::string method;
+    std::string path;
+    std::map<std::string, std::string> headers;
+};
+
+std::optional<ParsedRequest> parse_request_headers(std::string_view text) {
+    const std::size_t line_end = text.find("\r\n");
+    if (line_end == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::istringstream request_line(std::string(text.substr(0, line_end)));
+    ParsedRequest request;
+    std::string version;
+    request_line >> request.method >> request.path >> version;
+    if (request.method.empty() || request.path.empty() || version.rfind("HTTP/", 0) != 0) {
+        return std::nullopt;
+    }
+
+    std::size_t cursor = line_end + 2;
+    while (cursor < text.size()) {
+        const std::size_t next = text.find("\r\n", cursor);
+        if (next == std::string_view::npos || next == cursor) {
+            break;
+        }
+        const std::string_view line = text.substr(cursor, next - cursor);
+        const std::size_t colon = line.find(':');
+        if (colon == std::string_view::npos) {
+            return std::nullopt;
+        }
+        request.headers.emplace(lower_ascii(trim(line.substr(0, colon))), trim(line.substr(colon + 1)));
+        cursor = next + 2;
+    }
+    return request;
+}
+
+}  // namespace
+
+ChunkedBodyDecoder::ChunkedBodyDecoder(std::size_t max_chunk_size)
+    : max_chunk_size_(max_chunk_size) {}
+
+void ChunkedBodyDecoder::append(std::span<const std::uint8_t> bytes) {
+    if (state_ == State::kFailed || state_ == State::kComplete) {
+        return;
+    }
+    input_.insert(input_.end(), bytes.begin(), bytes.end());
+    parse_available();
+}
+
+std::vector<std::uint8_t> ChunkedBodyDecoder::take_decoded() {
+    std::vector<std::uint8_t> out;
+    out.swap(decoded_);
+    return out;
+}
+
+bool ChunkedBodyDecoder::complete() const {
+    return state_ == State::kComplete;
+}
+
+bool ChunkedBodyDecoder::failed() const {
+    return state_ == State::kFailed;
+}
+
+const std::string& ChunkedBodyDecoder::error() const {
+    return error_;
+}
+
+void ChunkedBodyDecoder::fail(std::string message) {
+    state_ = State::kFailed;
+    error_ = std::move(message);
+}
+
+void ChunkedBodyDecoder::parse_available() {
+    while (state_ != State::kFailed && state_ != State::kComplete) {
+        if (state_ == State::kSizeLine || state_ == State::kTrailerLine) {
+            constexpr std::array<std::uint8_t, 2> kCrLf{'\r', '\n'};
+            auto crlf = std::search(input_.begin(), input_.end(), kCrLf.begin(), kCrLf.end());
+            if (crlf == input_.end()) {
+                return;
+            }
+            const std::string line(input_.begin(), crlf);
+            input_.erase(input_.begin(), crlf + 2);
+            if (state_ == State::kTrailerLine) {
+                if (line.empty()) {
+                    state_ = State::kComplete;
+                }
+                continue;
+            }
+
+            const std::size_t extension = line.find(';');
+            const std::string size_text = line.substr(0, extension);
+            if (size_text.empty()) {
+                fail("empty chunk size");
+                return;
+            }
+            std::size_t value = 0;
+            for (const char ch : size_text) {
+                int digit = -1;
+                if (ch >= '0' && ch <= '9') {
+                    digit = ch - '0';
+                } else if (ch >= 'a' && ch <= 'f') {
+                    digit = 10 + ch - 'a';
+                } else if (ch >= 'A' && ch <= 'F') {
+                    digit = 10 + ch - 'A';
+                } else {
+                    fail("invalid chunk size");
+                    return;
+                }
+                if (value > (std::numeric_limits<std::size_t>::max() - static_cast<std::size_t>(digit)) / 16U) {
+                    fail("chunk size overflow");
+                    return;
+                }
+                value = value * 16U + static_cast<std::size_t>(digit);
+            }
+            if (value > max_chunk_size_) {
+                fail("chunk exceeds maximum size");
+                return;
+            }
+            current_chunk_size_ = value;
+            state_ = value == 0 ? State::kTrailerLine : State::kData;
+            continue;
+        }
+
+        if (state_ == State::kData) {
+            if (input_.size() < current_chunk_size_) {
+                return;
+            }
+            decoded_.insert(decoded_.end(), input_.begin(),
+                            input_.begin() + static_cast<std::ptrdiff_t>(current_chunk_size_));
+            input_.erase(input_.begin(), input_.begin() + static_cast<std::ptrdiff_t>(current_chunk_size_));
+            state_ = State::kDataCrLf;
+            continue;
+        }
+
+        if (state_ == State::kDataCrLf) {
+            if (input_.size() < 2) {
+                return;
+            }
+            if (input_[0] != '\r' || input_[1] != '\n') {
+                fail("missing chunk data terminator");
+                return;
+            }
+            input_.erase(input_.begin(), input_.begin() + 2);
+            state_ = State::kSizeLine;
+        }
+    }
+}
+
+LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth)
+    : queue_depth_(queue_depth == 0 ? 1 : queue_depth) {}
+
+void LiveDashIngestSession::ingest(std::string path, std::span<const std::uint8_t> bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PathState& path_state = paths_[path];
+    path_state.reader.append(bytes.data(), bytes.size());
+    while (std::optional<StreamingBoxResult> box = path_state.reader.next_box()) {
+        process_box_locked(path_state, path, *box);
+    }
+    cv_.notify_all();
+}
+
+void LiveDashIngestSession::close() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+    }
+    cv_.notify_all();
+}
+
+bool LiveDashIngestSession::wait_for_tracks(std::chrono::milliseconds first_track_timeout,
+                                            std::chrono::milliseconds settle_timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (tracks_.empty()) {
+        if (!cv_.wait_for(lock, first_track_timeout, [&]() { return !tracks_.empty() || closed_; })) {
+            return false;
+        }
+    }
+    if (tracks_.empty()) {
+        return false;
+    }
+    std::size_t observed_count = tracks_.size();
+    while (!closed_) {
+        const bool changed = cv_.wait_for(lock, settle_timeout, [&]() {
+            return closed_ || tracks_.size() != observed_count;
+        });
+        if (!changed || closed_) {
+            break;
+        }
+        observed_count = tracks_.size();
+    }
+    return !tracks_.empty();
+}
+
+LiveObjectSource LiveDashIngestSession::source() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return LiveObjectSource{
+        .tracks = snapshot_tracks_locked(),
+        .next_object = [this]() {
+            return next_object_blocking();
+        },
+    };
+}
+
+std::optional<LiveObject> LiveDashIngestSession::try_next_object() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (catalog_dirty_ && !tracks_.empty()) {
+        catalog_dirty_ = false;
+        return build_catalog_locked();
+    }
+    if (queue_.empty()) {
+        return std::nullopt;
+    }
+    LiveObject object = std::move(queue_.front());
+    queue_.pop_front();
+    return object;
+}
+
+std::optional<LiveObject> LiveDashIngestSession::next_object_blocking() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&]() { return closed_ || catalog_dirty_ || !queue_.empty(); });
+    if (catalog_dirty_ && !tracks_.empty()) {
+        catalog_dirty_ = false;
+        return build_catalog_locked();
+    }
+    if (queue_.empty()) {
+        return std::nullopt;
+    }
+    LiveObject object = std::move(queue_.front());
+    queue_.pop_front();
+    return object;
+}
+
+void LiveDashIngestSession::process_box_locked(PathState& path_state,
+                                               std::string_view path,
+                                               const StreamingBoxResult& box) {
+    if (box.type == "ftyp" || box.type == "moov") {
+        path_state.init_bytes.insert(path_state.init_bytes.end(), box.bytes.begin(), box.bytes.end());
+        if (box.type == "moov" && !path_state.initialized) {
+            path_state.tracks = extract_tracks(parse_mp4_boxes(path_state.init_bytes), path_state.init_bytes);
+            const std::string prefix = path_slug(path);
+            for (auto& track : path_state.tracks) {
+                track.track_name = prefix + "_" + track.track_name;
+                tracks_.push_back(track);
+            }
+            path_state.initialized = true;
+            catalog_dirty_ = true;
+        }
+        return;
+    }
+    if (!path_state.initialized) {
+        return;
+    }
+    if (box.type == "moof") {
+        path_state.pending_moof = box.bytes;
+        return;
+    }
+    if (box.type != "mdat" || path_state.pending_moof.empty()) {
+        return;
+    }
+
+    MediaFragment fragment = build_live_fragment(path_state.pending_moof, box.bytes, path_state.tracks,
+                                                 path_state.next_group_by_track[path_slug(path)]);
+    fragment.group_id = path_state.next_group_by_track[fragment.track_name]++;
+    path_state.pending_moof.clear();
+    enqueue_locked(LiveObject{
+        .track_name = fragment.track_name,
+        .group_id = fragment.group_id,
+        .subgroup_id = 0,
+        .object_id = fragment.object_id,
+        .media_time_us = fragment.start_time_us,
+        .media_duration_us = fragment.duration_us,
+        .payload = std::move(fragment.payload.owned_bytes),
+    });
+}
+
+void LiveDashIngestSession::enqueue_locked(LiveObject object) {
+    while (queue_.size() >= queue_depth_) {
+        queue_.pop_front();
+    }
+    queue_.push_back(std::move(object));
+}
+
+std::vector<LiveTrack> LiveDashIngestSession::snapshot_tracks_locked() const {
+    std::vector<LiveTrack> out;
+    if (!tracks_.empty()) {
+        out.push_back(LiveTrack{.track_name = "catalog"});
+    }
+    for (const auto& track : tracks_) {
+        out.push_back(LiveTrack{.track_name = track.track_name});
+    }
+    return out;
+}
+
+LiveObject LiveDashIngestSession::build_catalog_locked() const {
+    std::ostringstream catalog;
+    catalog << "{\"version\":1,\"format\":\"cmsf\",\"tracks\":[";
+    bool first = true;
+    for (const auto& track : tracks_) {
+        if (!first) {
+            catalog << ',';
+        }
+        first = false;
+        catalog << "{\"name\":\"" << json_escape(track.track_name) << "\","
+                << "\"id\":" << track.track_id << ','
+                << "\"role\":\"" << role_for_handler(track.handler_type) << "\","
+                << "\"packaging\":\"cmaf\","
+                << "\"isLive\":true";
+        if (!track.codec.empty()) {
+            catalog << ",\"codec\":\"" << json_escape(track.codec) << "\"";
+        }
+        catalog << '}';
+    }
+    catalog << "]}";
+    const std::string payload = catalog.str();
+    return LiveObject{
+        .track_name = "catalog",
+        .group_id = 0,
+        .subgroup_id = 0,
+        .object_id = 0,
+        .media_time_us = 0,
+        .media_duration_us = 0,
+        .payload = std::vector<std::uint8_t>(payload.begin(), payload.end()),
+    };
+}
+
+struct LiveDashIngestServer::Impl {
+    explicit Impl(LiveDashIngestConfig server_config)
+        : config(std::move(server_config)),
+          session(config.queue_depth) {}
+
+    LiveDashIngestConfig config;
+    LiveDashIngestSession session;
+    std::thread accept_thread;
+    std::vector<std::thread> worker_threads;
+    mutable std::mutex mutex;
+    bool stop_requested = false;
+    int listen_fd = -1;
+    std::uint16_t bound_port = 0;
+
+    void accept_loop();
+    void handle_client(int client_fd);
+};
+
+LiveDashIngestServer::LiveDashIngestServer(LiveDashIngestConfig config)
+    : impl_(std::make_shared<Impl>(std::move(config))) {}
+
+LiveDashIngestServer::~LiveDashIngestServer() {
+    stop();
+}
+
+transport::TransportStatus LiveDashIngestServer::start() {
+#if defined(_WIN32)
+    return transport::TransportStatus::failure("DASH ingest server is not supported on Windows yet");
+#else
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (impl_->listen_fd < 0) {
+        return transport::TransportStatus::failure("failed to create DASH ingest socket");
+    }
+
+    int reuse = 1;
+    static_cast<void>(setsockopt(impl_->listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(impl_->config.port);
+    if (::inet_pton(AF_INET, impl_->config.host.c_str(), &address.sin_addr) != 1) {
+        close_fd(impl_->listen_fd);
+        impl_->listen_fd = -1;
+        return transport::TransportStatus::failure("invalid DASH ingest listen host");
+    }
+    if (::bind(impl_->listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        close_fd(impl_->listen_fd);
+        impl_->listen_fd = -1;
+        return transport::TransportStatus::failure("failed to bind DASH ingest socket");
+    }
+    if (::listen(impl_->listen_fd, 16) != 0) {
+        close_fd(impl_->listen_fd);
+        impl_->listen_fd = -1;
+        return transport::TransportStatus::failure("failed to listen on DASH ingest socket");
+    }
+    sockaddr_in bound{};
+    socklen_t bound_len = sizeof(bound);
+    if (::getsockname(impl_->listen_fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0) {
+        impl_->bound_port = ntohs(bound.sin_port);
+    }
+    impl_->accept_thread = std::thread([impl = impl_]() {
+        impl->accept_loop();
+    });
+    return transport::TransportStatus::success();
+#endif
+}
+
+void LiveDashIngestServer::stop() {
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->stop_requested) {
+            return;
+        }
+        impl_->stop_requested = true;
+#if !defined(_WIN32)
+        if (impl_->listen_fd >= 0) {
+            static_cast<void>(::shutdown(impl_->listen_fd, SHUT_RDWR));
+        }
+#endif
+        close_fd(impl_->listen_fd);
+        impl_->listen_fd = -1;
+    }
+    impl_->session.close();
+    if (impl_->accept_thread.joinable()) {
+        impl_->accept_thread.join();
+    }
+    std::vector<std::thread> workers;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        workers.swap(impl_->worker_threads);
+    }
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+std::uint16_t LiveDashIngestServer::bound_port() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->bound_port;
+}
+
+bool LiveDashIngestServer::wait_for_tracks(std::chrono::milliseconds first_track_timeout,
+                                           std::chrono::milliseconds settle_timeout) {
+    return impl_->session.wait_for_tracks(first_track_timeout, settle_timeout);
+}
+
+LiveObjectSource LiveDashIngestServer::source() {
+    return impl_->session.source();
+}
+
+void LiveDashIngestServer::Impl::accept_loop() {
+#if !defined(_WIN32)
+    while (true) {
+        int client_fd = ::accept(listen_fd, nullptr, nullptr);
+        if (client_fd < 0) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stop_requested) {
+                break;
+            }
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        if (stop_requested) {
+            close_fd(client_fd);
+            break;
+        }
+        worker_threads.emplace_back([this, client_fd]() {
+            handle_client(client_fd);
+        });
+    }
+#endif
+}
+
+void LiveDashIngestServer::Impl::handle_client(int client_fd) {
+#if defined(_WIN32)
+    close_fd(client_fd);
+#else
+    auto finish = [&](std::string_view status) {
+        const std::string response = std::string("HTTP/1.1 ") + std::string(status) +
+                                     "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        static_cast<void>(send_all(client_fd, response));
+        close_fd(client_fd);
+    };
+
+    std::vector<std::uint8_t> received;
+    std::array<std::uint8_t, 4096> buffer{};
+    std::size_t header_end = std::string::npos;
+    while (header_end == std::string::npos) {
+        const ssize_t count = ::recv(client_fd, buffer.data(), buffer.size(), 0);
+        if (count <= 0) {
+            finish("400 Bad Request");
+            return;
+        }
+        received.insert(received.end(), buffer.begin(), buffer.begin() + count);
+        const std::string view(received.begin(), received.end());
+        header_end = view.find("\r\n\r\n");
+        if (received.size() > 64 * 1024) {
+            finish("400 Bad Request");
+            return;
+        }
+    }
+
+    const std::string header_text(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(header_end + 4));
+    std::optional<ParsedRequest> parsed = parse_request_headers(header_text);
+    if (!parsed.has_value()) {
+        finish("400 Bad Request");
+        return;
+    }
+    if (parsed->method != "PUT" && parsed->method != "POST") {
+        finish("405 Method Not Allowed");
+        return;
+    }
+    if (!path_matches_prefix(parsed->path, config.path_prefix)) {
+        finish("404 Not Found");
+        return;
+    }
+    const auto transfer_encoding = parsed->headers.find("transfer-encoding");
+    if (transfer_encoding == parsed->headers.end() ||
+        lower_ascii(transfer_encoding->second).find("chunked") == std::string::npos) {
+        finish("400 Bad Request");
+        return;
+    }
+
+    ChunkedBodyDecoder decoder(config.max_chunk_size);
+    auto feed_decoder = [&](std::span<const std::uint8_t> bytes) -> bool {
+        decoder.append(bytes);
+        std::vector<std::uint8_t> decoded = decoder.take_decoded();
+        if (!decoded.empty()) {
+            session.ingest(parsed->path, decoded);
+        }
+        return !decoder.failed();
+    };
+
+    if (header_end + 4 < received.size()) {
+        if (!feed_decoder(std::span<const std::uint8_t>(received.data() + header_end + 4,
+                                                        received.size() - header_end - 4))) {
+            finish("400 Bad Request");
+            return;
+        }
+    }
+    while (!decoder.complete()) {
+        const ssize_t count = ::recv(client_fd, buffer.data(), buffer.size(), 0);
+        if (count <= 0) {
+            finish("400 Bad Request");
+            return;
+        }
+        if (!feed_decoder(std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(count)))) {
+            finish("400 Bad Request");
+            return;
+        }
+    }
+    finish("204 No Content");
+#endif
+}
+
+}  // namespace openmoq::publisher

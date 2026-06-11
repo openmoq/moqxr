@@ -24,12 +24,18 @@ enum class LiveSourceKind {
     kAuto,
     kStdin,
     kSrt,
+    kDash,
 };
 
 struct CliOptions {
     InputSource input_source;
     LiveSourceKind live_source = LiveSourceKind::kAuto;
     std::optional<std::filesystem::path> srt_config_path;
+    std::optional<std::string> dash_listen;
+    std::string dash_listen_host = "127.0.0.1";
+    std::uint16_t dash_listen_port = 8080;
+    std::string dash_path_prefix = "/ingest";
+    std::size_t dash_queue_depth = 128;
     std::optional<std::filesystem::path> emit_dir;
     std::optional<transport::EndpointConfig> endpoint;
     transport::TransportKind transport = transport::TransportKind::kRawQuic;

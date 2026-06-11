@@ -16,6 +16,7 @@ It turns MP4 input into CMSF-style publishable objects, builds draft-aware MOQT 
 - Emits generated objects and catalog metadata to disk for inspection.
 - Supports draft-aware MOQT framing for drafts 14, 16, and 18.
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
+- Accepts live CTE LL-DASH/CMAF ingest over HTTP/1.1 chunked `POST` or `PUT` requests.
 
 ## Quick Start
 
@@ -53,7 +54,7 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
-Live ingest examples (choose one path, not both):
+Live ingest examples (choose one path):
 
 1. SRT ingest path (`--live-source srt`)
 
@@ -134,6 +135,34 @@ ffmpeg -i /home/ubuntu/bbb_sunflower_1080p_30fps_normal.mp4 \
     --draft 16 \
     --timeout 120 \
     --forward 0
+```
+
+3. CTE LL-DASH ingest path (`--live-source dash`)
+
+Start the publisher with an HTTP/1.1 chunked CMAF ingest listener and a MoQ relay target:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Send CMAF/fMP4 bytes with chunked transfer encoding. Multiple concurrent paths under the prefix are accepted, for example `/ingest/video` and `/ingest/audio`; each path gets path-prefixed track names in the MoQ catalog.
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
 ```
 
 `--live-source both` is intentionally not supported.

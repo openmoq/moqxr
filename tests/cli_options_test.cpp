@@ -172,5 +172,46 @@ int main() {
         ok &= expect(threw, "expected --live-source srt without --srt-config to fail");
     }
 
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--live-source", "dash",
+                   "--dash-listen", "127.0.0.1:8080",
+                   "--dash-path", "/ingest",
+                   "--dash-queue-depth", "32",
+                   "--endpoint", "https://relay.example.com:443/moq"});
+        ok &= expect(options.live_source == openmoq::publisher::LiveSourceKind::kDash,
+                     "expected --live-source dash");
+        ok &= expect(options.dash_listen_host == "127.0.0.1",
+                     "expected --dash-listen host");
+        ok &= expect(options.dash_listen_port == 8080,
+                     "expected --dash-listen port");
+        ok &= expect(options.dash_path_prefix == "/ingest",
+                     "expected --dash-path prefix");
+        ok &= expect(options.dash_queue_depth == 32,
+                     "expected --dash-queue-depth value");
+    }
+
+    {
+        bool threw = false;
+        try {
+            parse({"openmoq-publisher", "--live-source", "dash",
+                   "--endpoint", "https://relay.example.com:443/moq"});
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--live-source dash requires --dash-listen";
+        }
+        ok &= expect(threw, "expected --live-source dash without --dash-listen to fail");
+    }
+
+    {
+        bool threw = false;
+        try {
+            parse({"openmoq-publisher", "--live-source", "dash",
+                   "--dash-listen", "127.0.0.1:8080"});
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--live-source dash requires --endpoint";
+        }
+        ok &= expect(threw, "expected --live-source dash without --endpoint to fail");
+    }
+
     return ok ? 0 : 1;
 }
