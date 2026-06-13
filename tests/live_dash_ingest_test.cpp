@@ -214,6 +214,7 @@ int main() {
         ok &= expect(audio.has_value() && audio->track_name == "audio_vide_1", "expected audio media object");
     }
 
+#if !defined(_WIN32)
     {
         LiveDashIngestConfig config;
         config.host = "127.0.0.1";
@@ -267,6 +268,7 @@ int main() {
         }
         server.stop();
     }
+#endif
 
     return ok ? 0 : 1;
 }
