@@ -3,6 +3,7 @@
 #include "openmoq/publisher/mp4_box.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <cctype>
@@ -10,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -99,7 +101,11 @@ std::string lower_ascii(std::string value) {
 bool send_all(int fd, std::string_view bytes) {
 #if !defined(_WIN32)
     while (!bytes.empty()) {
-        const ssize_t sent = ::send(fd, bytes.data(), bytes.size(), 0);
+        int flags = 0;
+#if defined(MSG_NOSIGNAL)
+        flags = MSG_NOSIGNAL;
+#endif
+        const ssize_t sent = ::send(fd, bytes.data(), bytes.size(), flags);
         if (sent <= 0) {
             return false;
         }
@@ -456,13 +462,20 @@ struct LiveDashIngestServer::Impl {
     LiveDashIngestConfig config;
     LiveDashIngestSession session;
     std::thread accept_thread;
-    std::vector<std::thread> worker_threads;
+    struct WorkerThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic_bool> done;
+    };
+    std::vector<WorkerThread> worker_threads;
+    std::set<int> active_client_fds;
     mutable std::mutex mutex;
     bool stop_requested = false;
     int listen_fd = -1;
     std::uint16_t bound_port = 0;
 
     void accept_loop();
+    void reap_finished_workers_locked();
+    void shutdown_active_clients_locked();
     void handle_client(int client_fd);
 };
 
@@ -527,6 +540,7 @@ void LiveDashIngestServer::stop() {
         if (impl_->listen_fd >= 0) {
             static_cast<void>(::shutdown(impl_->listen_fd, SHUT_RDWR));
         }
+        impl_->shutdown_active_clients_locked();
 #endif
         close_fd(impl_->listen_fd);
         impl_->listen_fd = -1;
@@ -535,14 +549,14 @@ void LiveDashIngestServer::stop() {
     if (impl_->accept_thread.joinable()) {
         impl_->accept_thread.join();
     }
-    std::vector<std::thread> workers;
+    std::vector<LiveDashIngestServer::Impl::WorkerThread> workers;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         workers.swap(impl_->worker_threads);
     }
     for (auto& worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
+        if (worker.thread.joinable()) {
+            worker.thread.join();
         }
     }
 }
@@ -577,9 +591,40 @@ void LiveDashIngestServer::Impl::accept_loop() {
             close_fd(client_fd);
             break;
         }
-        worker_threads.emplace_back([this, client_fd]() {
-            handle_client(client_fd);
+        reap_finished_workers_locked();
+        active_client_fds.insert(client_fd);
+        auto done = std::make_shared<std::atomic_bool>(false);
+        worker_threads.push_back(WorkerThread{
+            .thread = std::thread([this, client_fd, done]() {
+                handle_client(client_fd);
+                done->store(true, std::memory_order_release);
+            }),
+            .done = done,
         });
+    }
+#endif
+}
+
+void LiveDashIngestServer::Impl::reap_finished_workers_locked() {
+    auto worker = worker_threads.begin();
+    while (worker != worker_threads.end()) {
+        if (!worker->done->load(std::memory_order_acquire)) {
+            ++worker;
+            continue;
+        }
+        if (worker->thread.joinable()) {
+            worker->thread.join();
+        }
+        worker = worker_threads.erase(worker);
+    }
+}
+
+void LiveDashIngestServer::Impl::shutdown_active_clients_locked() {
+#if !defined(_WIN32)
+    for (const int client_fd : active_client_fds) {
+        if (client_fd >= 0) {
+            static_cast<void>(::shutdown(client_fd, SHUT_RDWR));
+        }
     }
 #endif
 }
@@ -588,11 +633,16 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
 #if defined(_WIN32)
     close_fd(client_fd);
 #else
+    auto close_client = [&]() {
+        close_fd(client_fd);
+        std::lock_guard<std::mutex> lock(mutex);
+        active_client_fds.erase(client_fd);
+    };
     auto finish = [&](std::string_view status) {
         const std::string response = std::string("HTTP/1.1 ") + std::string(status) +
                                      "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
         static_cast<void>(send_all(client_fd, response));
-        close_fd(client_fd);
+        close_client();
     };
 
     std::vector<std::uint8_t> received;

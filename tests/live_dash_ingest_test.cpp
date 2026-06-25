@@ -1,10 +1,13 @@
 #include "openmoq/publisher/live_dash_ingest.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -181,6 +184,49 @@ std::string send_chunked_put(std::uint16_t port,
 #endif
 }
 
+int open_stalled_chunked_put(std::uint16_t port, const std::string& path) {
+#if defined(_WIN32)
+    static_cast<void>(port);
+    static_cast<void>(path);
+    return -1;
+#else
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    static_cast<void>(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr));
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        static_cast<void>(::close(fd));
+        return -1;
+    }
+    std::ostringstream request;
+    request << "PUT " << path << " HTTP/1.1\r\n"
+            << "Host: 127.0.0.1\r\n"
+            << "Transfer-Encoding: chunked\r\n"
+            << "Content-Type: video/iso.segment\r\n"
+            << "\r\n"
+            << "10\r\n"
+            << "abc";
+    const std::string bytes = request.str();
+    static_cast<void>(::send(fd, bytes.data(), bytes.size(), 0));
+    return fd;
+#endif
+}
+
+void close_socket(int fd) {
+#if !defined(_WIN32)
+    if (fd >= 0) {
+        static_cast<void>(::shutdown(fd, SHUT_RDWR));
+        static_cast<void>(::close(fd));
+    }
+#else
+    static_cast<void>(fd);
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -267,6 +313,90 @@ int main() {
                          "expected HTTP ingest objects from two different paths");
         }
         server.stop();
+    }
+
+    {
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for FFmpeg-style representation test: " +
+                                    status.message);
+        const std::uint16_t port = server.bound_port();
+
+        const auto video0_init = make_init_segment(1);
+        const auto video1_init = make_init_segment(2);
+        const auto video2_init = make_init_segment(3);
+        ok &= expect(send_chunked_put(port, "/ingest/video0",
+                                      std::span<const std::uint8_t>(video0_init.data(), video0_init.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected FFmpeg video0 init request to receive 204");
+        ok &= expect(send_chunked_put(port, "/ingest/video1",
+                                      std::span<const std::uint8_t>(video1_init.data(), video1_init.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected FFmpeg video1 init request to receive 204");
+        ok &= expect(send_chunked_put(port, "/ingest/video2",
+                                      std::span<const std::uint8_t>(video2_init.data(), video2_init.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected FFmpeg video2 init request to receive 204");
+        ok &= expect(server.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected FFmpeg-style representation init requests to discover tracks");
+        auto source = server.source();
+        ok &= expect(source.tracks.size() == 4,
+                     "expected catalog plus three FFmpeg representation tracks");
+
+        const auto video0_media = make_media_fragment(1, 0, 0x51);
+        const auto video1_media = make_media_fragment(2, 0, 0x52);
+        const auto video2_media = make_media_fragment(3, 0, 0x53);
+        ok &= expect(send_chunked_put(port, "/ingest/video0",
+                                      std::span<const std::uint8_t>(video0_media.data(), video0_media.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected FFmpeg video0 media request to receive 204");
+        ok &= expect(send_chunked_put(port, "/ingest/video1",
+                                      std::span<const std::uint8_t>(video1_media.data(), video1_media.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected FFmpeg video1 media request to receive 204");
+        ok &= expect(send_chunked_put(port, "/ingest/video2",
+                                      std::span<const std::uint8_t>(video2_media.data(), video2_media.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected FFmpeg video2 media request to receive 204");
+        const std::optional<LiveObject> catalog = source.next_object();
+        const std::optional<LiveObject> first = source.next_object();
+        const std::optional<LiveObject> second = source.next_object();
+        const std::optional<LiveObject> third = source.next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected FFmpeg-style ingest catalog object");
+        ok &= expect(first.has_value() && second.has_value() && third.has_value(),
+                     "expected FFmpeg-style media objects for three representations");
+        server.stop();
+    }
+
+    {
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for stalled client stop test: " +
+                                    status.message);
+        const int stalled_fd = open_stalled_chunked_put(server.bound_port(), "/ingest/stalled");
+        ok &= expect(stalled_fd >= 0, "expected stalled chunked client to connect");
+
+        auto stopped = std::async(std::launch::async, [&server]() {
+            server.stop();
+        });
+        const bool stop_returned =
+            stopped.wait_for(std::chrono::milliseconds(300)) == std::future_status::ready;
+        if (!stop_returned) {
+            close_socket(stalled_fd);
+            static_cast<void>(stopped.wait_for(std::chrono::seconds(2)));
+        } else {
+            close_socket(stalled_fd);
+        }
+        ok &= expect(stop_returned, "expected stop to close active stalled clients before joining workers");
     }
 #endif
 
