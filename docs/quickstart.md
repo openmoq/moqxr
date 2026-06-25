@@ -135,6 +135,40 @@ curl -X PUT \
   http://127.0.0.1:8080/ingest/video
 ```
 
+The server accepts `PUT` or `POST` requests with HTTP/1.1 chunked transfer encoding. Every path under the prefix keeps its own MP4 parser state, so independent representations can send init segments and media fragments on separate request paths. Track names in the MoQ catalog are prefixed with the final path component; for example, `/ingest/video0` becomes track names such as `video0_vide_1`.
+
+FFmpeg DASH output can push directly to the ingest endpoint:
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+Useful DASH ingest flags:
+
+- `--dash-listen <host:port>` chooses the local HTTP listener address
+- `--dash-path <prefix>` limits accepted request paths to that prefix
+- `--dash-queue-depth <count>` controls how many pending live objects are retained when publishers run ahead of subscribers
+- `--publish-catalog` publishes the CMSF catalog track
+- `--forward 1` forwards media objects immediately after publishing to the relay
+- `--forward 0` waits for subscriber interest before media is sent
+
+When `--forward 0` is used, seeing a relay connection ID only confirms that the publisher connected and announced the namespace. Media delivery still depends on the relay forwarding a subscription for one of the catalog or media tracks. Use `--forward 1` for a smoke test that should send objects without waiting for a subscriber.
+
+The DASH ingest listener is currently supported on Unix-like platforms. Windows builds compile the CLI but report DASH ingest server startup as unsupported.
+
 ## Output Notes
 
 - default output includes the `catalog` object plus media objects

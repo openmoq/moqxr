@@ -165,9 +165,30 @@ curl -X PUT \
   http://127.0.0.1:8080/ingest/video
 ```
 
+FFmpeg can push live DASH/CMAF requests directly to the ingest prefix. This example creates two video representations plus audio; FFmpeg writes representation requests such as `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`.
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+Use `--forward 1` when the relay should receive objects immediately. Use `--forward 0` for await-subscribe mode, where media is sent after the relay forwards subscriber interest for the published tracks.
+
 `--live-source both` is intentionally not supported.
 
-On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publisher.exe` or the matching build configuration path.
+On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publisher.exe` or the matching build configuration path. The DASH ingest listener itself is currently supported on Unix-like platforms; Windows builds report the mode as unsupported.
 
 ## Documentation
 
