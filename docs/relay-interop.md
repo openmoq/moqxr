@@ -85,7 +85,7 @@ Run against an already-started relay:
 
 ```bash
 CAT4MOQ_TOKEN_FILE=/tmp/publish-token.cwt \
-CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 CAT4MOQ_NAMESPACE='cat4moq.example' \
 CAT4MOQ_TRACK='video' \
 ./examples/auth/run-cat4moq-auth-example.sh
@@ -96,19 +96,23 @@ Run with separate setup/action tokens:
 ```bash
 CAT4MOQ_SETUP_TOKEN_FILE=/tmp/setup.cwt \
 CAT4MOQ_ACTION_TOKEN_FILE=/tmp/publish.cwt \
-CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
 
-Run with a Catapult issuer command:
+Run with moqx as the Catapult/CAT4MOQ issuer command:
 
 ```bash
-CATAPULT_CAT4MOQ_COMMAND='catapult-issue --action {action} --namespace {namespace} --track {track}' \
-CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
 
-When using the default CAT wrapper, configure moqx service auth with `token_type: 16`. If using `CAT4MOQ_TOKEN_WRAPPER=out-of-band`, configure `token_type: 0`. See [examples/auth/README.md](../examples/auth/README.md) for token encoding and test details.
+When using the default CAT wrapper, configure moqx service auth with
+`token_type: 16`, matching the token type wrapped by moqxr. If using
+`CAT4MOQ_TOKEN_WRAPPER=out-of-band`, configure `token_type: 0`. See
+[examples/auth/README.md](../examples/auth/README.md) for the local moqx auth
+config, token generation, token encoding, and focused-test workflow.
 
 ## Trace CSV
 

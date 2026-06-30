@@ -37,7 +37,7 @@ The command may include placeholders. The example shell-quotes replacements befo
 Example:
 
 ```bash
-CATAPULT_CAT4MOQ_COMMAND='catapult-issue --action {action} --namespace {namespace} --track {track}' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
 
@@ -49,6 +49,33 @@ Token input defaults to `auto` decoding:
 - plain printable text is passed as raw text bytes
 
 Override with `CAT4MOQ_TOKEN_ENCODING=raw|base64|hex|auto`.
+
+## Generating Tokens with moqx
+
+The sibling `moqx` relay can issue CAT4MOQ CWT bytes with `moqx issue-cat-token`.
+The command prints `base64:<token>` by default, which this example decodes when
+`CAT4MOQ_TOKEN_ENCODING=auto` is used. Keep the default
+`CAT4MOQ_TOKEN_WRAPPER=cat` so those CWT bytes are wrapped as a MoQ
+`AUTHORIZATION_TOKEN` value with token type `16`.
+
+Generate a token directly:
+
+```bash
+../moqx/build/moqx issue-cat-token \
+  --config /tmp/moqx-auth.yaml \
+  --auth-service live \
+  --auth-key-id cat-dev \
+  --auth-actions client_setup,publish_namespace,publish \
+  --auth-namespace cat4moq.example \
+  --auth-track video
+```
+
+For this publisher example, the broad publisher grant above is the simplest
+shape: it authorizes setup, namespace publication, and track publication with
+one token. The helper invokes `CATAPULT_CAT4MOQ_COMMAND` once for the setup token
+and once for the action token. If your issuer uses the `{action}` placeholder,
+make sure the action token still includes both `publish_namespace` and `publish`
+when the relay authorizes namespace and track requests separately.
 
 ## Token Wrapper
 
@@ -66,20 +93,68 @@ For local relay config, the service auth token type must match the wrapper:
 
 ## Running Against moqx
 
-Start a moqx relay separately, or provide a relay command for the script to start:
+Start a moqx relay separately, or provide a relay command for the script to
+start. A minimal local relay config is:
+
+```yaml
+listeners:
+  - name: main
+    udp:
+      socket:
+        address: "::"
+        port: 4433
+    tls:
+      insecure: true
+    endpoint: "/moq-relay"
+
+services:
+  live:
+    match:
+      - authority: {any: true}
+        path: {exact: "/moq-relay"}
+    cache:
+      enabled: true
+      max_tracks: 100
+      max_groups_per_track: 3
+    auth:
+      enabled: true
+      token_type: 16
+      hmac_keys:
+        - id: "cat-dev"
+          secret: "replace-with-long-random-secret"
+      require_setup_token: true
+      allow_request_token_override: true
+      strict_claims: false
+```
+
+Save that as `/tmp/moqx-auth.yaml`, then run the relay:
 
 ```bash
-MOQX_RELAY_CMD='../../../moqx/build/moqx --config /tmp/moqx-auth.yaml --logtostderr -v 2' \
-CATAPULT_CAT4MOQ_COMMAND='catapult-issue --action {action} --namespace {namespace} --track {track}' \
-CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+../moqx/build/moqx serve --config /tmp/moqx-auth.yaml
+```
+
+Run the auth example against the relay with moqx as the token issuer:
+
+```bash
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
 
-If the relay is already running:
+Or let the script start the relay for the run:
+
+```bash
+MOQX_RELAY_CMD='../moqx/build/moqx serve --config /tmp/moqx-auth.yaml' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
+./examples/auth/run-cat4moq-auth-example.sh
+```
+
+If the relay is already running and tokens were generated separately:
 
 ```bash
 CAT4MOQ_TOKEN_FILE=/tmp/publish-token.cwt \
-CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 CAT4MOQ_NAMESPACE='cat4moq.example' \
 CAT4MOQ_TRACK='video' \
 ./examples/auth/run-cat4moq-auth-example.sh
@@ -106,7 +181,7 @@ The executable can be run without the shell wrapper:
 
 ```bash
 ./build/openmoq-publisher-auth-example \
-  --endpoint https://127.0.0.1:4433/moq \
+  --endpoint https://127.0.0.1:4433/moq-relay \
   --namespace cat4moq.example \
   --track video \
   --draft 16 \
@@ -120,7 +195,7 @@ Use separate setup/action tokens when the relay requires distinct CAT grants:
 
 ```bash
 ./build/openmoq-publisher-auth-example \
-  --endpoint https://127.0.0.1:4433/moq \
+  --endpoint https://127.0.0.1:4433/moq-relay \
   --namespace cat4moq.example \
   --track video \
   --setup-token-file /tmp/setup.cwt \
