@@ -5,6 +5,9 @@
 #include "openmoq/publisher/transport/moqt_session.h"
 #include "openmoq/publisher/transport/picoquic_client.h"
 #include "openmoq/publisher/transport/webtransport_client.h"
+#ifdef OPENMOQ_HAS_LIBMOQ
+#include "openmoq/publisher/transport/libmoq_publisher.h"
+#endif
 
 #include <stdexcept>
 #include <sstream>
@@ -76,6 +79,7 @@ struct Publisher::ActiveSession {
 Publisher::Publisher(PublisherConfig config, TransportFactory transport_factory)
     : config_(std::move(config)),
       transport_factory_(std::move(transport_factory)) {
+    transport_factory_injected_ = static_cast<bool>(transport_factory_);
     if (!transport_factory_) {
         transport_factory_ = default_transport_factory();
     }
@@ -127,6 +131,43 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
                                               const transport::EndpointConfig& endpoint,
                                               const transport::TlsConfig& tls,
                                               bool endpoint_alpn_overridden) const {
+#ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+    // Batch publishing prefers the libmoq service tier unless a custom
+    // TransportFactory was injected (tests still exercise the local path).
+    // The live paths (stdin, SRT, LiveObjectSource) route to libmoq in their
+    // own methods below; the MoqtSession transport now only serves injected-
+    // factory callers and builds without libmoq.
+    if (!transport_factory_injected_) {
+        const transport::EndpointConfig resolved_endpoint =
+            resolve_endpoint(endpoint, endpoint_alpn_overridden);
+        const PublishPlan materialized =
+            materialize_publish_plan(prepared.plan, prepared.input_bytes);
+        transport::LibmoqPublishStats libmoq_stats;
+        const transport::TransportStatus status = transport::publish_plan_via_libmoq(
+            materialized, config_, resolved_endpoint, tls, libmoq_stats);
+        if (!status.ok) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            stats_.active = false;
+            stats_.connected = false;
+            stats_.publishing_live = false;
+            stats_.last_error = status.message;
+            return status;
+        }
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        stats_.active = false;
+        stats_.connected = true;
+        stats_.publishing_live = false;
+        stats_.transport = resolved_endpoint.transport;
+        stats_.host = resolved_endpoint.host;
+        stats_.port = resolved_endpoint.port;
+        stats_.path = resolved_endpoint.path;
+        stats_.bytes_published = libmoq_stats.bytes_published;
+        stats_.objects_published = libmoq_stats.objects_published;
+        stats_.groups_published = libmoq_stats.groups_published;
+        stats_.last_error.clear();
+        return status;
+    }
+#endif
     if (!transport_factory_) {
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
@@ -204,6 +245,94 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                                                    const transport::EndpointConfig& endpoint,
                                                    const transport::TlsConfig& tls,
                                                    bool endpoint_alpn_overridden) const {
+#ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+    // Live stdin and SRT publishing prefer the libmoq service tier unless a
+    // custom TransportFactory was injected. (publish_live_objects routes to
+    // libmoq in its own method.)
+    if (!transport_factory_injected_ && ingest.use_stdin && ingest.srt_callers.empty()) {
+        if (stdin_input == nullptr) {
+            return transport::TransportStatus::failure("live stdin publish requires an input stream");
+        }
+        const transport::EndpointConfig resolved_endpoint =
+            resolve_endpoint(endpoint, endpoint_alpn_overridden);
+        auto live = std::make_shared<transport::LibmoqLiveHandle>();
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            libmoq_live_ = live;
+        }
+        transport::LibmoqPublishStats libmoq_stats;
+        const transport::TransportStatus status = transport::publish_live_stdin_via_libmoq(
+            *stdin_input, config_, resolved_endpoint, tls, libmoq_stats, live.get());
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (libmoq_live_ == live) {
+            libmoq_live_.reset();
+        }
+        stats_.active = false;
+        stats_.connected = status.ok;
+        stats_.publishing_live = false;
+        stats_.transport = resolved_endpoint.transport;
+        stats_.host = resolved_endpoint.host;
+        stats_.port = resolved_endpoint.port;
+        stats_.path = resolved_endpoint.path;
+        stats_.bytes_published = libmoq_stats.bytes_published;
+        stats_.objects_published = libmoq_stats.objects_published;
+        stats_.groups_published = libmoq_stats.groups_published;
+        stats_.last_error = status.ok ? std::string() : status.message;
+        return status;
+    }
+    // SRT-only live publishing also prefers the libmoq service tier. Mixed
+    // stdin+SRT does not match either branch and falls through to the old path
+    // below, which rejects it (consistent with existing validation).
+    if (!transport_factory_injected_ && !ingest.use_stdin && !ingest.srt_callers.empty()) {
+        std::vector<LiveSrtCallerRuntimeConfig> runtime_callers;
+        runtime_callers.reserve(ingest.srt_callers.size());
+        for (const auto& caller : ingest.srt_callers) {
+            LiveSrtCallerRuntimeConfig rc;
+            rc.id = caller.id;
+            rc.endpoint = caller.endpoint;
+            rc.fragment_on_keyframe = caller.fragment_on_keyframe;
+            rc.empty_moov = caller.empty_moov;
+            rc.default_base_moof = caller.default_base_moof;
+            rc.separate_moof_per_track = caller.separate_moof_per_track;
+            rc.target_fragment_duration_ms = caller.target_fragment_duration_ms;
+            rc.latency_ms = caller.latency_ms;
+            rc.auto_detect_program = caller.auto_detect_program;
+            rc.program_number = caller.program_number.value_or(0);
+            rc.has_program_number = caller.program_number.has_value();
+            rc.video_pid = caller.video_pid.value_or(0);
+            rc.has_video_pid = caller.video_pid.has_value();
+            rc.audio_pid = caller.audio_pid.value_or(0);
+            rc.has_audio_pid = caller.audio_pid.has_value();
+            runtime_callers.push_back(std::move(rc));
+        }
+        const transport::EndpointConfig resolved_endpoint =
+            resolve_endpoint(endpoint, endpoint_alpn_overridden);
+        auto live = std::make_shared<transport::LibmoqLiveHandle>();
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            libmoq_live_ = live;
+        }
+        transport::LibmoqPublishStats libmoq_stats;
+        const transport::TransportStatus status = transport::publish_live_srt_via_libmoq(
+            std::move(runtime_callers), config_, resolved_endpoint, tls, libmoq_stats, live.get());
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (libmoq_live_ == live) {
+            libmoq_live_.reset();
+        }
+        stats_.active = false;
+        stats_.connected = status.ok;
+        stats_.publishing_live = false;
+        stats_.transport = resolved_endpoint.transport;
+        stats_.host = resolved_endpoint.host;
+        stats_.port = resolved_endpoint.port;
+        stats_.path = resolved_endpoint.path;
+        stats_.bytes_published = libmoq_stats.bytes_published;
+        stats_.objects_published = libmoq_stats.objects_published;
+        stats_.groups_published = libmoq_stats.groups_published;
+        stats_.last_error = status.ok ? std::string() : status.message;
+        return status;
+    }
+#endif
     if (!transport_factory_) {
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
@@ -276,6 +405,50 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
                                                            const transport::EndpointConfig& endpoint,
                                                            const transport::TlsConfig& tls,
                                                            bool endpoint_alpn_overridden) const {
+#ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+    // publish_live_objects prefers the libmoq service tier unless a custom
+    // TransportFactory was injected (legacy MoqtSession tests). libmoq requires
+    // real media metadata per track; a bare/legacy LiveTrack fails with a clear
+    // message rather than being faked as a generic media track.
+    if (!transport_factory_injected_) {
+        for (const auto& track : source.tracks) {
+            if (!transport::live_track_has_media_metadata(track)) {
+                return transport::TransportStatus::failure(
+                    "libmoq-backed publish_live_objects requires media metadata on LiveTrack '" +
+                    track.track_name +
+                    "' (set media_type, codec, and -- for audio -- sample_rate/channel_count); "
+                    "bare object tracks are legacy-only: inject a TransportFactory to use the "
+                    "MoqtSession path");
+            }
+        }
+        const transport::EndpointConfig resolved_endpoint =
+            resolve_endpoint(endpoint, endpoint_alpn_overridden);
+        auto live = std::make_shared<transport::LibmoqLiveHandle>();
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            libmoq_live_ = live;
+        }
+        transport::LibmoqPublishStats libmoq_stats;
+        const transport::TransportStatus status = transport::publish_live_objects_via_libmoq(
+            source, config_, resolved_endpoint, tls, libmoq_stats, live.get());
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (libmoq_live_ == live) {
+            libmoq_live_.reset();
+        }
+        stats_.active = false;
+        stats_.connected = status.ok;
+        stats_.publishing_live = false;
+        stats_.transport = resolved_endpoint.transport;
+        stats_.host = resolved_endpoint.host;
+        stats_.port = resolved_endpoint.port;
+        stats_.path = resolved_endpoint.path;
+        stats_.bytes_published = libmoq_stats.bytes_published;
+        stats_.objects_published = libmoq_stats.objects_published;
+        stats_.groups_published = libmoq_stats.groups_published;
+        stats_.last_error = status.ok ? std::string() : status.message;
+        return status;
+    }
+#endif
     if (!transport_factory_) {
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
@@ -323,10 +496,20 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
 
 transport::TransportStatus Publisher::disconnect(std::uint64_t application_error_code) const {
     std::shared_ptr<ActiveSession> active;
+    std::shared_ptr<transport::LibmoqLiveHandle> live;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         active = active_session_;
+        live = libmoq_live_;
     }
+    // A libmoq-backed live publish does not use active_session_; request_cancel()
+    // sets its cancel flag AND interrupts the live endpoint so a blocking wait
+    // returns immediately (not just at the next poll).
+#ifdef OPENMOQ_HAS_LIBMOQ
+    if (live) {
+        live->request_cancel();
+    }
+#endif
     if (!active || !active->session) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         stats_.active = false;

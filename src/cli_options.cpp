@@ -15,20 +15,21 @@ InputSource parse_input_source(std::string_view value) {
 }
 
 DraftVersion parse_draft(std::string_view value) {
-    if (value == "14") {
-        return DraftVersion::kDraft14;
-    }
     if (value == "16") {
         return DraftVersion::kDraft16;
-    }
-    if (value == "17") {
-        return DraftVersion::kDraft17;
     }
     if (value == "18") {
         return DraftVersion::kDraft18;
     }
+    // Draft-14 and draft-17 are no longer user-selectable; only draft-16 and
+    // draft-18 are supported going forward.
+    if (value == "14" || value == "17") {
+        throw std::runtime_error(
+            "draft " + std::string(value) +
+            " is no longer supported; only draft 16 and 18 are available");
+    }
 
-    throw std::runtime_error("unsupported draft value: expected 14, 16, 17, or 18");
+    throw std::runtime_error("unsupported draft value: expected 16 or 18");
 }
 
 transport::TransportKind parse_transport_kind(std::string_view value) {
@@ -240,7 +241,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
 std::string build_usage(const char* argv0) {
     return std::string("Usage: ") + argv0 +
            " --input <mp4|-> [--live-source auto|stdin|srt] [--srt-config <path>]"
-           " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
+           " [--transport raw|webtransport] [--draft 16|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";

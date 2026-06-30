@@ -173,19 +173,44 @@ if (!status.ok) {
 Applications that already produce MoQ objects directly can bypass fragmented MP4
 ingest with `publish_live_objects(...)`.
 
+When built against libmoq (the default service-tier path), each `LiveTrack` must
+declare real media metadata so the libmoq media sender can author the catalog and
+package objects. Required: `media_type` and `codec`; video tracks add
+`width`/`height`, audio tracks add `sample_rate`/`channel_count`. `packaging`
+selects RAW vs CMAF object framing. `bitrate` is optional (a media-type default is
+used when omitted).
+
+`init_data` (codec/decoder configuration) is **optional** — supply it only when
+the codec or container needs out-of-band decoder config: a CMAF init segment, or
+codecs whose parameter sets are not carried in-band (H.264/HEVC SPS/PPS/VPS, AAC
+AudioSpecificConfig, ...). A RAW track whose codec carries its parameters in-band
+may omit it.
+
 ```cpp
 std::vector<openmoq::publisher::LiveObject> objects = {
     {
-        .track_name = "events",
+        .track_name = "video",
         .group_id = 0,
         .object_id = 0,
-        .payload = {'h', 'e', 'l', 'l', 'o'},
+        .media_time_us = 0,
+        .payload = encoded_access_unit,
     },
 };
 std::size_t next = 0;
 
 openmoq::publisher::LiveObjectSource source;
-source.tracks = {{.track_name = "events"}};
+source.tracks = {
+    openmoq::publisher::LiveTrack{
+        .track_name = "video",
+        .media_type = openmoq::publisher::LiveMediaType::kVideo,
+        .packaging = openmoq::publisher::LivePackaging::kRaw,  // or kCmaf
+        .codec = "av01",
+        .init_data = decoder_config,   // SPS/PPS, AV1 config, CMAF init segment, ...
+        .bitrate = 1500000,
+        .width = 1280,
+        .height = 720,
+    },
+};
 source.next_object = [&]() -> std::optional<openmoq::publisher::LiveObject> {
     if (next >= objects.size()) {
         return std::nullopt;
@@ -196,9 +221,30 @@ source.next_object = [&]() -> std::optional<openmoq::publisher::LiveObject> {
 const auto status = publisher.publish_live_objects(source, endpoint, tls);
 ```
 
-Each `LiveObject` supplies the target track, group/object IDs, optional media
-timing, and the payload bytes to send. The fragmented MP4 `publish_live(...)`
-API remains the default live publishing path.
+Each `LiveObject` supplies the target track, group/object IDs, media timing, and
+the payload bytes to send. `object_id == 0` starts a group (and is treated as a
+sync point); `final_in_subgroup && subgroup_contains_group_largest` closes the
+group.
+
+**Demand gating (lazy relays).** When built against libmoq, the publish path waits
+for at least one downstream media subscriber before producing media — a lazy relay
+forwards a SUBSCRIBE only when a player subscribes. Until then nothing is written
+(batch/objects/stdin do not consume their source; live SRT drops fragments to stay
+bounded). If no subscriber appears within `PublisherConfig::subscriber_timeout`,
+the call fails with `timed out waiting for media subscriber` instead of hanging.
+
+Calling `disconnect()` from another thread stops a running `publish_live_objects`
+(or live stdin/SRT) publish promptly; the driver loop breaks, the endpoint is
+interrupted, and the call returns success. For stdin specifically, cancellation is
+observed once the current blocking read returns.
+
+> **Legacy note:** bare `LiveTrack{.track_name = ...}` entries with no media
+> metadata (a generic "events"-style object track) are **legacy-only**. They are
+> rejected on the libmoq path with a clear error; to publish such tracks you must
+> inject a custom `TransportFactory`, which forces the older MoqtSession transport.
+
+The fragmented MP4 `publish_live(...)` API remains the default live publishing
+path for media ingest.
 
 ## 10. ALPN Override Behavior
 

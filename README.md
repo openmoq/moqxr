@@ -16,6 +16,31 @@ It turns MP4 input into CMSF-style publishable objects, builds draft-aware MOQT 
 - Emits generated objects and catalog metadata to disk for inspection.
 - Supports draft-aware MOQT framing for drafts 14, 16, and 18.
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
+- Optionally publishes through the [**moq5**](https://github.com/openmoq/moq5) Media-over-QUIC library (drafts 16 and 18).
+
+## Publishing via moq5
+
+`moqxr` can publish through [**moq5**](https://github.com/openmoq/moq5), the C11
+Media-over-QUIC reference library, as an opt-in backend alongside the built-in
+picoquic transport. When enabled, the batch, live (stdin and SRT), and
+live-object publish paths are routed through moq5's service tier, which owns
+catalog publication, CMSF/CMAF object validation, demand-aware subscription
+gating, bounded backpressure handling, and a graceful transport drain that
+flushes queued media to the wire before the connection is torn down.
+
+Media is packaged into bounded, keyframe-aligned CMAF objects so that coalesced
+publishing produces per-GOP objects rather than a single whole-track payload.
+
+Enable the moq5 backend at configure time (the moq5 library must be available
+alongside the publisher):
+
+```bash
+cmake -S . -B build -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON
+```
+
+The default build keeps the existing transport path; the backend is selectable
+while the integration matures. See [docs/build.md](docs/build.md) for the
+configuration details.
 
 ## Quick Start
 

@@ -12,7 +12,7 @@ enum class DraftVersion {
 };
 
 struct DraftProfile {
-    DraftVersion version = DraftVersion::kDraft14;
+    DraftVersion version = DraftVersion::kDraft16;
     std::string subscribe_namespace_label;
     std::string track_alias_label;
     std::string object_status_label;

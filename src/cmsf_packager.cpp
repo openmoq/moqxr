@@ -577,6 +577,8 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
             .object_id = fragment.object_id,
             .media_time_us = fragment.start_time_us,
             .media_duration_us = fragment.duration_us,
+            .sap_type = fragment.sap_type,         // carry CMSF SAP type into the object
+            .has_sap_type = fragment.has_sap_type,
             .payload = fragment.payload.span,
             .owned_payload = fragment.payload.owned_bytes,
         });

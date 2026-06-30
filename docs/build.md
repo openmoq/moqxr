@@ -80,6 +80,31 @@ GitHub Actions workflows set `OPENSSL_ROOT_DIR` automatically from the runner's 
 - `-DOPENMOQ_PICOTLS_SOURCE_DIR=/path/to/picotls`
 - `-DOPENSSL_ROOT_DIR=/path/to/openssl`
 - `-DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON|OFF`
+- `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON|OFF` (default `OFF`)
+
+### Publish backend (temporary migration gate)
+
+moqxr is migrating its publish path from the legacy MoqtSession/moxygen-style
+transport onto the sibling **libmoq** service tier. While the migration is being
+reviewed, the backend is selectable:
+
+- **libmoq available** — the libmoq integration code (translation, drivers,
+  tests) builds and is validated whenever a sibling `../libmoq` is present; this
+  is independent of which backend is *selected*.
+- **`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`** — the production `Publisher` routes
+  batch, live stdin, live SRT, and `LiveObjectSource` publishing through libmoq.
+- **default (`OFF`)** — publishing stays on the legacy MoqtSession path.
+
+Configure-time output reports both, e.g.:
+
+```
+-- OpenMOQ: libmoq available .......... ON
+-- OpenMOQ: publish backend .......... legacy MoqtSession (set -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON for libmoq)
+```
+
+This gate is **temporary** — it will be removed once the libmoq publish path is
+accepted as the default. An injected `TransportFactory` always forces the legacy
+path regardless of this option.
 
 ## Release Builds
 

@@ -258,5 +258,34 @@ int main() {
                      "expected live-object publish to preserve default raw draft ALPN");
     }
 
+    // Backend-selection gate. When libmoq is the selected publish backend
+    // (OPENMOQ_USE_LIBMOQ_PUBLISHER=ON), a non-injected publish_live_objects with
+    // a bare/legacy LiveTrack is rejected up front by libmoq's media-metadata gate
+    // -- a deterministic, network-free signal that the libmoq route was taken.
+    // When the gate is OFF the libmoq route is compiled out and non-injected
+    // publishing stays on the MoqtSession path (which would attempt a real
+    // connection, so it is not exercised here -- the injected-factory cases above
+    // already cover the old path, and they force it regardless of the gate).
+#ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+    {
+        Publisher publisher(PublisherConfig{});  // no injected factory
+
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = []() { return std::nullopt; },
+        };
+
+        EndpointConfig endpoint;
+        endpoint.transport = TransportKind::kRawQuic;
+        endpoint.host = "relay.example.com";
+        endpoint.port = 443;
+
+        const TransportStatus status = publisher.publish_live_objects(source, endpoint);
+        ok &= expect(!status.ok, "expected bare-track libmoq publish_live_objects to fail");
+        ok &= expect(status.message.find("media metadata") != std::string::npos,
+                     "expected a clear media-metadata failure on the libmoq route");
+    }
+#endif
+
     return ok ? 0 : 1;
 }
