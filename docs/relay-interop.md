@@ -71,6 +71,45 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
 
 `moq-relay.red5.net:4433` currently accepts WebTransport on `/moq`; `/moq-relay` returns HTTP `404` during CONNECT. The moqx relay examples use a placeholder hostname because those relay hostnames are not public yet; moqx uses `/moq-relay`.
 
+## CAT4MOQ Authorization with moqx
+
+For moqx services with auth enabled, use the auth example instead of the generic CLI. It obtains CAT4MOQ token bytes from a file or Catapult command, configures `PublisherConfig::authorization`, and publishes a deterministic live-object track.
+
+Build the example:
+
+```bash
+cmake --build build --target openmoq-publisher-auth-example
+```
+
+Run against an already-started relay:
+
+```bash
+CAT4MOQ_TOKEN_FILE=/tmp/publish-token.cwt \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+CAT4MOQ_NAMESPACE='cat4moq.example' \
+CAT4MOQ_TRACK='video' \
+./examples/auth/run-cat4moq-auth-example.sh
+```
+
+Run with separate setup/action tokens:
+
+```bash
+CAT4MOQ_SETUP_TOKEN_FILE=/tmp/setup.cwt \
+CAT4MOQ_ACTION_TOKEN_FILE=/tmp/publish.cwt \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+./examples/auth/run-cat4moq-auth-example.sh
+```
+
+Run with a Catapult issuer command:
+
+```bash
+CATAPULT_CAT4MOQ_COMMAND='catapult-issue --action {action} --namespace {namespace} --track {track}' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+./examples/auth/run-cat4moq-auth-example.sh
+```
+
+When using the default CAT wrapper, configure moqx service auth with `token_type: 16`. If using `CAT4MOQ_TOKEN_WRAPPER=out-of-band`, configure `token_type: 0`. See [examples/auth/README.md](../examples/auth/README.md) for token encoding and test details.
+
 ## Trace CSV
 
 If you want a per-object CSV trace for pacing and enqueue correlation, set `OPENMOQ_PICOQUIC_TRACE_CSV` alongside `OPENMOQ_PICOQUIC_TRACE`:

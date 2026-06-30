@@ -107,6 +107,32 @@ cat sample.mp4 | ./build/openmoq-publisher \
   --insecure
 ```
 
+## CAT4MOQ Auth Example
+
+Build the CAT4MOQ auth example when testing a relay that requires MoQ authorization tokens:
+
+```bash
+cmake --build build --target openmoq-publisher-auth-example
+```
+
+Run it with a token file:
+
+```bash
+CAT4MOQ_TOKEN_FILE=/tmp/publish-token.cwt \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+./examples/auth/run-cat4moq-auth-example.sh
+```
+
+Or run it with an existing Catapult issuer command:
+
+```bash
+CATAPULT_CAT4MOQ_COMMAND='catapult-issue --action {action} --namespace {namespace} --track {track}' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq' \
+./examples/auth/run-cat4moq-auth-example.sh
+```
+
+See [examples/auth/README.md](../examples/auth/README.md) for the full token-source, relay, and focused-test workflow.
+
 ## Output Notes
 
 - default output includes the `catalog` object plus media objects
