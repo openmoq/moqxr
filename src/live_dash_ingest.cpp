@@ -21,7 +21,9 @@
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -592,6 +594,12 @@ transport::TransportStatus LiveDashIngestServer::start() {
         impl_->listen_fd = -1;
         return transport::TransportStatus::failure("failed to listen on DASH ingest socket");
     }
+    // Non-blocking so accept() cannot park if a ready connection is aborted
+    // between the accept loop's poll() wakeup and the accept() call.
+    const int listen_flags = ::fcntl(impl_->listen_fd, F_GETFL, 0);
+    if (listen_flags >= 0) {
+        static_cast<void>(::fcntl(impl_->listen_fd, F_SETFL, listen_flags | O_NONBLOCK));
+    }
     sockaddr_in bound{};
     socklen_t bound_len = sizeof(bound);
     if (::getsockname(impl_->listen_fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0) {
@@ -660,7 +668,22 @@ LiveObjectSource LiveDashIngestServer::source() {
 
 void LiveDashIngestServer::Impl::accept_loop() {
 #if !defined(_WIN32)
+    // shutdown() on a listening socket does not wake a blocked accept() on
+    // macOS/BSD (it fails with ENOTCONN), so never park in accept(): poll with
+    // a bounded timeout and re-check stop_requested, mirroring the 100ms
+    // receive cadence used by the client workers.
+    constexpr int kAcceptPollTimeoutMsec = 100;
     while (true) {
+        if (stop_requested_now()) {
+            break;
+        }
+        pollfd poll_fd{};
+        poll_fd.fd = listen_fd;
+        poll_fd.events = POLLIN;
+        const int ready = ::poll(&poll_fd, 1, kAcceptPollTimeoutMsec);
+        if (ready <= 0) {
+            continue;
+        }
         int client_fd = ::accept(listen_fd, nullptr, nullptr);
         if (client_fd < 0) {
             std::lock_guard<std::mutex> lock(mutex);
@@ -769,6 +792,14 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         static_cast<void>(send_all(client_fd, response));
         close_client();
     };
+
+    // BSD-derived systems hand accepted sockets the listener's O_NONBLOCK;
+    // clear it so the SO_RCVTIMEO cadence below governs the receive loop
+    // instead of a hot EAGAIN spin.
+    const int client_flags = ::fcntl(client_fd, F_GETFL, 0);
+    if (client_flags >= 0 && (client_flags & O_NONBLOCK) != 0) {
+        static_cast<void>(::fcntl(client_fd, F_SETFL, client_flags & ~O_NONBLOCK));
+    }
 
     constexpr suseconds_t kReceiveTimeoutUsec = 100 * 1000;
     timeval receive_timeout{};
