@@ -540,6 +540,7 @@ struct LiveDashIngestServer::Impl {
     void accept_loop();
     void reap_finished_workers_locked();
     void shutdown_active_clients_locked();
+    bool stop_requested_now() const;
     void handle_client(int client_fd);
 };
 
@@ -710,6 +711,11 @@ void LiveDashIngestServer::Impl::shutdown_active_clients_locked() {
 #endif
 }
 
+bool LiveDashIngestServer::Impl::stop_requested_now() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return stop_requested;
+}
+
 void LiveDashIngestServer::Impl::handle_client(int client_fd) {
 #if defined(_WIN32)
     close_fd(client_fd);
@@ -724,6 +730,28 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         }
         close_fd(client_fd);
     };
+    struct ReceiveResult {
+        ssize_t count;
+        bool stopped;
+    };
+    const auto recv_or_stop = [&](std::span<std::uint8_t> destination) -> ReceiveResult {
+        while (true) {
+            const ssize_t count = ::recv(client_fd, destination.data(), destination.size(), 0);
+            if (count >= 0) {
+                return ReceiveResult{.count = count, .stopped = false};
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!stop_requested_now()) {
+                    continue;
+                }
+                return ReceiveResult{.count = 0, .stopped = true};
+            }
+            return ReceiveResult{.count = -1, .stopped = false};
+        }
+    };
     auto finish = [&](std::string_view status) {
         const std::string response = std::string("HTTP/1.1 ") + std::string(status) +
                                      "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
@@ -731,16 +759,26 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         close_client();
     };
 
+    timeval receive_timeout{};
+    receive_timeout.tv_sec = 0;
+    receive_timeout.tv_usec = 100 * 1000;
+    static_cast<void>(::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                                   sizeof(receive_timeout)));
+
     std::vector<std::uint8_t> received;
     std::array<std::uint8_t, 4096> buffer{};
     std::size_t header_end = std::string::npos;
     while (header_end == std::string::npos) {
-        const ssize_t count = ::recv(client_fd, buffer.data(), buffer.size(), 0);
-        if (count <= 0) {
-            finish("400 Bad Request");
+        const ReceiveResult received_chunk = recv_or_stop(buffer);
+        if (received_chunk.count <= 0) {
+            if (received_chunk.stopped) {
+                close_client();
+            } else {
+                finish("400 Bad Request");
+            }
             return;
         }
-        received.insert(received.end(), buffer.begin(), buffer.begin() + count);
+        received.insert(received.end(), buffer.begin(), buffer.begin() + received_chunk.count);
         const std::string view(received.begin(), received.end());
         header_end = view.find("\r\n\r\n");
         if (received.size() > 64 * 1024) {
@@ -797,12 +835,17 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         }
     }
     while (!decoder.complete()) {
-        const ssize_t count = ::recv(client_fd, buffer.data(), buffer.size(), 0);
-        if (count <= 0) {
-            finish("400 Bad Request");
+        const ReceiveResult received_chunk = recv_or_stop(buffer);
+        if (received_chunk.count <= 0) {
+            if (received_chunk.stopped) {
+                close_client();
+            } else {
+                finish("400 Bad Request");
+            }
             return;
         }
-        if (!feed_decoder(std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(count)))) {
+        if (!feed_decoder(
+                std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received_chunk.count)))) {
             finish("400 Bad Request");
             return;
         }
