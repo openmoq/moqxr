@@ -208,6 +208,9 @@ void ChunkedBodyDecoder::parse_available() {
             constexpr std::array<std::uint8_t, 2> kCrLf{'\r', '\n'};
             auto crlf = std::search(input_.begin(), input_.end(), kCrLf.begin(), kCrLf.end());
             if (crlf == input_.end()) {
+                if (input_.size() > 8192) {
+                    fail("chunk header line too long");
+                }
                 return;
             }
             const std::string line(input_.begin(), crlf);
