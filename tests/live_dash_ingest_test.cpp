@@ -260,6 +260,62 @@ int main() {
         ok &= expect(audio.has_value() && audio->track_name == "audio_vide_1", "expected audio media object");
     }
 
+    {
+        // The catalog must embed each track's base64 CMAF init segment so
+        // subscribers can initialize their decoders.
+        LiveDashIngestSession session(8);
+        const auto init = make_init_segment(1);
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(init.data(), init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected tracks after init for initData test");
+        const auto source = session.source();
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected catalog object for initData test");
+        if (catalog.has_value()) {
+            ok &= expect(as_string(catalog->payload).find("\"initData\":\"") != std::string::npos,
+                         "expected catalog to embed base64 initData for the track");
+        }
+    }
+
+    {
+        // A media fragment referencing a track that was never declared in the
+        // init segment must be dropped, not crash the ingest via an uncaught
+        // exception, and must not be enqueued as an object.
+        LiveDashIngestSession session(8);
+        const auto init = make_init_segment(1);
+        const auto bad_fragment = make_media_fragment(99, 0, 0x11);
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(init.data(), init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected tracks after init for malformed-fragment test");
+        const auto source = session.source();
+        session.ingest("/ingest/video",
+                       std::span<const std::uint8_t>(bad_fragment.data(), bad_fragment.size()));
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        const std::optional<LiveObject> media = session.try_next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected catalog after malformed fragment");
+        ok &= expect(!media.has_value(),
+                     "expected malformed fragment to be dropped rather than enqueued");
+    }
+
+    {
+        // Once source() has frozen the announced track set, a path whose init
+        // segment arrives afterwards is ignored rather than added (the publisher
+        // could not alias it and would abort the whole session).
+        LiveDashIngestSession session(8);
+        const auto video_init = make_init_segment(1);
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(video_init.data(), video_init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected tracks before freezing for late-path test");
+        const auto snapshot = session.source();
+        ok &= expect(snapshot.tracks.size() == 2, "expected catalog plus one track before late path");
+        const auto audio_init = make_init_segment(2);
+        session.ingest("/ingest/audio", std::span<const std::uint8_t>(audio_init.data(), audio_init.size()));
+        const auto after = session.source();
+        ok &= expect(after.tracks.size() == 2, "expected late path to be ignored after the snapshot froze");
+    }
+
 #if !defined(_WIN32)
     {
         LiveDashIngestConfig config;

@@ -1,5 +1,6 @@
 #include "openmoq/publisher/live_dash_ingest.h"
 
+#include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/mp4_box.h"
 
 #include <algorithm>
@@ -324,12 +325,24 @@ bool LiveDashIngestSession::wait_for_tracks(std::chrono::milliseconds first_trac
 
 LiveObjectSource LiveDashIngestSession::source() {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Freeze the announced track set: the publisher builds a fixed alias table
+    // from this snapshot, so any path that appears afterwards must be dropped
+    // rather than enqueued against an unknown track.
+    tracks_frozen_ = true;
     return LiveObjectSource{
         .tracks = snapshot_tracks_locked(),
         .next_object = [this]() {
             return next_object_blocking();
         },
+        .is_finished = [this]() {
+            return finished();
+        },
     };
+}
+
+bool LiveDashIngestSession::finished() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return closed_;
 }
 
 std::optional<LiveObject> LiveDashIngestSession::try_next_object() {
@@ -347,8 +360,15 @@ std::optional<LiveObject> LiveDashIngestSession::try_next_object() {
 }
 
 std::optional<LiveObject> LiveDashIngestSession::next_object_blocking() {
+    // Bounded wait so the publisher periodically regains control to service
+    // subscribe/control messages during media gaps instead of parking here.
+    // A gap returns nullopt with closed_ == false, which the publisher treats
+    // as "keep polling" via the source's is_finished predicate; only close()
+    // ends the stream.
+    constexpr auto kPollInterval = std::chrono::milliseconds(200);
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [&]() { return closed_ || catalog_dirty_ || !queue_.empty(); });
+    cv_.wait_for(lock, kPollInterval,
+                 [&]() { return closed_ || catalog_dirty_ || !queue_.empty(); });
     if (catalog_dirty_ && !tracks_.empty()) {
         catalog_dirty_ = false;
         return build_catalog_locked();
@@ -367,11 +387,28 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
     if (box.type == "ftyp" || box.type == "moov") {
         path_state.init_bytes.insert(path_state.init_bytes.end(), box.bytes.begin(), box.bytes.end());
         if (box.type == "moov" && !path_state.initialized) {
+            // The announced track set is frozen once publishing starts; a path
+            // whose init segment arrives afterwards cannot be added, so ignore
+            // it rather than emit media the publisher would reject.
+            if (tracks_frozen_) {
+                std::cerr << "[dash-ingest] ignoring late path '" << path
+                          << "': track set already published" << std::endl;
+                return;
+            }
             path_state.tracks = extract_tracks(parse_mp4_boxes(path_state.init_bytes), path_state.init_bytes);
             const std::string prefix = path_slug(path);
-            for (auto& track : path_state.tracks) {
+            for (std::size_t index = 0; index < path_state.tracks.size(); ++index) {
+                TrackDescription& track = path_state.tracks[index];
                 track.track_name = prefix + "_" + track.track_name;
-                tracks_.push_back(track);
+                std::string init_data;
+                try {
+                    init_data = track_init_data_base64(path_state.init_bytes, track, index);
+                } catch (const std::exception& error) {
+                    std::cerr << "[dash-ingest] track '" << track.track_name
+                              << "' has no usable init segment: " << error.what() << std::endl;
+                }
+                tracks_.push_back(RegisteredTrack{.description = track,
+                                                  .init_data_base64 = std::move(init_data)});
             }
             path_state.initialized = true;
             catalog_dirty_ = true;
@@ -389,10 +426,22 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         return;
     }
 
-    MediaFragment fragment = build_live_fragment(path_state.pending_moof, box.bytes, path_state.tracks,
-                                                 path_state.next_group_by_track[path_slug(path)]);
-    fragment.group_id = path_state.next_group_by_track[fragment.track_name]++;
+    MediaFragment fragment;
+    try {
+        fragment = build_live_fragment(path_state.pending_moof, box.bytes, path_state.tracks, 0);
+    } catch (const std::exception& error) {
+        // A malformed fragment (e.g. a moof referencing an unknown track) must
+        // not take down the ingest thread; drop it and keep serving the path.
+        std::cerr << "[dash-ingest] dropping fragment on path '" << path
+                  << "': " << error.what() << std::endl;
+        path_state.pending_moof.clear();
+        return;
+    }
     path_state.pending_moof.clear();
+    if (!track_published_locked(fragment.track_name)) {
+        return;
+    }
+    fragment.group_id = path_state.next_group_by_track[fragment.track_name]++;
     enqueue_locked(LiveObject{
         .track_name = fragment.track_name,
         .group_id = fragment.group_id,
@@ -402,6 +451,15 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         .media_duration_us = fragment.duration_us,
         .payload = std::move(fragment.payload.owned_bytes),
     });
+}
+
+bool LiveDashIngestSession::track_published_locked(std::string_view track_name) const {
+    for (const auto& track : tracks_) {
+        if (track.description.track_name == track_name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void LiveDashIngestSession::enqueue_locked(LiveObject object) {
@@ -417,16 +475,17 @@ std::vector<LiveTrack> LiveDashIngestSession::snapshot_tracks_locked() const {
         out.push_back(LiveTrack{.track_name = "catalog"});
     }
     for (const auto& track : tracks_) {
-        out.push_back(LiveTrack{.track_name = track.track_name});
+        out.push_back(LiveTrack{.track_name = track.description.track_name});
     }
     return out;
 }
 
-LiveObject LiveDashIngestSession::build_catalog_locked() const {
+LiveObject LiveDashIngestSession::build_catalog_locked() {
     std::ostringstream catalog;
     catalog << "{\"version\":1,\"format\":\"cmsf\",\"tracks\":[";
     bool first = true;
-    for (const auto& track : tracks_) {
+    for (const auto& registered : tracks_) {
+        const TrackDescription& track = registered.description;
         if (!first) {
             catalog << ',';
         }
@@ -439,13 +498,18 @@ LiveObject LiveDashIngestSession::build_catalog_locked() const {
         if (!track.codec.empty()) {
             catalog << ",\"codec\":\"" << json_escape(track.codec) << "\"";
         }
+        if (!registered.init_data_base64.empty()) {
+            catalog << ",\"initData\":\"" << registered.init_data_base64 << "\"";
+        }
         catalog << '}';
     }
     catalog << "]}";
     const std::string payload = catalog.str();
+    // A fresh group per emission keeps re-published catalogs (a new track set)
+    // from colliding with the object IDs of an already-delivered catalog.
     return LiveObject{
         .track_name = "catalog",
-        .group_id = 0,
+        .group_id = catalog_group_id_++,
         .subgroup_id = 0,
         .object_id = 0,
         .media_time_us = 0,
@@ -530,6 +594,7 @@ transport::TransportStatus LiveDashIngestServer::start() {
 }
 
 void LiveDashIngestServer::stop() {
+    int listen_fd_to_close = -1;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (impl_->stop_requested) {
@@ -542,13 +607,20 @@ void LiveDashIngestServer::stop() {
         }
         impl_->shutdown_active_clients_locked();
 #endif
-        close_fd(impl_->listen_fd);
-        impl_->listen_fd = -1;
+        // Keep listen_fd valid (shutdown, not closed) until the accept thread
+        // has exited. Closing it now would let another thread reuse the number
+        // while accept_loop is still calling ::accept() on it.
+        listen_fd_to_close = impl_->listen_fd;
     }
     impl_->session.close();
     if (impl_->accept_thread.joinable()) {
         impl_->accept_thread.join();
     }
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->listen_fd = -1;
+    }
+    close_fd(listen_fd_to_close);
     std::vector<LiveDashIngestServer::Impl::WorkerThread> workers;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -596,7 +668,16 @@ void LiveDashIngestServer::Impl::accept_loop() {
         auto done = std::make_shared<std::atomic_bool>(false);
         worker_threads.push_back(WorkerThread{
             .thread = std::thread([this, client_fd, done]() {
-                handle_client(client_fd);
+                // Last-resort guard so no exception can escape the thread and
+                // abort the process; handle_client already reports and closes
+                // on its own error paths.
+                try {
+                    handle_client(client_fd);
+                } catch (const std::exception& error) {
+                    std::cerr << "[dash-ingest] client handler error: " << error.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[dash-ingest] client handler error: unknown exception" << std::endl;
+                }
                 done->store(true, std::memory_order_release);
             }),
             .done = done,
@@ -634,9 +715,14 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
     close_fd(client_fd);
 #else
     auto close_client = [&]() {
+        // Deregister before closing: otherwise the accept loop could reuse this
+        // fd number for a new client and this erase would drop that client's
+        // registration, so stop() would never shut it down.
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_client_fds.erase(client_fd);
+        }
         close_fd(client_fd);
-        std::lock_guard<std::mutex> lock(mutex);
-        active_client_fds.erase(client_fd);
     };
     auto finish = [&](std::string_view status) {
         const std::string response = std::string("HTTP/1.1 ") + std::string(status) +
@@ -689,7 +775,16 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         decoder.append(bytes);
         std::vector<std::uint8_t> decoded = decoder.take_decoded();
         if (!decoded.empty()) {
-            session.ingest(parsed->path, decoded);
+            // Never let a parse error from client-controlled bytes escape the
+            // worker thread: an uncaught exception here would call std::terminate
+            // and take down the whole publisher.
+            try {
+                session.ingest(parsed->path, decoded);
+            } catch (const std::exception& error) {
+                std::cerr << "[dash-ingest] ingest error on '" << parsed->path
+                          << "': " << error.what() << std::endl;
+                return false;
+            }
         }
         return !decoder.failed();
     };

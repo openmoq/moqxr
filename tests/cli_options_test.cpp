@@ -213,5 +213,50 @@ int main() {
         ok &= expect(threw, "expected --live-source dash without --endpoint to fail");
     }
 
+    {
+        bool threw = false;
+        try {
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--dash-path", "/ingest"});
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--dash-path requires --live-source dash";
+        }
+        ok &= expect(threw, "expected --dash-path without --live-source dash to fail");
+    }
+
+    {
+        bool threw = false;
+        try {
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--dash-queue-depth", "32"});
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--dash-queue-depth requires --live-source dash";
+        }
+        ok &= expect(threw, "expected --dash-queue-depth without --live-source dash to fail");
+    }
+
+    {
+        bool threw = false;
+        try {
+            parse({"openmoq-publisher", "--live-source", "dash",
+                   "--dash-listen", "127.0.0.1:80abc",
+                   "--endpoint", "relay.example.com:443"});
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--dash-listen port must be a valid integer";
+        }
+        ok &= expect(threw, "expected trailing garbage in --dash-listen port to be rejected");
+    }
+
+    {
+        bool threw = false;
+        try {
+            parse({"openmoq-publisher", "--live-source", "dash",
+                   "--dash-listen", "127.0.0.1:8080",
+                   "--dash-queue-depth", "32junk",
+                   "--endpoint", "relay.example.com:443"});
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--dash-queue-depth must be a valid integer";
+        }
+        ok &= expect(threw, "expected trailing garbage in --dash-queue-depth to be rejected");
+    }
+
     return ok ? 0 : 1;
 }

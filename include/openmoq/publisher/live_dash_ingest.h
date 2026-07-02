@@ -69,6 +69,8 @@ public:
     LiveObjectSource source();
     std::optional<LiveObject> try_next_object();
 
+    bool finished() const;
+
 private:
     struct PathState {
         StreamingMp4Reader reader;
@@ -79,18 +81,32 @@ private:
         bool initialized = false;
     };
 
+    // A track announced to subscribers, paired with the base64 CMAF init
+    // segment carried in the catalog so subscribers can initialize decoders.
+    struct RegisteredTrack {
+        TrackDescription description;
+        std::string init_data_base64;
+    };
+
     std::optional<LiveObject> next_object_blocking();
     void process_box_locked(PathState& path_state,
                             std::string_view path,
                             const StreamingBoxResult& box);
     void enqueue_locked(LiveObject object);
+    bool track_published_locked(std::string_view track_name) const;
     std::vector<LiveTrack> snapshot_tracks_locked() const;
-    LiveObject build_catalog_locked() const;
+    LiveObject build_catalog_locked();
 
     std::size_t queue_depth_ = 0;
     std::map<std::string, PathState> paths_;
-    std::vector<TrackDescription> tracks_;
+    std::vector<RegisteredTrack> tracks_;
     std::deque<LiveObject> queue_;
+    // Once source() hands the track snapshot to the publisher, the announced
+    // track set is frozen: paths that appear later cannot be added (the
+    // publisher's alias table is fixed), so their media is dropped rather than
+    // aborting the whole session on an unknown track.
+    bool tracks_frozen_ = false;
+    std::size_t catalog_group_id_ = 0;
     bool catalog_dirty_ = false;
     bool closed_ = false;
     mutable std::mutex mutex_;

@@ -123,13 +123,33 @@ LiveSourceKind parse_live_source(std::string_view value) {
     throw std::runtime_error("unsupported --live-source value: expected auto, stdin, srt, or dash");
 }
 
+int parse_strict_int(std::string_view value, std::string_view option_name) {
+    // Reject empty, non-numeric, or trailing-garbage input with a clear,
+    // option-specific message rather than a bare std::stoi("stoi") exception,
+    // and so "80abc" is not silently accepted as 80.
+    if (value.empty()) {
+        throw std::runtime_error(std::string(option_name) + " requires a numeric value");
+    }
+    std::size_t consumed = 0;
+    int parsed = 0;
+    try {
+        parsed = std::stoi(std::string(value), &consumed);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string(option_name) + " must be a valid integer");
+    }
+    if (consumed != value.size()) {
+        throw std::runtime_error(std::string(option_name) + " must be a valid integer");
+    }
+    return parsed;
+}
+
 std::pair<std::string, std::uint16_t> parse_host_port(std::string_view value, std::string_view option_name) {
     const std::size_t colon = value.rfind(':');
     if (colon == std::string_view::npos || colon == 0 || colon + 1 >= value.size()) {
         throw std::runtime_error(std::string(option_name) + " must be in host:port form");
     }
     const std::string host(value.substr(0, colon));
-    const int port = std::stoi(std::string(value.substr(colon + 1)));
+    const int port = parse_strict_int(value.substr(colon + 1), std::string(option_name) + " port");
     if (port <= 0 || port > 65535) {
         throw std::runtime_error(std::string(option_name) + " port must be between 1 and 65535");
     }
@@ -137,7 +157,7 @@ std::pair<std::string, std::uint16_t> parse_host_port(std::string_view value, st
 }
 
 std::size_t parse_queue_depth(std::string_view value) {
-    const int depth = std::stoi(std::string(value));
+    const int depth = parse_strict_int(value, "--dash-queue-depth");
     if (depth <= 0) {
         throw std::runtime_error("--dash-queue-depth must be greater than zero");
     }
@@ -148,6 +168,8 @@ std::size_t parse_queue_depth(std::string_view value) {
 
 CliOptions parse_cli_options(int argc, char** argv) {
     CliOptions options;
+    bool dash_path_set = false;
+    bool dash_queue_depth_set = false;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
@@ -174,8 +196,10 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.dash_listen_port = port;
         } else if (argument == "--dash-path") {
             options.dash_path_prefix = std::string(require_value("--dash-path"));
+            dash_path_set = true;
         } else if (argument == "--dash-queue-depth") {
             options.dash_queue_depth = parse_queue_depth(require_value("--dash-queue-depth"));
+            dash_queue_depth_set = true;
         } else if (argument == "--transport") {
             options.transport = parse_transport_kind(require_value("--transport"));
         } else if (argument == "--endpoint") {
@@ -260,6 +284,12 @@ CliOptions parse_cli_options(int argc, char** argv) {
     }
     if (!live_source_uses_dash && options.dash_listen.has_value()) {
         throw std::runtime_error("--dash-listen requires --live-source dash");
+    }
+    if (!live_source_uses_dash && dash_path_set) {
+        throw std::runtime_error("--dash-path requires --live-source dash");
+    }
+    if (!live_source_uses_dash && dash_queue_depth_set) {
+        throw std::runtime_error("--dash-queue-depth requires --live-source dash");
     }
     if (!options.dash_path_prefix.empty() && options.dash_path_prefix.front() != '/') {
         throw std::runtime_error("--dash-path must start with /");
