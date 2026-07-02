@@ -279,8 +279,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
     if (live_source_uses_dash && !options.dash_listen.has_value()) {
         throw std::runtime_error("--live-source dash requires --dash-listen");
     }
-    if (live_source_uses_dash && !options.endpoint.has_value()) {
-        throw std::runtime_error("--live-source dash requires --endpoint");
+    if (live_source_uses_dash && !options.endpoint.has_value() && !options.dump_plan) {
+        throw std::runtime_error("--live-source dash requires --endpoint or --dump-plan");
     }
     if (!live_source_uses_dash && options.dash_listen.has_value()) {
         throw std::runtime_error("--dash-listen requires --live-source dash");

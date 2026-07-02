@@ -208,9 +208,22 @@ int main() {
             parse({"openmoq-publisher", "--live-source", "dash",
                    "--dash-listen", "127.0.0.1:8080"});
         } catch (const std::runtime_error& error) {
-            threw = std::string(error.what()) == "--live-source dash requires --endpoint";
+            threw = std::string(error.what()) == "--live-source dash requires --endpoint or --dump-plan";
         }
         ok &= expect(threw, "expected --live-source dash without --endpoint to fail");
+    }
+
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--live-source", "dash",
+                   "--dash-listen", "127.0.0.1:8080",
+                   "--dump-plan"});
+        ok &= expect(options.live_source == openmoq::publisher::LiveSourceKind::kDash,
+                     "expected --live-source dash with --dump-plan to parse");
+        ok &= expect(options.dump_plan,
+                     "expected --dump-plan to be set for dash dry run");
+        ok &= expect(!options.endpoint.has_value(),
+                     "expected dash dry run to omit --endpoint");
     }
 
     {

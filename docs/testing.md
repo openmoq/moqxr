@@ -88,3 +88,19 @@ Use stdin when the source is already being produced by another command:
 ```bash
 cat sample.mp4 | ./build/openmoq-publisher --input - --draft 14 --dump-plan
 ```
+
+## CTE DASH Ingest Dry-Run Testing
+
+`--dump-plan` also works with `--live-source dash`, replacing the otherwise required `--endpoint`. The publisher starts the chunked-transfer ingest listener, waits for tracks, and prints the live plan (track names followed by one line per live object) instead of publishing to a relay:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 127.0.0.1:8099 \
+  --dash-path /ingest \
+  --draft 18 \
+  --publish-catalog \
+  --dump-plan
+```
+
+Push CMAF segments with HTTP/1.1 chunked transfer encoding (curl or the FFmpeg DASH recipe in `docs/quickstart.md`) at `http://127.0.0.1:8099/ingest/...`. Like a live publish, the dry run keeps draining objects until it is interrupted; wrap it in `timeout` for scripted checks.
