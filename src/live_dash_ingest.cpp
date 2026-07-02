@@ -286,7 +286,14 @@ LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth)
 
 void LiveDashIngestSession::ingest(std::string path, std::span<const std::uint8_t> bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PathState& path_state = paths_[path];
+    auto it = paths_.find(path);
+    if (it == paths_.end()) {
+        if (tracks_frozen_) {
+            return;
+        }
+        it = paths_.emplace(path, PathState{}).first;
+    }
+    PathState& path_state = it->second;
     path_state.reader.append(bytes.data(), bytes.size());
     while (std::optional<StreamingBoxResult> box = path_state.reader.next_box()) {
         process_box_locked(path_state, path, *box);
