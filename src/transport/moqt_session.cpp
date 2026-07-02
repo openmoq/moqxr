@@ -4543,6 +4543,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             // A live source with a liveness predicate distinguishes a transient
             // media gap (keep polling, keep servicing control) from real EOF.
             if (source.is_finished && !source.is_finished()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
             source_eof = true;
