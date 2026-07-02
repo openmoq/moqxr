@@ -759,9 +759,10 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         close_client();
     };
 
+    constexpr suseconds_t kReceiveTimeoutUs = 100 * 1000;
     timeval receive_timeout{};
     receive_timeout.tv_sec = 0;
-    receive_timeout.tv_usec = 100 * 1000;
+    receive_timeout.tv_usec = kReceiveTimeoutUs;
     static_cast<void>(::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
                                    sizeof(receive_timeout)));
 
