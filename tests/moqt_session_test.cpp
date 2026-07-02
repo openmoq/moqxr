@@ -33,7 +33,6 @@ using openmoq::publisher::PublishPlan;
 using openmoq::publisher::TrackDescription;
 using openmoq::publisher::materialize_publish_plan;
 using openmoq::publisher::transport::ConnectionState;
-using openmoq::publisher::transport::ServerSetupMessage;
 using openmoq::publisher::transport::SubscribeMessage;
 using openmoq::publisher::transport::SubscribeNamespaceMessage;
 using openmoq::publisher::transport::EndpointConfig;
@@ -303,6 +302,7 @@ void append_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
 
 std::vector<std::uint8_t> make_box(std::string_view type, std::vector<std::uint8_t> payload) {
     std::vector<std::uint8_t> out;
+    out.reserve(8 + payload.size());
     append_be32(out, static_cast<std::uint32_t>(8 + payload.size()));
     out.insert(out.end(), type.begin(), type.end());
     out.insert(out.end(), payload.begin(), payload.end());
