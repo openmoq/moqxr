@@ -1,4 +1,5 @@
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/moqt_session.h"
@@ -588,6 +589,16 @@ void queue_publish_ok_responses(MockTransport& transport,
 
 bool bytes_equal(const std::vector<std::uint8_t>& bytes, std::initializer_list<std::uint8_t> expected) {
     return std::vector<std::uint8_t>(expected) == bytes;
+}
+
+bool contains_subsequence(const std::vector<std::uint8_t>& bytes,
+                          const std::vector<std::uint8_t>& expected) {
+    for (std::size_t index = 0; index + expected.size() <= bytes.size(); ++index) {
+        if (std::equal(expected.begin(), expected.end(), bytes.begin() + static_cast<std::ptrdiff_t>(index))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string hex_dump(const std::vector<std::uint8_t>& bytes) {
@@ -1500,6 +1511,66 @@ int main() {
     ok &= expect(authority == "example.com:4433", "expected draft-16 CLIENT_SETUP authority");
     ok &= expect(path == "/", "expected draft-16 CLIENT_SETUP path");
     ok &= expect(max_request_id == kExpectedClientMaxRequestId, "expected draft-16 CLIENT_SETUP max_request_id");
+
+    {
+        const std::vector<std::uint8_t> raw_cwt{0xa1, 0x18, 0x64, 0x81, 0x83};
+        const auto auth_token = openmoq::publisher::cat4moq::wrap_cat_token(raw_cwt);
+        openmoq::publisher::cat4moq::AuthorizationConfig auth_config;
+        auth_config.setup_token = auth_token;
+        auth_config.action_token = auth_token;
+
+        MockTransport auth_transport;
+        auth_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        queue_subscribe_requests(auth_transport, DraftVersion::kDraft16, kTestTrackNamespace, {{1, "catalog"}, {3, "vide_1"}});
+        MoqtSession auth_session(auth_transport,
+                                 std::string(kTestTrackNamespace),
+                                 false,
+                                 false,
+                                 false,
+                                 false,
+                                 std::chrono::seconds(30),
+                                 auth_config);
+        status = auth_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected auth session connect to succeed");
+        status = auth_session.publish(draft16_materialized);
+        ok &= expect(status.ok, "expected auth session publish to succeed");
+        ok &= expect(auth_transport.writes.size() >= 2,
+                     "expected auth session to write setup and namespace messages");
+        if (auth_transport.writes.size() >= 2) {
+            ok &= expect(contains_subsequence(auth_transport.writes[0].bytes, auth_token.bytes),
+                         "expected setup message to include configured CAT token");
+            ok &= expect(contains_subsequence(auth_transport.writes[1].bytes, auth_token.bytes),
+                         "expected namespace publish to include configured CAT token");
+        }
+
+        MockTransport auth_forward_transport;
+        auth_forward_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        queue_publish_ok_responses(auth_forward_transport, DraftVersion::kDraft16, {2, 4});
+        MoqtSession auth_forward_session(auth_forward_transport,
+                                         std::string(kTestTrackNamespace),
+                                         true,
+                                         false,
+                                         false,
+                                         false,
+                                         std::chrono::seconds(30),
+                                         auth_config);
+        status = auth_forward_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected auth forward session connect to succeed");
+        status = auth_forward_session.publish(draft16_materialized);
+        ok &= expect(status.ok, "expected auth forward session publish to succeed");
+        ok &= expect(auth_forward_transport.writes.size() >= 3,
+                     "expected auth forward session to write setup, namespace, and publish messages");
+        if (auth_forward_transport.writes.size() >= 3) {
+            ok &= expect(contains_subsequence(auth_forward_transport.writes[2].bytes, auth_token.bytes),
+                         "expected publish track request to include configured CAT token");
+        }
+    }
 
     const auto draft14_wt_setup = encode_setup_message({
         .draft = DraftVersion::kDraft14,

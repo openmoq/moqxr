@@ -151,6 +151,7 @@ On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publ
 | FFmpeg input recipes | [docs/ffmpeg.md](docs/ffmpeg.md) |
 | Relay interoperability | [docs/relay-interop.md](docs/relay-interop.md) |
 | C++ Publisher API | [docs/publisher-api.md](docs/publisher-api.md) |
+| CAT4MOQ auth example | [examples/auth/README.md](examples/auth/README.md) |
 | Protocol mapping | [docs/protocol-mapping.md](docs/protocol-mapping.md) |
 | WebTransport compliance | [docs/webtransport-compliance.md](docs/webtransport-compliance.md) |
 | Transport plan | [docs/transport-plan.md](docs/transport-plan.md) |
