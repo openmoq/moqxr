@@ -740,10 +740,11 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
             if (count >= 0) {
                 return ReceiveResult{.count = count, .stopped = false};
             }
-            if (errno == EINTR) {
+            const int recv_errno = errno;
+            if (recv_errno == EINTR) {
                 continue;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (recv_errno == EAGAIN || recv_errno == EWOULDBLOCK) {
                 if (!stop_requested_now()) {
                     continue;
                 }
@@ -759,10 +760,10 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         close_client();
     };
 
-    constexpr suseconds_t kReceiveTimeoutUs = 100 * 1000;
+    constexpr suseconds_t kReceiveTimeoutUsec = 100 * 1000;
     timeval receive_timeout{};
     receive_timeout.tv_sec = 0;
-    receive_timeout.tv_usec = kReceiveTimeoutUs;
+    receive_timeout.tv_usec = kReceiveTimeoutUsec;
     static_cast<void>(::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
                                    sizeof(receive_timeout)));
 
