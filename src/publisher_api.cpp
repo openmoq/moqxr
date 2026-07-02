@@ -143,7 +143,8 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         config_.publish_catalog,
         config_.paced,
         config_.loop,
-        config_.subscriber_timeout);
+        config_.subscriber_timeout,
+        config_.authorization);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, false);
@@ -220,7 +221,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         config_.publish_catalog,
         config_.paced,
         config_.loop,
-        config_.subscriber_timeout);
+        config_.subscriber_timeout,
+        config_.authorization);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);
@@ -292,7 +294,8 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         config_.publish_catalog,
         config_.paced,
         config_.loop,
-        config_.subscriber_timeout);
+        config_.subscriber_timeout,
+        config_.authorization);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);

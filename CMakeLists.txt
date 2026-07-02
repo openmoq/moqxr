@@ -143,6 +143,7 @@ if(OPENMOQ_ENABLE_PICOQUIC AND EXISTS "${OPENMOQ_PICOQUIC_SOURCE_DIR}/CMakeLists
 endif()
 
 add_library(openmoq_publisher_lib STATIC
+    src/cat4moq.cpp
     src/cli_options.cpp
     src/cmaf_segmenter.cpp
     src/cmsf_packager.cpp
@@ -208,6 +209,12 @@ add_executable(openmoq-publisher-psychedelic-example
 )
 target_link_libraries(openmoq-publisher-psychedelic-example PRIVATE openmoq_publisher_lib)
 
+add_executable(openmoq-publisher-auth-example
+    examples/auth/AuthPublisher.cpp
+    examples/auth/catapult_client.cpp
+)
+target_link_libraries(openmoq-publisher-auth-example PRIVATE openmoq_publisher_lib)
+
 include(CTest)
 
 if(OPENMOQ_BUILD_TESTS)
@@ -252,6 +259,18 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-api-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-api-tests COMMAND openmoq-publisher-api-tests)
+
+    add_executable(openmoq-publisher-cat4moq-api-tests
+        tests/cat4moq_api_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-cat4moq-api-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-cat4moq-api-tests COMMAND openmoq-publisher-cat4moq-api-tests)
+
+    add_executable(openmoq-publisher-cat4moq-transport-token-tests
+        tests/cat4moq_transport_token_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-cat4moq-transport-token-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-cat4moq-transport-token-tests COMMAND openmoq-publisher-cat4moq-transport-token-tests)
 
     add_executable(openmoq-publisher-control-message-tests
         tests/moqt_control_messages_test.cpp
