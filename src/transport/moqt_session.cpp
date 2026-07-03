@@ -5,7 +5,9 @@
 #include "openmoq/publisher/mp4_box.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +25,11 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 namespace openmoq::publisher::transport {
 
@@ -3279,6 +3286,52 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         encode_publish_namespace_done_message(namespace_message), false);
 }
 
+namespace {
+
+// Reads live input for publish_live, appending to the streaming reader and
+// returning the byte count (0 on end of stream or stop request). For real
+// stdin on POSIX, reads the fd directly behind a bounded poll: istream::read
+// would park until a full chunk arrives, which made shutdown joins hang on a
+// feeder that is alive but idle, and mixing istream reads with raw fd reads
+// would lose bytes buffered inside cin/stdio — so every stdin byte in this
+// flow must come through here. A null stop means wait indefinitely for data,
+// matching the blocking semantics of the pre-thread discovery phase.
+std::size_t read_live_input(std::istream& input,
+                            openmoq::publisher::StreamingMp4Reader& reader,
+                            const std::atomic<bool>* stop) {
+#if !defined(_WIN32)
+    if (&input == &std::cin) {
+        constexpr int kStdinPollTimeoutMsec = 100;
+        std::array<std::uint8_t, 16384> buffer;
+        while (stop == nullptr || !stop->load(std::memory_order_acquire)) {
+            pollfd poll_fd{};
+            poll_fd.fd = STDIN_FILENO;
+            poll_fd.events = POLLIN;
+            const int ready = ::poll(&poll_fd, 1, kStdinPollTimeoutMsec);
+            if (ready <= 0) {
+                continue;
+            }
+            const ssize_t count = ::read(STDIN_FILENO, buffer.data(), buffer.size());
+            if (count < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                return 0;
+            }
+            if (count == 0) {
+                return 0;
+            }
+            reader.append(buffer.data(), static_cast<std::size_t>(count));
+            return static_cast<std::size_t>(count);
+        }
+        return 0;
+    }
+#endif
+    return reader.read_from(input);
+}
+
+}  // namespace
+
 TransportStatus MoqtSession::publish_live(std::istream& input,
                                            openmoq::publisher::DraftVersion draft_version,
                                            bool /*split_cmaf_chunks*/) {
@@ -3303,7 +3356,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     std::cerr << "[moqt-session] live: waiting for ftyp+moov from stdin...\n";
 
     while (ftyp_bytes.empty() || moov_bytes.empty()) {
-        const std::size_t bytes_read = reader.read_from(input);
+        const std::size_t bytes_read = read_live_input(input, reader, nullptr);
         if (bytes_read == 0 && ftyp_bytes.empty()) {
             return TransportStatus::failure("stdin EOF before ftyp box");
         }
@@ -3455,14 +3508,20 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     };
     auto queue = std::make_shared<LiveMediaQueue>();
 
-    std::thread stdin_thread([&reader, &input, &tracks, queue]() {
+    std::atomic<bool> stdin_stop{false};
+    std::thread stdin_thread([&reader, &input, &tracks, queue, &stdin_stop]() {
         std::vector<std::uint8_t> pending_moof;
         std::size_t shared_group_id = 0;
         std::map<std::string, std::size_t> object_id_in_group;  // per track, resets on new group
         bool first_keyframe_seen = false;
 
         while (true) {
-            const std::size_t bytes_read = reader.read_from(input);
+            if (stdin_stop.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(queue->mutex);
+                queue->eof = true;
+                break;
+            }
+            const std::size_t bytes_read = read_live_input(input, reader, &stdin_stop);
 
             while (auto box = reader.next_box()) {
                 if (box->type == "moof") {
@@ -3529,6 +3588,13 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
         }
     });
+
+    const auto join_stdin_thread = [&stdin_thread, &stdin_stop]() {
+        stdin_stop.store(true, std::memory_order_release);
+        if (stdin_thread.joinable()) {
+            stdin_thread.join();
+        }
+    };
 
     // Main loop: drain queue and publish fragments
     std::map<std::string, SubgroupSenderState> sender_by_track;
@@ -3950,7 +4016,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             {
                 status = drain_queue();
                 if (!status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return status;
                 }
             }
@@ -3963,7 +4029,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
             auto [pre_status, pre_subs] = process_control_messages();
             if (!pre_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return pre_status;
             }
 
@@ -3977,7 +4043,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             auto [ctrl_status, new_subs] = process_control_messages();
             if (!ctrl_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return ctrl_status;
             }
 
@@ -4011,7 +4077,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 // Drain remaining
                 status = drain_queue();
                 if (!status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return status;
                 }
                 break;
@@ -4023,14 +4089,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!pending_control_bytes_.empty()) {
                 auto [pre_status, pre_subs] = process_control_messages();
                 if (!pre_status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return pre_status;
                 }
             }
 
             auto [request_status, request_subs] = process_control_messages();
             if (!request_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return request_status;
             }
 
@@ -4065,14 +4131,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     break;
                 }
             } else {
-                stdin_thread.join();
+                join_stdin_thread();
                 return read_status;
             }
 
             // Process control messages
             auto [ctrl_status, new_subs] = process_control_messages();
             if (!ctrl_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return ctrl_status;
             }
 
@@ -4084,7 +4150,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!subscribed_tracks.empty()) {
                 status = drain_queue();
                 if (!status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return status;
                 }
             }
@@ -4098,7 +4164,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
     }
 
-    stdin_thread.join();
+    join_stdin_thread();
 
     for (auto& [track_name, sender] : sender_by_track) {
         status = sender.finish_group(transport_);
