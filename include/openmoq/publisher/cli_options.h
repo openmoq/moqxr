@@ -42,6 +42,7 @@ struct CliOptions {
     bool include_sap = false;
     bool include_msf_timeline = false;
     bool split_cmaf_chunks = true;
+    bool stream_per_object = false;
     bool paced = false;
     bool loop = false;
     bool dump_plan = false;

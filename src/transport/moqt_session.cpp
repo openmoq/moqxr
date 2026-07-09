@@ -2930,7 +2930,8 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
 TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                           std::istream* stdin_input,
                                           openmoq::publisher::DraftVersion draft_version,
-                                          bool split_cmaf_chunks) {
+                                          bool split_cmaf_chunks,
+                                          bool stream_per_object) {
     if (ingest.use_stdin && !ingest.srt_callers.empty()) {
         return TransportStatus::failure("mixed stdin+SRT ingest is not supported; use either stdin or srt");
     }
@@ -2941,7 +2942,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return TransportStatus::failure("live ingest requires at least one active source");
     }
     if (ingest.use_stdin) {
-        return publish_live(*stdin_input, draft_version, split_cmaf_chunks);
+        return publish_live(*stdin_input, draft_version, split_cmaf_chunks, stream_per_object);
     }
 
     // SRT-only path below.
@@ -3281,7 +3282,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
 TransportStatus MoqtSession::publish_live(std::istream& input,
                                            openmoq::publisher::DraftVersion draft_version,
-                                           bool /*split_cmaf_chunks*/) {
+                                           bool /*split_cmaf_chunks*/,
+                                           bool stream_per_object) {
     if (transport_.state() != ConnectionState::kConnected) {
         return TransportStatus::failure("transport is not connected");
     }
@@ -3590,7 +3592,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             const std::span<const std::uint8_t> payload(fragment.payload.owned_bytes);
             TransportStatus write_status = sender.serve(
                 transport_, draft_version, alias_it->second, send_seq,
-                object, true, true, payload);
+                object, true, stream_per_object, payload);
             if (!write_status.ok) {
                 return write_status;
             }

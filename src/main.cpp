@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
             .include_sap = options.include_sap,
             .include_msf_timeline = options.include_msf_timeline,
             .split_cmaf_chunks = options.split_cmaf_chunks,
+            .live_stream_per_object = options.stream_per_object,
             .paced = options.paced,
             .loop = options.loop,
             .subscriber_timeout = options.subscriber_timeout,

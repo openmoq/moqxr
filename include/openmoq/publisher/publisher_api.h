@@ -28,6 +28,7 @@ struct PublisherConfig {
     bool include_sap = false;
     bool include_msf_timeline = false;
     bool split_cmaf_chunks = true;
+    bool live_stream_per_object = false;
     bool paced = false;
     bool loop = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);

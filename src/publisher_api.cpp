@@ -256,7 +256,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     status = active->session->publish_live(session_ingest,
                                            stdin_input,
                                            config_.draft_version,
-                                           config_.split_cmaf_chunks);
+                                           config_.split_cmaf_chunks,
+                                           config_.live_stream_per_object);
     if (!status.ok) {
         const std::string error = "transport live publish failed: " + status.message;
         static_cast<void>(active->session->close(0));

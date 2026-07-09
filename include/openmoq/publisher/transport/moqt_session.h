@@ -67,11 +67,13 @@ public:
     TransportStatus publish(const openmoq::publisher::PublishPlan& plan);
     TransportStatus publish_live(std::istream& input,
                                  openmoq::publisher::DraftVersion draft_version,
-                                 bool split_cmaf_chunks);
+                                 bool split_cmaf_chunks,
+                                 bool stream_per_object);
     TransportStatus publish_live(const LiveIngestOptions& ingest,
                                  std::istream* stdin_input,
                                  openmoq::publisher::DraftVersion draft_version,
-                                 bool split_cmaf_chunks);
+                                 bool split_cmaf_chunks,
+                                 bool stream_per_object);
     TransportStatus publish_live_objects(const openmoq::publisher::LiveObjectSource& source,
                                          openmoq::publisher::DraftVersion draft_version);
     TransportStatus close(std::uint64_t application_error_code = 0);
