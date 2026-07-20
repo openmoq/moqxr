@@ -107,6 +107,70 @@ cat sample.mp4 | ./build/openmoq-publisher \
   --insecure
 ```
 
+## CTE LL-DASH Live Ingest
+
+Start an HTTP/1.1 chunked CMAF ingest endpoint and publish the resulting live objects to a MoQ relay:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Each concurrent path below `--dash-path` is accepted independently:
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
+```
+
+The server accepts `PUT` or `POST` requests with HTTP/1.1 chunked transfer encoding. Every path under the prefix keeps its own MP4 parser state, so independent representations can send init segments and media fragments on separate request paths. Track names in the MoQ catalog are prefixed with the final path component; for example, `/ingest/video0` becomes track names such as `video0_vide_1`.
+
+FFmpeg DASH output can push directly to the ingest endpoint:
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+Useful DASH ingest flags:
+
+- `--dash-listen <host:port>` chooses the local HTTP listener address
+- `--dash-path <prefix>` limits accepted request paths to that prefix
+- `--dash-queue-depth <count>` controls how many pending live objects are retained when publishers run ahead of subscribers
+- `--publish-catalog` publishes the CMSF catalog track
+- `--forward 1` forwards media objects immediately after publishing to the relay
+- `--forward 0` waits for subscriber interest before media is sent
+
+When `--forward 0` is used, `connection_id=` confirms that the transport connection and MOQT setup completed. It is printed before namespace acceptance and does not indicate subscriber interest. The publisher completes the draft-specific namespace and track signaling, then withholds media until the relay forwards a subscription for a catalog or media track. Drafts 14 and 16 carry that interest on the control stream; drafts 17 and 18 use a bidirectional request stream, which may deliver the request in multiple reads. The publisher reassembles the request and sends `SUBSCRIBE_OK` on the same request stream.
+
+`--timeout` bounds the initial wait for subscriber interest. Reaching the timeout with no subscription is an idle, successful exit rather than a transport failure. Use `--forward 1` for a smoke test that should send objects without waiting for a subscriber. Set `OPENMOQ_PICOQUIC_TRACE=1` when diagnosing whether the relay accepted the namespace and delivered the subscriber request.
+
+The DASH ingest listener is currently supported on Unix-like platforms. Windows builds compile the CLI but report DASH ingest server startup as unsupported. The listener and live stdin reader use bounded polling so shutdown does not hang on idle input; see [macos-accept-shutdown-quirk.txt](macos-accept-shutdown-quirk.txt) for the macOS listener details.
+
 ## CAT4MOQ Auth Example
 
 Build the CAT4MOQ auth example when testing a relay that requires MoQ authorization tokens:
@@ -143,5 +207,7 @@ config, token generation, relay connection, and focused-test workflow.
 - `--coalesce-cmaf-chunks` restores one media object per group
 - draft-14 defaults to ALPN `moq-00`
 - draft-16 defaults to ALPN `moqt-16`
+- draft-17 defaults to ALPN `moqt-17`
 - draft-18 defaults to ALPN `moqt-18`
+- draft-19 is archived as a local text reference but is not selectable
 - `--alpn` overrides the draft default when targeting a specific relay

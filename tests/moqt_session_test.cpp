@@ -174,6 +174,9 @@ struct MockTransport final : PublisherTransport {
                 return TransportStatus::success();
             }
         }
+        if (on_accept_timeout) {
+            on_accept_timeout(*this, direction);
+        }
         return TransportStatus::failure("timed out waiting for stream data");
     }
 
@@ -259,6 +262,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<std::chrono::milliseconds> read_timeouts;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> accepted_streams;
+    std::function<void(MockTransport&, StreamDirection)> on_accept_timeout;
     std::function<void(MockTransport&, std::uint64_t)> on_read;
     std::atomic<bool> block_writes{false};
     std::atomic<bool> release_writes{false};
@@ -2090,8 +2094,11 @@ int main() {
         draft18_subscribe_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_subscribe_transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
-        draft18_subscribe_transport.reads[1].push_back(
-            encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 0, DraftVersion::kDraft18));
+        const std::vector<std::uint8_t> subscribe_message =
+            encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 0, DraftVersion::kDraft18);
+        const auto subscribe_split = subscribe_message.begin() + 4;
+        const std::vector<std::uint8_t> subscribe_prefix(subscribe_message.begin(), subscribe_split);
+        const std::vector<std::uint8_t> subscribe_suffix(subscribe_split, subscribe_message.end());
 
         MoqtSession draft18_subscribe_session(
             draft18_subscribe_transport,
@@ -2103,10 +2110,21 @@ int main() {
         status = draft18_subscribe_session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected draft-18 SUBSCRIBE session connect to succeed");
 
+        bool injected_subscribe = false;
+        draft18_subscribe_transport.on_accept_timeout =
+            [&](MockTransport& transport, StreamDirection direction) {
+                if (!injected_subscribe && direction == StreamDirection::kBidirectional) {
+                    transport.reads[1].push_back(subscribe_prefix);
+                    transport.reads[1].push_back(subscribe_suffix);
+                    injected_subscribe = true;
+                }
+            };
+
         const PublishPlan draft18_materialized =
             materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft18), source_bytes);
         status = draft18_subscribe_session.publish(draft18_materialized);
         ok &= expect(status.ok, "expected draft-18 SUBSCRIBE request stream publish to succeed");
+        ok &= expect(injected_subscribe, "expected draft-18 SUBSCRIBE to arrive during the control-stream wait");
 
         bool saw_subscribe_ok_on_request_stream = false;
         bool saw_object_on_unidirectional_stream = false;
@@ -2500,6 +2518,74 @@ int main() {
         ok &= expect(!object_live_transport.writes.empty() &&
                          message_type(object_live_transport.writes.back().bytes) == 0x09,
                      "expected arbitrary live-object publish to finish with PUBLISH_NAMESPACE_DONE");
+    }
+
+    {
+        MockTransport dash_live_transport;
+        dash_live_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 16,
+        }));
+        dash_live_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        dash_live_transport.reads[0].push_back(
+            encode_subscribe_message(
+                1, kTestTrackNamespace, "video0_vide_1", 0, DraftVersion::kDraft16));
+        // Keep the mock control stream open while each queued source object is considered.
+        for (int i = 0; i < 4; ++i) {
+            dash_live_transport.reads[0].push_back({});
+        }
+
+        bool subscribe_read = false;
+        dash_live_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id == 0 && transport.read_count >= 3) {
+                subscribe_read = true;
+            }
+        };
+
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .object_id = 0, .payload = {'C'}},
+            LiveObject{.track_name = "video0_vide_1", .group_id = 0, .object_id = 0, .payload = {'V', '0'}},
+            LiveObject{.track_name = "video1_vide_2", .group_id = 0, .object_id = 0, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video2_vide_3", .group_id = 0, .object_id = 0, .payload = {'V', '2'}},
+        };
+        std::size_t object_index = 0;
+        bool consumed_before_subscribe = false;
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video0_vide_1"},
+                LiveTrack{.track_name = "video1_vide_2"},
+                LiveTrack{.track_name = "video2_vide_3"},
+            },
+            .next_object = [&]() -> std::optional<LiveObject> {
+                consumed_before_subscribe = consumed_before_subscribe || !subscribe_read;
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+        };
+
+        MoqtSession dash_live_session(
+            dash_live_transport,
+            std::string(kTestTrackNamespace),
+            false,
+            true,
+            false,
+            std::chrono::seconds(1));
+        status = dash_live_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected FFmpeg-style DASH session connect to succeed");
+        status = dash_live_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(status.ok, "expected FFmpeg-style DASH publish to enter await-subscribe mode");
+        ok &= expect(subscribe_read && !consumed_before_subscribe,
+                     "expected FFmpeg-style DASH media consumption to wait for SUBSCRIBE");
+        ok &= expect(control_message_count(dash_live_transport, 0x1d) == 4,
+                     "expected catalog plus three FFmpeg-style DASH tracks to be published");
+        ok &= expect(control_message_count(dash_live_transport, 0x04) == 1,
+                     "expected FFmpeg-style DASH subscriber to receive SUBSCRIBE_OK");
+        ok &= expect(dash_live_session.publish_stats().objects_published == 2,
+                     "expected catalog and subscribed FFmpeg-style DASH representation only");
     }
 
     {

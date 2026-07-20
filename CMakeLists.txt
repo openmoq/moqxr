@@ -149,6 +149,7 @@ add_library(openmoq_publisher_lib STATIC
     src/cmsf_packager.cpp
     src/live_srt_ingest.cpp
     src/live_srt_config.cpp
+    src/live_dash_ingest.cpp
     src/moq_draft.cpp
     src/mp4_box.cpp
     src/publisher_api.cpp
@@ -234,6 +235,12 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-live-srt-config-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-live-srt-config-tests COMMAND openmoq-publisher-live-srt-config-tests)
+
+    add_executable(openmoq-publisher-live-dash-tests
+        tests/live_dash_ingest_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-live-dash-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-live-dash-tests COMMAND openmoq-publisher-live-dash-tests)
 
     add_executable(openmoq-publisher-transport-tests
         tests/moqt_session_test.cpp

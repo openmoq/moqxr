@@ -5,7 +5,9 @@
 #include "openmoq/publisher/mp4_box.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +25,11 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 namespace openmoq::publisher::transport {
 
@@ -1469,6 +1476,38 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
 
 using PublishedObjectSink = std::function<void(const std::string&, std::uint64_t, std::size_t)>;
 
+TransportStatus read_request_stream_message(PublisherTransport& transport,
+                                            std::uint64_t request_stream_id,
+                                            openmoq::publisher::DraftVersion draft,
+                                            std::chrono::milliseconds timeout,
+                                            std::vector<std::uint8_t>& message_bytes) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    message_bytes.clear();
+
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = now < deadline
+                                   ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                                   : std::chrono::milliseconds(0);
+        std::vector<std::uint8_t> chunk;
+        bool fin = false;
+        const TransportStatus read_status =
+            transport.read_stream(request_stream_id, chunk, fin, remaining);
+        if (!read_status.ok) {
+            return read_status;
+        }
+        message_bytes.insert(message_bytes.end(), chunk.begin(), chunk.end());
+
+        std::size_t message_size = 0;
+        if (next_control_message(message_bytes, draft, message_size)) {
+            return TransportStatus::success();
+        }
+        if (fin) {
+            return protocol_violation(transport, "request stream closed before a complete message");
+        }
+    }
+}
+
 TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     PublishedObjectSink published_sink,
                                     std::uint64_t control_stream_id,
@@ -1500,6 +1539,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     std::uint64_t first_media_time_us = 0;
     bool first_media_time_set = false;
     const auto pacing_start = std::chrono::steady_clock::now();
+    const auto await_subscribe_deadline = pacing_start + subscriber_timeout;
     NamespaceMessage namespace_message{
         .draft = draft,
         .track_namespace = std::string(track_namespace),
@@ -1525,13 +1565,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 }
 
                 std::vector<std::uint8_t> message_bytes;
-                bool request_fin = false;
                 const TransportStatus read_status =
-                    transport.read_stream(request_stream_id, message_bytes, request_fin, subscriber_timeout);
+                    read_request_stream_message(
+                        transport, request_stream_id, draft, subscriber_timeout, message_bytes);
                 if (!read_status.ok) {
                     return read_status;
                 }
-                static_cast<void>(request_fin);
                 trace_control_message(message_bytes, draft);
 
                 std::size_t request_offset = 0;
@@ -2192,13 +2231,21 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         }
 
         std::vector<std::uint8_t> chunk;
-        const TransportStatus read_status = transport.read_stream(control_read_stream_id, chunk, fin, subscriber_timeout);
+        const auto read_timeout = uses_request_streams(draft)
+                                      ? std::chrono::milliseconds(25)
+                                      : subscriber_timeout;
+        const TransportStatus read_status =
+            transport.read_stream(control_read_stream_id, chunk, fin, read_timeout);
         if (!read_status.ok) {
-            if (!served_any_subscription && is_idle_subscribe_exit(read_status.message)) {
-                break;
-            }
             if (read_status.message == "timed out waiting for stream data" ||
                 read_status.message == "no queued read for stream") {
+                if (uses_request_streams(draft) &&
+                    std::chrono::steady_clock::now() < await_subscribe_deadline) {
+                    continue;
+                }
+                break;
+            }
+            if (!served_any_subscription && is_idle_subscribe_exit(read_status.message)) {
                 break;
             }
             return read_status;
@@ -3280,6 +3327,52 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         encode_publish_namespace_done_message(namespace_message), false);
 }
 
+namespace {
+
+// Reads live input for publish_live, appending to the streaming reader and
+// returning the byte count (0 on end of stream or stop request). For real
+// stdin on POSIX, reads the fd directly behind a bounded poll: istream::read
+// would park until a full chunk arrives, which made shutdown joins hang on a
+// feeder that is alive but idle, and mixing istream reads with raw fd reads
+// would lose bytes buffered inside cin/stdio — so every stdin byte in this
+// flow must come through here. A null stop means wait indefinitely for data,
+// matching the blocking semantics of the pre-thread discovery phase.
+std::size_t read_live_input(std::istream& input,
+                            openmoq::publisher::StreamingMp4Reader& reader,
+                            const std::atomic<bool>* stop) {
+#if !defined(_WIN32)
+    if (&input == &std::cin) {
+        constexpr int kStdinPollTimeoutMsec = 100;
+        std::array<std::uint8_t, 16384> buffer;
+        while (stop == nullptr || !stop->load(std::memory_order_acquire)) {
+            pollfd poll_fd{};
+            poll_fd.fd = STDIN_FILENO;
+            poll_fd.events = POLLIN;
+            const int ready = ::poll(&poll_fd, 1, kStdinPollTimeoutMsec);
+            if (ready <= 0) {
+                continue;
+            }
+            const ssize_t count = ::read(STDIN_FILENO, buffer.data(), buffer.size());
+            if (count < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                return 0;
+            }
+            if (count == 0) {
+                return 0;
+            }
+            reader.append(buffer.data(), static_cast<std::size_t>(count));
+            return static_cast<std::size_t>(count);
+        }
+        return 0;
+    }
+#endif
+    return reader.read_from(input);
+}
+
+}  // namespace
+
 TransportStatus MoqtSession::publish_live(std::istream& input,
                                            openmoq::publisher::DraftVersion draft_version,
                                            bool /*split_cmaf_chunks*/,
@@ -3305,7 +3398,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     std::cerr << "[moqt-session] live: waiting for ftyp+moov from stdin...\n";
 
     while (ftyp_bytes.empty() || moov_bytes.empty()) {
-        const std::size_t bytes_read = reader.read_from(input);
+        const std::size_t bytes_read = read_live_input(input, reader, nullptr);
         if (bytes_read == 0 && ftyp_bytes.empty()) {
             return TransportStatus::failure("stdin EOF before ftyp box");
         }
@@ -3457,14 +3550,20 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     };
     auto queue = std::make_shared<LiveMediaQueue>();
 
-    std::thread stdin_thread([&reader, &input, &tracks, queue]() {
+    std::atomic<bool> stdin_stop{false};
+    std::thread stdin_thread([&reader, &input, &tracks, queue, &stdin_stop]() {
         std::vector<std::uint8_t> pending_moof;
         std::size_t shared_group_id = 0;
         std::map<std::string, std::size_t> object_id_in_group;  // per track, resets on new group
         bool first_keyframe_seen = false;
 
         while (true) {
-            const std::size_t bytes_read = reader.read_from(input);
+            if (stdin_stop.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(queue->mutex);
+                queue->eof = true;
+                break;
+            }
+            const std::size_t bytes_read = read_live_input(input, reader, &stdin_stop);
 
             while (auto box = reader.next_box()) {
                 if (box->type == "moof") {
@@ -3531,6 +3630,13 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
         }
     });
+
+    const auto join_stdin_thread = [&stdin_thread, &stdin_stop]() {
+        stdin_stop.store(true, std::memory_order_release);
+        if (stdin_thread.joinable()) {
+            stdin_thread.join();
+        }
+    };
 
     // Main loop: drain queue and publish fragments
     std::map<std::string, SubgroupSenderState> sender_by_track;
@@ -3681,13 +3787,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 }
 
                 std::vector<std::uint8_t> request_bytes;
-                bool request_fin = false;
                 TransportStatus read_status =
-                    transport_.read_stream(request_stream_id, request_bytes, request_fin, subscriber_timeout_);
+                    read_request_stream_message(
+                        transport_, request_stream_id, draft_version, subscriber_timeout_, request_bytes);
                 if (!read_status.ok) {
                     return {read_status, 0};
                 }
-                static_cast<void>(request_fin);
                 trace_control_message(request_bytes, draft_version);
 
                 std::size_t request_offset = 0;
@@ -3952,7 +4057,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             {
                 status = drain_queue();
                 if (!status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return status;
                 }
             }
@@ -3965,7 +4070,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
             auto [pre_status, pre_subs] = process_control_messages();
             if (!pre_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return pre_status;
             }
 
@@ -3979,7 +4084,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             auto [ctrl_status, new_subs] = process_control_messages();
             if (!ctrl_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return ctrl_status;
             }
 
@@ -4013,7 +4118,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 // Drain remaining
                 status = drain_queue();
                 if (!status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return status;
                 }
                 break;
@@ -4025,14 +4130,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!pending_control_bytes_.empty()) {
                 auto [pre_status, pre_subs] = process_control_messages();
                 if (!pre_status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return pre_status;
                 }
             }
 
             auto [request_status, request_subs] = process_control_messages();
             if (!request_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return request_status;
             }
 
@@ -4067,14 +4172,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     break;
                 }
             } else {
-                stdin_thread.join();
+                join_stdin_thread();
                 return read_status;
             }
 
             // Process control messages
             auto [ctrl_status, new_subs] = process_control_messages();
             if (!ctrl_status.ok) {
-                stdin_thread.join();
+                join_stdin_thread();
                 return ctrl_status;
             }
 
@@ -4086,7 +4191,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!subscribed_tracks.empty()) {
                 status = drain_queue();
                 if (!status.ok) {
-                    stdin_thread.join();
+                    join_stdin_thread();
                     return status;
                 }
             }
@@ -4100,7 +4205,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
     }
 
-    stdin_thread.join();
+    join_stdin_thread();
 
     for (auto& [track_name, sender] : sender_by_track) {
         status = sender.finish_group(transport_);
@@ -4323,13 +4428,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 }
 
                 std::vector<std::uint8_t> request_bytes;
-                bool request_fin = false;
                 TransportStatus read_status =
-                    transport_.read_stream(request_stream_id, request_bytes, request_fin, subscriber_timeout_);
+                    read_request_stream_message(
+                        transport_, request_stream_id, draft_version, subscriber_timeout_, request_bytes);
                 if (!read_status.ok) {
                     return read_status;
                 }
-                static_cast<void>(request_fin);
                 trace_control_message(request_bytes, draft_version);
 
                 std::size_t request_offset = 0;
@@ -4542,6 +4646,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
         std::optional<openmoq::publisher::LiveObject> next = source.next_object();
         if (!next.has_value()) {
+            // A live source with a liveness predicate distinguishes a transient
+            // media gap (keep polling, keep servicing control) from real EOF.
+            if (source.is_finished && !source.is_finished()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             source_eof = true;
             break;
         }

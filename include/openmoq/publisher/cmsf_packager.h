@@ -60,4 +60,12 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
                                bool is_live = true);
 
+// Base64-encoded, track-specific CMAF init segment (ftyp + single-track moov)
+// for the track at track_index within init_segment. This is exactly the value
+// build_live_catalog embeds in each track's "initData" field, exposed so live
+// sources that assemble catalogs from per-path init segments can reuse it.
+std::string track_init_data_base64(std::span<const std::uint8_t> init_segment,
+                                   const TrackDescription& track,
+                                   std::size_t track_index);
+
 }  // namespace openmoq::publisher
