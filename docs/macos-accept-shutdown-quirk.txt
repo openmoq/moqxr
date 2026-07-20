@@ -1,0 +1,57 @@
+macOS accept()/shutdown() quirk in the DASH ingest server
+==========================================================
+
+Symptom
+-------
+The macOS CI job (build-and-test macos-latest) appeared to time out or fail on
+every push to feature/ctedash, taking ~26 minutes. The real failure was the
+openmoq-publisher-live-dash-tests binary hanging until ctest killed it at the
+1500 second per-test timeout (exit code 8). Linux and Windows were unaffected.
+
+Root cause
+----------
+Commit 6c08575 changed LiveDashIngestServer::stop() to keep the listening file
+descriptor open (only shutdown() it) until the accept thread joins. That is
+correct for the fd-reuse race it fixed, but it relies on shutdown() waking a
+blocked accept().
+
+Platform difference:
+- Linux: shutdown(listen_fd, SHUT_RDWR) on a listening socket wakes a blocked
+  accept(), which returns with EINVAL. Tests pass.
+- macOS/BSD: shutdown() on a listening (unconnected) socket fails with ENOTCONN
+  and does NOT wake accept(). The accept thread sleeps forever, stop() blocks
+  in accept_thread.join(), and the first server start/stop test hangs.
+
+Historically the code closed the listening fd during stop(), and on BSD-derived
+systems close() does wake accept() - which is why the hang only appeared once
+the close was deferred until after the join.
+
+A follow-up commit (8b4b99b, "make DASH ingest shutdown responsive on macOS")
+only fixed the client recv() path with SO_RCVTIMEO polling; it did not touch
+accept(), so the hang persisted.
+
+Fix (commit 65c5a4f)
+--------------------
+In src/live_dash_ingest.cpp:
+1. The accept loop never parks in accept(). It waits in poll() on the listening
+   fd with a bounded 100 ms timeout and re-checks stop_requested each cycle,
+   mirroring the client workers' SO_RCVTIMEO receive cadence.
+2. The listening socket is set O_NONBLOCK after listen(), so a connection that
+   is aborted between the poll() wakeup and the accept() call cannot re-block
+   the loop.
+3. handle_client() clears O_NONBLOCK on the accepted client fd before applying
+   SO_RCVTIMEO. BSD-derived systems (macOS) make accepted sockets inherit the
+   listener's O_NONBLOCK (Linux does not); without clearing it the worker recv
+   loop would hot-spin on EAGAIN instead of honoring the timed cadence.
+
+Portable-shutdown rules worth remembering
+-----------------------------------------
+- Never rely on shutdown() of a listening socket to unblock accept() - it is
+  Linux-only behavior. Use a bounded poll()+stop-flag loop, a self-pipe, or a
+  wake connection instead.
+- Accepted sockets inherit O_NONBLOCK from the listener on BSD/macOS but not
+  on Linux; normalize the flag explicitly on the accepted fd.
+- Keeping a listening fd open until its accept thread joins avoids fd-reuse
+  races, but the wake mechanism must then be something other than close().
+
+Verification: after 65c5a4f, macOS CI run 28627497050 passed in 43 seconds.
