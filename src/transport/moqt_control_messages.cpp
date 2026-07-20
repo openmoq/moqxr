@@ -372,7 +372,9 @@ void append_setup_option_delta(std::vector<std::uint8_t>& out,
                                std::uint64_t type,
                                std::span<const std::uint8_t> value) {
     append_moqint(out, draft, type - previous_type);
-    append_moqint(out, draft, value.size());
+    if ((type & 0x1ULL) != 0) {
+        append_moqint(out, draft, value.size());
+    }
     out.insert(out.end(), value.begin(), value.end());
     previous_type = type;
 }
@@ -654,18 +656,27 @@ bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetu
         std::uint64_t previous_option_type = 0;
         while (offset < payload_end) {
             std::uint64_t option_type = 0;
-            std::uint64_t option_length = 0;
             if (!decode_parameter_type(payload_bytes,
                                        offset,
                                        message_draft,
                                        previous_option_type,
                                        true,
-                                       option_type) ||
-                !decode_moqint_impl(payload_bytes, offset, message_draft, option_length) ||
-                offset + option_length > payload_end) {
+                                       option_type)) {
                 return false;
             }
-            offset += static_cast<std::size_t>(option_length);
+            if ((option_type & 0x1ULL) == 0) {
+                std::uint64_t option_value = 0;
+                if (!decode_moqint_impl(payload_bytes, offset, message_draft, option_value)) {
+                    return false;
+                }
+            } else {
+                std::uint64_t option_length = 0;
+                if (!decode_moqint_impl(payload_bytes, offset, message_draft, option_length) ||
+                    option_length > payload_end - offset) {
+                    return false;
+                }
+                offset += static_cast<std::size_t>(option_length);
+            }
         }
         return offset == payload_end;
     }
@@ -1303,18 +1314,20 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
                                                       std::size_t largest_object_id,
                                                       bool content_exists) {
     std::vector<std::uint8_t> payload;
-    append_varint(payload, request_id);
+    if (!uses_moq_vi64(draft)) {
+        append_moqint(payload, draft, request_id);
+    }
     if (draft == DraftVersion::kDraft14) {
-        append_varint(payload, track_alias);
-        append_varint(payload, 0);
+        append_moqint(payload, draft, track_alias);
+        append_moqint(payload, draft, 0);
         payload.push_back(kGroupOrderAscending);
         payload.push_back(content_exists ? kContentExistsTrue : 0);
         if (content_exists) {
             append_location(payload, draft, largest_group_id, largest_object_id);
         }
-        append_varint(payload, 0);
+        append_moqint(payload, draft, 0);
     } else {
-        append_varint(payload, track_alias);
+        append_moqint(payload, draft, track_alias);
         std::vector<std::uint8_t> parameters;
         std::uint64_t previous_parameter_type = 0;
         std::uint64_t parameter_count = 0;
@@ -1324,12 +1337,12 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
             append_parameter_delta(parameters, draft, previous_parameter_type, 0x09, largest_object);
             ++parameter_count;
         }
-        append_varint(payload, parameter_count);
+        append_moqint(payload, draft, parameter_count);
         payload.insert(payload.end(), parameters.begin(), parameters.end());
     }
 
     std::vector<std::uint8_t> message_bytes;
-    append_varint(message_bytes, kSubscribeOkType);
+    append_moqint(message_bytes, draft, kSubscribeOkType);
     append_uint16(message_bytes, static_cast<std::uint16_t>(payload.size()));
     message_bytes.insert(message_bytes.end(), payload.begin(), payload.end());
     return message_bytes;

@@ -174,6 +174,9 @@ struct MockTransport final : PublisherTransport {
                 return TransportStatus::success();
             }
         }
+        if (on_accept_timeout) {
+            on_accept_timeout(*this, direction);
+        }
         return TransportStatus::failure("timed out waiting for stream data");
     }
 
@@ -259,6 +262,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<std::chrono::milliseconds> read_timeouts;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> accepted_streams;
+    std::function<void(MockTransport&, StreamDirection)> on_accept_timeout;
     std::function<void(MockTransport&, std::uint64_t)> on_read;
     std::atomic<bool> block_writes{false};
     std::atomic<bool> release_writes{false};
@@ -2090,8 +2094,11 @@ int main() {
         draft18_subscribe_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_subscribe_transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
-        draft18_subscribe_transport.reads[1].push_back(
-            encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 0, DraftVersion::kDraft18));
+        const std::vector<std::uint8_t> subscribe_message =
+            encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 0, DraftVersion::kDraft18);
+        const auto subscribe_split = subscribe_message.begin() + 4;
+        const std::vector<std::uint8_t> subscribe_prefix(subscribe_message.begin(), subscribe_split);
+        const std::vector<std::uint8_t> subscribe_suffix(subscribe_split, subscribe_message.end());
 
         MoqtSession draft18_subscribe_session(
             draft18_subscribe_transport,
@@ -2103,10 +2110,21 @@ int main() {
         status = draft18_subscribe_session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected draft-18 SUBSCRIBE session connect to succeed");
 
+        bool injected_subscribe = false;
+        draft18_subscribe_transport.on_accept_timeout =
+            [&](MockTransport& transport, StreamDirection direction) {
+                if (!injected_subscribe && direction == StreamDirection::kBidirectional) {
+                    transport.reads[1].push_back(subscribe_prefix);
+                    transport.reads[1].push_back(subscribe_suffix);
+                    injected_subscribe = true;
+                }
+            };
+
         const PublishPlan draft18_materialized =
             materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft18), source_bytes);
         status = draft18_subscribe_session.publish(draft18_materialized);
         ok &= expect(status.ok, "expected draft-18 SUBSCRIBE request stream publish to succeed");
+        ok &= expect(injected_subscribe, "expected draft-18 SUBSCRIBE to arrive during the control-stream wait");
 
         bool saw_subscribe_ok_on_request_stream = false;
         bool saw_object_on_unidirectional_stream = false;

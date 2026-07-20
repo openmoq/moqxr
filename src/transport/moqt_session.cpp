@@ -1476,6 +1476,38 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
 
 using PublishedObjectSink = std::function<void(const std::string&, std::uint64_t, std::size_t)>;
 
+TransportStatus read_request_stream_message(PublisherTransport& transport,
+                                            std::uint64_t request_stream_id,
+                                            openmoq::publisher::DraftVersion draft,
+                                            std::chrono::milliseconds timeout,
+                                            std::vector<std::uint8_t>& message_bytes) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    message_bytes.clear();
+
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = now < deadline
+                                   ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                                   : std::chrono::milliseconds(0);
+        std::vector<std::uint8_t> chunk;
+        bool fin = false;
+        const TransportStatus read_status =
+            transport.read_stream(request_stream_id, chunk, fin, remaining);
+        if (!read_status.ok) {
+            return read_status;
+        }
+        message_bytes.insert(message_bytes.end(), chunk.begin(), chunk.end());
+
+        std::size_t message_size = 0;
+        if (next_control_message(message_bytes, draft, message_size)) {
+            return TransportStatus::success();
+        }
+        if (fin) {
+            return protocol_violation(transport, "request stream closed before a complete message");
+        }
+    }
+}
+
 TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     PublishedObjectSink published_sink,
                                     std::uint64_t control_stream_id,
@@ -1507,6 +1539,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     std::uint64_t first_media_time_us = 0;
     bool first_media_time_set = false;
     const auto pacing_start = std::chrono::steady_clock::now();
+    const auto await_subscribe_deadline = pacing_start + subscriber_timeout;
     NamespaceMessage namespace_message{
         .draft = draft,
         .track_namespace = std::string(track_namespace),
@@ -1532,13 +1565,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 }
 
                 std::vector<std::uint8_t> message_bytes;
-                bool request_fin = false;
                 const TransportStatus read_status =
-                    transport.read_stream(request_stream_id, message_bytes, request_fin, subscriber_timeout);
+                    read_request_stream_message(
+                        transport, request_stream_id, draft, subscriber_timeout, message_bytes);
                 if (!read_status.ok) {
                     return read_status;
                 }
-                static_cast<void>(request_fin);
                 trace_control_message(message_bytes, draft);
 
                 std::size_t request_offset = 0;
@@ -2199,13 +2231,21 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         }
 
         std::vector<std::uint8_t> chunk;
-        const TransportStatus read_status = transport.read_stream(control_read_stream_id, chunk, fin, subscriber_timeout);
+        const auto read_timeout = uses_request_streams(draft)
+                                      ? std::chrono::milliseconds(25)
+                                      : subscriber_timeout;
+        const TransportStatus read_status =
+            transport.read_stream(control_read_stream_id, chunk, fin, read_timeout);
         if (!read_status.ok) {
-            if (!served_any_subscription && is_idle_subscribe_exit(read_status.message)) {
-                break;
-            }
             if (read_status.message == "timed out waiting for stream data" ||
                 read_status.message == "no queued read for stream") {
+                if (uses_request_streams(draft) &&
+                    std::chrono::steady_clock::now() < await_subscribe_deadline) {
+                    continue;
+                }
+                break;
+            }
+            if (!served_any_subscription && is_idle_subscribe_exit(read_status.message)) {
                 break;
             }
             return read_status;
@@ -3745,13 +3785,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 }
 
                 std::vector<std::uint8_t> request_bytes;
-                bool request_fin = false;
                 TransportStatus read_status =
-                    transport_.read_stream(request_stream_id, request_bytes, request_fin, subscriber_timeout_);
+                    read_request_stream_message(
+                        transport_, request_stream_id, draft_version, subscriber_timeout_, request_bytes);
                 if (!read_status.ok) {
                     return {read_status, 0};
                 }
-                static_cast<void>(request_fin);
                 trace_control_message(request_bytes, draft_version);
 
                 std::size_t request_offset = 0;
@@ -4387,13 +4426,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 }
 
                 std::vector<std::uint8_t> request_bytes;
-                bool request_fin = false;
                 TransportStatus read_status =
-                    transport_.read_stream(request_stream_id, request_bytes, request_fin, subscriber_timeout_);
+                    read_request_stream_message(
+                        transport_, request_stream_id, draft_version, subscriber_timeout_, request_bytes);
                 if (!read_status.ok) {
                     return read_status;
                 }
-                static_cast<void>(request_fin);
                 trace_control_message(request_bytes, draft_version);
 
                 std::size_t request_offset = 0;
