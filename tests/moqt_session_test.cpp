@@ -2530,16 +2530,24 @@ int main() {
             encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
         dash_live_transport.reads[0].push_back(
             encode_subscribe_message(
-                1, kTestTrackNamespace, "video0_vide_1", 0, DraftVersion::kDraft16));
+                1, kTestTrackNamespace, "catalog", 0, DraftVersion::kDraft16));
+        dash_live_transport.reads[0].push_back({});
+        dash_live_transport.reads[0].push_back(
+            encode_subscribe_message(
+                3, kTestTrackNamespace, "video0_vide_1", 0, DraftVersion::kDraft16));
         // Keep the mock control stream open while each queued source object is considered.
         for (int i = 0; i < 4; ++i) {
             dash_live_transport.reads[0].push_back({});
         }
 
-        bool subscribe_read = false;
+        bool catalog_subscribe_read = false;
+        bool media_subscribe_read = false;
         dash_live_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
             if (stream_id == 0 && transport.read_count >= 3) {
-                subscribe_read = true;
+                catalog_subscribe_read = true;
+            }
+            if (stream_id == 0 && transport.read_count >= 5) {
+                media_subscribe_read = true;
             }
         };
 
@@ -2551,6 +2559,7 @@ int main() {
         };
         std::size_t object_index = 0;
         bool consumed_before_subscribe = false;
+        bool media_consumed_before_media_subscribe = false;
         LiveObjectSource source{
             .tracks = {
                 LiveTrack{.track_name = "catalog"},
@@ -2559,7 +2568,9 @@ int main() {
                 LiveTrack{.track_name = "video2_vide_3"},
             },
             .next_object = [&]() -> std::optional<LiveObject> {
-                consumed_before_subscribe = consumed_before_subscribe || !subscribe_read;
+                consumed_before_subscribe = consumed_before_subscribe || !catalog_subscribe_read;
+                media_consumed_before_media_subscribe =
+                    media_consumed_before_media_subscribe || (object_index > 0 && !media_subscribe_read);
                 if (object_index >= objects.size()) {
                     return std::nullopt;
                 }
@@ -2578,11 +2589,13 @@ int main() {
         ok &= expect(status.ok, "expected FFmpeg-style DASH session connect to succeed");
         status = dash_live_session.publish_live_objects(source, DraftVersion::kDraft16);
         ok &= expect(status.ok, "expected FFmpeg-style DASH publish to enter await-subscribe mode");
-        ok &= expect(subscribe_read && !consumed_before_subscribe,
+        ok &= expect(catalog_subscribe_read && media_subscribe_read && !consumed_before_subscribe,
                      "expected FFmpeg-style DASH media consumption to wait for SUBSCRIBE");
+        ok &= expect(!media_consumed_before_media_subscribe,
+                     "expected catalog-first subscription to preserve queued media until media SUBSCRIBE");
         ok &= expect(control_message_count(dash_live_transport, 0x1d) == 4,
                      "expected catalog plus three FFmpeg-style DASH tracks to be published");
-        ok &= expect(control_message_count(dash_live_transport, 0x04) == 1,
+        ok &= expect(control_message_count(dash_live_transport, 0x04) == 2,
                      "expected FFmpeg-style DASH subscriber to receive SUBSCRIBE_OK");
         ok &= expect(dash_live_session.publish_stats().objects_published == 2,
                      "expected catalog and subscribed FFmpeg-style DASH representation only");

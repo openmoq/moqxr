@@ -4597,6 +4597,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     std::optional<std::chrono::steady_clock::time_point> object_pacing_start;
     std::optional<std::uint64_t> object_first_media_time_us;
     bool live_object_catalog_sent = !alias_by_track.contains("catalog");
+    const bool has_media_tracks = std::any_of(alias_by_track.begin(), alias_by_track.end(),
+                                              [](const auto& entry) { return entry.first != "catalog"; });
+    const auto has_media_subscription = [&]() {
+        return std::any_of(subscribed_tracks.begin(), subscribed_tracks.end(),
+                           [](const std::string& track_name) { return track_name != "catalog"; });
+    };
     const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
     while (!source_eof) {
         if (stop_requested_.load(std::memory_order_acquire)) {
@@ -4611,7 +4617,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         bool read_fin = false;
         const bool waiting_for_first_subscription =
             !auto_forward_ && active_subscriptions.empty() && subscribed_tracks.empty();
-        const auto read_timeout = waiting_for_first_subscription && !uses_request_streams(draft_version)
+        const bool waiting_for_media_subscription =
+            !auto_forward_ && live_object_catalog_sent && has_media_tracks && !has_media_subscription();
+        const bool waiting_for_required_subscription =
+            waiting_for_first_subscription || waiting_for_media_subscription;
+        const auto read_timeout = waiting_for_required_subscription && !uses_request_streams(draft_version)
                                       ? subscriber_timeout_
                                       : std::chrono::milliseconds(0);
         const TransportStatus read_status =
@@ -4621,7 +4631,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             control_fin = read_fin;
         } else if (read_status.message == "timed out waiting for stream data" ||
                    read_status.message == "no queued read for stream") {
-            if (waiting_for_first_subscription && std::chrono::steady_clock::now() >= await_subscribe_deadline) {
+            if (waiting_for_required_subscription &&
+                std::chrono::steady_clock::now() >= await_subscribe_deadline) {
                 break;
             }
         } else {
@@ -4641,6 +4652,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
 
         if (!auto_forward_ && subscribed_tracks.empty()) {
+            continue;
+        }
+        if (!auto_forward_ && live_object_catalog_sent && has_media_tracks && !has_media_subscription()) {
             continue;
         }
 

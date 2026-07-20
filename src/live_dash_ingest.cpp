@@ -506,9 +506,20 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
                 << "\"id\":" << track.track_id << ','
                 << "\"role\":\"" << role_for_handler(track.handler_type) << "\","
                 << "\"packaging\":\"cmaf\","
+                << "\"renderGroup\":1,"
                 << "\"isLive\":true";
         if (!track.codec.empty()) {
             catalog << ",\"codec\":\"" << json_escape(track.codec) << "\"";
+        }
+        if (track.handler_type == "vide") {
+            catalog << ",\"width\":" << track.width
+                    << ",\"height\":" << track.height;
+            if (track.frame_rate > 0.0) {
+                catalog << ",\"frameRate\":" << std::setprecision(6) << track.frame_rate;
+            }
+        } else if (track.handler_type == "soun") {
+            catalog << ",\"sampleRate\":" << track.sample_rate
+                    << ",\"channelCount\":" << track.channel_count;
         }
         if (!registered.init_data_base64.empty()) {
             catalog << ",\"initData\":\"" << registered.init_data_base64 << "\"";

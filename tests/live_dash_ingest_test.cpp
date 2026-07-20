@@ -273,8 +273,14 @@ int main() {
         ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
                      "expected catalog object for initData test");
         if (catalog.has_value()) {
-            ok &= expect(as_string(catalog->payload).find("\"initData\":\"") != std::string::npos,
+            const std::string catalog_text = as_string(catalog->payload);
+            ok &= expect(catalog_text.find("\"initData\":\"") != std::string::npos,
                          "expected catalog to embed base64 initData for the track");
+            ok &= expect(catalog_text.find("\"renderGroup\":1") != std::string::npos,
+                         "expected DASH catalog track to declare its render group");
+            ok &= expect(catalog_text.find("\"width\":320") != std::string::npos &&
+                             catalog_text.find("\"height\":240") != std::string::npos,
+                         "expected DASH catalog video dimensions for renderer selection");
         }
     }
 
