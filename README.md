@@ -14,7 +14,7 @@ It turns MP4 input into CMSF-style publishable objects, builds draft-aware MOQT 
 - Preserves HEVC signaling and normalizes `hev1` to `hvc1` when needed.
 - Builds publish plans with catalog, optional MSF media timeline and SAP event timeline metadata, and media objects.
 - Emits generated objects and catalog metadata to disk for inspection.
-- Supports draft-aware MOQT framing for drafts 14, 16, and 18.
+- Supports draft-aware MOQT framing for drafts 14, 16, 17, and 18.
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
 - Accepts live CTE LL-DASH/CMAF ingest over HTTP/1.1 chunked `POST` or `PUT` requests.
 
@@ -184,7 +184,7 @@ ffmpeg -re \
   http://127.0.0.1:8080/ingest/
 ```
 
-Use `--forward 1` when the relay should receive objects immediately. Use `--forward 0` for await-subscribe mode, where media is sent after the relay forwards subscriber interest for the published tracks.
+Use `--forward 1` when the relay should receive objects immediately. Use `--forward 0` for await-subscribe mode, where media is sent after the relay forwards subscriber interest for the published tracks. A printed `connection_id=` confirms transport and MOQT setup only; it does not confirm namespace acceptance or a downstream subscription.
 
 `--live-source both` is intentionally not supported.
 
@@ -204,6 +204,7 @@ On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publ
 | CAT4MOQ auth example | [examples/auth/README.md](examples/auth/README.md) |
 | Protocol mapping | [docs/protocol-mapping.md](docs/protocol-mapping.md) |
 | WebTransport compliance | [docs/webtransport-compliance.md](docs/webtransport-compliance.md) |
+| macOS DASH shutdown behavior | [docs/macos-accept-shutdown-quirk.txt](docs/macos-accept-shutdown-quirk.txt) |
 | Transport plan | [docs/transport-plan.md](docs/transport-plan.md) |
 | Project status and roadmap | [docs/status.md](docs/status.md) |
 
@@ -221,6 +222,6 @@ Localized Publisher API guides are available in [Spanish](docs/publisher-api.es.
 
 ## Current Status
 
-The publisher can generate publish plans, emit inspectable output, and publish over picoquic-backed Raw QUIC and WebTransport transports. Draft 14 is the primary target, draft 16 is maintained as a compatibility profile, and draft 18 support is implemented for version selection, setup/request framing codec paths, and request-stream response correlation while interop hardening continues.
+The publisher can generate publish plans, emit inspectable output, and publish over picoquic-backed Raw QUIC and WebTransport transports. Draft 14 is the primary target, draft 16 is maintained as a compatibility profile, and drafts 17 and 18 provide the newer VI64 and request-stream protocol profiles. Draft-18 subscriber interest is accepted on fragmented request-stream reads and answered on the same request stream. The draft-19 text is archived under `docs/superpowers/specs/` for review only; `--draft 19` is not implemented.
 
 For the detailed roadmap, see [docs/status.md](docs/status.md).

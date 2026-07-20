@@ -156,6 +156,7 @@ Par défaut, l'API applique l'ALPN adapté au transport :
 
 - Raw QUIC + draft-14 : `moq-00`
 - Raw QUIC + draft-16 : `moqt-16`
+- Raw QUIC + draft-17 : `moqt-17`
 - Raw QUIC + draft-18 : `moqt-18`
 - WebTransport : `h3`
 

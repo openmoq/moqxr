@@ -165,9 +165,11 @@ Useful DASH ingest flags:
 - `--forward 1` forwards media objects immediately after publishing to the relay
 - `--forward 0` waits for subscriber interest before media is sent
 
-When `--forward 0` is used, seeing a relay connection ID only confirms that the publisher connected and announced the namespace. Media delivery still depends on the relay forwarding a subscription for one of the catalog or media tracks. Use `--forward 1` for a smoke test that should send objects without waiting for a subscriber.
+When `--forward 0` is used, `connection_id=` confirms that the transport connection and MOQT setup completed. It is printed before namespace acceptance and does not indicate subscriber interest. The publisher completes the draft-specific namespace and track signaling, then withholds media until the relay forwards a subscription for a catalog or media track. Drafts 14 and 16 carry that interest on the control stream; drafts 17 and 18 use a bidirectional request stream, which may deliver the request in multiple reads. The publisher reassembles the request and sends `SUBSCRIBE_OK` on the same request stream.
 
-The DASH ingest listener is currently supported on Unix-like platforms. Windows builds compile the CLI but report DASH ingest server startup as unsupported.
+`--timeout` bounds the initial wait for subscriber interest. Reaching the timeout with no subscription is an idle, successful exit rather than a transport failure. Use `--forward 1` for a smoke test that should send objects without waiting for a subscriber. Set `OPENMOQ_PICOQUIC_TRACE=1` when diagnosing whether the relay accepted the namespace and delivered the subscriber request.
+
+The DASH ingest listener is currently supported on Unix-like platforms. Windows builds compile the CLI but report DASH ingest server startup as unsupported. The listener and live stdin reader use bounded polling so shutdown does not hang on idle input; see [macos-accept-shutdown-quirk.txt](macos-accept-shutdown-quirk.txt) for the macOS listener details.
 
 ## CAT4MOQ Auth Example
 
@@ -205,5 +207,7 @@ config, token generation, relay connection, and focused-test workflow.
 - `--coalesce-cmaf-chunks` restores one media object per group
 - draft-14 defaults to ALPN `moq-00`
 - draft-16 defaults to ALPN `moqt-16`
+- draft-17 defaults to ALPN `moqt-17`
 - draft-18 defaults to ALPN `moqt-18`
+- draft-19 is archived as a local text reference but is not selectable
 - `--alpn` overrides the draft default when targeting a specific relay

@@ -119,4 +119,4 @@ ffmpeg -re \
 
 With this naming pattern, FFmpeg sends representation requests under the ingest prefix, such as `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`. The publisher treats each representation path independently, discovers tracks from init segments sent on those paths, and emits catalog plus media objects for subscribers.
 
-For relay smoke testing, use `--forward 1` so objects are forwarded immediately. Use `--forward 0` when the relay should wait for subscriber interest before media delivery.
+For relay smoke testing, use `--forward 1` so objects are forwarded immediately. Use `--forward 0` when the relay should wait for subscriber interest before media delivery. In that mode, `connection_id=` confirms transport and MOQT setup only; it does not mean the relay accepted the namespace or forwarded a subscription. Draft-16 subscriptions arrive on the control stream, while draft-17/18 subscriptions arrive on bidirectional request streams and are acknowledged with `SUBSCRIBE_OK` on the same stream. Use `--timeout` to bound the initial wait and `OPENMOQ_PICOQUIC_TRACE=1` to inspect relay control traffic.

@@ -15,8 +15,10 @@ This covers:
 - fragmented MP4 packaging
 - progressive MP4 remux into CMAF-style objects
 - CLI option parsing and validation
-- MOQT setup encoding and decoding
+- MOQT setup and control-message encoding/decoding for drafts 14, 16, 17, and 18
 - binary namespace announcement plus subscribe-serving or forward-publish control/object sequencing
+- draft-18 fragmented request-stream reads and same-stream `SUBSCRIBE_OK` responses
+- draft-16 LL-DASH await-subscribe behavior with catalog plus multiple FFmpeg-style representation paths
 - multitrack subscribe serving in publish-plan/media-time order rather than draining one track at a time
 - paced send scheduling against fragment media timestamps
 - QUIC varint boundary coverage
@@ -104,3 +106,13 @@ cat sample.mp4 | ./build/openmoq-publisher --input - --draft 14 --dump-plan
 ```
 
 Push CMAF segments with HTTP/1.1 chunked transfer encoding (curl or the FFmpeg DASH recipe in `docs/quickstart.md`) at `http://127.0.0.1:8099/ingest/...`. Like a live publish, the dry run keeps draining objects until it is interrupted; wrap it in `timeout` for scripted checks.
+
+Run the focused DASH ingest and subscriber-interest regressions with:
+
+```bash
+cmake --build build --target openmoq-publisher-live-dash-tests openmoq-publisher-transport-tests
+./build/openmoq-publisher-live-dash-tests
+./build/openmoq-publisher-transport-tests
+```
+
+The DASH test covers separate init and media requests on `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`. The transport test verifies that a draft-16 live publisher advertises those tracks, waits for `SUBSCRIBE`, acknowledges it, and sends only the catalog plus the subscribed representation.
