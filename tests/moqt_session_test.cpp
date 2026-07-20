@@ -2521,6 +2521,74 @@ int main() {
     }
 
     {
+        MockTransport dash_live_transport;
+        dash_live_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 16,
+        }));
+        dash_live_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        dash_live_transport.reads[0].push_back(
+            encode_subscribe_message(
+                1, kTestTrackNamespace, "video0_vide_1", 0, DraftVersion::kDraft16));
+        // Keep the mock control stream open while each queued source object is considered.
+        for (int i = 0; i < 4; ++i) {
+            dash_live_transport.reads[0].push_back({});
+        }
+
+        bool subscribe_read = false;
+        dash_live_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id == 0 && transport.read_count >= 3) {
+                subscribe_read = true;
+            }
+        };
+
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .object_id = 0, .payload = {'C'}},
+            LiveObject{.track_name = "video0_vide_1", .group_id = 0, .object_id = 0, .payload = {'V', '0'}},
+            LiveObject{.track_name = "video1_vide_2", .group_id = 0, .object_id = 0, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video2_vide_3", .group_id = 0, .object_id = 0, .payload = {'V', '2'}},
+        };
+        std::size_t object_index = 0;
+        bool consumed_before_subscribe = false;
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video0_vide_1"},
+                LiveTrack{.track_name = "video1_vide_2"},
+                LiveTrack{.track_name = "video2_vide_3"},
+            },
+            .next_object = [&]() -> std::optional<LiveObject> {
+                consumed_before_subscribe = consumed_before_subscribe || !subscribe_read;
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+        };
+
+        MoqtSession dash_live_session(
+            dash_live_transport,
+            std::string(kTestTrackNamespace),
+            false,
+            true,
+            false,
+            std::chrono::seconds(1));
+        status = dash_live_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected FFmpeg-style DASH session connect to succeed");
+        status = dash_live_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(status.ok, "expected FFmpeg-style DASH publish to enter await-subscribe mode");
+        ok &= expect(subscribe_read && !consumed_before_subscribe,
+                     "expected FFmpeg-style DASH media consumption to wait for SUBSCRIBE");
+        ok &= expect(control_message_count(dash_live_transport, 0x1d) == 4,
+                     "expected catalog plus three FFmpeg-style DASH tracks to be published");
+        ok &= expect(control_message_count(dash_live_transport, 0x04) == 1,
+                     "expected FFmpeg-style DASH subscriber to receive SUBSCRIBE_OK");
+        ok &= expect(dash_live_session.publish_stats().objects_published == 2,
+                     "expected catalog and subscribed FFmpeg-style DASH representation only");
+    }
+
+    {
         MockTransport live_draft18_transport;
         live_draft18_transport.reads[3].push_back(encode_draft18_setup_response());
         live_draft18_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
