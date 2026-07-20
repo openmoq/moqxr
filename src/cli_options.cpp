@@ -178,6 +178,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.include_msf_timeline = true;
         } else if (argument == "--coalesce-cmaf-chunks") {
             options.split_cmaf_chunks = false;
+        } else if (argument == "--stream-per-object") {
+            options.stream_per_object = true;
         } else if (argument == "--timeout") {
             options.subscriber_timeout = parse_timeout(require_value("--timeout"));
         } else if (argument == "--paced") {
@@ -241,7 +243,7 @@ std::string build_usage(const char* argv0) {
     return std::string("Usage: ") + argv0 +
            " --input <mp4|-> [--live-source auto|stdin|srt] [--srt-config <path>]"
            " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
-           " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
+            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";
 }
