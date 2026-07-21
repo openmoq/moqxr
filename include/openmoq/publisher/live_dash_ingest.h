@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -107,6 +108,11 @@ private:
     // aborting the whole session on an unknown track.
     bool tracks_frozen_ = false;
     std::size_t catalog_group_id_ = 0;
+    std::size_t shared_media_group_id_ = 0;
+    std::uint64_t shared_group_start_time_us_ = 0;
+    std::map<std::string, std::size_t> shared_object_id_by_track_;
+    std::set<std::string> video_tracks_started_in_group_;
+    bool shared_media_group_started_ = false;
     bool catalog_dirty_ = false;
     bool closed_ = false;
     mutable std::mutex mutex_;

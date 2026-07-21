@@ -200,4 +200,12 @@ For `--forward 0`, once `PUBLISH_NAMESPACE_OK` has been received:
 
 This behavior is intentional. It keeps interoperability probes from being reported as publish failures when the relay accepted the namespace but no subscriber appeared during the configured wait window.
 
-Automated regressions cover the reported live DASH shape with catalog plus `/ingest/video0`, `/ingest/video1`, and `/ingest/video2` representations. The draft-16 session test verifies that source objects are not consumed before `SUBSCRIBE`, that `SUBSCRIBE_OK` is returned, and that only the catalog plus subscribed representation are sent. Draft-18 session coverage separately verifies that a `SUBSCRIBE` split across multiple request-stream reads is reassembled and answered on that request stream.
+Automated regressions cover the reported live DASH shape with catalog plus
+multiple representation paths. They verify shared audio/video keyframe groups,
+explicit `trun` sample metadata derived from FFmpeg `tfhd` defaults, subgroup
+stream reuse within a group, and stream closure at a group transition. The
+draft-16 session test also verifies that source objects are not consumed before
+`SUBSCRIBE`, that `SUBSCRIBE_OK` is returned, and that the catalog remains
+available while waiting for media interest. Draft-18 session coverage
+separately verifies that a `SUBSCRIBE` split across multiple request-stream
+reads is reassembled and answered on that request stream.

@@ -4596,6 +4596,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     bool control_fin = false;
     std::optional<std::chrono::steady_clock::time_point> object_pacing_start;
     std::optional<std::uint64_t> object_first_media_time_us;
+    std::map<std::string, std::uint64_t> last_group_id_by_track;
     bool live_object_catalog_sent = !alias_by_track.contains("catalog");
     const bool has_media_tracks = std::any_of(alias_by_track.begin(), alias_by_track.end(),
                                               [](const auto& entry) { return entry.first != "catalog"; });
@@ -4738,7 +4739,16 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             pace_until(*object_pacing_start, *object_first_media_time_us, object, true);
         }
-        status = sender_by_track[next->track_name].serve(
+        auto& sender = sender_by_track[next->track_name];
+        const auto group_it = last_group_id_by_track.find(next->track_name);
+        if (group_it != last_group_id_by_track.end() &&
+            group_it->second != static_cast<std::uint64_t>(next->group_id)) {
+            status = sender.finish_group(transport_);
+            if (!status.ok) {
+                return status;
+            }
+        }
+        status = sender.serve(
             transport_,
             draft_version,
             alias_it->second,
@@ -4758,6 +4768,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         record_published_object(next->track_name,
                                 static_cast<std::uint64_t>(next->group_id),
                                 next->payload.size());
+        last_group_id_by_track[next->track_name] = static_cast<std::uint64_t>(next->group_id);
         if (stop_requested_.load(std::memory_order_acquire)) {
             break;
         }

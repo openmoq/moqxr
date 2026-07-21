@@ -25,7 +25,8 @@ This covers:
 
 Publish-plan numbering notes:
 
-- `group_id` is allocated per track, not across all tracks, so interleaved audio and video fragments can both use `0, 1, 2, ...`
+- file-based publish plans allocate `group_id` per track, so interleaved audio and video fragments can both use `0, 1, 2, ...`
+- live DASH uses each video keyframe to start a shared media group; audio joins that active group and each track maintains its own `object_id` sequence within it
 - by default, `object_id` advances within a group when CMAF content is split into multiple MOQT objects for lower latency
 - `--coalesce-cmaf-chunks` forces `object_id = 0` for the current one-object-per-group fallback
 - MSF media timeline tracks are disabled by default; add `--msf-timeline` when you want a `timeline` metadata track and object
@@ -115,4 +116,9 @@ cmake --build build --target openmoq-publisher-live-dash-tests openmoq-publisher
 ./build/openmoq-publisher-transport-tests
 ```
 
-The DASH test covers separate init and media requests on `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`. The transport test verifies that a draft-16 live publisher advertises those tracks, waits for `SUBSCRIBE`, acknowledges it, and sends only the catalog plus the subscribed representation.
+The DASH test covers separate init and media requests, shared audio/video
+keyframe groups, and normalization of FFmpeg `tfhd` sample defaults into
+explicit `trun` sample fields. The transport test verifies that draft-16 keeps
+objects from the same group on one subgroup stream, closes that stream at a
+group transition, waits for `SUBSCRIBE`, and preserves the catalog while
+waiting for media interest.

@@ -453,7 +453,40 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
     if (!track_published_locked(fragment.track_name)) {
         return;
     }
-    fragment.group_id = path_state.next_group_by_track[fragment.track_name]++;
+    const auto track_it = std::find_if(path_state.tracks.begin(), path_state.tracks.end(),
+                                       [&](const TrackDescription& track) {
+                                           return track.track_name == fragment.track_name;
+                                       });
+    const bool is_video = track_it != path_state.tracks.end() && track_it->handler_type == "vide";
+    const bool has_video = std::any_of(tracks_.begin(), tracks_.end(),
+                                       [](const RegisteredTrack& track) {
+                                           return track.description.handler_type == "vide";
+                                       });
+    if (has_video) {
+        if (is_video && fragment.is_video_keyframe) {
+            if (!shared_media_group_started_) {
+                shared_media_group_started_ = true;
+                shared_group_start_time_us_ = fragment.start_time_us;
+            } else if (fragment.start_time_us > shared_group_start_time_us_) {
+                ++shared_media_group_id_;
+                shared_group_start_time_us_ = fragment.start_time_us;
+                shared_object_id_by_track_.clear();
+                video_tracks_started_in_group_.clear();
+            } else if (fragment.start_time_us < shared_group_start_time_us_) {
+                return;
+            }
+            video_tracks_started_in_group_.insert(fragment.track_name);
+        }
+        if (!shared_media_group_started_ ||
+            (is_video && !video_tracks_started_in_group_.contains(fragment.track_name))) {
+            return;
+        }
+        fragment.group_id = shared_media_group_id_;
+        fragment.object_id = shared_object_id_by_track_[fragment.track_name]++;
+    } else {
+        fragment.group_id = path_state.next_group_by_track[fragment.track_name]++;
+        fragment.object_id = 0;
+    }
     enqueue_locked(LiveObject{
         .track_name = fragment.track_name,
         .group_id = fragment.group_id,
@@ -462,6 +495,7 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         .media_time_us = fragment.start_time_us,
         .media_duration_us = fragment.duration_us,
         .payload = std::move(fragment.payload.owned_bytes),
+        .final_in_subgroup = false,
     });
 }
 

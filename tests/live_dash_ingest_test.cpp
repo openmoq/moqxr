@@ -1,4 +1,5 @@
 #include "openmoq/publisher/live_dash_ingest.h"
+#include "openmoq/publisher/mp4_box.h"
 
 #include <array>
 #include <chrono>
@@ -81,17 +82,49 @@ std::vector<std::uint8_t> be32(std::uint32_t value) {
     return out;
 }
 
-std::vector<std::uint8_t> make_init_segment(std::uint32_t track_id) {
+std::vector<std::uint8_t> be64(std::uint64_t value) {
+    return concat({be32(static_cast<std::uint32_t>(value >> 32U)),
+                   be32(static_cast<std::uint32_t>(value))});
+}
+
+std::uint32_t read_be32(std::span<const std::uint8_t> bytes, std::size_t offset) {
+    return (static_cast<std::uint32_t>(bytes[offset]) << 24U) |
+           (static_cast<std::uint32_t>(bytes[offset + 1]) << 16U) |
+           (static_cast<std::uint32_t>(bytes[offset + 2]) << 8U) |
+           static_cast<std::uint32_t>(bytes[offset + 3]);
+}
+
+std::vector<std::uint8_t> make_init_segment(std::uint32_t track_id,
+                                            std::string_view handler_type = "vide") {
+    const bool is_audio = handler_type == "soun";
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
     const auto tkhd = full_box("tkhd", 0, 0, concat({std::vector<std::uint8_t>(8, 0), be32(track_id), std::vector<std::uint8_t>(4, 0)}));
-    const auto mdhd = full_box("mdhd", 0, 0, concat({std::vector<std::uint8_t>(8, 0), be32(1000), std::vector<std::uint8_t>(8, 0)}));
-    const auto hdlr = full_box("hdlr", 0, 0, {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
-    visual_header[24] = 0x01;
-    visual_header[25] = 0x40;
-    visual_header[26] = 0x00;
-    visual_header[27] = 0xf0;
-    const auto sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    const auto mdhd = full_box("mdhd", 0, 0, concat({std::vector<std::uint8_t>(8, 0), be32(is_audio ? 48000 : 1000), std::vector<std::uint8_t>(8, 0)}));
+    const auto hdlr = full_box("hdlr", 0, 0,
+                               is_audio
+                                   ? std::vector<std::uint8_t>{0, 0, 0, 0, 's', 'o', 'u', 'n', 0, 0, 0, 0}
+                                   : std::vector<std::uint8_t>{0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    std::vector<std::uint8_t> sample_entry;
+    if (is_audio) {
+        auto audio_header = std::vector<std::uint8_t>(28, 0);
+        audio_header[16] = 0x00;
+        audio_header[17] = 0x02;
+        audio_header[24] = 0xbb;
+        audio_header[25] = 0x80;
+        sample_entry = make_box(
+            "mp4a",
+            concat({audio_header,
+                    make_box("esds", {0x00, 0x00, 0x00, 0x00, 0x03, 0x19, 0x00, 0x02,
+                                      0x00, 0x04, 0x11, 0x40, 0x15, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x10, 0x10})}));
+    } else {
+        auto visual_header = std::vector<std::uint8_t>(70, 0);
+        visual_header[24] = 0x01;
+        visual_header[25] = 0x40;
+        visual_header[26] = 0x00;
+        visual_header[27] = 0xf0;
+        sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    }
     const auto stsd = full_box("stsd", 0, 0, concat({be32(1), sample_entry}));
     const auto stbl = make_box("stbl", stsd);
     const auto minf = make_box("minf", stbl);
@@ -105,13 +138,32 @@ std::vector<std::uint8_t> make_init_segment(std::uint32_t track_id) {
 
 std::vector<std::uint8_t> make_media_fragment(std::uint32_t track_id,
                                               std::uint32_t decode_time,
-                                              std::uint8_t payload_byte) {
-    const auto tfhd = full_box("tfhd", 0, 0x000038, concat({be32(track_id), be32(1000), be32(1), be32(0x02000000)}));
+                                              std::uint8_t payload_byte,
+                                              std::uint32_t sample_flags = 0x02000000) {
+    const auto tfhd = full_box(
+        "tfhd", 0, 0x000038, concat({be32(track_id), be32(1000), be32(1), be32(sample_flags)}));
     const auto tfdt = full_box("tfdt", 0, 0, be32(decode_time));
     const auto trun = full_box("trun", 0, 0x000201, concat({be32(1), be32(16), be32(1)}));
     const auto traf = make_box("traf", concat({tfhd, tfdt, trun}));
     const auto moof = make_box("moof", traf);
     const auto mdat = make_box("mdat", {payload_byte});
+    return concat({moof, mdat});
+}
+
+std::vector<std::uint8_t> make_dash_media_fragment(std::uint32_t track_id,
+                                                   std::uint64_t decode_time,
+                                                   std::vector<std::uint8_t> sample) {
+    const auto tfhd = full_box(
+        "tfhd", 0, 0x020038,
+        concat({be32(track_id), be32(512), be32(static_cast<std::uint32_t>(sample.size())),
+                be32(0x01010000)}));
+    const auto tfdt = full_box("tfdt", 1, 0, be64(decode_time));
+    const auto trun = full_box(
+        "trun", 0, 0x000005,
+        concat({be32(1), be32(112), be32(0x02000000)}));
+    const auto traf = make_box("traf", concat({tfhd, tfdt, trun}));
+    const auto moof = make_box("moof", concat({full_box("mfhd", 0, 0, be32(1)), traf}));
+    const auto mdat = make_box("mdat", sample);
     return concat({moof, mdat});
 }
 
@@ -237,6 +289,106 @@ int main() {
     ok &= expect_chunked_rejects("FFFFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n");
 
     {
+        // FFmpeg's DASH muxer stores duration, size, and default flags in
+        // tfhd and omits them from trun. The relay consumes trun samples
+        // directly, so the live ingest must materialize those defaults.
+        LiveDashIngestSession session(8);
+        const auto init = make_init_segment(1);
+        const auto dash_fragment = make_dash_media_fragment(1, 0, {0x11, 0x22, 0x33});
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(init.data(), init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected track before DASH tfhd-default normalization test");
+        const auto source = session.source();
+        session.ingest("/ingest/video",
+                       std::span<const std::uint8_t>(dash_fragment.data(), dash_fragment.size()));
+
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        const std::optional<LiveObject> media = session.try_next_object();
+        ok &= expect(catalog.has_value() && media.has_value(),
+                     "expected catalog and normalized DASH media object");
+        if (media.has_value()) {
+            const auto boxes = openmoq::publisher::parse_mp4_boxes(media->payload);
+            const auto* traf = boxes.empty() ? nullptr
+                                              : openmoq::publisher::find_child_box(boxes.front(), "traf");
+            const auto* trun = traf == nullptr ? nullptr
+                                                : openmoq::publisher::find_child_box(*traf, "trun");
+            ok &= expect(trun != nullptr, "expected normalized DASH trun");
+            if (trun != nullptr) {
+                const std::uint32_t flags = read_be32(media->payload, trun->payload.offset) & 0x00FFFFFFU;
+                std::size_t cursor = trun->payload.offset + 4;
+                const std::uint32_t sample_count = read_be32(media->payload, cursor);
+                cursor += 4;
+                const std::uint32_t data_offset = read_be32(media->payload, cursor);
+                cursor += 4;
+                if ((flags & 0x000004U) != 0) {
+                    cursor += 4;
+                }
+                ok &= expect((flags & 0x000700U) == 0x000700U,
+                             "expected trun to carry explicit sample duration, size, and flags");
+                ok &= expect(sample_count == 1, "expected one normalized DASH sample");
+                ok &= expect(read_be32(media->payload, cursor) == 512,
+                             "expected tfhd default sample duration in trun");
+                ok &= expect(read_be32(media->payload, cursor + 4) == 3,
+                             "expected tfhd default sample size in trun");
+                ok &= expect(read_be32(media->payload, cursor + 8) == 0x02000000,
+                             "expected first-sample flags in the normalized trun sample");
+                ok &= expect(data_offset == boxes.front().span.size + 8,
+                             "expected normalized trun data offset to follow the resized moof");
+            }
+        }
+    }
+
+    {
+        LiveDashIngestSession session(16);
+        const auto video_init = make_init_segment(1);
+        const auto audio_init = make_init_segment(1, "soun");
+        session.ingest("/ingest/video0", std::span<const std::uint8_t>(video_init.data(), video_init.size()));
+        session.ingest("/ingest/video1", std::span<const std::uint8_t>(audio_init.data(), audio_init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected audio and video tracks before shared-group test");
+        const auto source = session.source();
+
+        const auto audio_before_video = make_media_fragment(1, 0, 0x21);
+        const auto video_keyframe_a = make_media_fragment(1, 0, 0x11);
+        const auto video_dependent = make_media_fragment(1, 1000, 0x12, 0x00010000);
+        const auto audio_a = make_media_fragment(1, 1024, 0x22);
+        const auto video_keyframe_b = make_media_fragment(1, 2000, 0x13);
+        const auto audio_b = make_media_fragment(1, 2048, 0x23);
+        session.ingest("/ingest/video1", std::span<const std::uint8_t>(audio_before_video.data(), audio_before_video.size()));
+        session.ingest("/ingest/video0", std::span<const std::uint8_t>(video_keyframe_a.data(), video_keyframe_a.size()));
+        session.ingest("/ingest/video0", std::span<const std::uint8_t>(video_dependent.data(), video_dependent.size()));
+        session.ingest("/ingest/video1", std::span<const std::uint8_t>(audio_a.data(), audio_a.size()));
+        session.ingest("/ingest/video0", std::span<const std::uint8_t>(video_keyframe_b.data(), video_keyframe_b.size()));
+        session.ingest("/ingest/video1", std::span<const std::uint8_t>(audio_b.data(), audio_b.size()));
+
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        const std::optional<LiveObject> video_a = session.try_next_object();
+        const std::optional<LiveObject> video_delta = session.try_next_object();
+        const std::optional<LiveObject> audio_group_a = session.try_next_object();
+        const std::optional<LiveObject> video_b = session.try_next_object();
+        const std::optional<LiveObject> audio_group_b = session.try_next_object();
+        const std::optional<LiveObject> extra = session.try_next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected catalog before shared-group media");
+        ok &= expect(video_a.has_value() && video_a->track_name == "video0_vide_1" &&
+                         video_a->group_id == 0 && video_a->object_id == 0,
+                     "expected first video keyframe in shared group 0");
+        ok &= expect(video_delta.has_value() && video_delta->track_name == "video0_vide_1" &&
+                         video_delta->group_id == 0 && video_delta->object_id == 1,
+                     "expected dependent video in shared group 0");
+        ok &= expect(audio_group_a.has_value() && audio_group_a->track_name == "video1_soun_1" &&
+                         audio_group_a->group_id == 0 && audio_group_a->object_id == 0,
+                     "expected audio to join active video group 0");
+        ok &= expect(video_b.has_value() && video_b->track_name == "video0_vide_1" &&
+                         video_b->group_id == 1 && video_b->object_id == 0,
+                     "expected next video keyframe in shared group 1");
+        ok &= expect(audio_group_b.has_value() && audio_group_b->track_name == "video1_soun_1" &&
+                         audio_group_b->group_id == 1 && audio_group_b->object_id == 0,
+                     "expected audio to join active video group 1");
+        ok &= expect(!extra.has_value(), "expected audio before the first video keyframe to be dropped");
+    }
+
+    {
         LiveDashIngestSession session(8);
         const auto init = make_init_segment(1);
         const auto video_a = make_media_fragment(1, 0, 0x11);
@@ -258,6 +410,43 @@ int main() {
         ok &= expect(catalog.has_value() && catalog->track_name == "catalog", "expected catalog object first");
         ok &= expect(video.has_value() && video->track_name == "video_vide_1", "expected video media object");
         ok &= expect(audio.has_value() && audio->track_name == "audio_vide_1", "expected audio media object");
+    }
+
+    {
+        LiveDashIngestSession session(8);
+        const auto init = make_init_segment(1);
+        const auto keyframe_a = make_media_fragment(1, 0, 0x11);
+        const auto dependent_a = make_media_fragment(1, 1000, 0x12, 0x00010000);
+        const auto dependent_b = make_media_fragment(1, 2000, 0x13, 0x00010000);
+        const auto keyframe_b = make_media_fragment(1, 3000, 0x14);
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(init.data(), init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected track before keyframe-grouping test");
+        const auto source = session.source();
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(keyframe_a.data(), keyframe_a.size()));
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(dependent_a.data(), dependent_a.size()));
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(dependent_b.data(), dependent_b.size()));
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(keyframe_b.data(), keyframe_b.size()));
+
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        const std::optional<LiveObject> first = session.try_next_object();
+        const std::optional<LiveObject> second = session.try_next_object();
+        const std::optional<LiveObject> third = session.try_next_object();
+        const std::optional<LiveObject> fourth = session.try_next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected catalog before keyframe-grouped media");
+        ok &= expect(first.has_value() && first->group_id == 0 && first->object_id == 0,
+                     "expected first keyframe to start group 0");
+        ok &= expect(second.has_value() && second->group_id == 0 && second->object_id == 1,
+                     "expected first dependent frame to remain in group 0");
+        ok &= expect(third.has_value() && third->group_id == 0 && third->object_id == 2,
+                     "expected second dependent frame to remain in group 0");
+        ok &= expect(fourth.has_value() && fourth->group_id == 1 && fourth->object_id == 0,
+                     "expected next keyframe to start group 1");
+        ok &= expect(first.has_value() && second.has_value() && third.has_value() && fourth.has_value() &&
+                         !first->final_in_subgroup && !second->final_in_subgroup &&
+                         !third->final_in_subgroup && !fourth->final_in_subgroup,
+                     "expected DASH group objects to keep their subgroup stream open");
     }
 
     {

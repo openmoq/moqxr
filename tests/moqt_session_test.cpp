@@ -2521,6 +2521,75 @@ int main() {
     }
 
     {
+        MockTransport grouped_live_transport;
+        grouped_live_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        grouped_live_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        grouped_live_transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "video", 0, DraftVersion::kDraft16));
+        for (int i = 0; i < 4; ++i) {
+            grouped_live_transport.reads[0].push_back({});
+        }
+
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "video", .group_id = 0, .object_id = 0,
+                       .payload = {'V', '0'}, .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 0, .object_id = 1,
+                       .payload = {'V', '1'}, .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 1, .object_id = 0,
+                       .payload = {'V', '2'}, .final_in_subgroup = false},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+        };
+
+        MoqtSession grouped_live_session(
+            grouped_live_transport,
+            std::string(kTestTrackNamespace),
+            false,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = grouped_live_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected grouped live-object session connect to succeed");
+        status = grouped_live_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(status.ok, "expected grouped live-object publish to succeed");
+
+        std::vector<MockTransport::WriteEvent> media_writes;
+        for (const auto& write : grouped_live_transport.writes) {
+            if (write.stream_id != 0) {
+                media_writes.push_back(write);
+            }
+        }
+        ok &= expect(media_writes.size() == 5,
+                     "expected two group streams with explicit FIN writes");
+        if (media_writes.size() == 5) {
+            ok &= expect(media_writes[0].stream_id == media_writes[1].stream_id &&
+                             !media_writes[0].fin && !media_writes[1].fin,
+                         "expected same-group live objects on one open subgroup stream");
+            ok &= expect(media_writes[2].stream_id == media_writes[0].stream_id &&
+                             media_writes[2].bytes.empty() && media_writes[2].fin,
+                         "expected previous subgroup stream to finish at the group boundary");
+            ok &= expect(media_writes[3].stream_id != media_writes[0].stream_id &&
+                             !media_writes[3].fin,
+                         "expected next group to open a new subgroup stream");
+            ok &= expect(media_writes[4].stream_id == media_writes[3].stream_id &&
+                             media_writes[4].bytes.empty() && media_writes[4].fin,
+                         "expected final live subgroup stream to finish at end of source");
+        }
+    }
+
+    {
         MockTransport dash_live_transport;
         dash_live_transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,

@@ -156,6 +156,13 @@ ffmpeg -re \
   http://127.0.0.1:8080/ingest/
 ```
 
+For FFmpeg DASH input, the ingest adapter expands `tfhd` sample defaults into
+the outgoing `trun` entries before publishing CMAF objects. Video keyframes
+start shared media groups, and audio objects join the active video group;
+media received before the first video keyframe is discarded. This keeps the
+representations independently addressable while preserving aligned render
+groups for downstream playback.
+
 Useful DASH ingest flags:
 
 - `--dash-listen <host:port>` chooses the local HTTP listener address
