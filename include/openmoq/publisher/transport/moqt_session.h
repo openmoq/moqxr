@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -13,6 +14,7 @@
 #include <string_view>
 #include <map>
 #include <unordered_map>
+#include <vector>
 
 namespace openmoq::publisher::transport {
 
@@ -49,7 +51,8 @@ public:
                          bool auto_forward,
                          bool publish_catalog,
                          bool paced,
-                         std::chrono::seconds subscriber_timeout);
+                         std::chrono::seconds subscriber_timeout,
+                         openmoq::publisher::cat4moq::AuthorizationConfig authorization = {});
 
     explicit MoqtSession(PublisherTransport& transport,
                          std::string track_namespace = "media",
@@ -57,17 +60,20 @@ public:
                          bool publish_catalog = false,
                          bool paced = false,
                          bool loop = false,
-                         std::chrono::seconds subscriber_timeout = std::chrono::seconds(30));
+                         std::chrono::seconds subscriber_timeout = std::chrono::seconds(30),
+                         openmoq::publisher::cat4moq::AuthorizationConfig authorization = {});
 
     TransportStatus connect(const EndpointConfig& endpoint, const TlsConfig& tls);
     TransportStatus publish(const openmoq::publisher::PublishPlan& plan);
     TransportStatus publish_live(std::istream& input,
                                  openmoq::publisher::DraftVersion draft_version,
-                                 bool split_cmaf_chunks);
+                                 bool split_cmaf_chunks,
+                                 bool stream_per_object = false);
     TransportStatus publish_live(const LiveIngestOptions& ingest,
                                  std::istream* stdin_input,
                                  openmoq::publisher::DraftVersion draft_version,
-                                 bool split_cmaf_chunks);
+                                 bool split_cmaf_chunks,
+                                 bool stream_per_object = false);
     TransportStatus publish_live_objects(const openmoq::publisher::LiveObjectSource& source,
                                          openmoq::publisher::DraftVersion draft_version);
     TransportStatus close(std::uint64_t application_error_code = 0);
@@ -76,6 +82,8 @@ public:
 private:
     void reset_publish_stats();
     void record_published_object(const std::string& track_name, std::uint64_t group_id, std::size_t payload_bytes);
+    std::optional<std::vector<std::uint8_t>> setup_authorization_token() const;
+    std::optional<std::vector<std::uint8_t>> action_authorization_token() const;
 
     TransportStatus ensure_setup(openmoq::publisher::DraftVersion draft);
     TransportStatus ensure_control_stream(openmoq::publisher::DraftVersion draft);
@@ -88,6 +96,7 @@ private:
     bool paced_ = false;
     bool loop_ = false;
     std::chrono::seconds subscriber_timeout_ = std::chrono::seconds(30);
+    openmoq::publisher::cat4moq::AuthorizationConfig authorization_;
     std::optional<EndpointConfig> endpoint_;
     std::uint64_t control_stream_id_ = 0;
     std::uint64_t peer_control_stream_id_ = 0;

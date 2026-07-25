@@ -797,4 +797,10 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
     return result;
 }
 
+std::string track_init_data_base64(std::span<const std::uint8_t> init_segment,
+                                   const TrackDescription& track,
+                                   std::size_t track_index) {
+    return base64_encode(build_track_specific_init_segment(init_segment, track, track_index));
+}
+
 }  // namespace openmoq::publisher

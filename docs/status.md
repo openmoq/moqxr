@@ -8,13 +8,15 @@ Draft status:
 
 - draft 14 is the primary target
 - draft 16 is maintained as a secondary compatibility profile
-- draft 18 support is implemented for version selection, setup/request framing codec paths, and request-stream response correlation
-- draft 18 interop hardening is still in progress
+- draft 17 is selectable and has VI64, request-stream, control-codec, ALPN, and WebTransport protocol-offer support; relay interop coverage remains limited
+- draft 18 support includes version selection, setup/request framing, request-stream response correlation, fragmented subscriber-interest reads, and same-stream `SUBSCRIBE_OK` responses
+- draft 19 is archived as `docs/superpowers/specs/draft-ietf-moq-transport-19.txt` for later review and is not selectable
+- CTE LL-DASH regressions cover FFmpeg-style multi-representation paths and draft-16 await-subscribe delivery
 
 ## Roadmap
 
-1. Keep draft-14, draft-16, and draft-18 message/subgroup serde tests aligned with the current relay matrix so wire placement regressions are caught in CI.
-2. Harden draft-18 request-stream lifecycle behavior, especially stream retention, close/reset behavior, and relay-specific response timing.
+1. Keep draft-14, draft-16, draft-17, and draft-18 message/subgroup serde tests aligned with the current relay matrix so wire placement regressions are caught in CI.
+2. Continue draft-17/18 request-stream interop validation, especially stream retention, close/reset behavior, fragmented delivery, and relay-specific response timing.
 3. Continue Red5 relay and player interop validation, including catalog publication, downstream subscription discovery, and Red5 Pro playback behavior.
 4. Expand CMAF packaging coverage for fragmented and progressive inputs, including Opus, AAC, H.264, HEVC, edit lists, and less common sample-table layouts.
 5. Track CMSF catalog/schema changes and keep emitted catalog metadata, init segments, SAP timeline tracks, and per-track roles aligned with the current packaging draft.

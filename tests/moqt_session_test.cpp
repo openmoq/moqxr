@@ -1,4 +1,5 @@
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/moqt_session.h"
@@ -32,7 +33,6 @@ using openmoq::publisher::PublishPlan;
 using openmoq::publisher::TrackDescription;
 using openmoq::publisher::materialize_publish_plan;
 using openmoq::publisher::transport::ConnectionState;
-using openmoq::publisher::transport::ServerSetupMessage;
 using openmoq::publisher::transport::SubscribeMessage;
 using openmoq::publisher::transport::SubscribeNamespaceMessage;
 using openmoq::publisher::transport::EndpointConfig;
@@ -174,6 +174,9 @@ struct MockTransport final : PublisherTransport {
                 return TransportStatus::success();
             }
         }
+        if (on_accept_timeout) {
+            on_accept_timeout(*this, direction);
+        }
         return TransportStatus::failure("timed out waiting for stream data");
     }
 
@@ -259,6 +262,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<std::chrono::milliseconds> read_timeouts;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> accepted_streams;
+    std::function<void(MockTransport&, StreamDirection)> on_accept_timeout;
     std::function<void(MockTransport&, std::uint64_t)> on_read;
     std::atomic<bool> block_writes{false};
     std::atomic<bool> release_writes{false};
@@ -302,6 +306,7 @@ void append_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
 
 std::vector<std::uint8_t> make_box(std::string_view type, std::vector<std::uint8_t> payload) {
     std::vector<std::uint8_t> out;
+    out.reserve(8 + payload.size());
     append_be32(out, static_cast<std::uint32_t>(8 + payload.size()));
     out.insert(out.end(), type.begin(), type.end());
     out.insert(out.end(), payload.begin(), payload.end());
@@ -588,6 +593,16 @@ void queue_publish_ok_responses(MockTransport& transport,
 
 bool bytes_equal(const std::vector<std::uint8_t>& bytes, std::initializer_list<std::uint8_t> expected) {
     return std::vector<std::uint8_t>(expected) == bytes;
+}
+
+bool contains_subsequence(const std::vector<std::uint8_t>& bytes,
+                          const std::vector<std::uint8_t>& expected) {
+    for (std::size_t index = 0; index + expected.size() <= bytes.size(); ++index) {
+        if (std::equal(expected.begin(), expected.end(), bytes.begin() + static_cast<std::ptrdiff_t>(index))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string hex_dump(const std::vector<std::uint8_t>& bytes) {
@@ -1501,6 +1516,66 @@ int main() {
     ok &= expect(path == "/", "expected draft-16 CLIENT_SETUP path");
     ok &= expect(max_request_id == kExpectedClientMaxRequestId, "expected draft-16 CLIENT_SETUP max_request_id");
 
+    {
+        const std::vector<std::uint8_t> raw_cwt{0xa1, 0x18, 0x64, 0x81, 0x83};
+        const auto auth_token = openmoq::publisher::cat4moq::wrap_cat_token(raw_cwt);
+        openmoq::publisher::cat4moq::AuthorizationConfig auth_config;
+        auth_config.setup_token = auth_token;
+        auth_config.action_token = auth_token;
+
+        MockTransport auth_transport;
+        auth_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        queue_subscribe_requests(auth_transport, DraftVersion::kDraft16, kTestTrackNamespace, {{1, "catalog"}, {3, "vide_1"}});
+        MoqtSession auth_session(auth_transport,
+                                 std::string(kTestTrackNamespace),
+                                 false,
+                                 false,
+                                 false,
+                                 false,
+                                 std::chrono::seconds(30),
+                                 auth_config);
+        status = auth_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected auth session connect to succeed");
+        status = auth_session.publish(draft16_materialized);
+        ok &= expect(status.ok, "expected auth session publish to succeed");
+        ok &= expect(auth_transport.writes.size() >= 2,
+                     "expected auth session to write setup and namespace messages");
+        if (auth_transport.writes.size() >= 2) {
+            ok &= expect(contains_subsequence(auth_transport.writes[0].bytes, auth_token.bytes),
+                         "expected setup message to include configured CAT token");
+            ok &= expect(contains_subsequence(auth_transport.writes[1].bytes, auth_token.bytes),
+                         "expected namespace publish to include configured CAT token");
+        }
+
+        MockTransport auth_forward_transport;
+        auth_forward_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        queue_publish_ok_responses(auth_forward_transport, DraftVersion::kDraft16, {2, 4});
+        MoqtSession auth_forward_session(auth_forward_transport,
+                                         std::string(kTestTrackNamespace),
+                                         true,
+                                         false,
+                                         false,
+                                         false,
+                                         std::chrono::seconds(30),
+                                         auth_config);
+        status = auth_forward_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected auth forward session connect to succeed");
+        status = auth_forward_session.publish(draft16_materialized);
+        ok &= expect(status.ok, "expected auth forward session publish to succeed");
+        ok &= expect(auth_forward_transport.writes.size() >= 3,
+                     "expected auth forward session to write setup, namespace, and publish messages");
+        if (auth_forward_transport.writes.size() >= 3) {
+            ok &= expect(contains_subsequence(auth_forward_transport.writes[2].bytes, auth_token.bytes),
+                         "expected publish track request to include configured CAT token");
+        }
+    }
+
     const auto draft14_wt_setup = encode_setup_message({
         .draft = DraftVersion::kDraft14,
         .transport = openmoq::publisher::transport::TransportKind::kWebTransport,
@@ -2019,8 +2094,11 @@ int main() {
         draft18_subscribe_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_subscribe_transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
-        draft18_subscribe_transport.reads[1].push_back(
-            encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 0, DraftVersion::kDraft18));
+        const std::vector<std::uint8_t> subscribe_message =
+            encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 0, DraftVersion::kDraft18);
+        const auto subscribe_split = subscribe_message.begin() + 4;
+        const std::vector<std::uint8_t> subscribe_prefix(subscribe_message.begin(), subscribe_split);
+        const std::vector<std::uint8_t> subscribe_suffix(subscribe_split, subscribe_message.end());
 
         MoqtSession draft18_subscribe_session(
             draft18_subscribe_transport,
@@ -2032,10 +2110,21 @@ int main() {
         status = draft18_subscribe_session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected draft-18 SUBSCRIBE session connect to succeed");
 
+        bool injected_subscribe = false;
+        draft18_subscribe_transport.on_accept_timeout =
+            [&](MockTransport& transport, StreamDirection direction) {
+                if (!injected_subscribe && direction == StreamDirection::kBidirectional) {
+                    transport.reads[1].push_back(subscribe_prefix);
+                    transport.reads[1].push_back(subscribe_suffix);
+                    injected_subscribe = true;
+                }
+            };
+
         const PublishPlan draft18_materialized =
             materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft18), source_bytes);
         status = draft18_subscribe_session.publish(draft18_materialized);
         ok &= expect(status.ok, "expected draft-18 SUBSCRIBE request stream publish to succeed");
+        ok &= expect(injected_subscribe, "expected draft-18 SUBSCRIBE to arrive during the control-stream wait");
 
         bool saw_subscribe_ok_on_request_stream = false;
         bool saw_object_on_unidirectional_stream = false;
@@ -2429,6 +2518,156 @@ int main() {
         ok &= expect(!object_live_transport.writes.empty() &&
                          message_type(object_live_transport.writes.back().bytes) == 0x09,
                      "expected arbitrary live-object publish to finish with PUBLISH_NAMESPACE_DONE");
+    }
+
+    {
+        MockTransport grouped_live_transport;
+        grouped_live_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        grouped_live_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        grouped_live_transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "video", 0, DraftVersion::kDraft16));
+        for (int i = 0; i < 4; ++i) {
+            grouped_live_transport.reads[0].push_back({});
+        }
+
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "video", .group_id = 0, .object_id = 0,
+                       .payload = {'V', '0'}, .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 0, .object_id = 1,
+                       .payload = {'V', '1'}, .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 1, .object_id = 0,
+                       .payload = {'V', '2'}, .final_in_subgroup = false},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+        };
+
+        MoqtSession grouped_live_session(
+            grouped_live_transport,
+            std::string(kTestTrackNamespace),
+            false,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = grouped_live_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected grouped live-object session connect to succeed");
+        status = grouped_live_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(status.ok, "expected grouped live-object publish to succeed");
+
+        std::vector<MockTransport::WriteEvent> media_writes;
+        for (const auto& write : grouped_live_transport.writes) {
+            if (write.stream_id != 0) {
+                media_writes.push_back(write);
+            }
+        }
+        ok &= expect(media_writes.size() == 5,
+                     "expected two group streams with explicit FIN writes");
+        if (media_writes.size() == 5) {
+            ok &= expect(media_writes[0].stream_id == media_writes[1].stream_id &&
+                             !media_writes[0].fin && !media_writes[1].fin,
+                         "expected same-group live objects on one open subgroup stream");
+            ok &= expect(media_writes[2].stream_id == media_writes[0].stream_id &&
+                             media_writes[2].bytes.empty() && media_writes[2].fin,
+                         "expected previous subgroup stream to finish at the group boundary");
+            ok &= expect(media_writes[3].stream_id != media_writes[0].stream_id &&
+                             !media_writes[3].fin,
+                         "expected next group to open a new subgroup stream");
+            ok &= expect(media_writes[4].stream_id == media_writes[3].stream_id &&
+                             media_writes[4].bytes.empty() && media_writes[4].fin,
+                         "expected final live subgroup stream to finish at end of source");
+        }
+    }
+
+    {
+        MockTransport dash_live_transport;
+        dash_live_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 16,
+        }));
+        dash_live_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        dash_live_transport.reads[0].push_back(
+            encode_subscribe_message(
+                1, kTestTrackNamespace, "catalog", 0, DraftVersion::kDraft16));
+        dash_live_transport.reads[0].push_back({});
+        dash_live_transport.reads[0].push_back(
+            encode_subscribe_message(
+                3, kTestTrackNamespace, "video0_vide_1", 0, DraftVersion::kDraft16));
+        // Keep the mock control stream open while each queued source object is considered.
+        for (int i = 0; i < 4; ++i) {
+            dash_live_transport.reads[0].push_back({});
+        }
+
+        bool catalog_subscribe_read = false;
+        bool media_subscribe_read = false;
+        dash_live_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id == 0 && transport.read_count >= 3) {
+                catalog_subscribe_read = true;
+            }
+            if (stream_id == 0 && transport.read_count >= 5) {
+                media_subscribe_read = true;
+            }
+        };
+
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .object_id = 0, .payload = {'C'}},
+            LiveObject{.track_name = "video0_vide_1", .group_id = 0, .object_id = 0, .payload = {'V', '0'}},
+            LiveObject{.track_name = "video1_vide_2", .group_id = 0, .object_id = 0, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video2_vide_3", .group_id = 0, .object_id = 0, .payload = {'V', '2'}},
+        };
+        std::size_t object_index = 0;
+        bool consumed_before_subscribe = false;
+        bool media_consumed_before_media_subscribe = false;
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video0_vide_1"},
+                LiveTrack{.track_name = "video1_vide_2"},
+                LiveTrack{.track_name = "video2_vide_3"},
+            },
+            .next_object = [&]() -> std::optional<LiveObject> {
+                consumed_before_subscribe = consumed_before_subscribe || !catalog_subscribe_read;
+                media_consumed_before_media_subscribe =
+                    media_consumed_before_media_subscribe || (object_index > 0 && !media_subscribe_read);
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+        };
+
+        MoqtSession dash_live_session(
+            dash_live_transport,
+            std::string(kTestTrackNamespace),
+            false,
+            true,
+            false,
+            std::chrono::seconds(1));
+        status = dash_live_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected FFmpeg-style DASH session connect to succeed");
+        status = dash_live_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(status.ok, "expected FFmpeg-style DASH publish to enter await-subscribe mode");
+        ok &= expect(catalog_subscribe_read && media_subscribe_read && !consumed_before_subscribe,
+                     "expected FFmpeg-style DASH media consumption to wait for SUBSCRIBE");
+        ok &= expect(!media_consumed_before_media_subscribe,
+                     "expected catalog-first subscription to preserve queued media until media SUBSCRIBE");
+        ok &= expect(control_message_count(dash_live_transport, 0x1d) == 4,
+                     "expected catalog plus three FFmpeg-style DASH tracks to be published");
+        ok &= expect(control_message_count(dash_live_transport, 0x04) == 2,
+                     "expected FFmpeg-style DASH subscriber to receive SUBSCRIBE_OK");
+        ok &= expect(dash_live_session.publish_stats().objects_published == 2,
+                     "expected catalog and subscribed FFmpeg-style DASH representation only");
     }
 
     {

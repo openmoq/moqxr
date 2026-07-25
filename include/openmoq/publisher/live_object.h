@@ -59,6 +59,12 @@ struct LiveObject {
 struct LiveObjectSource {
     std::vector<LiveTrack> tracks;
     std::function<std::optional<LiveObject>()> next_object;
+    // Optional liveness predicate. When set, a nullopt from next_object() is
+    // treated as a transient gap (the publisher keeps polling and servicing
+    // control messages) as long as this returns false; it means end-of-stream
+    // only once this returns true. When unset, a nullopt means end-of-stream,
+    // preserving the behavior of finite sources.
+    std::function<bool()> is_finished;
 };
 
 }  // namespace openmoq::publisher

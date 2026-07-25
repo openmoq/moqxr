@@ -1,5 +1,6 @@
 #include "openmoq/publisher/cli_options.h"
 
+#include <cstdint>
 #include <stdexcept>
 #include <string_view>
 
@@ -114,16 +115,62 @@ LiveSourceKind parse_live_source(std::string_view value) {
     if (value == "srt") {
         return LiveSourceKind::kSrt;
     }
+    if (value == "dash") {
+        return LiveSourceKind::kDash;
+    }
     if (value == "both") {
         throw std::runtime_error("--live-source 'both' is not supported; use either 'stdin' or 'srt'");
     }
-    throw std::runtime_error("unsupported --live-source value: expected auto, stdin, or srt");
+    throw std::runtime_error("unsupported --live-source value: expected auto, stdin, srt, or dash");
+}
+
+int parse_strict_int(std::string_view value, std::string_view option_name) {
+    // Reject empty, non-numeric, or trailing-garbage input with a clear,
+    // option-specific message rather than a bare std::stoi("stoi") exception,
+    // and so "80abc" is not silently accepted as 80.
+    if (value.empty()) {
+        throw std::runtime_error(std::string(option_name) + " requires a numeric value");
+    }
+    std::size_t consumed = 0;
+    int parsed = 0;
+    try {
+        parsed = std::stoi(std::string(value), &consumed);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string(option_name) + " must be a valid integer");
+    }
+    if (consumed != value.size()) {
+        throw std::runtime_error(std::string(option_name) + " must be a valid integer");
+    }
+    return parsed;
+}
+
+std::pair<std::string, std::uint16_t> parse_host_port(std::string_view value, std::string_view option_name) {
+    const std::size_t colon = value.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 >= value.size()) {
+        throw std::runtime_error(std::string(option_name) + " must be in host:port form");
+    }
+    const std::string host(value.substr(0, colon));
+    const int port = parse_strict_int(value.substr(colon + 1), std::string(option_name) + " port");
+    if (port <= 0 || port > 65535) {
+        throw std::runtime_error(std::string(option_name) + " port must be between 1 and 65535");
+    }
+    return {host, static_cast<std::uint16_t>(port)};
+}
+
+std::size_t parse_queue_depth(std::string_view value) {
+    const int depth = parse_strict_int(value, "--dash-queue-depth");
+    if (depth <= 0) {
+        throw std::runtime_error("--dash-queue-depth must be greater than zero");
+    }
+    return static_cast<std::size_t>(depth);
 }
 
 }  // namespace
 
 CliOptions parse_cli_options(int argc, char** argv) {
     CliOptions options;
+    bool dash_path_set = false;
+    bool dash_queue_depth_set = false;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
@@ -142,6 +189,18 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.live_source = parse_live_source(require_value("--live-source"));
         } else if (argument == "--srt-config") {
             options.srt_config_path = std::filesystem::path(require_value("--srt-config"));
+        } else if (argument == "--dash-listen") {
+            const std::string_view value = require_value("--dash-listen");
+            const auto [host, port] = parse_host_port(value, "--dash-listen");
+            options.dash_listen = std::string(value);
+            options.dash_listen_host = host;
+            options.dash_listen_port = port;
+        } else if (argument == "--dash-path") {
+            options.dash_path_prefix = std::string(require_value("--dash-path"));
+            dash_path_set = true;
+        } else if (argument == "--dash-queue-depth") {
+            options.dash_queue_depth = parse_queue_depth(require_value("--dash-queue-depth"));
+            dash_queue_depth_set = true;
         } else if (argument == "--transport") {
             options.transport = parse_transport_kind(require_value("--transport"));
         } else if (argument == "--endpoint") {
@@ -179,6 +238,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.include_msf_timeline = true;
         } else if (argument == "--coalesce-cmaf-chunks") {
             options.split_cmaf_chunks = false;
+        } else if (argument == "--stream-per-object") {
+            options.stream_per_object = true;
         } else if (argument == "--timeout") {
             options.subscriber_timeout = parse_timeout(require_value("--timeout"));
         } else if (argument == "--paced") {
@@ -207,6 +268,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
     const bool live_source_uses_srt =
         options.live_source == LiveSourceKind::kSrt;
+    const bool live_source_uses_dash =
+        options.live_source == LiveSourceKind::kDash;
     if (live_source_uses_srt && !options.srt_config_path.has_value()) {
         throw std::runtime_error("--live-source srt requires --srt-config");
     }
@@ -215,6 +278,24 @@ CliOptions parse_cli_options(int argc, char** argv) {
     }
     if (!live_source_uses_srt && options.srt_config_path.has_value()) {
         throw std::runtime_error("--srt-config requires --live-source srt");
+    }
+    if (live_source_uses_dash && !options.dash_listen.has_value()) {
+        throw std::runtime_error("--live-source dash requires --dash-listen");
+    }
+    if (live_source_uses_dash && !options.endpoint.has_value() && !options.dump_plan) {
+        throw std::runtime_error("--live-source dash requires --endpoint or --dump-plan");
+    }
+    if (!live_source_uses_dash && options.dash_listen.has_value()) {
+        throw std::runtime_error("--dash-listen requires --live-source dash");
+    }
+    if (!live_source_uses_dash && dash_path_set) {
+        throw std::runtime_error("--dash-path requires --live-source dash");
+    }
+    if (!live_source_uses_dash && dash_queue_depth_set) {
+        throw std::runtime_error("--dash-queue-depth requires --live-source dash");
+    }
+    if (!options.dash_path_prefix.empty() && options.dash_path_prefix.front() != '/') {
+        throw std::runtime_error("--dash-path must start with /");
     }
 
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
@@ -240,9 +321,10 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
 std::string build_usage(const char* argv0) {
     return std::string("Usage: ") + argv0 +
-           " --input <mp4|-> [--live-source auto|stdin|srt] [--srt-config <path>]"
-           " [--transport raw|webtransport] [--draft 16|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
-           " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
+           " --input <mp4|-> [--live-source auto|stdin|srt|dash] [--srt-config <path>]"
+           " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
+           " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
+           " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";
 }

@@ -184,7 +184,8 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         config_.publish_catalog,
         config_.paced,
         config_.loop,
-        config_.subscriber_timeout);
+        config_.subscriber_timeout,
+        config_.authorization);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, false);
@@ -349,7 +350,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         config_.publish_catalog,
         config_.paced,
         config_.loop,
-        config_.subscriber_timeout);
+        config_.subscriber_timeout,
+        config_.authorization);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);
@@ -383,7 +385,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     status = active->session->publish_live(session_ingest,
                                            stdin_input,
                                            config_.draft_version,
-                                           config_.split_cmaf_chunks);
+                                           config_.split_cmaf_chunks,
+                                           config_.live_stream_per_object);
     if (!status.ok) {
         const std::string error = "transport live publish failed: " + status.message;
         static_cast<void>(active->session->close(0));
@@ -465,7 +468,8 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         config_.publish_catalog,
         config_.paced,
         config_.loop,
-        config_.subscriber_timeout);
+        config_.subscriber_timeout,
+        config_.authorization);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);

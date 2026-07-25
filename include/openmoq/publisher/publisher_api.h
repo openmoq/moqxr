@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
@@ -35,9 +36,11 @@ struct PublisherConfig {
     bool include_sap = false;
     bool include_msf_timeline = false;
     bool split_cmaf_chunks = true;
+    bool live_stream_per_object = false;
     bool paced = false;
     bool loop = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
+    cat4moq::AuthorizationConfig authorization;
 };
 
 struct PreparedPublish {

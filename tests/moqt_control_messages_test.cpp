@@ -527,6 +527,15 @@ bool test_setup_serdes_for_all_drafts() {
                                                 DraftVersion::kDraft18,
                                                 legacy_server_setup),
                  "draft-18 setup response rejects legacy SERVER_SETUP");
+
+    const std::vector<std::uint8_t> relay_setup_with_unknown_even_option{
+        0xaf, 0x00, 0x00, 0x02, 0x02, 0x64,
+    };
+    ServerSetupMessage relay_server_setup;
+    ok &= expect(decode_setup_response_message(relay_setup_with_unknown_even_option,
+                                               DraftVersion::kDraft18,
+                                               relay_server_setup),
+                 "draft-18 setup response ignores unknown even option");
     return ok;
 }
 
@@ -655,8 +664,10 @@ bool test_publisher_control_message_encoders_for_all_drafts() {
         ok &= expect_uint16_frame(subscribe_ok, 0x04, frame, label + " subscribe ok");
         if (draft != DraftVersion::kDraft14) {
             offset = frame.payload_offset;
-            ok &= expect(read_moqint(subscribe_ok, offset, draft, request_id) && request_id == 44,
-                         label + " subscribe ok request id");
+            if (!uses_vi64(draft)) {
+                ok &= expect(read_moqint(subscribe_ok, offset, draft, request_id) && request_id == 44,
+                             label + " subscribe ok request id");
+            }
             ok &= expect(read_moqint(subscribe_ok, offset, draft, alias) && alias == 7,
                          label + " subscribe ok track alias");
             ok &= expect(read_moqint(subscribe_ok, offset, draft, parameter_count) && parameter_count == 1,

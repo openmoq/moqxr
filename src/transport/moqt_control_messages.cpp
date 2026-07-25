@@ -45,6 +45,7 @@ constexpr std::uint64_t kSubgroupHeaderEndOfGroupBit = 0x08;
 constexpr std::uint64_t kObjectDatagramTypeDraft14 = 0x10;
 constexpr std::uint64_t kSetupParamPath = 0x1;
 constexpr std::uint64_t kSetupParamMaxRequestId = 0x2;
+constexpr std::uint64_t kParamAuthorizationToken = 0x3;
 constexpr std::uint64_t kSetupParamAuthority = 0x5;
 constexpr std::uint64_t kDraft14Version = 0xff00000eULL;
 constexpr std::uint64_t kDraft16Version = 0xff000010ULL;
@@ -371,7 +372,9 @@ void append_setup_option_delta(std::vector<std::uint8_t>& out,
                                std::uint64_t type,
                                std::span<const std::uint8_t> value) {
     append_moqint(out, draft, type - previous_type);
-    append_moqint(out, draft, value.size());
+    if ((type & 0x1ULL) != 0) {
+        append_moqint(out, draft, value.size());
+    }
     out.insert(out.end(), value.begin(), value.end());
     previous_type = type;
 }
@@ -551,7 +554,13 @@ std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
             const std::vector<std::uint8_t> authority = to_bytes(message.authority);
             std::uint64_t previous_option_type = 0;
             append_setup_option_delta(payload, message.draft, previous_option_type, kSetupParamPath, path);
+            if (message.authorization_token.has_value()) {
+                append_setup_option_delta(payload, message.draft, previous_option_type, kParamAuthorizationToken, *message.authorization_token);
+            }
             append_setup_option_delta(payload, message.draft, previous_option_type, kSetupParamAuthority, authority);
+        } else if (message.authorization_token.has_value()) {
+            std::uint64_t previous_option_type = 0;
+            append_setup_option_delta(payload, message.draft, previous_option_type, kParamAuthorizationToken, *message.authorization_token);
         }
 
         std::vector<std::uint8_t> message_bytes;
@@ -569,7 +578,11 @@ std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
     }
 
     const bool include_native_quic_location = message.transport == TransportKind::kRawQuic;
-    append_moqint(payload, message.draft, include_native_quic_location ? 3 : 1);
+    std::uint64_t parameter_count = include_native_quic_location ? 3 : 1;
+    if (message.authorization_token.has_value()) {
+        ++parameter_count;
+    }
+    append_moqint(payload, message.draft, parameter_count);
     std::uint64_t previous_parameter_type = 0;
     if (include_native_quic_location) {
         const std::vector<std::uint8_t> path = to_bytes(message.path);
@@ -585,12 +598,18 @@ std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
     append_moqint(max_request_id, message.draft, message.max_request_id);
     if (message.draft == DraftVersion::kDraft16) {
         append_parameter_delta(payload, message.draft, previous_parameter_type, kSetupParamMaxRequestId, max_request_id);
+        if (message.authorization_token.has_value()) {
+            append_parameter_delta(payload, message.draft, previous_parameter_type, kParamAuthorizationToken, *message.authorization_token);
+        }
         if (include_native_quic_location) {
             const std::vector<std::uint8_t> authority = to_bytes(message.authority);
             append_parameter_delta(payload, message.draft, previous_parameter_type, kSetupParamAuthority, authority);
         }
     } else {
         append_parameter(payload, message.draft, kSetupParamMaxRequestId, max_request_id);
+        if (message.authorization_token.has_value()) {
+            append_parameter(payload, message.draft, kParamAuthorizationToken, *message.authorization_token);
+        }
     }
 
     std::vector<std::uint8_t> message_bytes;
@@ -637,18 +656,27 @@ bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetu
         std::uint64_t previous_option_type = 0;
         while (offset < payload_end) {
             std::uint64_t option_type = 0;
-            std::uint64_t option_length = 0;
             if (!decode_parameter_type(payload_bytes,
                                        offset,
                                        message_draft,
                                        previous_option_type,
                                        true,
-                                       option_type) ||
-                !decode_moqint_impl(payload_bytes, offset, message_draft, option_length) ||
-                offset + option_length > payload_end) {
+                                       option_type)) {
                 return false;
             }
-            offset += static_cast<std::size_t>(option_length);
+            if ((option_type & 0x1ULL) == 0) {
+                std::uint64_t option_value = 0;
+                if (!decode_moqint_impl(payload_bytes, offset, message_draft, option_value)) {
+                    return false;
+                }
+            } else {
+                std::uint64_t option_length = 0;
+                if (!decode_moqint_impl(payload_bytes, offset, message_draft, option_length) ||
+                    option_length > payload_end - offset) {
+                    return false;
+                }
+                offset += static_cast<std::size_t>(option_length);
+            }
         }
         return offset == payload_end;
     }
@@ -779,7 +807,12 @@ std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& messa
         append_moqint(payload, message.draft, 0);  // Required Request ID Delta: no dependency.
     }
     append_track_namespace(payload, message.draft, message.track_namespace);
-    append_moqint(payload, message.draft, 0);
+    if (message.authorization_token.has_value()) {
+        append_moqint(payload, message.draft, 1);
+        append_parameter(payload, message.draft, kParamAuthorizationToken, *message.authorization_token);
+    } else {
+        append_moqint(payload, message.draft, 0);
+    }
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, message.draft, kPublishNamespaceType);
@@ -1281,18 +1314,20 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
                                                       std::size_t largest_object_id,
                                                       bool content_exists) {
     std::vector<std::uint8_t> payload;
-    append_varint(payload, request_id);
+    if (!uses_moq_vi64(draft)) {
+        append_moqint(payload, draft, request_id);
+    }
     if (draft == DraftVersion::kDraft14) {
-        append_varint(payload, track_alias);
-        append_varint(payload, 0);
+        append_moqint(payload, draft, track_alias);
+        append_moqint(payload, draft, 0);
         payload.push_back(kGroupOrderAscending);
         payload.push_back(content_exists ? kContentExistsTrue : 0);
         if (content_exists) {
             append_location(payload, draft, largest_group_id, largest_object_id);
         }
-        append_varint(payload, 0);
+        append_moqint(payload, draft, 0);
     } else {
-        append_varint(payload, track_alias);
+        append_moqint(payload, draft, track_alias);
         std::vector<std::uint8_t> parameters;
         std::uint64_t previous_parameter_type = 0;
         std::uint64_t parameter_count = 0;
@@ -1302,12 +1337,12 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
             append_parameter_delta(parameters, draft, previous_parameter_type, 0x09, largest_object);
             ++parameter_count;
         }
-        append_varint(payload, parameter_count);
+        append_moqint(payload, draft, parameter_count);
         payload.insert(payload.end(), parameters.begin(), parameters.end());
     }
 
     std::vector<std::uint8_t> message_bytes;
-    append_varint(message_bytes, kSubscribeOkType);
+    append_moqint(message_bytes, draft, kSubscribeOkType);
     append_uint16(message_bytes, static_cast<std::uint16_t>(payload.size()));
     message_bytes.insert(message_bytes.end(), payload.begin(), payload.end());
     return message_bytes;
@@ -1374,7 +1409,12 @@ std::vector<std::uint8_t> encode_track_message(const TrackMessage& message) {
         payload.push_back(kForwardPreference);
     }
 
-    append_moqint(payload, message.draft, 0);
+    if (message.authorization_token.has_value()) {
+        append_moqint(payload, message.draft, 1);
+        append_parameter(payload, message.draft, kParamAuthorizationToken, *message.authorization_token);
+    } else {
+        append_moqint(payload, message.draft, 0);
+    }
     if (message.draft == DraftVersion::kDraft16) {
         // No Track Extensions are needed for the current draft-16 publish path.
     }

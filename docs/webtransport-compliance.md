@@ -5,6 +5,7 @@ It is intentionally limited to the draft variants we support today:
 
 - MoQ Transport draft 14
 - MoQ Transport draft 16
+- MoQ Transport draft 17
 - MoQ Transport draft 18
 - WebTransport over HTTP/3 draft 14
 
@@ -145,12 +146,13 @@ Before changing wire behavior, verify each of these:
 3. The WT application stream gets exactly one WT preamble.
 4. Incoming CONNECT-stream bytes are logged as WT control/capsule traffic, not parsed as MoQ.
 5. Incoming application-stream bytes are delivered without the WT preamble before MoQ parsing.
-6. Draft-14, draft-16, and draft-18 are tested separately.
+6. Draft-14, draft-16, and draft-18 transport sessions are tested separately; draft-17 control-codec coverage is maintained alongside them.
 
 ## Current risk focus
 
 The current WebTransport path is interoperating with the tested moqx and Red5
-draft-16/draft-18 relay paths. Remaining risk is now concentrated in broader
+draft-16/draft-18 relay paths. Draft-17 is selectable and codec-tested, but has
+less relay coverage. Remaining risk is now concentrated in broader
 coverage rather than initial session establishment:
 
 - higher object volume and backpressure behavior
@@ -197,3 +199,13 @@ For `--forward 0`, once `PUBLISH_NAMESPACE_OK` has been received:
 - the publisher emits `PUBLISH_NAMESPACE_DONE` and exits successfully
 
 This behavior is intentional. It keeps interoperability probes from being reported as publish failures when the relay accepted the namespace but no subscriber appeared during the configured wait window.
+
+Automated regressions cover the reported live DASH shape with catalog plus
+multiple representation paths. They verify shared audio/video keyframe groups,
+explicit `trun` sample metadata derived from FFmpeg `tfhd` defaults, subgroup
+stream reuse within a group, and stream closure at a group transition. The
+draft-16 session test also verifies that source objects are not consumed before
+`SUBSCRIBE`, that `SUBSCRIBE_OK` is returned, and that the catalog remains
+available while waiting for media interest. Draft-18 session coverage
+separately verifies that a `SUBSCRIBE` split across multiple request-stream
+reads is reassembled and answered on that request stream.

@@ -212,6 +212,124 @@ std::vector<std::uint8_t> concat_boxes(const std::vector<std::vector<std::uint8_
     return out;
 }
 
+struct LiveTrunSample {
+    std::uint32_t duration = 0;
+    std::uint32_t size = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t composition_offset = 0;
+};
+
+std::vector<std::uint8_t> materialize_live_trun_defaults(
+    std::span<const std::uint8_t> moof_bytes,
+    std::uint32_t default_sample_duration,
+    std::uint32_t default_sample_size,
+    std::uint32_t default_sample_flags) {
+    const auto boxes = parse_mp4_boxes(moof_bytes);
+    if (boxes.empty() || boxes.front().type != "moof") {
+        throw std::runtime_error("materialize_live_trun_defaults: expected moof box");
+    }
+    const Mp4Box& moof = boxes.front();
+    const Mp4Box* traf = find_child_box(moof, "traf");
+    const Mp4Box* trun = traf == nullptr ? nullptr : find_child_box(*traf, "trun");
+    if (traf == nullptr || trun == nullptr || trun->payload.size < 8) {
+        throw std::runtime_error("materialize_live_trun_defaults: missing traf/trun");
+    }
+
+    const std::uint8_t version = moof_bytes[trun->payload.offset];
+    const std::uint32_t original_flags = read_full_box_flags(*trun, moof_bytes);
+    std::size_t cursor = trun->payload.offset + 4;
+    const std::uint32_t sample_count = read_be32(moof_bytes, cursor);
+    cursor += 4;
+    if ((original_flags & 0x000001U) != 0) {
+        if (cursor + 4 > moof_bytes.size()) {
+            throw std::runtime_error("materialize_live_trun_defaults: truncated data offset");
+        }
+        cursor += 4;
+    }
+
+    std::uint32_t first_sample_flags = default_sample_flags;
+    if ((original_flags & 0x000004U) != 0) {
+        if (cursor + 4 > moof_bytes.size()) {
+            throw std::runtime_error("materialize_live_trun_defaults: truncated first-sample flags");
+        }
+        first_sample_flags = read_be32(moof_bytes, cursor);
+        cursor += 4;
+    }
+
+    std::vector<LiveTrunSample> samples;
+    samples.reserve(sample_count);
+    for (std::uint32_t index = 0; index < sample_count; ++index) {
+        LiveTrunSample sample{
+            .duration = default_sample_duration,
+            .size = default_sample_size,
+            .flags = index == 0 ? first_sample_flags : default_sample_flags,
+        };
+        const auto read_optional = [&](std::uint32_t flag, std::uint32_t& value) {
+            if ((original_flags & flag) == 0) {
+                return;
+            }
+            if (cursor + 4 > moof_bytes.size()) {
+                throw std::runtime_error("materialize_live_trun_defaults: truncated sample fields");
+            }
+            value = read_be32(moof_bytes, cursor);
+            cursor += 4;
+        };
+        read_optional(0x000100U, sample.duration);
+        read_optional(0x000200U, sample.size);
+        read_optional(0x000400U, sample.flags);
+        read_optional(0x000800U, sample.composition_offset);
+        if (sample.size == 0) {
+            throw std::runtime_error("materialize_live_trun_defaults: missing sample size");
+        }
+        samples.push_back(sample);
+    }
+
+    const std::uint32_t normalized_flags = (original_flags & ~0x000004U) | 0x000701U;
+    const auto build_trun = [&](std::uint32_t data_offset) {
+        std::vector<std::uint8_t> payload;
+        append_be32(payload, sample_count);
+        append_be32(payload, data_offset);
+        for (const auto& sample : samples) {
+            append_be32(payload, sample.duration);
+            append_be32(payload, sample.size);
+            append_be32(payload, sample.flags);
+            if ((normalized_flags & 0x000800U) != 0) {
+                append_be32(payload, sample.composition_offset);
+            }
+        }
+        return make_full_box("trun", version, normalized_flags, payload);
+    };
+
+    const auto rebuild_moof = [&](const std::vector<std::uint8_t>& normalized_trun) {
+        std::vector<std::vector<std::uint8_t>> traf_children;
+        traf_children.reserve(traf->children.size());
+        for (const auto& child : traf->children) {
+            if (child.span.offset == trun->span.offset) {
+                traf_children.push_back(normalized_trun);
+            } else {
+                const auto raw = slice_bytes(moof_bytes, child.span);
+                traf_children.emplace_back(raw.begin(), raw.end());
+            }
+        }
+        const auto normalized_traf = make_box("traf", concat_boxes(traf_children));
+
+        std::vector<std::vector<std::uint8_t>> moof_children;
+        moof_children.reserve(moof.children.size());
+        for (const auto& child : moof.children) {
+            if (child.span.offset == traf->span.offset) {
+                moof_children.push_back(normalized_traf);
+            } else {
+                const auto raw = slice_bytes(moof_bytes, child.span);
+                moof_children.emplace_back(raw.begin(), raw.end());
+            }
+        }
+        return make_box("moof", concat_boxes(moof_children));
+    };
+
+    const auto placeholder_moof = rebuild_moof(build_trun(0));
+    return rebuild_moof(build_trun(static_cast<std::uint32_t>(placeholder_moof.size() + 8)));
+}
+
 const Mp4Box* require_child(const Mp4Box& box, std::string_view type) {
     const Mp4Box* child = find_child_box(box, type);
     if (child == nullptr) {
@@ -1186,6 +1304,7 @@ MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
     }
 
     std::uint32_t default_sample_duration = 0;
+    std::uint32_t default_sample_size = 0;
     std::uint32_t default_sample_flags = 0x02000000U;
     if (const Mp4Box* tfhd = find_child_box(*traf, "tfhd")) {
         const std::uint32_t flags = read_full_box_flags(*tfhd, moof_bytes);
@@ -1197,6 +1316,7 @@ MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
             cursor += 4;
         }
         if ((flags & 0x000010U) != 0 && cursor + 4 <= moof_bytes.size()) {
+            default_sample_size = read_be32(moof_bytes, cursor);
             cursor += 4;
         }
         if ((flags & 0x000020U) != 0 && cursor + 4 <= moof_bytes.size()) {
@@ -1269,10 +1389,16 @@ MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
     // A video keyframe: video track with sync first sample
     const bool is_video_keyframe = is_video && first_sample_is_sync;
 
+    // FFmpeg's DASH muxer relies on tfhd defaults and emits minimal trun
+    // entries. Materialize those values for CMAF consumers that read sample
+    // metadata directly from trun.
+    const std::vector<std::uint8_t> normalized_moof = materialize_live_trun_defaults(
+        moof_bytes, default_sample_duration, default_sample_size, default_sample_flags);
+
     // Combine moof+mdat into a single owned payload (CMSF compliance).
     std::vector<std::uint8_t> payload;
-    payload.reserve(moof_bytes.size() + mdat_bytes.size());
-    payload.insert(payload.end(), moof_bytes.begin(), moof_bytes.end());
+    payload.reserve(normalized_moof.size() + mdat_bytes.size());
+    payload.insert(payload.end(), normalized_moof.begin(), normalized_moof.end());
     payload.insert(payload.end(), mdat_bytes.begin(), mdat_bytes.end());
 
     return MediaFragment{

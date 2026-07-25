@@ -19,6 +19,7 @@ struct SetupMessage {
     std::string authority;
     std::string path = "/";
     std::uint64_t max_request_id = 0;
+    std::optional<std::vector<std::uint8_t>> authorization_token;
 };
 
 struct ServerSetupMessage {
@@ -34,6 +35,7 @@ struct NamespaceMessage {
     DraftVersion draft = DraftVersion::kDraft14;
     std::string track_namespace = "media";
     std::uint64_t request_id = 0;
+    std::optional<std::vector<std::uint8_t>> authorization_token;
 };
 
 struct TrackMessage {
@@ -45,6 +47,7 @@ struct TrackMessage {
     std::size_t largest_group_id = 0;
     std::size_t largest_object_id = 0;
     bool content_exists = false;
+    std::optional<std::vector<std::uint8_t>> authorization_token;
 };
 
 struct PublishNamespaceOk {

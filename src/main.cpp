@@ -2,11 +2,14 @@
 #include "openmoq/publisher/cli_options.h"
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/live_srt_config.h"
+#include "openmoq/publisher/live_dash_ingest.h"
 #include "openmoq/publisher/publisher_api.h"
 #include "openmoq/publisher/transport/moqt_session.h"
 
 #include <exception>
+#include <chrono>
 #include <iostream>
+#include <thread>
 #include <utility>
 
 int main(int argc, char** argv) {
@@ -18,7 +21,11 @@ int main(int argc, char** argv) {
         const bool stdin_source_available = options.input_source.kind == InputSourceKind::kStdin;
         const bool live_srt = options.live_source == LiveSourceKind::kSrt &&
                               options.srt_config_path.has_value() && options.endpoint.has_value();
+        const bool live_dash = options.live_source == LiveSourceKind::kDash &&
+                               options.dash_listen.has_value() &&
+                               (options.endpoint.has_value() || options.dump_plan);
         const bool live_stdin = !live_srt &&
+                                !live_dash &&
                                 (options.live_source == LiveSourceKind::kAuto ||
                                  options.live_source == LiveSourceKind::kStdin) &&
                                 stdin_source_available && options.endpoint.has_value();
@@ -30,13 +37,80 @@ int main(int argc, char** argv) {
             .include_sap = options.include_sap,
             .include_msf_timeline = options.include_msf_timeline,
             .split_cmaf_chunks = options.split_cmaf_chunks,
+            .live_stream_per_object = options.stream_per_object,
             .paced = options.paced,
             .loop = options.loop,
             .subscriber_timeout = options.subscriber_timeout,
         };
         Publisher publisher(config);
 
-        if (live_stdin || live_srt) {
+        if (live_dash) {
+            std::cerr << "live_source=dash listen=" << options.dash_listen_host
+                      << ":" << options.dash_listen_port
+                      << " path=" << options.dash_path_prefix << std::endl;
+            LiveDashIngestConfig dash_config;
+            dash_config.host = options.dash_listen_host;
+            dash_config.port = options.dash_listen_port;
+            dash_config.path_prefix = options.dash_path_prefix;
+            dash_config.queue_depth = options.dash_queue_depth;
+            LiveDashIngestServer dash_server(dash_config);
+            const auto start_status = dash_server.start();
+            if (!start_status.ok) {
+                throw std::runtime_error(start_status.message);
+            }
+            std::cerr << "dash_ingest_bound_port=" << dash_server.bound_port() << std::endl;
+            // Give concurrent encoders a short settle window after the first init
+            // segment so multiple paths can be included in the MoQ track snapshot.
+            if (!dash_server.wait_for_tracks(std::chrono::seconds(30), std::chrono::milliseconds(500))) {
+                dash_server.stop();
+                throw std::runtime_error("DASH ingest did not receive any tracks before publishing");
+            }
+            auto source = dash_server.source();
+            if (source.tracks.empty()) {
+                dash_server.stop();
+                throw std::runtime_error("DASH ingest did not receive any tracks before publishing");
+            }
+            if (!options.endpoint.has_value()) {
+                // Dry run: render the live plan without touching the network.
+                std::cout << "live publish plan (dash dry run)\n";
+                for (const auto& track : source.tracks) {
+                    std::cout << "track name=" << track.track_name << '\n';
+                }
+                std::cout.flush();
+                while (true) {
+                    auto object = source.next_object();
+                    if (!object.has_value()) {
+                        if (!source.is_finished || source.is_finished()) {
+                            break;
+                        }
+                        continue;
+                    }
+                    std::cout << "object track=" << object->track_name
+                              << " group=" << object->group_id
+                              << " subgroup=" << object->subgroup_id
+                              << " object=" << object->object_id
+                              << " bytes=" << object->payload.size()
+                              << " time_us=" << object->media_time_us
+                              << " duration_us=" << object->media_duration_us
+                              << std::endl;
+                }
+                dash_server.stop();
+            } else {
+                const auto status = publisher.publish_live_objects(
+                    source,
+                    *options.endpoint,
+                    options.tls,
+                    options.endpoint_alpn_overridden);
+                dash_server.stop();
+                if (!status.ok) {
+                    throw std::runtime_error(status.message);
+                }
+                const auto disconnect_status = publisher.disconnect(0);
+                if (!disconnect_status.ok) {
+                    throw std::runtime_error(disconnect_status.message);
+                }
+            }
+        } else if (live_stdin || live_srt) {
             LiveIngestConfig ingest;
             ingest.use_stdin = live_stdin;
 

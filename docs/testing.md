@@ -15,15 +15,18 @@ This covers:
 - fragmented MP4 packaging
 - progressive MP4 remux into CMAF-style objects
 - CLI option parsing and validation
-- MOQT setup encoding and decoding
+- MOQT setup and control-message encoding/decoding for drafts 14, 16, 17, and 18
 - binary namespace announcement plus subscribe-serving or forward-publish control/object sequencing
+- draft-18 fragmented request-stream reads and same-stream `SUBSCRIBE_OK` responses
+- draft-16 LL-DASH await-subscribe behavior with catalog plus multiple FFmpeg-style representation paths
 - multitrack subscribe serving in publish-plan/media-time order rather than draining one track at a time
 - paced send scheduling against fragment media timestamps
 - QUIC varint boundary coverage
 
 Publish-plan numbering notes:
 
-- `group_id` is allocated per track, not across all tracks, so interleaved audio and video fragments can both use `0, 1, 2, ...`
+- file-based publish plans allocate `group_id` per track, so interleaved audio and video fragments can both use `0, 1, 2, ...`
+- live DASH uses each video keyframe to start a shared media group; audio joins that active group and each track maintains its own `object_id` sequence within it
 - by default, `object_id` advances within a group when CMAF content is split into multiple MOQT objects for lower latency
 - `--coalesce-cmaf-chunks` forces `object_id = 0` for the current one-object-per-group fallback
 - MSF media timeline tracks are disabled by default; add `--msf-timeline` when you want a `timeline` metadata track and object
@@ -88,3 +91,34 @@ Use stdin when the source is already being produced by another command:
 ```bash
 cat sample.mp4 | ./build/openmoq-publisher --input - --draft 14 --dump-plan
 ```
+
+## CTE DASH Ingest Dry-Run Testing
+
+`--dump-plan` also works with `--live-source dash`, replacing the otherwise required `--endpoint`. The publisher starts the chunked-transfer ingest listener, waits for tracks, and prints the live plan (track names followed by one line per live object) instead of publishing to a relay:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 127.0.0.1:8099 \
+  --dash-path /ingest \
+  --draft 18 \
+  --publish-catalog \
+  --dump-plan
+```
+
+Push CMAF segments with HTTP/1.1 chunked transfer encoding (curl or the FFmpeg DASH recipe in `docs/quickstart.md`) at `http://127.0.0.1:8099/ingest/...`. Like a live publish, the dry run keeps draining objects until it is interrupted; wrap it in `timeout` for scripted checks.
+
+Run the focused DASH ingest and subscriber-interest regressions with:
+
+```bash
+cmake --build build --target openmoq-publisher-live-dash-tests openmoq-publisher-transport-tests
+./build/openmoq-publisher-live-dash-tests
+./build/openmoq-publisher-transport-tests
+```
+
+The DASH test covers separate init and media requests, shared audio/video
+keyframe groups, and normalization of FFmpeg `tfhd` sample defaults into
+explicit `trun` sample fields. The transport test verifies that draft-16 keeps
+objects from the same group on one subgroup stream, closes that stream at a
+group transition, waits for `SUBSCRIBE`, and preserves the catalog while
+waiting for media interest.

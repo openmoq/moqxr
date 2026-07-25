@@ -13,6 +13,7 @@ Key types:
 - `openmoq::publisher::PublisherConfig`
 - `openmoq::publisher::Publisher`
 - `openmoq::publisher::PreparedPublish`
+- `openmoq::publisher::cat4moq::AuthorizationConfig`
 
 ## 2. Link the Library
 
@@ -52,7 +53,36 @@ config.subscriber_timeout = std::chrono::seconds(30);
 openmoq::publisher::Publisher publisher(config);
 ```
 
-## 4. Prepare Media Once (Batch Mode)
+## 4. Optional CAT4MOQ Authorization
+
+Applications that need CAT4MOQ or other MoQ authorization-token carriage configure tokens at the public API layer. Transport internals consume this config when encoding setup, namespace, and publish request messages.
+
+```cpp
+#include "openmoq/publisher/cat4moq.h"
+#include "openmoq/publisher/publisher_api.h"
+
+std::vector<std::uint8_t> setup_cwt = read_setup_token();
+std::vector<std::uint8_t> publish_cwt = read_publish_token();
+
+openmoq::publisher::PublisherConfig config;
+config.authorization.setup_token =
+    openmoq::publisher::cat4moq::wrap_cat_token(setup_cwt);
+config.authorization.action_token =
+    openmoq::publisher::cat4moq::wrap_cat_token(publish_cwt);
+```
+
+`setup_token` is carried on the session setup message. `action_token` is carried on publisher action requests such as namespace publish and track publish. Leave either field empty when that part of the relay policy does not require a token.
+
+Helper wrappers:
+
+- `wrap_cat_token(...)`: wraps raw Catapult/CAT CWT bytes as a CAT authorization-token value.
+- `wrap_out_of_band_token(...)`: wraps raw private token bytes with the out-of-band token type.
+- `AuthorizationToken`: stores the encoded authorization-token value sent on the wire.
+- `AuthorizationConfig`: groups setup-level and action-level tokens for `PublisherConfig`.
+
+The runnable example in [examples/auth](../examples/auth/README.md) shows file-based tokens, Catapult command integration, and a deterministic `publish_live_objects(...)` flow against a moqx relay.
+
+## 5. Prepare Media Once (Batch Mode)
 
 For file or buffered stream workflows, prepare media first:
 
@@ -78,7 +108,7 @@ This is useful for larger apps that want to:
 - store plan state
 - publish the same prepared asset to multiple endpoints
 
-## 5. Optional: Inspect or Emit the Plan
+## 6. Optional: Inspect or Emit the Plan
 
 Render the plan for logging/debug:
 
@@ -92,7 +122,7 @@ Emit generated catalog and media objects to disk:
 publisher.emit_objects(prepared, "out");
 ```
 
-## 6. Configure Endpoint and TLS
+## 7. Configure Endpoint and TLS
 
 Build `EndpointConfig` and optional `TlsConfig`.
 
@@ -126,7 +156,7 @@ tls.insecure_skip_verify = false;
 // tls.private_key_path = "...";
 ```
 
-## 7. Publish Prepared Content
+## 8. Publish Prepared Content
 
 Use prepared content plus endpoint:
 
@@ -149,7 +179,7 @@ Convenience helpers:
 - `publish_file(path, endpoint, tls)`
 - `publish_stream(input, source_name, endpoint, tls)`
 
-## 8. Live Input Publish (Incremental stdin/stream)
+## 9. Live Input Publish (Incremental stdin/stream)
 
 The default live path expects fragmented MP4, which matches ffmpeg/CMAF
 pipelines:
@@ -168,7 +198,7 @@ if (!status.ok) {
 
 `publish_live(...)` uses incremental parsing and live publish flow instead of buffering to EOF.
 
-## 9. Arbitrary Live Object Publish
+## 10. Arbitrary Live Object Publish
 
 Applications that already produce MoQ objects directly can bypass fragmented MP4
 ingest with `publish_live_objects(...)`.
@@ -246,12 +276,13 @@ observed once the current blocking read returns.
 The fragmented MP4 `publish_live(...)` API remains the default live publishing
 path for media ingest.
 
-## 10. ALPN Override Behavior
+## 11. ALPN Override Behavior
 
 By default, the API applies transport-appropriate ALPN:
 
 - Raw QUIC + draft-14: `moq-00`
 - Raw QUIC + draft-16: `moqt-16`
+- Raw QUIC + draft-17: `moqt-17`
 - Raw QUIC + draft-18: `moqt-18`
 - WebTransport: `h3`
 
@@ -275,7 +306,7 @@ The same override flag exists on:
 - `publish_live(...)`
 - `publish_live_objects(...)`
 
-## 11. Error Handling Pattern
+## 12. Error Handling Pattern
 
 All API publish calls return `TransportStatus`:
 
@@ -297,7 +328,7 @@ if (!status.ok) {
 }
 ```
 
-## 12. Integration Pattern for Larger Applications
+## 13. Integration Pattern for Larger Applications
 
 For service-style integration:
 
@@ -309,7 +340,7 @@ For service-style integration:
 6. For direct object producers, provide a `LiveObjectSource` and call `publish_live_objects(...)`.
 7. Use `TransportStatus` messages for metrics and retry decisions.
 
-## 13. Publish Summary (`stats`)
+## 14. Publish Summary (`stats`)
 
 The publisher API is blocking: `publish(...)`, `publish_file(...)`,
 `publish_stream(...)`, and `publish_live(...)` run the session on the calling
@@ -378,7 +409,7 @@ Example:
 }
 ```
 
-## 14. Complete Example
+## 15. Complete Example
 
 ```cpp
 #include "openmoq/publisher/publisher_api.h"
@@ -424,7 +455,7 @@ int main() {
 }
 ```
 
-## 15. Live Publish with Audio/Video Encoders on Other Threads
+## 16. Live Publish with Audio/Video Encoders on Other Threads
 
 `publish_live(...)` consumes one MP4 byte stream.  
 For multi-track live publishing, the common pattern is:

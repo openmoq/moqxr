@@ -14,8 +14,9 @@ It turns MP4 input into CMSF-style publishable objects, builds draft-aware MOQT 
 - Preserves HEVC signaling and normalizes `hev1` to `hvc1` when needed.
 - Builds publish plans with catalog, optional MSF media timeline and SAP event timeline metadata, and media objects.
 - Emits generated objects and catalog metadata to disk for inspection.
-- Supports draft-aware MOQT framing for drafts 14, 16, and 18.
+- Supports draft-aware MOQT framing for drafts 14, 16, 17, and 18.
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
+- Accepts live CTE LL-DASH/CMAF ingest over HTTP/1.1 chunked `POST` or `PUT` requests.
 - Optionally publishes through the [**moq5**](https://github.com/openmoq/moq5) Media-over-QUIC library (drafts 16 and 18).
 
 ## Publishing via moq5
@@ -78,7 +79,7 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
-Live ingest examples (choose one path, not both):
+Live ingest examples (choose one path):
 
 1. SRT ingest path (`--live-source srt`)
 
@@ -161,9 +162,58 @@ ffmpeg -i /home/ubuntu/bbb_sunflower_1080p_30fps_normal.mp4 \
     --forward 0
 ```
 
+3. CTE LL-DASH ingest path (`--live-source dash`)
+
+Start the publisher with an HTTP/1.1 chunked CMAF ingest listener and a MoQ relay target:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Send CMAF/fMP4 bytes with chunked transfer encoding. Multiple concurrent paths under the prefix are accepted, for example `/ingest/video` and `/ingest/audio`; each path gets path-prefixed track names in the MoQ catalog.
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
+```
+
+FFmpeg can push live DASH/CMAF requests directly to the ingest prefix. This example creates two video representations plus audio; FFmpeg writes representation requests such as `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`.
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+Use `--forward 1` when the relay should receive objects immediately. Use `--forward 0` for await-subscribe mode, where media is sent after the relay forwards subscriber interest for the published tracks. A printed `connection_id=` confirms transport and MOQT setup only; it does not confirm namespace acceptance or a downstream subscription.
+
 `--live-source both` is intentionally not supported.
 
-On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publisher.exe` or the matching build configuration path.
+On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publisher.exe` or the matching build configuration path. The DASH ingest listener itself is currently supported on Unix-like platforms; Windows builds report the mode as unsupported.
 
 ## Documentation
 
@@ -176,8 +226,10 @@ On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publ
 | FFmpeg input recipes | [docs/ffmpeg.md](docs/ffmpeg.md) |
 | Relay interoperability | [docs/relay-interop.md](docs/relay-interop.md) |
 | C++ Publisher API | [docs/publisher-api.md](docs/publisher-api.md) |
+| CAT4MOQ auth example | [examples/auth/README.md](examples/auth/README.md) |
 | Protocol mapping | [docs/protocol-mapping.md](docs/protocol-mapping.md) |
 | WebTransport compliance | [docs/webtransport-compliance.md](docs/webtransport-compliance.md) |
+| macOS DASH shutdown behavior | [docs/macos-accept-shutdown-quirk.txt](docs/macos-accept-shutdown-quirk.txt) |
 | Transport plan | [docs/transport-plan.md](docs/transport-plan.md) |
 | Project status and roadmap | [docs/status.md](docs/status.md) |
 
@@ -195,6 +247,6 @@ Localized Publisher API guides are available in [Spanish](docs/publisher-api.es.
 
 ## Current Status
 
-The publisher can generate publish plans, emit inspectable output, and publish over picoquic-backed Raw QUIC and WebTransport transports. Draft 14 is the primary target, draft 16 is maintained as a compatibility profile, and draft 18 support is implemented for version selection, setup/request framing codec paths, and request-stream response correlation while interop hardening continues.
+The publisher can generate publish plans, emit inspectable output, and publish over picoquic-backed Raw QUIC and WebTransport transports. Draft 14 is the primary target, draft 16 is maintained as a compatibility profile, and drafts 17 and 18 provide the newer VI64 and request-stream protocol profiles. Draft-18 subscriber interest is accepted on fragmented request-stream reads and answered on the same request stream. The draft-19 text is archived under `docs/superpowers/specs/` for review only; `--draft 19` is not implemented.
 
 For the detailed roadmap, see [docs/status.md](docs/status.md).

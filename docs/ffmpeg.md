@@ -79,3 +79,44 @@ ffmpeg -stream_loop -1 -re -i bbb_sunflower_1080p_30fps_normal.mp4 \
     --namespace live/demo \
     --timeout 120
 ```
+
+## CTE LL-DASH HTTP Ingest
+
+The DASH live path lets FFmpeg send CMAF/fMP4 over HTTP/1.1 chunked requests instead of piping fragmented MP4 through stdin. Start the publisher first:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Then push a live DASH feed to the ingest prefix:
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+With this naming pattern, FFmpeg sends representation requests under the ingest prefix, such as `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`. The publisher treats each representation path independently, discovers tracks from init segments sent on those paths, and emits catalog plus media objects for subscribers.
+
+For relay smoke testing, use `--forward 1` so objects are forwarded immediately. Use `--forward 0` when the relay should wait for subscriber interest before media delivery. In that mode, `connection_id=` confirms transport and MOQT setup only; it does not mean the relay accepted the namespace or forwarded a subscription. Draft-16 subscriptions arrive on the control stream, while draft-17/18 subscriptions arrive on bidirectional request streams and are acknowledged with `SUBSCRIBE_OK` on the same stream. Use `--timeout` to bound the initial wait and `OPENMOQ_PICOQUIC_TRACE=1` to inspect relay control traffic.
