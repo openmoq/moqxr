@@ -1,9 +1,8 @@
 #include "../msfts_source.h"
 #include "../msfts_options.h"
+#include "fixture_file.h"
 
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -82,17 +81,6 @@ void append_packet(std::vector<std::uint8_t>& bytes,
     bytes.insert(bytes.end(), packet.begin(), packet.end());
 }
 
-std::filesystem::path write_fixture(const std::vector<std::uint8_t>& bytes,
-                                    const std::string& suffix) {
-    const auto path = std::filesystem::temp_directory_path() /
-                      ("openmoq-msfts-" + suffix + ".bin");
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    output.write(reinterpret_cast<const char*>(bytes.data()),
-                 static_cast<std::streamsize>(bytes.size()));
-    output.close();
-    return path;
-}
-
 std::uint16_t packet_pid(const std::uint8_t* packet, std::size_t packet_size) {
     const std::uint8_t* ts = packet + (packet_size == 192 ? 4 : 0);
     return static_cast<std::uint16_t>(((ts[1] & 0x1f) << 8) | ts[2]);
@@ -106,17 +94,15 @@ void test_source_catalog_and_filtering(std::size_t packet_size) {
     append_packet(fixture, make_packet(0x101, 0x11), packet_size);
     append_packet(fixture, make_packet(0x111, 0x22), packet_size);
     append_packet(fixture, make_packet(0x101, 0x33), packet_size);
-    const auto path = write_fixture(fixture, std::to_string(packet_size));
+    const FixtureFile fixture_file(fixture, std::to_string(packet_size));
 
     std::string error;
     auto source = MsftsSource::open(MsftsSourceConfig{
-        .input_path = path,
+        .input_path = fixture_file.path(),
         .track_name = "transport",
         .requested_program = 1,
         .packets_per_object = 2,
     }, error);
-    std::filesystem::remove(path);
-
     expect(source != nullptr, "expected valid " + std::to_string(packet_size) + "-byte source");
     if (source == nullptr) {
         std::cerr << error << '\n';
@@ -186,11 +172,11 @@ void test_ambiguous_m2ts_prefix_is_detected_as_192_bytes() {
     append_packet(fixture, pat, 192);
     append_packet(fixture, make_pmt(0x100, 1, 0x101), 192);
     fixture[0] = 0x47;
-    const auto path = write_fixture(fixture, "ambiguous-192");
+    const FixtureFile fixture_file(fixture, "ambiguous-192");
 
     std::string error;
-    auto source = MsftsSource::open(MsftsSourceConfig{.input_path = path}, error);
-    std::filesystem::remove(path);
+    auto source = MsftsSource::open(
+        MsftsSourceConfig{.input_path = fixture_file.path()}, error);
     expect(source != nullptr && source->info().packet_size == 192,
            "expected file-size and sync alignment to disambiguate M2TS");
 }
@@ -200,11 +186,11 @@ void test_partial_packet_is_rejected() {
     append_packet(fixture, make_pat(), 188);
     append_packet(fixture, make_pmt(0x100, 1, 0x101), 188);
     fixture.push_back(0x47);
-    const auto path = write_fixture(fixture, "partial");
+    const FixtureFile fixture_file(fixture, "partial");
 
     std::string error;
-    auto source = MsftsSource::open(MsftsSourceConfig{.input_path = path}, error);
-    std::filesystem::remove(path);
+    auto source = MsftsSource::open(
+        MsftsSourceConfig{.input_path = fixture_file.path()}, error);
 
     expect(source == nullptr, "expected partial source packet to be rejected");
     expect(error.find("partial") != std::string::npos,
@@ -218,14 +204,13 @@ void test_corrupt_packet_does_not_publish_partial_object() {
     auto corrupt = make_packet(0x101);
     corrupt[0] = 0;
     append_packet(fixture, corrupt, 188);
-    const auto path = write_fixture(fixture, "corrupt");
+    const FixtureFile fixture_file(fixture, "corrupt");
 
     std::string error;
     auto source = MsftsSource::open(MsftsSourceConfig{
-        .input_path = path,
+        .input_path = fixture_file.path(),
         .packets_per_object = 4,
     }, error);
-    std::filesystem::remove(path);
     expect(source != nullptr, "expected discovery before the corrupt packet");
     if (source == nullptr) {
         return;
@@ -244,10 +229,10 @@ void test_program_discovery_errors() {
         std::vector<std::uint8_t> fixture;
         append_packet(fixture, make_packet(0x101), 188);
         append_packet(fixture, make_packet(0x101), 188);
-        const auto path = write_fixture(fixture, "missing-pat");
+        const FixtureFile fixture_file(fixture, "missing-pat");
         std::string error;
-        auto source = MsftsSource::open(MsftsSourceConfig{.input_path = path}, error);
-        std::filesystem::remove(path);
+        auto source = MsftsSource::open(
+            MsftsSourceConfig{.input_path = fixture_file.path()}, error);
         expect(source == nullptr && error.find("PAT") != std::string::npos,
                "expected a missing PAT to be rejected");
     }
@@ -256,12 +241,14 @@ void test_program_discovery_errors() {
         std::vector<std::uint8_t> fixture;
         append_packet(fixture, make_pat(), 188);
         append_packet(fixture, make_pmt(0x100, 1, 0x101), 188);
-        const auto path = write_fixture(fixture, "missing-program");
+        const FixtureFile fixture_file(fixture, "missing-program");
         std::string error;
         auto source = MsftsSource::open(
-            MsftsSourceConfig{.input_path = path, .requested_program = 3},
+            MsftsSourceConfig{
+                .input_path = fixture_file.path(),
+                .requested_program = 3,
+            },
             error);
-        std::filesystem::remove(path);
         expect(source == nullptr && error.find("requested program 3") != std::string::npos,
                "expected an absent requested program to be rejected");
     }
@@ -270,12 +257,14 @@ void test_program_discovery_errors() {
         std::vector<std::uint8_t> fixture;
         append_packet(fixture, make_pat(), 188);
         append_packet(fixture, make_pmt(0x100, 1, 0x101), 188);
-        const auto path = write_fixture(fixture, "missing-pmt");
+        const FixtureFile fixture_file(fixture, "missing-pmt");
         std::string error;
         auto source = MsftsSource::open(
-            MsftsSourceConfig{.input_path = path, .requested_program = 2},
+            MsftsSourceConfig{
+                .input_path = fixture_file.path(),
+                .requested_program = 2,
+            },
             error);
-        std::filesystem::remove(path);
         expect(source == nullptr && error.find("PMT") != std::string::npos,
                "expected a missing selected-program PMT to be rejected");
     }
@@ -290,14 +279,13 @@ void test_declared_psi_interval_is_honored() {
                       make_packet(0x101, static_cast<std::uint8_t>(index)),
                       188);
     }
-    const auto path = write_fixture(fixture, "psi-interval");
+    const FixtureFile fixture_file(fixture, "psi-interval");
 
     std::string error;
     auto source = MsftsSource::open(MsftsSourceConfig{
-        .input_path = path,
+        .input_path = fixture_file.path(),
         .packets_per_object = 2,
     }, error);
-    std::filesystem::remove(path);
     expect(source != nullptr, "expected PSI interval fixture to open");
     if (source == nullptr) {
         return;
