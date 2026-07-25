@@ -26,6 +26,7 @@ using openmoq::publisher::ByteSpan;
 using openmoq::publisher::CmsfObject;
 using openmoq::publisher::CmsfObjectKind;
 using openmoq::publisher::DraftVersion;
+using openmoq::publisher::LiveCatalogMode;
 using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
 using openmoq::publisher::LiveTrack;
@@ -2518,6 +2519,181 @@ int main() {
         ok &= expect(!object_live_transport.writes.empty() &&
                          message_type(object_live_transport.writes.back().bytes) == 0x09,
                      "expected arbitrary live-object publish to finish with PUBLISH_NAMESPACE_DONE");
+    }
+
+    {
+        MockTransport invalid_catalog_transport;
+        invalid_catalog_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        invalid_catalog_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video"},
+            },
+            .next_object = []() -> std::optional<LiveObject> {
+                return LiveObject{
+                    .track_name = "video",
+                    .group_id = 0,
+                    .object_id = 0,
+                    .payload = {'V'},
+                };
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        MoqtSession invalid_catalog_session(
+            invalid_catalog_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = invalid_catalog_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected source-catalog validation session connect to succeed");
+        status = invalid_catalog_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(!status.ok, "expected source-catalog mode to reject a media object first");
+        ok &= expect(status.message.find("first object") != std::string::npos,
+                     "expected source-catalog ordering failure to identify the first object");
+    }
+
+    {
+        MockTransport empty_catalog_transport;
+        empty_catalog_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        empty_catalog_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video"},
+            },
+            .next_object = []() -> std::optional<LiveObject> {
+                return LiveObject{
+                    .track_name = "catalog",
+                    .group_id = 0,
+                    .object_id = 0,
+                };
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        MoqtSession empty_catalog_session(
+            empty_catalog_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = empty_catalog_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected empty-catalog validation session connect to succeed");
+        status = empty_catalog_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(!status.ok, "expected source-catalog mode to reject an empty catalog");
+        ok &= expect(status.message.find("non-empty") != std::string::npos,
+                     "expected empty-catalog failure to identify the payload contract");
+    }
+
+    {
+        MockTransport missing_catalog_transport;
+        missing_catalog_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        missing_catalog_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video"},
+            },
+            .next_object = []() { return std::nullopt; },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        MoqtSession missing_catalog_session(
+            missing_catalog_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = missing_catalog_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected missing-catalog validation session connect to succeed");
+        status = missing_catalog_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(!status.ok && status.message.find("before producing") != std::string::npos,
+                     "expected source EOF before its catalog to fail");
+    }
+
+    {
+        MockTransport media_first_transport;
+        media_first_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        media_first_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        media_first_transport.reads[0].push_back(
+            encode_subscribe_message(
+                1, kTestTrackNamespace, "video", 0, DraftVersion::kDraft16));
+        media_first_transport.reads[0].push_back({});
+        media_first_transport.reads[0].push_back(
+            encode_subscribe_message(
+                3, kTestTrackNamespace, "catalog", 0, DraftVersion::kDraft16));
+        media_first_transport.reads[0].push_back({});
+        std::size_t object_writes_before_catalog_subscribe = 0;
+        media_first_transport.on_read = [&](MockTransport& transport,
+                                            std::uint64_t stream_id) {
+            if (stream_id == 0 && transport.read_count == 5) {
+                object_writes_before_catalog_subscribe =
+                    static_cast<std::size_t>(std::count_if(
+                        transport.writes.begin(),
+                        transport.writes.end(),
+                        [](const auto& write) { return write.stream_id != 0; }));
+            }
+        };
+
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .payload = {'C'}},
+            LiveObject{.track_name = "video", .payload = {'V'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video"},
+            },
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        MoqtSession media_first_session(
+            media_first_transport,
+            std::string(kTestTrackNamespace),
+            false,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = media_first_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected media-first subscription session connect to succeed");
+        status = media_first_session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(status.ok, "expected media-first subscription publish to succeed");
+        ok &= expect(object_writes_before_catalog_subscribe == 1,
+                     "expected only media to publish before the catalog subscription");
+        ok &= expect(media_first_session.publish_stats().objects_published == 2,
+                     "expected media object plus retained catalog replay for late catalog subscription");
     }
 
     {

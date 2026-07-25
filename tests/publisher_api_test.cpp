@@ -11,6 +11,8 @@
 namespace {
 
 using openmoq::publisher::DraftVersion;
+using openmoq::publisher::LiveCatalogMode;
+using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
 using openmoq::publisher::LiveTrack;
 using openmoq::publisher::PreparedPublish;
@@ -258,6 +260,26 @@ int main() {
                      "expected live-object publish to preserve default raw draft ALPN");
     }
 
+    {
+        Publisher publisher(PublisherConfig{});
+
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = []() { return std::nullopt; },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        EndpointConfig endpoint;
+        endpoint.transport = TransportKind::kRawQuic;
+        endpoint.host = "relay.example.com";
+        endpoint.port = 443;
+
+        const TransportStatus status = publisher.publish_live_objects(source, endpoint);
+        ok &= expect(!status.ok, "expected source-catalog mode without a catalog track to fail");
+        ok &= expect(status.message.find("catalog track") != std::string::npos,
+                     "expected missing catalog track failure to identify the contract");
+    }
+
     // Backend-selection gate. When libmoq is the selected publish backend
     // (OPENMOQ_USE_LIBMOQ_PUBLISHER=ON), a non-injected publish_live_objects with
     // a bare/legacy LiveTrack is rejected up front by libmoq's media-metadata gate
@@ -284,6 +306,32 @@ int main() {
         ok &= expect(!status.ok, "expected bare-track libmoq publish_live_objects to fail");
         ok &= expect(status.message.find("media metadata") != std::string::npos,
                      "expected a clear media-metadata failure on the libmoq route");
+    }
+
+    {
+        Publisher publisher(PublisherConfig{});  // no injected factory
+
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "transport"},
+            },
+            .next_object = []() -> std::optional<LiveObject> {
+                return LiveObject{
+                    .track_name = "catalog",
+                    .payload = {'{', '}'},
+                };
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        EndpointConfig endpoint;
+        endpoint.transport = static_cast<TransportKind>(0xff);
+
+        const TransportStatus status = publisher.publish_live_objects(source, endpoint);
+        ok &= expect(!status.ok, "expected unsupported source-catalog transport to fail");
+        ok &= expect(status.message == "failed to create requested transport",
+                     "expected source-catalog mode to bypass the libmoq metadata gate");
     }
 #endif
 

@@ -29,6 +29,16 @@ The build also produces the reusable publisher API static library:
 
 The CMake target remains `openmoq_publisher_lib`, so projects that include this repository with `add_subdirectory(...)` should link that target. Projects that consume the raw archive directly should add `include/` to their include path and link the same transport dependencies used by the build, especially picoquic, picotls, OpenSSL, and platform socket libraries when picoquic transport support is enabled.
 
+The default build also compiles the MSFTS Publisher API example:
+
+```bash
+cmake --build build --target openmoq-publisher-msfts-example
+./build/examples/msfts-publisher/openmoq-publisher-msfts-example --help
+```
+
+Its CMake target links only `openmoq_publisher_lib`; it does not consume moq5
+or picoquic APIs directly.
+
 ## Build with Local Picoquic and Picotls
 
 By default, CMake looks for:
@@ -98,6 +108,10 @@ reviewed, the backend is selectable:
   is independent of which backend is *selected*.
 - **`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`** — the production `Publisher` routes
   batch, live stdin, live SRT, and `LiveObjectSource` publishing through libmoq.
+- **Caller-supplied catalog exception** — a `LiveObjectSource` using
+  `LiveCatalogMode::kSourceObject` is routed through `MoqtSession` in either
+  configuration. This preserves catalog formats such as MSFTS `"m2ts"` that
+  libmoq's current RAW/CMAF media sender cannot author.
 - **default (`OFF`)** — publishing stays on the legacy MoqtSession path.
 
 Configure-time output reports both, e.g.:

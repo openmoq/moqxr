@@ -256,6 +256,31 @@ the payload bytes to send. `object_id == 0` starts a group (and is treated as a
 sync point); `final_in_subgroup && subgroup_contains_group_largest` closes the
 group.
 
+### Caller-supplied catalogs
+
+Set `LiveCatalogMode::kSourceObject` when the source must provide a catalog
+whose format cannot be generated from `LiveTrack` media metadata:
+
+```cpp
+openmoq::publisher::LiveObjectSource source;
+source.tracks = {
+    openmoq::publisher::LiveTrack{.track_name = "catalog"},
+    openmoq::publisher::LiveTrack{.track_name = "transport"},
+};
+source.next_object = next_catalog_then_media_object;
+source.catalog_mode =
+    openmoq::publisher::LiveCatalogMode::kSourceObject;
+```
+
+This mode requires exactly one track named `catalog`, at least one non-catalog
+track, and a non-empty catalog as the first returned object. The Publisher uses
+the `MoqtSession` object path for such a source even when the libmoq backend is
+selected, because libmoq currently authors catalogs only for its RAW and CMAF
+media packaging. The MSFTS example under `examples/msfts-publisher` uses this
+mode for `"m2ts"` packaging and supplies packet-size, program/PID, PSI interval,
+random-access, timestamp-mode, and Base64 PAT/PMT `initData` fields from its
+local text draft.
+
 **Demand gating (lazy relays).** When the libmoq backend is selected, the publish
 path waits for at least one downstream media subscriber before producing media —
 a lazy relay forwards a SUBSCRIBE only when a player subscribes. Until then
@@ -270,9 +295,10 @@ interrupted, and the call returns success. For stdin specifically, cancellation 
 observed once the current blocking read returns.
 
 > **Legacy note:** bare `LiveTrack{.track_name = ...}` entries with no media
-> metadata (a generic "events"-style object track) are **legacy-only**. They are
-> rejected on the libmoq path with a clear error; to publish such tracks you must
-> inject a custom `TransportFactory`, which forces the older MoqtSession transport.
+> metadata (a generic "events"-style object track) are rejected on the normal
+> libmoq-generated-catalog path. Inject a custom `TransportFactory` for generic
+> legacy object tracks, or use `LiveCatalogMode::kSourceObject` only when the
+> source genuinely supplies the required catalog object.
 
 The fragmented MP4 `publish_live(...)` API remains the default live publishing
 path for media ingest.

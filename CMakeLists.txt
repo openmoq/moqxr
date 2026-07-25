@@ -352,6 +352,8 @@ target_link_libraries(openmoq-publisher-auth-example PRIVATE openmoq_publisher_l
 
 include(CTest)
 
+add_subdirectory(examples/msfts-publisher)
+
 if(OPENMOQ_BUILD_TESTS)
     add_executable(openmoq-publisher-packaging-tests
         tests/cmaf_segmenter_test.cpp

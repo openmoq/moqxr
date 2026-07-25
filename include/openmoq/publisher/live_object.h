@@ -23,6 +23,15 @@ enum class LivePackaging {
     kCmaf,
 };
 
+// Controls ownership of the catalog track for arbitrary live-object sources.
+// Generated mode preserves the normal CMSF/libmoq catalog behavior. Source
+// object mode is for formats such as MSFTS whose catalog metadata cannot be
+// represented by LiveTrack's media fields and must be emitted by the caller.
+enum class LiveCatalogMode {
+    kGenerated,
+    kSourceObject,
+};
+
 struct LiveTrack {
     std::string track_name;
 
@@ -65,6 +74,7 @@ struct LiveObjectSource {
     // only once this returns true. When unset, a nullopt means end-of-stream,
     // preserving the behavior of finite sources.
     std::function<bool()> is_finished;
+    LiveCatalogMode catalog_mode = LiveCatalogMode::kGenerated;
 };
 
 }  // namespace openmoq::publisher

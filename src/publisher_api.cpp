@@ -408,12 +408,27 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
                                                            const transport::EndpointConfig& endpoint,
                                                            const transport::TlsConfig& tls,
                                                            bool endpoint_alpn_overridden) const {
+    const bool source_supplies_catalog =
+        source.catalog_mode == LiveCatalogMode::kSourceObject;
+    if (source_supplies_catalog) {
+        const std::size_t catalog_track_count =
+            static_cast<std::size_t>(std::count_if(
+                source.tracks.begin(), source.tracks.end(),
+                [](const LiveTrack& track) { return track.track_name == "catalog"; }));
+        const bool has_media_track =
+            std::any_of(source.tracks.begin(), source.tracks.end(),
+                        [](const LiveTrack& track) { return track.track_name != "catalog"; });
+        if (catalog_track_count != 1 || !has_media_track) {
+            return transport::TransportStatus::failure(
+                "source-catalog mode requires exactly one catalog track and at least one media track");
+        }
+    }
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
     // publish_live_objects prefers the libmoq service tier unless a custom
     // TransportFactory was injected (legacy MoqtSession tests). libmoq requires
     // real media metadata per track; a bare/legacy LiveTrack fails with a clear
     // message rather than being faked as a generic media track.
-    if (!transport_factory_injected_) {
+    if (!transport_factory_injected_ && !source_supplies_catalog) {
         for (const auto& track : source.tracks) {
             if (!transport::live_track_has_media_metadata(track)) {
                 return transport::TransportStatus::failure(

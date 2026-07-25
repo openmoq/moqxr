@@ -79,6 +79,24 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
+Publish a packet-aligned MPEG-2 TS or M2TS file with the MSFTS example:
+
+```bash
+./build/examples/msfts-publisher/openmoq-publisher-msfts-example \
+  --input sample.m2ts \
+  --endpoint https://relay.example.com:443/moq \
+  --namespace media.msfts \
+  --track transport \
+  --draft 17
+```
+
+The example uses the public `Publisher::publish_live_objects(...)` API. It
+discovers PAT/PMT data, selects one program, filters unrelated PIDs, and emits
+the caller-supplied `"m2ts"` catalog required by the text draft in
+`examples/msfts-publisher/docs/`. Add `--program NUMBER` to select a specific
+program, `--packets-per-object COUNT` to change object sizing, or `--insecure`
+only for a relay whose certificate is intentionally untrusted.
+
 Live ingest examples (choose one path):
 
 1. SRT ingest path (`--live-source srt`)

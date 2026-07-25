@@ -4594,15 +4594,70 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
     bool source_eof = false;
     bool control_fin = false;
+    bool awaiting_source_catalog =
+        source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject;
     std::optional<std::chrono::steady_clock::time_point> object_pacing_start;
     std::optional<std::uint64_t> object_first_media_time_us;
     std::map<std::string, std::uint64_t> last_group_id_by_track;
     bool live_object_catalog_sent = !alias_by_track.contains("catalog");
+    std::optional<openmoq::publisher::LiveObject> retained_source_catalog;
+    std::size_t served_catalog_subscription_count = 0;
     const bool has_media_tracks = std::any_of(alias_by_track.begin(), alias_by_track.end(),
                                               [](const auto& entry) { return entry.first != "catalog"; });
     const auto has_media_subscription = [&]() {
         return std::any_of(subscribed_tracks.begin(), subscribed_tracks.end(),
                            [](const std::string& track_name) { return track_name != "catalog"; });
+    };
+    const auto catalog_subscription_count = [&]() {
+        return static_cast<std::size_t>(std::count_if(
+            active_subscriptions.begin(),
+            active_subscriptions.end(),
+            [](const auto& entry) { return entry.second.track_name == "catalog"; }));
+    };
+    const auto send_retained_catalog = [&]() -> TransportStatus {
+        if (!retained_source_catalog.has_value()) {
+            return TransportStatus::success();
+        }
+        const std::size_t subscription_count = catalog_subscription_count();
+        const bool should_send =
+            (auto_forward_ && !live_object_catalog_sent) ||
+            (!auto_forward_ &&
+             subscription_count > served_catalog_subscription_count);
+        if (!should_send) {
+            return TransportStatus::success();
+        }
+
+        const auto alias_it = alias_by_track.find("catalog");
+        const auto& catalog = *retained_source_catalog;
+        const openmoq::publisher::CmsfObject object{
+            .kind = openmoq::publisher::CmsfObjectKind::kInitialization,
+            .track_name = catalog.track_name,
+            .group_id = catalog.group_id,
+            .subgroup_id = catalog.subgroup_id,
+            .object_id = catalog.object_id,
+            .media_time_us = catalog.media_time_us,
+            .media_duration_us = catalog.media_duration_us,
+            .payload = {},
+            .owned_payload = catalog.payload,
+        };
+        const std::uint64_t send_seq = next_send_seq();
+        TransportStatus send_status = sender_by_track["catalog"].serve(
+            transport_,
+            draft_version,
+            alias_it->second,
+            send_seq,
+            object,
+            catalog.subgroup_contains_group_largest,
+            catalog.final_in_subgroup,
+            std::span<const std::uint8_t>(catalog.payload));
+        if (!send_status.ok) {
+            return send_status;
+        }
+        record_published_object(
+            "catalog", static_cast<std::uint64_t>(catalog.group_id), catalog.payload.size());
+        live_object_catalog_sent = true;
+        served_catalog_subscription_count = subscription_count;
+        return TransportStatus::success();
     };
     const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
     while (!source_eof) {
@@ -4648,6 +4703,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         if (!status.ok) {
             return status;
         }
+        status = send_retained_catalog();
+        if (!status.ok) {
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                break;
+            }
+            return status;
+        }
         if (control_fin) {
             break;
         }
@@ -4667,47 +4729,37 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+            if (awaiting_source_catalog) {
+                return TransportStatus::failure(
+                    "source-catalog mode ended before producing its catalog object");
+            }
             source_eof = true;
             break;
+        }
+        if (awaiting_source_catalog) {
+            if (next->track_name != "catalog") {
+                return TransportStatus::failure(
+                    "source-catalog mode requires the first object to be the catalog");
+            }
+            if (next->payload.empty()) {
+                return TransportStatus::failure(
+                    "source-catalog mode requires a non-empty catalog object");
+            }
+            awaiting_source_catalog = false;
         }
         const auto alias_it = alias_by_track.find(next->track_name);
         if (alias_it == alias_by_track.end()) {
             return TransportStatus::failure("live object references unknown track: " + next->track_name);
         }
         if (next->track_name == "catalog") {
-            const openmoq::publisher::CmsfObject object{
-                .kind = openmoq::publisher::CmsfObjectKind::kInitialization,
-                .track_name = next->track_name,
-                .group_id = next->group_id,
-                .subgroup_id = next->subgroup_id,
-                .object_id = next->object_id,
-                .media_time_us = next->media_time_us,
-                .media_duration_us = next->media_duration_us,
-                .payload = {},
-                .owned_payload = next->payload,
-            };
-            const std::uint64_t send_seq = next_send_seq();
-            status = sender_by_track[next->track_name].serve(
-                transport_,
-                draft_version,
-                alias_it->second,
-                send_seq,
-                object,
-                next->subgroup_contains_group_largest,
-                next->final_in_subgroup,
-                std::span<const std::uint8_t>(next->payload));
+            retained_source_catalog = std::move(*next);
+            status = send_retained_catalog();
             if (!status.ok) {
-                // A send failure that races with a concurrent close() is a
-                // benign stop, not a transport error: break to the flush.
                 if (stop_requested_.load(std::memory_order_acquire)) {
                     break;
                 }
                 return status;
             }
-            record_published_object(next->track_name,
-                                    static_cast<std::uint64_t>(next->group_id),
-                                    next->payload.size());
-            live_object_catalog_sent = true;
             if (stop_requested_.load(std::memory_order_acquire)) {
                 break;
             }

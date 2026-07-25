@@ -21,6 +21,10 @@ This covers:
 - draft-16 LL-DASH await-subscribe behavior with catalog plus multiple FFmpeg-style representation paths
 - multitrack subscribe serving in publish-plan/media-time order rather than draining one track at a time
 - paced send scheduling against fragment media timestamps
+- caller-supplied catalog declaration, ordering, and backend-routing validation
+- MSFTS 188-byte TS and 192-byte M2TS detection, program filtering, rewritten
+  PAT/PMT `initData`, catalog fields, whole-packet object payloads, and invalid
+  partial-packet rejection
 - QUIC varint boundary coverage
 
 Publish-plan numbering notes:
@@ -63,6 +67,23 @@ additional `openmoq-publisher-libmoq-translation-tests` coverage verifies
 track/object translation, readiness and demand waits, bounded backpressure
 retries, cancellation, and live-object metadata validation. CMake also detects
 moq5 at `../libmoq`, `third_party/moq5`, and `thirdparty/moq5`.
+
+## MSFTS Example Tests
+
+Build and run the focused MSFTS Publisher API coverage with:
+
+```bash
+cmake --build build --target \
+  openmoq-publisher-msfts-example \
+  openmoq-publisher-msfts-tests
+ctest --test-dir build -R openmoq-publisher-msfts-tests --output-on-failure
+./build/examples/msfts-publisher/openmoq-publisher-msfts-example --help
+```
+
+The tests use synthetic transport streams for both supported source-packet
+sizes and do not require a relay. A live relay run is a separate
+interoperability check and should use a real subscriber before claiming media
+delivery.
 
 ## Picoquic Loopback Smoke Test
 
