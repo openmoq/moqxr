@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,9 +34,12 @@ using openmoq::publisher::transport::MoqtSession;
 using openmoq::publisher::transport::PicoquicClient;
 using openmoq::publisher::transport::ServerSetupMessage;
 using openmoq::publisher::transport::TlsConfig;
+using openmoq::publisher::transport::decode_varint;
 using openmoq::publisher::transport::encode_server_setup_message;
+using openmoq::publisher::transport::encode_varint;
+using openmoq::publisher::transport::next_control_message;
 
-constexpr const char* kPicoquicSourceDir = "/media/mondain/terrorbyte/workspace/github/picoquic";
+constexpr const char* kPicoquicSourceDir = OPENMOQ_PICOQUIC_SOURCE_DIR;
 
 struct SmokeServer {
     picoquic_quic_t* quic = nullptr;
@@ -44,11 +48,15 @@ struct SmokeServer {
     std::condition_variable condition;
     uint16_t port = 0;
     std::size_t bytes_received = 0;
+    std::vector<std::uint8_t> control_bytes;
+    std::size_t publish_response_count = 0;
     bool loop_ready = false;
     bool stop_requested = false;
     bool loop_exited = false;
     int loop_return_code = 0;
     bool setup_response_sent = false;
+    bool namespace_response_sent = false;
+    bool publish_responses_sent = false;
 };
 
 bool trace_enabled() {
@@ -93,6 +101,34 @@ PublishPlan make_span_backed_plan() {
     };
 }
 
+std::vector<std::uint8_t> encode_publish_namespace_ok(std::uint64_t request_id) {
+    const std::vector<std::uint8_t> payload = encode_varint(request_id);
+    std::vector<std::uint8_t> message = {
+        0x07,
+        static_cast<std::uint8_t>((payload.size() >> 8) & 0xff),
+        static_cast<std::uint8_t>(payload.size() & 0xff),
+    };
+    message.insert(message.end(), payload.begin(), payload.end());
+    return message;
+}
+
+std::vector<std::uint8_t> encode_publish_ok(std::uint64_t request_id) {
+    std::vector<std::uint8_t> payload = encode_varint(request_id);
+    payload.push_back(1);     // Forward.
+    payload.push_back(0x80);  // Subscriber priority.
+    payload.push_back(1);     // Group order.
+    const std::vector<std::uint8_t> filter_type = encode_varint(0);
+    const std::vector<std::uint8_t> parameter_count = encode_varint(0);
+    payload.insert(payload.end(), filter_type.begin(), filter_type.end());
+    payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
+
+    std::vector<std::uint8_t> message = encode_varint(0x1e);
+    const std::vector<std::uint8_t> payload_length = encode_varint(payload.size());
+    message.insert(message.end(), payload_length.begin(), payload_length.end());
+    message.insert(message.end(), payload.begin(), payload.end());
+    return message;
+}
+
 int smoke_server_callback(picoquic_cnx_t* cnx,
                           uint64_t stream_id,
                           uint8_t* bytes,
@@ -115,13 +151,45 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
             trace("server stream data event bytes=" + std::to_string(length));
             std::lock_guard<std::mutex> lock(server->mutex);
             server->bytes_received += length;
-            if (!server->setup_response_sent && stream_id == 0) {
-                const std::vector<std::uint8_t> server_setup = encode_server_setup_message({
-                    .draft = DraftVersion::kDraft14,
-                    .max_request_id = 8,
-                });
-                if (picoquic_add_to_stream(cnx, stream_id, server_setup.data(), server_setup.size(), 0) == 0) {
-                    server->setup_response_sent = true;
+            if (stream_id == 0) {
+                server->control_bytes.insert(server->control_bytes.end(), bytes, bytes + length);
+                std::size_t message_size = 0;
+                while (next_control_message(server->control_bytes, DraftVersion::kDraft14, message_size)) {
+                    const std::span<const std::uint8_t> message(server->control_bytes.data(), message_size);
+                    std::size_t offset = 0;
+                    std::uint64_t message_type = 0;
+                    if (!decode_varint(message, offset, message_type)) {
+                        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+                    }
+
+                    std::vector<std::uint8_t> response;
+                    if (message_type == 0x20 && !server->setup_response_sent) {
+                        response = encode_server_setup_message({
+                            .draft = DraftVersion::kDraft14,
+                            .max_request_id = 8,
+                        });
+                    } else if (message_type == 0x06 && !server->namespace_response_sent) {
+                        response = encode_publish_namespace_ok(0);
+                    } else if (message_type == 0x1d && server->publish_response_count < 2) {
+                        const std::uint64_t request_id = 2 + (2 * server->publish_response_count);
+                        response = encode_publish_ok(request_id);
+                    }
+
+                    if (!response.empty() &&
+                        picoquic_add_to_stream(cnx, stream_id, response.data(), response.size(), 0) == 0) {
+                        if (message_type == 0x20) {
+                            server->setup_response_sent = true;
+                        } else if (message_type == 0x06) {
+                            server->namespace_response_sent = true;
+                        } else if (message_type == 0x1d) {
+                            ++server->publish_response_count;
+                            server->publish_responses_sent = server->publish_response_count == 2;
+                        }
+                    }
+
+                    server->control_bytes.erase(server->control_bytes.begin(),
+                                                server->control_bytes.begin() +
+                                                    static_cast<std::ptrdiff_t>(message_size));
                 }
             }
             server->condition.notify_all();
@@ -285,7 +353,7 @@ int main() {
     };
 
     PicoquicClient transport;
-    MoqtSession session(transport);
+    MoqtSession session(transport, "media", true);
 
     auto status = session.connect(endpoint, tls);
     if (!status.ok) {
@@ -305,11 +373,15 @@ int main() {
     ok &= expect(status.ok, status.ok ? "expected publish to succeed after setup negotiation"
                                       : "expected publish to succeed after setup negotiation: " + status.message);
 
-    std::unique_lock<std::mutex> lock(server.mutex);
-    ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
-                     return server.setup_response_sent;
-                 }),
-                 "expected server to send SERVER_SETUP");
+    {
+        std::unique_lock<std::mutex> lock(server.mutex);
+        ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                         return server.setup_response_sent &&
+                                server.namespace_response_sent &&
+                                server.publish_responses_sent;
+                     }),
+                     "expected server to acknowledge setup, namespace, and track publishing");
+    }
 
     status = session.close(0);
     ok &= expect(status.ok, "expected picoquic session close to succeed");

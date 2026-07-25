@@ -33,7 +33,8 @@ The CMake target remains `openmoq_publisher_lib`, so projects that include this 
 
 By default, CMake looks for:
 
-- `third_party/picoquic` and `third_party/picotls`
+- sibling `../picoquic` and `../picotls` checkouts
+- fallback: `third_party/picoquic` and `third_party/picotls`
 - fallback: `thirdparty/picoquic` and `thirdparty/picotls`
 
 If you prefer custom paths, clone picoquic and picotls to any convenient location and initialize the picotls submodules:
@@ -78,6 +79,8 @@ GitHub Actions workflows set `OPENSSL_ROOT_DIR` automatically from the runner's 
 - `-DOPENMOQ_ENABLE_PICOQUIC=ON|OFF`
 - `-DOPENMOQ_PICOQUIC_SOURCE_DIR=/path/to/picoquic`
 - `-DOPENMOQ_PICOTLS_SOURCE_DIR=/path/to/picotls`
+- `-DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5`
+- `-DOPENMOQ_OPENSSL_ROOT_DIR=/path/to/openssl`
 - `-DOPENSSL_ROOT_DIR=/path/to/openssl`
 - `-DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON|OFF`
 - `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON|OFF` (default `OFF`)
@@ -89,7 +92,9 @@ transport onto the sibling **libmoq** service tier. While the migration is being
 reviewed, the backend is selectable:
 
 - **libmoq available** — the libmoq integration code (translation, drivers,
-  tests) builds and is validated whenever a sibling `../libmoq` is present; this
+  tests) builds and is validated whenever CMake finds a sibling `../moq5`
+  checkout. It also accepts `../libmoq`, `third_party/moq5`,
+  `thirdparty/moq5`, or an explicit `OPENMOQ_LIBMOQ_SOURCE_DIR`; availability
   is independent of which backend is *selected*.
 - **`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`** — the production `Publisher` routes
   batch, live stdin, live SRT, and `LiveObjectSource` publishing through libmoq.
@@ -106,6 +111,16 @@ This gate is **temporary** — it will be removed once the libmoq publish path i
 accepted as the default. An injected `TransportFactory` always forces the legacy
 path regardless of this option.
 
+For a checkout outside the auto-detected locations:
+
+```bash
+cmake -S . -B build-libmoq \
+  -DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5 \
+  -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON
+cmake --build build-libmoq
+ctest --test-dir build-libmoq --output-on-failure
+```
+
 ## Release Builds
 
 GitHub Actions publishes release archives for Linux, macOS, and Windows:
@@ -121,8 +136,10 @@ GitHub Actions publishes release archives for Linux, macOS, and Windows:
 
 GitHub Actions builds and tests the project on:
 
-- `ubuntu-latest`
-- `macos-latest`
-- `windows-latest`
+- the default legacy backend on `ubuntu-latest`, `macos-latest`, and
+  `windows-latest`
+- the opt-in libmoq backend on `ubuntu-latest`, including the
+  `openmoq-publisher-libmoq-translation-tests` target
 
-The workflow runs the same CMake configure, build, static-library existence check, and CTest steps on all three platforms.
+Every lane runs CMake configure, the full default build, a static-library
+existence check, and CTest.

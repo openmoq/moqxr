@@ -203,9 +203,9 @@ if (!status.ok) {
 Applications that already produce MoQ objects directly can bypass fragmented MP4
 ingest with `publish_live_objects(...)`.
 
-When built against libmoq (the default service-tier path), each `LiveTrack` must
-declare real media metadata so the libmoq media sender can author the catalog and
-package objects. Required: `media_type` and `codec`; video tracks add
+When the opt-in libmoq backend is selected, each `LiveTrack` must declare real
+media metadata so the libmoq media sender can author the catalog and package
+objects. Required: `media_type` and `codec`; video tracks add
 `width`/`height`, audio tracks add `sample_rate`/`channel_count`. `packaging`
 selects RAW vs CMAF object framing. `bitrate` is optional (a media-type default is
 used when omitted).
@@ -256,12 +256,13 @@ the payload bytes to send. `object_id == 0` starts a group (and is treated as a
 sync point); `final_in_subgroup && subgroup_contains_group_largest` closes the
 group.
 
-**Demand gating (lazy relays).** When built against libmoq, the publish path waits
-for at least one downstream media subscriber before producing media — a lazy relay
-forwards a SUBSCRIBE only when a player subscribes. Until then nothing is written
-(batch/objects/stdin do not consume their source; live SRT drops fragments to stay
-bounded). If no subscriber appears within `PublisherConfig::subscriber_timeout`,
-the call fails with `timed out waiting for media subscriber` instead of hanging.
+**Demand gating (lazy relays).** When the libmoq backend is selected, the publish
+path waits for at least one downstream media subscriber before producing media —
+a lazy relay forwards a SUBSCRIBE only when a player subscribes. Until then
+nothing is written (batch/objects/stdin do not consume their source; live SRT
+drops fragments to stay bounded). If no subscriber appears within
+`PublisherConfig::subscriber_timeout`, the call fails with
+`timed out waiting for media subscriber` instead of hanging.
 
 Calling `disconnect()` from another thread stops a running `publish_live_objects`
 (or live stdin/SRT) publish promptly; the driver loop breaks, the endpoint is

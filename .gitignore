@@ -30,7 +30,11 @@ Testing/
 
 # Tooling
 compile_commands.json
-graphify-out/
+graphify-out/*
+graphify-work/*
+!graphify-out/graph.html
+!graphify-out/graph.json
+!graphify-out/GRAPH_REPORT.md
 
 # Local test artifacts
 /tmp-*.mp4

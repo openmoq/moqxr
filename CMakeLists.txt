@@ -61,6 +61,23 @@ set(OPENMOQ_PICOQUIC_SOURCE_DIR "${_OPENMOQ_DEFAULT_PICOQUIC_SOURCE_DIR}" CACHE 
 set(OPENMOQ_PICOTLS_SOURCE_DIR "${_OPENMOQ_DEFAULT_PICOTLS_SOURCE_DIR}" CACHE PATH
     "Path to a picotls source checkout (defaults to ../picotls, then third_party/, then thirdparty/)")
 
+function(_openmoq_pick_libmoq_default out_var)
+    foreach(_candidate
+            "${CMAKE_CURRENT_SOURCE_DIR}/../moq5"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../libmoq"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/moq5"
+            "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/moq5")
+        if(EXISTS "${_candidate}/CMakeLists.txt")
+            get_filename_component(_abs "${_candidate}" ABSOLUTE)
+            set(${out_var} "${_abs}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${out_var} "${CMAKE_CURRENT_SOURCE_DIR}/../moq5" PARENT_SCOPE)
+endfunction()
+
+_openmoq_pick_libmoq_default(_OPENMOQ_DEFAULT_LIBMOQ_SOURCE_DIR)
+
 # OpenSSL coherency: the picotls checkout here uses 1.1.x-only APIs
 # (EVP_PKEY_*_tls_encodedpoint), so pin ONE OpenSSL 1.1 install for both headers
 # AND libraries. Without this, CMake's FindOpenSSL on macOS can mix
@@ -197,8 +214,8 @@ endif()
 # still publishes via its own (legacy) transport; the Publisher only routes
 # through libmoq when -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON. Linking libmoq always
 # validates that the service tier builds and links into this project.
-set(OPENMOQ_LIBMOQ_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libmoq" CACHE PATH
-    "Path to the sibling libmoq source checkout")
+set(OPENMOQ_LIBMOQ_SOURCE_DIR "${_OPENMOQ_DEFAULT_LIBMOQ_SOURCE_DIR}" CACHE PATH
+    "Path to the moq5/libmoq source checkout (defaults to ../moq5, then ../libmoq, third_party/moq5, or thirdparty/moq5)")
 
 set(OPENMOQ_HAS_LIBMOQ OFF)
 if(EXISTS "${OPENMOQ_LIBMOQ_SOURCE_DIR}/CMakeLists.txt")
@@ -228,7 +245,7 @@ if(EXISTS "${OPENMOQ_LIBMOQ_SOURCE_DIR}/CMakeLists.txt")
         message(STATUS "libmoq: picoquic not available; building core/service tier without the raw QUIC adapter")
     endif()
 
-    add_subdirectory("${OPENMOQ_LIBMOQ_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/libmoq")
+    add_subdirectory("${OPENMOQ_LIBMOQ_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/libmoq" EXCLUDE_FROM_ALL)
     set(OPENMOQ_HAS_LIBMOQ ON)
 else()
     message(STATUS "libmoq source not found at ${OPENMOQ_LIBMOQ_SOURCE_DIR}; building without libmoq integration")
@@ -421,6 +438,9 @@ if(OPENMOQ_BUILD_TESTS)
         target_link_libraries(openmoq-publisher-picoquic-smoke-tests PRIVATE openmoq_publisher_lib)
         target_include_directories(openmoq-publisher-picoquic-smoke-tests PRIVATE
             "${OPENMOQ_PICOQUIC_SOURCE_DIR}/picoquic"
+        )
+        target_compile_definitions(openmoq-publisher-picoquic-smoke-tests PRIVATE
+            OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_PICOQUIC_SOURCE_DIR}"
         )
         add_test(NAME openmoq-publisher-picoquic-smoke-tests COMMAND openmoq-publisher-picoquic-smoke-tests)
     endif()

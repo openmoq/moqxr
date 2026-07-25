@@ -32,8 +32,8 @@ flushes queued media to the wire before the connection is torn down.
 Media is packaged into bounded, keyframe-aligned CMAF objects so that coalesced
 publishing produces per-GOP objects rather than a single whole-track payload.
 
-Enable the moq5 backend at configure time (the moq5 library must be available
-alongside the publisher):
+Enable the moq5 backend at configure time. CMake auto-detects a sibling
+`../moq5` checkout; use `OPENMOQ_LIBMOQ_SOURCE_DIR` when it is elsewhere:
 
 ```bash
 cmake -S . -B build -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON

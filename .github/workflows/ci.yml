@@ -9,15 +9,21 @@ on:
 
 jobs:
   build-and-test:
+    name: Build and test (${{ matrix.os }}, ${{ matrix.backend }})
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            backend: legacy
+          - os: macos-latest
+            backend: legacy
+          - os: windows-latest
+            backend: legacy
+          - os: ubuntu-latest
+            backend: libmoq
 
     steps:
       - name: Checkout
@@ -37,6 +43,14 @@ jobs:
           ref: master
           path: third_party/picotls
           submodules: recursive
+
+      - name: Checkout moq5
+        if: matrix.backend == 'libmoq'
+        uses: actions/checkout@v5
+        with:
+          repository: openmoq/moq5
+          ref: main
+          path: third_party/moq5
 
       - name: Show toolchain
         shell: bash
@@ -87,6 +101,11 @@ jobs:
             "-DOPENMOQ_PICOQUIC_SOURCE_DIR=${{ github.workspace }}/third_party/picoquic"
             "-DOPENMOQ_PICOTLS_SOURCE_DIR=${{ github.workspace }}/third_party/picotls"
           )
+          if [ "${{ matrix.backend }}" = "libmoq" ]; then
+            args+=(
+              -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON
+            )
+          fi
           if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
             args+=("-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}")
           fi

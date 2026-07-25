@@ -40,6 +40,30 @@ cmake --build build-nosmoke
 ctest --test-dir build-nosmoke --output-on-failure
 ```
 
+## Libmoq Backend Tests
+
+When a sibling `../moq5` checkout is present, CMake builds the libmoq
+translation test even if the legacy backend remains selected. To compile and
+test the production libmoq route itself, enable the migration gate in a separate
+build tree:
+
+```bash
+cmake -S . -B build-libmoq \
+  -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON \
+  -DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF
+cmake --build build-libmoq
+ctest --test-dir build-libmoq --output-on-failure
+```
+
+If moq5 is not at `../moq5`, add
+`-DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5`. The full build intentionally
+configures moq5 but compiles only the dependency closure required by moqxr
+targets; standalone moq5 examples remain outside the default moqxr build. The
+additional `openmoq-publisher-libmoq-translation-tests` coverage verifies
+track/object translation, readiness and demand waits, bounded backpressure
+retries, cancellation, and live-object metadata validation. CMake also detects
+moq5 at `../libmoq`, `third_party/moq5`, and `thirdparty/moq5`.
+
 ## Picoquic Loopback Smoke Test
 
 When you want to exercise the live QUIC path locally, enable the smoke test target:
