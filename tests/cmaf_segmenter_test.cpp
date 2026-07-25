@@ -191,6 +191,98 @@ std::vector<std::uint8_t> make_progressive_test_mp4() {
     return file;
 }
 
+// Progressive (non-fragmented) MP4 with `sample_count` video samples (each
+// `sample_size` bytes, all in one chunk) and sync samples at the given 1-based
+// indices. Exercises bounded per-GOP coalescing: multiple keyframes -> multiple
+// groups; a long run between keyframes -> capped continuation objects. Mirrors
+// make_progressive_test_mp4's box layout so the stco patch offset formula holds.
+std::vector<std::uint8_t> make_progressive_gops_mp4(std::uint32_t sample_count,
+                                                    const std::vector<std::uint32_t>& sync_numbers,
+                                                    std::uint32_t sample_size = 2) {
+    auto put = [](std::vector<std::uint8_t>& v, std::uint32_t x) {
+        const auto b = be32_bytes(x);
+        v.insert(v.end(), b.begin(), b.end());
+    };
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 7, 208, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+
+    std::vector<std::uint8_t> stts_payload;  // one run: sample_count samples, delta 1000
+    put(stts_payload, 1);
+    put(stts_payload, sample_count);
+    put(stts_payload, 1000);
+    const auto stts = make_full_box("stts", stts_payload);
+
+    std::vector<std::uint8_t> stsc_payload;  // all samples in one chunk
+    put(stsc_payload, 1);              // entry_count
+    put(stsc_payload, 1);              // first_chunk
+    put(stsc_payload, sample_count);   // samples_per_chunk
+    put(stsc_payload, 1);              // sample_description_index
+    const auto stsc = make_full_box("stsc", stsc_payload);
+
+    std::vector<std::uint8_t> stsz_payload;  // explicit per-sample sizes
+    put(stsz_payload, 0);              // sample_size 0 -> per-sample table
+    put(stsz_payload, sample_count);
+    for (std::uint32_t i = 0; i < sample_count; ++i) {
+        put(stsz_payload, sample_size);
+    }
+    const auto stsz = make_full_box("stsz", stsz_payload);
+
+    auto stco = make_full_box("stco", concat({be32_bytes(1), be32_bytes(0)}));  // one chunk, patched below
+
+    std::vector<std::uint8_t> stss_payload;  // sync sample numbers (1-based)
+    put(stss_payload, static_cast<std::uint32_t>(sync_numbers.size()));
+    for (const std::uint32_t n : sync_numbers) {
+        put(stss_payload, n);
+    }
+    const auto stss = make_full_box("stss", stss_payload);
+
+    const auto stbl = make_box("stbl", concat({stsd, stts, stsc, stsz, stco, stss}));
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+    const std::vector<std::uint8_t> mdat_box =
+        make_box("mdat", std::vector<std::uint8_t>(static_cast<std::size_t>(sample_count) * sample_size, 0x41));
+
+    std::vector<std::uint8_t> file = concat({ftyp, moov, mdat_box});
+    const std::uint32_t mdat_payload_offset = static_cast<std::uint32_t>(ftyp.size() + moov.size() + 8);
+    const std::size_t stco_payload_offset =
+        ftyp.size() + 8 + tkhd.size() + 8 + mdhd.size() + hdlr.size() + 8 + 8 + stsd.size() + stts.size() +
+        stsc.size() + stsz.size() + 16;
+    patch_be32(file, stco_payload_offset, mdat_payload_offset);
+    return file;
+}
+
+// Largest trun sample_count across all fragments in a CMAF object's bytes.
+// Scans for the trun FourCC (synthetic mdat payloads never contain it), reading
+// the sample_count field 8 bytes past the type (after the 4-byte version/flags).
+std::uint32_t max_trun_sample_count(const std::vector<std::uint8_t>& fragment) {
+    std::uint32_t mx = 0;
+    for (std::size_t i = 0; i + 12 <= fragment.size(); ++i) {
+        if (fragment[i] == 't' && fragment[i + 1] == 'r' && fragment[i + 2] == 'u' && fragment[i + 3] == 'n') {
+            const std::size_t p = i + 8;
+            const std::uint32_t sc = (static_cast<std::uint32_t>(fragment[p]) << 24) |
+                                     (static_cast<std::uint32_t>(fragment[p + 1]) << 16) |
+                                     (static_cast<std::uint32_t>(fragment[p + 2]) << 8) |
+                                     static_cast<std::uint32_t>(fragment[p + 3]);
+            if (sc > mx) {
+                mx = sc;
+            }
+        }
+    }
+    return mx;
+}
+
 std::vector<std::uint8_t> make_multitrack_init_mp4() {
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
 
@@ -552,6 +644,65 @@ int main() {
                  "expected remuxed codec init payload");
     ok &= expect(!remuxed_plan.track_initializations.front().init_segment.empty(),
                  "expected remuxed standalone init segment");
+
+    // Bounded per-GOP coalescing: a multi-keyframe progressive MP4 must become
+    // multiple media objects (one group per GOP), never a single whole-track
+    // object, and no fragment may exceed libmoq's 512-sample CMAF validator.
+    {
+        // 8 samples, keyframes at sample 1 and sample 5 -> two GOPs of 4 samples.
+        const auto gops_bytes = make_progressive_gops_mp4(8, {1, 5});
+        ParsedMp4 gops{.bytes = gops_bytes, .top_level_boxes = parse_mp4_boxes(gops_bytes), .tracks = {}};
+        gops.tracks = extract_tracks(gops.top_level_boxes, gops.bytes);
+
+        const auto coalesced = segment_for_cmaf(gops, CmafObjectMode::kCoalesced);
+        const auto split = segment_for_cmaf(gops, CmafObjectMode::kSplit);
+
+        ok &= expect(split.fragments.size() == 8, "expected split mode to emit one object per sample");
+        ok &= expect(coalesced.fragments.size() == 2,
+                     "expected coalesced multi-GOP MP4 to emit one object per GOP, not one whole-track object");
+        ok &= expect(coalesced.fragments.size() > 1,
+                     "expected coalesced mode to never emit a single whole-track object");
+
+        bool groups_ok = true;
+        bool sap_ok = true;
+        bool bound_ok = true;
+        for (std::size_t i = 0; i < coalesced.fragments.size(); ++i) {
+            const auto& frag = coalesced.fragments[i];
+            // One group per track (track_index 0), each GOP a sequential object.
+            groups_ok = groups_ok && frag.group_id == 0 && frag.object_id == i;
+            // Each GOP-start video object carries declared SAP type 2.
+            sap_ok = sap_ok && frag.has_sap_type && frag.sap_type == 2;
+            const std::uint32_t trun_samples = max_trun_sample_count(frag.payload.owned_bytes);
+            bound_ok = bound_ok && trun_samples == 4 && trun_samples < 512;
+        }
+        ok &= expect(groups_ok, "expected one group per track with one sequential object per GOP");
+        ok &= expect(sap_ok, "expected each GOP-start video object to declare SAP type 2");
+        ok &= expect(bound_ok, "expected each per-GOP fragment to carry exactly its 4 samples (<512)");
+
+        // A long single GOP must be split into capped continuation objects rather
+        // than one oversized trun -- this is the >512-sample validator guard.
+        const auto long_bytes = make_progressive_gops_mp4(520, {1});
+        ParsedMp4 long_gop{.bytes = long_bytes, .top_level_boxes = parse_mp4_boxes(long_bytes), .tracks = {}};
+        long_gop.tracks = extract_tracks(long_gop.top_level_boxes, long_gop.bytes);
+        const auto long_coalesced = segment_for_cmaf(long_gop, CmafObjectMode::kCoalesced);
+
+        ok &= expect(long_coalesced.fragments.size() > 1,
+                     "expected a 520-sample GOP to be chunked into multiple capped objects");
+        bool long_bound_ok = !long_coalesced.fragments.empty();
+        bool single_group_ok = true;
+        for (std::size_t i = 0; i < long_coalesced.fragments.size(); ++i) {
+            const auto& frag = long_coalesced.fragments[i];
+            single_group_ok = single_group_ok && frag.group_id == 0 && frag.object_id == i;
+            const std::uint32_t trun_samples = max_trun_sample_count(frag.payload.owned_bytes);
+            long_bound_ok = long_bound_ok && trun_samples > 0 && trun_samples < 512;
+        }
+        ok &= expect(long_bound_ok, "expected every chunked fragment trun to stay below the 512-sample validator");
+        ok &= expect(single_group_ok, "expected a long GOP to stay one group with sequential continuation objects");
+        ok &= expect(long_coalesced.fragments.front().sap_type == 2,
+                     "expected the long GOP's first object to keep SAP type 2");
+        ok &= expect(long_coalesced.fragments.back().sap_type == 0,
+                     "expected long GOP continuation objects to be non-SAP");
+    }
 
     const auto multitrack_init_bytes = make_multitrack_init_mp4();
     const SegmentedMp4 multitrack_segmented{

@@ -24,6 +24,8 @@ struct CmsfObject {
     std::size_t object_id = 0;
     std::uint64_t media_time_us = 0;
     std::uint64_t media_duration_us = 0;
+    std::uint8_t sap_type = 0;   // concrete CMSF SAP type 0..3 when has_sap_type
+    bool has_sap_type = false;   // true: sap_type was computed (carried from MediaFragment)
     ByteSpan payload;
     std::vector<std::uint8_t> owned_payload;
 };

@@ -40,7 +40,7 @@ struct CliOptions {
     std::optional<transport::EndpointConfig> endpoint;
     transport::TransportKind transport = transport::TransportKind::kRawQuic;
     transport::TlsConfig tls;
-    DraftVersion draft_version = DraftVersion::kDraft14;
+    DraftVersion draft_version = DraftVersion::kDraft16;
     std::string track_namespace = "media";
     bool endpoint_alpn_overridden = false;
     bool forward = false;

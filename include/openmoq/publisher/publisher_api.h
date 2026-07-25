@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -20,8 +21,15 @@
 
 namespace openmoq::publisher {
 
+namespace transport {
+// Defined in transport/libmoq_publisher.h (libmoq builds only). Held here by
+// shared_ptr so disconnect() can interrupt an in-flight libmoq live publish; the
+// member stays null when libmoq is not compiled in.
+struct LibmoqLiveHandle;
+}  // namespace transport
+
 struct PublisherConfig {
-    DraftVersion draft_version = DraftVersion::kDraft14;
+    DraftVersion draft_version = DraftVersion::kDraft16;
     std::string track_namespace = "media";
     bool forward = false;
     bool publish_catalog = false;
@@ -151,8 +159,17 @@ private:
 
     PublisherConfig config_;
     TransportFactory transport_factory_;
+    // True when the caller injected a custom TransportFactory (e.g. a test
+    // mock). When false and libmoq is available, batch publishing prefers the
+    // libmoq service-tier path over the local MoqtSession transport.
+    bool transport_factory_injected_ = false;
     mutable std::mutex state_mutex_;
     mutable std::shared_ptr<ActiveSession> active_session_;
+    // Shared handle for an in-progress libmoq-backed live publish (cancel flag +
+    // the live endpoint). disconnect() calls request_cancel() on it so a running
+    // driver stops promptly AND its blocking wait is interrupted (the libmoq
+    // paths do not use active_session_). Guarded by state_mutex_.
+    mutable std::shared_ptr<transport::LibmoqLiveHandle> libmoq_live_;
     mutable StatsSnapshot stats_;
 };
 

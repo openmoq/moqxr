@@ -1433,7 +1433,11 @@ MediaFragment build_fragment_from_sample(const LiveSrtCallerRuntimeConfig& confi
     fragment.start_time_us = pts_us;
     fragment.duration_us = duration_us;
     fragment.earliest_presentation_time_us = pts_us;
-    fragment.sap_type = sample.is_video ? (sample.keyframe ? 1 : 2) : 1;
+    // Concrete CMSF SAP type, matching the segmenter convention: video keyframe = 2,
+    // non-key video = 0 (NONE -- a P/B frame is NOT a SAP; declaring it as one would
+    // corrupt SAP timelines / drop-recovery), audio = 1.
+    fragment.sap_type = sample.is_video ? (sample.keyframe ? 2 : 0) : 1;
+    fragment.has_sap_type = true;  // concrete SAP type computed above
     fragment.is_video_keyframe = sample.is_video && sample.keyframe;
     fragment.creation_time_us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(

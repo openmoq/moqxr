@@ -724,11 +724,14 @@ std::uint32_t sample_flags_for(const TrackRemuxInfo& track, std::size_t sample_i
     return 0x02000000U;
 }
 
-std::vector<std::uint8_t> build_trun_box(const TrackRemuxInfo& track, std::uint32_t data_offset) {
+std::vector<std::uint8_t> build_trun_range_box(const TrackRemuxInfo& track,
+                                               std::size_t first, std::size_t count,
+                                               std::uint32_t data_offset) {
     std::vector<std::uint8_t> trun_payload;
-    append_be32(trun_payload, static_cast<std::uint32_t>(track.sample_sizes.size()));
+    append_be32(trun_payload, static_cast<std::uint32_t>(count));
     append_be32(trun_payload, data_offset);
-    for (std::size_t index = 0; index < track.sample_sizes.size(); ++index) {
+    for (std::size_t k = 0; k < count; ++k) {
+        const std::size_t index = first + k;
         append_be32(trun_payload, track.sample_durations[index]);
         append_be32(trun_payload, track.sample_sizes[index]);
         append_be32(trun_payload, sample_flags_for(track, index));
@@ -780,12 +783,21 @@ std::vector<std::uint8_t> build_sample_object(std::uint32_t track_id,
     return concat_boxes({moof, mdat});
 }
 
-std::vector<std::uint8_t> build_remuxed_fragment(const TrackRemuxInfo& track,
-                                                 std::size_t sequence,
-                                                 std::span<const std::uint8_t> bytes) {
+// Build one CMAF fragment (moof+mdat) covering samples [first, first+count) of a
+// progressive track, with tfdt = base_decode_time. Used by bounded per-GOP
+// coalescing: each fragment carries a subrange of the track's samples (one GOP,
+// or a capped slice of a long GOP) rather than the whole track.
+std::vector<std::uint8_t> build_remuxed_fragment_range(const TrackRemuxInfo& track,
+                                                       std::size_t first, std::size_t count,
+                                                       std::uint64_t base_decode_time,
+                                                       std::size_t sequence,
+                                                       std::span<const std::uint8_t> bytes) {
     std::vector<std::uint8_t> mdat_payload;
-    mdat_payload.reserve(std::accumulate(track.sample_sizes.begin(), track.sample_sizes.end(), std::size_t{0}));
-    for (std::size_t index = 0; index < track.sample_sizes.size(); ++index) {
+    std::size_t total = 0;
+    for (std::size_t k = 0; k < count; ++k) total += track.sample_sizes[first + k];
+    mdat_payload.reserve(total);
+    for (std::size_t k = 0; k < count; ++k) {
+        const std::size_t index = first + k;
         const ByteSpan sample_span{.offset = static_cast<std::size_t>(track.sample_offsets[index]),
                                    .size = track.sample_sizes[index]};
         const auto sample_bytes = slice_bytes(bytes, sample_span);
@@ -801,27 +813,20 @@ std::vector<std::uint8_t> build_remuxed_fragment(const TrackRemuxInfo& track,
     const std::vector<std::uint8_t> tfhd = make_full_box("tfhd", 0, 0x020000, tfhd_payload);
 
     std::vector<std::uint8_t> tfdt_payload;
-    append_be32(tfdt_payload, 0);
+    append_be32(tfdt_payload, static_cast<std::uint32_t>(base_decode_time));
     const std::vector<std::uint8_t> tfdt = make_full_box("tfdt", 0, 0, tfdt_payload);
 
-    const std::vector<std::uint8_t> placeholder_trun = build_trun_box(track, 0);
+    const std::vector<std::uint8_t> placeholder_trun = build_trun_range_box(track, first, count, 0);
     const std::vector<std::uint8_t> placeholder_traf = make_box("traf", concat_boxes({tfhd, tfdt, placeholder_trun}));
     const std::vector<std::uint8_t> placeholder_moof = make_box("moof", concat_boxes({mfhd, placeholder_traf}));
     const std::uint32_t data_offset = static_cast<std::uint32_t>(placeholder_moof.size() + 8);
 
-    const std::vector<std::uint8_t> trun = build_trun_box(track, data_offset);
+    const std::vector<std::uint8_t> trun = build_trun_range_box(track, first, count, data_offset);
     const std::vector<std::uint8_t> traf = make_box("traf", concat_boxes({tfhd, tfdt, trun}));
     const std::vector<std::uint8_t> moof = make_box("moof", concat_boxes({mfhd, traf}));
     const std::vector<std::uint8_t> mdat = make_box("mdat", mdat_payload);
 
     return concat_boxes({moof, mdat});
-}
-
-std::uint64_t remux_fragment_duration_us(const TrackRemuxInfo& track) {
-    return scale_to_us(std::accumulate(track.sample_durations.begin(),
-                                       track.sample_durations.end(),
-                                       std::uint64_t{0}),
-                       track.timescale);
 }
 
 std::uint8_t sap_type_from_flags(std::string_view handler_type, std::uint32_t sample_flags) {
@@ -952,6 +957,123 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
     return samples;
 }
 
+// Cap on samples packed into a single coalesced CMAF object. Kept comfortably
+// below libmoq's CMAF validator scratch buffer (512 samples per trun) so a long
+// GOP is split across continuation objects within its group rather than
+// producing one oversized fragment that the validator rejects.
+constexpr std::size_t kMaxSamplesPerCoalescedObject = 120;
+
+// Decode-time (microseconds) at which each video GOP begins, used to align audio
+// group boundaries to the video group timeline.
+std::vector<std::uint64_t> video_group_start_times_us(const TrackRemuxInfo& video) {
+    std::vector<std::uint64_t> starts;
+    std::uint64_t decode_time = 0;
+    for (std::size_t i = 0; i < video.sample_sizes.size(); ++i) {
+        if (i == 0 || video.sync_samples[i]) {
+            starts.push_back(scale_to_us(decode_time, video.timescale));
+        }
+        decode_time += video.sample_durations[i];
+    }
+    return starts;
+}
+
+// Bounded coalescing for one progressive track. Video groups break at sync
+// samples (each GOP -> one group whose first object is a SAP); audio/other
+// groups break at the video group boundaries (or form a single group when there
+// is no video reference). Each group is then chunked into objects of at most
+// kMaxSamplesPerCoalescedObject samples. The track forms ONE MoQ group (like
+// the split path: group_id = track_index), so the relay forwards a single
+// long-lived subgroup rather than a burst of short-lived per-GOP groups -- the
+// latter does not survive a lazy relay's subscribe/forward window. GOP/segment
+// boundaries become OBJECT boundaries within that group: object 0 begins with
+// the track's first keyframe (the group-start SAP); each later video object
+// that begins a GOP is also a SAP, and continuation objects (a long GOP split
+// to stay under the validator buffer) are non-SAP. This replaces the previous
+// whole-track object, which produced one trun over every sample and tripped
+// libmoq's 512-sample CMAF validator.
+void append_coalesced_fragments(SegmentedMp4& segmented,
+                                const TrackRemuxInfo& track,
+                                std::size_t track_index,
+                                const std::vector<std::uint64_t>& video_group_starts_us,
+                                std::span<const std::uint8_t> bytes) {
+    const std::size_t n = track.sample_sizes.size();
+    if (n == 0) {
+        return;
+    }
+    const bool is_video = track.description.handler_type == "vide";
+
+    // Prefix sum of sample durations -> decode time (timescale units) per sample.
+    std::vector<std::uint64_t> decode_time(n + 1, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+        decode_time[i + 1] = decode_time[i] + track.sample_durations[i];
+    }
+
+    // GOP/segment boundaries: video breaks at sync samples; audio/other breaks
+    // at the video GOP timeline (each becomes an object boundary, not a group).
+    std::vector<std::size_t> gop_starts;
+    if (is_video) {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i == 0 || track.sync_samples[i]) {
+                gop_starts.push_back(i);
+            }
+        }
+    } else if (!video_group_starts_us.empty()) {
+        std::size_t vg = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint64_t t_us = scale_to_us(decode_time[i], track.timescale);
+            bool start = (i == 0);
+            while (vg + 1 < video_group_starts_us.size() &&
+                   t_us >= video_group_starts_us[vg + 1]) {
+                ++vg;
+                start = true;
+            }
+            if (start) {
+                gop_starts.push_back(i);
+            }
+        }
+    }
+    if (gop_starts.empty() || gop_starts.front() != 0) {
+        gop_starts.insert(gop_starts.begin(), 0);
+    }
+
+    std::size_t object_id = 0;
+    for (std::size_t g = 0; g < gop_starts.size(); ++g) {
+        const std::size_t gop_begin = gop_starts[g];
+        const std::size_t gop_end = (g + 1 < gop_starts.size()) ? gop_starts[g + 1] : n;
+
+        for (std::size_t c0 = gop_begin; c0 < gop_end; c0 += kMaxSamplesPerCoalescedObject) {
+            const std::size_t c1 = std::min(c0 + kMaxSamplesPerCoalescedObject, gop_end);
+            const std::size_t count = c1 - c0;
+            const std::uint64_t base_decode_time = decode_time[c0];
+            const std::uint64_t duration = decode_time[c1] - decode_time[c0];
+
+            // A video object that begins a GOP (c0 == gop_begin) starts with the
+            // keyframe -> SAP type 2; a continuation chunk of a long GOP is
+            // non-SAP. Every audio object is a SAP (type 1). object 0 is the
+            // group-start and is always a SAP, satisfying CMSF Section 3.4.
+            const std::uint8_t sap = is_video
+                ? static_cast<std::uint8_t>(c0 == gop_begin ? 2 : 0)
+                : static_cast<std::uint8_t>(1);
+
+            segmented.fragments.push_back({
+                .group_id = track_index,
+                .object_id = object_id,
+                .track_name = track.description.track_name,
+                .start_time_us = scale_to_us(base_decode_time, track.timescale),
+                .duration_us = scale_to_us(duration, track.timescale),
+                .earliest_presentation_time_us =
+                    presentation_time_us(base_decode_time, track.composition_offsets[c0], track.timescale),
+                .sap_type = sap,
+                .has_sap_type = true,
+                .payload = {.span = {},
+                            .owned_bytes = build_remuxed_fragment_range(track, c0, count,
+                                                                        base_decode_time, object_id, bytes)},
+            });
+            ++object_id;
+        }
+    }
+}
+
 }  // namespace
 
 SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object_mode) {
@@ -1010,6 +1132,7 @@ SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object
                             .earliest_presentation_time_us =
                                 presentation_time_us(sample.decode_time, sample.composition_offset, track_it->timescale),
                             .sap_type = sap_type_from_flags(track_it->handler_type, sample.flags),
+                            .has_sap_type = true,
                             .payload = {.span = {},
                                         .owned_bytes = build_sample_object(track_it->track_id,
                                                                            group_id * 1000 + sample_index,
@@ -1029,6 +1152,7 @@ SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object
                 .duration_us = timing.duration_us,
                 .earliest_presentation_time_us = timing.earliest_presentation_time_us,
                 .sap_type = timing.sap_type,
+                .has_sap_type = true,
                 .payload = {.span = {.offset = moofs[index]->span.offset,
                                      .size = moofs[index]->span.size + mdats[index]->span.size},
                             .owned_bytes = {}},
@@ -1041,6 +1165,28 @@ SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object
     segmented.initialization_segment.owned_bytes =
         build_fragmented_init_segment(*ftyp, *moov, parsed_mp4.tracks, parsed_mp4.bytes);
     segmented.initialization_segment.span = {};
+
+    // For bounded coalescing, audio group boundaries follow the video GOP
+    // timeline, so derive the video group start times before segmenting tracks.
+    std::vector<std::uint64_t> video_group_starts_us;
+    if (object_mode != CmafObjectMode::kSplit) {
+        std::size_t scan_index = 0;
+        for (const auto& child : moov->children) {
+            if (child.type != "trak") {
+                continue;
+            }
+            if (scan_index >= parsed_mp4.tracks.size()) {
+                break;
+            }
+            if (parsed_mp4.tracks[scan_index].handler_type == "vide") {
+                const TrackRemuxInfo video_info =
+                    parse_track_remux_info(child, parsed_mp4.tracks[scan_index], parsed_mp4.bytes);
+                video_group_starts_us = video_group_start_times_us(video_info);
+                break;
+            }
+            ++scan_index;
+        }
+    }
 
     std::size_t track_index = 0;
     for (const auto& child : moov->children) {
@@ -1073,6 +1219,7 @@ SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object
                     .earliest_presentation_time_us =
                         presentation_time_us(sample.decode_time, sample.composition_offset, track_info.timescale),
                     .sap_type = sap_type_from_flags(track_info.description.handler_type, sample.flags),
+                    .has_sap_type = true,
                     .payload = {.span = {},
                                 .owned_bytes = build_sample_object(track_info.description.track_id,
                                                                    track_index * 1000 + sample_index,
@@ -1082,21 +1229,12 @@ SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object
                 decode_time += sample.duration;
             }
         } else {
-            segmented.fragments.push_back({
-                .group_id = track_index,
-                .object_id = 0,
-                .track_name = track_info.description.track_name,
-                .start_time_us = 0,
-                .duration_us = remux_fragment_duration_us(track_info),
-                .earliest_presentation_time_us = track_info.composition_offsets.empty()
-                                                     ? 0
-                                                     : scale_to_us(static_cast<std::uint64_t>(std::max(track_info.composition_offsets.front(), 0)),
-                                                                   track_info.timescale),
-                .sap_type = static_cast<std::uint8_t>(track_info.description.handler_type == "vide"
-                                ? (track_info.sync_samples.empty() || track_info.sync_samples.front() ? 2 : 0)
-                                : 1),
-                .payload = {.span = {}, .owned_bytes = build_remuxed_fragment(track_info, track_index, parsed_mp4.bytes)},
-            });
+            // Bounded keyframe/GOP coalescing: one group per track (like split),
+            // with each GOP (video) or aligned span (audio) a separate object,
+            // chunked to stay under the 512-sample validator -- never a single
+            // whole-track fragment.
+            append_coalesced_fragments(segmented, track_info, track_index, video_group_starts_us,
+                                       parsed_mp4.bytes);
         }
         ++track_index;
     }
@@ -1271,6 +1409,7 @@ MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
         .duration_us = scale_to_us(duration, track_desc->timescale),
         .earliest_presentation_time_us = scale_to_us(earliest_presentation_time, track_desc->timescale),
         .sap_type = sap_type,
+        .has_sap_type = true,  // moqxr computed a concrete SAP type above
         .is_video_keyframe = is_video_keyframe,
         .payload = {.span = {}, .owned_bytes = std::move(payload)},
     };

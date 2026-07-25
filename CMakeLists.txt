@@ -8,7 +8,7 @@ endif()
 project(openmoq_publisher
     VERSION 0.1.0
     DESCRIPTION "OpenMOQ contribution project: C++20 publisher for fragmented MP4 to CMSF/MOQT"
-    LANGUAGES CXX)
+    LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +18,11 @@ option(OPENMOQ_BUILD_TESTS "Build OpenMOQ publisher tests" ON)
 option(OPENMOQ_ENABLE_PICOQUIC "Enable picoquic transport integration when picoquic is available" ON)
 option(OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS "Build and run picoquic loopback smoke tests" OFF)
 option(OPENMOQ_ENABLE_SRT "Enable libsrt ingest support when libsrt is available" ON)
+# Temporary migration gate: route the production Publisher through libmoq instead
+# of the legacy MoqtSession path. Requires libmoq to be available. OFF keeps the
+# old/moxygen publish path as the default until the migration is accepted; the
+# libmoq integration code still builds and is tested whenever libmoq is present.
+option(OPENMOQ_USE_LIBMOQ_PUBLISHER "Use libmoq as the production publish backend (requires libmoq)" OFF)
 
 set(OPENMOQ_HAS_SRT OFF)
 if(OPENMOQ_ENABLE_SRT)
@@ -30,18 +35,59 @@ if(OPENMOQ_ENABLE_SRT)
     endif()
 endif()
 
-set(_OPENMOQ_THIRDPARTY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
-if(NOT EXISTS "${_OPENMOQ_THIRDPARTY_ROOT}")
-    set(_OPENMOQ_THIRDPARTY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty")
-endif()
+# Resolve default picoquic/picotls source dirs, preferring (in order): an
+# existing sibling checkout next to moqxr (../picoquic, ../picotls), then
+# third_party/, then thirdparty/. The first candidate that contains a
+# CMakeLists.txt wins; otherwise fall back to the third_party path.
+function(_openmoq_pick_dep_default out_var name)
+    foreach(_candidate
+            "${CMAKE_CURRENT_SOURCE_DIR}/../${name}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${name}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/${name}")
+        if(EXISTS "${_candidate}/CMakeLists.txt")
+            get_filename_component(_abs "${_candidate}" ABSOLUTE)
+            set(${out_var} "${_abs}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${out_var} "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${name}" PARENT_SCOPE)
+endfunction()
 
-set(_OPENMOQ_DEFAULT_PICOQUIC_SOURCE_DIR "${_OPENMOQ_THIRDPARTY_ROOT}/picoquic")
-set(_OPENMOQ_DEFAULT_PICOTLS_SOURCE_DIR "${_OPENMOQ_THIRDPARTY_ROOT}/picotls")
+_openmoq_pick_dep_default(_OPENMOQ_DEFAULT_PICOQUIC_SOURCE_DIR picoquic)
+_openmoq_pick_dep_default(_OPENMOQ_DEFAULT_PICOTLS_SOURCE_DIR picotls)
 
 set(OPENMOQ_PICOQUIC_SOURCE_DIR "${_OPENMOQ_DEFAULT_PICOQUIC_SOURCE_DIR}" CACHE PATH
-    "Path to a picoquic source checkout (defaults to third_party/ or thirdparty/)")
+    "Path to a picoquic source checkout (defaults to ../picoquic, then third_party/, then thirdparty/)")
 set(OPENMOQ_PICOTLS_SOURCE_DIR "${_OPENMOQ_DEFAULT_PICOTLS_SOURCE_DIR}" CACHE PATH
-    "Path to a picotls source checkout (defaults to third_party/ or thirdparty/)")
+    "Path to a picotls source checkout (defaults to ../picotls, then third_party/, then thirdparty/)")
+
+# OpenSSL coherency: the picotls checkout here uses 1.1.x-only APIs
+# (EVP_PKEY_*_tls_encodedpoint), so pin ONE OpenSSL 1.1 install for both headers
+# AND libraries. Without this, CMake's FindOpenSSL on macOS can mix
+# GStreamer.framework headers with a Homebrew openssl@3 libcrypto, which lacks
+# those symbols -> undefined-symbol link failures in libpicotls-openssl.
+set(OPENMOQ_OPENSSL_ROOT_DIR "" CACHE PATH
+    "OpenSSL prefix for picoquic/picotls/libmoq (auto: Homebrew openssl@1.1 if found)")
+if(NOT OPENMOQ_OPENSSL_ROOT_DIR)
+    foreach(_ssl_prefix
+            "/opt/homebrew/opt/openssl@1.1"
+            "/usr/local/opt/openssl@1.1")
+        if(EXISTS "${_ssl_prefix}/include/openssl/ssl.h")
+            set(OPENMOQ_OPENSSL_ROOT_DIR "${_ssl_prefix}" CACHE PATH "" FORCE)
+            break()
+        endif()
+    endforeach()
+endif()
+if(OPENMOQ_OPENSSL_ROOT_DIR)
+    # Cache + FORCE so the picoquic/picotls subtree's find_package(OpenSSL) and
+    # libmoq all resolve the same prefix; FIND_FRAMEWORK LAST keeps Homebrew
+    # headers ahead of /Library/Frameworks/*.
+    set(OPENSSL_ROOT_DIR "${OPENMOQ_OPENSSL_ROOT_DIR}" CACHE PATH "" FORCE)
+    set(CMAKE_FIND_FRAMEWORK LAST)
+    message(STATUS "OpenMOQ: pinning OpenSSL to ${OPENMOQ_OPENSSL_ROOT_DIR}")
+else()
+    message(STATUS "OpenMOQ: no pinned OpenSSL found; relying on CMake default FindOpenSSL")
+endif()
 
 set(OPENMOQ_HAS_PICOQUIC OFF)
 
@@ -142,6 +188,52 @@ if(OPENMOQ_ENABLE_PICOQUIC AND EXISTS "${OPENMOQ_PICOQUIC_SOURCE_DIR}/CMakeLists
     endif()
 endif()
 
+# -- libmoq integration -------------------------------------------------
+# Build moqxr against the sibling libmoq service tier (moq::service). This is
+# added AFTER picoquic above on purpose: libmoq's find_package(Picoquic) uses
+# "already-defined target" as its first resolution step, so it reuses the
+# picoquic-core target moqxr already created instead of add_subdirectory'ing
+# picoquic a second time (which would collide on target names). By default moqxr
+# still publishes via its own (legacy) transport; the Publisher only routes
+# through libmoq when -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON. Linking libmoq always
+# validates that the service tier builds and links into this project.
+set(OPENMOQ_LIBMOQ_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libmoq" CACHE PATH
+    "Path to the sibling libmoq source checkout")
+
+set(OPENMOQ_HAS_LIBMOQ OFF)
+if(EXISTS "${OPENMOQ_LIBMOQ_SOURCE_DIR}/CMakeLists.txt")
+    # Service tier (endpoint + media sender/receiver) and its prerequisites.
+    set(MOQ_BUILD_SERVICE      ON CACHE BOOL "" FORCE)
+    set(MOQ_BUILD_MSF          ON CACHE BOOL "" FORCE)
+    set(MOQ_BUILD_MEDIA_OBJECT ON CACHE BOOL "" FORCE)  # required by MOQ_BUILD_SERVICE
+    # Keep libmoq's own test/sim suite out of moqxr's CTest run.
+    set(MOQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MOQ_BUILD_SIM   OFF CACHE BOOL "" FORCE)
+
+    if(OPENMOQ_HAS_PICOQUIC)
+        # Usable raw QUIC + WebTransport: enable the picoquic adapter + threaded
+        # helper AND the picoquic WebTransport adapter + managed helper (the test
+        # relay is WebTransport-only). Map moqxr's picoquic/picotls inputs onto
+        # libmoq's FindPicoquic hints; picohttp-core (built here with BUILD_HTTP)
+        # satisfies the pico-WT HTTP/3 requirement.
+        set(MOQ_BUILD_ADAPTER_PICOQUIC ON CACHE BOOL "" FORCE)
+        set(MOQ_BUILD_PQ_THREADED      ON CACHE BOOL "" FORCE)
+        set(MOQ_BUILD_ADAPTER_PICO_WT  ON CACHE BOOL "" FORCE)
+        set(MOQ_BUILD_PICO_WT_MANAGED  ON CACHE BOOL "" FORCE)
+        set(MOQ_PICOQUIC_SOURCE_DIR "${OPENMOQ_PICOQUIC_SOURCE_DIR}" CACHE PATH "" FORCE)
+        if(NOT MOQ_PICOTLS_PREFIX)
+            set(MOQ_PICOTLS_PREFIX "${OPENMOQ_PICOTLS_SOURCE_DIR}" CACHE PATH "" FORCE)
+        endif()
+    else()
+        message(STATUS "libmoq: picoquic not available; building core/service tier without the raw QUIC adapter")
+    endif()
+
+    add_subdirectory("${OPENMOQ_LIBMOQ_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/libmoq")
+    set(OPENMOQ_HAS_LIBMOQ ON)
+else()
+    message(STATUS "libmoq source not found at ${OPENMOQ_LIBMOQ_SOURCE_DIR}; building without libmoq integration")
+endif()
+
 add_library(openmoq_publisher_lib STATIC
     src/cat4moq.cpp
     src/cli_options.cpp
@@ -153,6 +245,7 @@ add_library(openmoq_publisher_lib STATIC
     src/moq_draft.cpp
     src/mp4_box.cpp
     src/publisher_api.cpp
+    src/transport/libmoq_publisher.cpp
     src/transport/moqt_control_messages.cpp
     src/transport/moqt_session.cpp
     src/transport/picoquic_client.cpp
@@ -193,6 +286,31 @@ if(OPENMOQ_HAS_SRT)
     target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_HAS_SRT=1)
     target_include_directories(openmoq_publisher_lib PRIVATE ${OPENMOQ_SRT_INCLUDE_DIR})
     target_link_libraries(openmoq_publisher_lib PRIVATE ${OPENMOQ_SRT_LIBRARY})
+endif()
+
+# OPENMOQ_HAS_LIBMOQ   = libmoq source/service tier is available and links.
+# OPENMOQ_ENABLE_LIBMOQ_PUBLISHER = the production Publisher routes through libmoq
+#                        (only when libmoq is available AND the gate is ON).
+set(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER OFF)
+if(OPENMOQ_HAS_LIBMOQ AND TARGET moq::service)
+    target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_HAS_LIBMOQ=1)
+    target_link_libraries(openmoq_publisher_lib PRIVATE moq::service)
+    if(OPENMOQ_USE_LIBMOQ_PUBLISHER)
+        set(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER ON)
+        target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_ENABLE_LIBMOQ_PUBLISHER=1)
+    endif()
+elseif(OPENMOQ_USE_LIBMOQ_PUBLISHER)
+    message(WARNING
+        "OPENMOQ_USE_LIBMOQ_PUBLISHER=ON but libmoq is not available; "
+        "falling back to the legacy MoqtSession publish backend.")
+endif()
+
+# Migration-gate status (temporary): availability vs. selected backend.
+message(STATUS "OpenMOQ: libmoq available .......... ${OPENMOQ_HAS_LIBMOQ}")
+if(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER)
+    message(STATUS "OpenMOQ: publish backend .......... libmoq (OPENMOQ_USE_LIBMOQ_PUBLISHER=ON)")
+else()
+    message(STATUS "OpenMOQ: publish backend .......... legacy MoqtSession (set -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON for libmoq)")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -258,6 +376,15 @@ if(OPENMOQ_BUILD_TESTS)
         tests/publisher_api_test.cpp
     )
     target_link_libraries(openmoq-publisher-api-tests PRIVATE openmoq_publisher_lib)
+    if(OPENMOQ_HAS_LIBMOQ)
+        target_compile_definitions(openmoq-publisher-api-tests PRIVATE OPENMOQ_HAS_LIBMOQ=1)
+    endif()
+    if(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER)
+        # Only when libmoq is the selected backend does the non-injected route go
+        # through libmoq (so the test can assert its metadata gate). With the gate
+        # off, non-injected publishing stays on the MoqtSession path.
+        target_compile_definitions(openmoq-publisher-api-tests PRIVATE OPENMOQ_ENABLE_LIBMOQ_PUBLISHER=1)
+    endif()
     add_test(NAME openmoq-publisher-api-tests COMMAND openmoq-publisher-api-tests)
 
     add_executable(openmoq-publisher-cat4moq-api-tests
@@ -277,6 +404,15 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-control-message-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-control-message-tests COMMAND openmoq-publisher-control-message-tests)
+
+    if(OPENMOQ_HAS_LIBMOQ)
+        add_executable(openmoq-publisher-libmoq-translation-tests
+            tests/libmoq_translation_test.cpp
+        )
+        target_compile_definitions(openmoq-publisher-libmoq-translation-tests PRIVATE OPENMOQ_HAS_LIBMOQ=1)
+        target_link_libraries(openmoq-publisher-libmoq-translation-tests PRIVATE openmoq_publisher_lib moq::service)
+        add_test(NAME openmoq-publisher-libmoq-translation-tests COMMAND openmoq-publisher-libmoq-translation-tests)
+    endif()
 
     if(OPENMOQ_HAS_PICOQUIC AND OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS)
         add_executable(openmoq-publisher-picoquic-smoke-tests
