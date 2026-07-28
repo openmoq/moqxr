@@ -81,13 +81,29 @@ bool is_well_formed_json(const std::string& text) {
                 if (next >= text.size()) {
                     return false;
                 }
+                // A literal (true/false/null) match must be followed by a
+                // delimiter or end of input, not just share a prefix -
+                // otherwise "truex" or "nullish" would false-pass as valid
+                // value starts.
+                const auto matches_literal = [&](const char* literal, std::size_t length) {
+                    if (text.compare(next, length, literal) != 0) {
+                        return false;
+                    }
+                    const std::size_t after = next + length;
+                    if (after >= text.size()) {
+                        return true;
+                    }
+                    const char delim = text[after];
+                    return delim == ',' || delim == '}' || delim == ']' || delim == ' ' ||
+                           delim == '\t' || delim == '\n' || delim == '\r';
+                };
                 const char value_start = text[next];
                 const bool valid_start = value_start == '"' || value_start == '{' ||
                                          value_start == '[' || value_start == '-' ||
                                          (value_start >= '0' && value_start <= '9') ||
-                                         text.compare(next, 4, "true") == 0 ||
-                                         text.compare(next, 5, "false") == 0 ||
-                                         text.compare(next, 4, "null") == 0;
+                                         matches_literal("true", 4) ||
+                                         matches_literal("false", 5) ||
+                                         matches_literal("null", 4);
                 if (!valid_start) {
                     return false;
                 }
@@ -98,6 +114,33 @@ bool is_well_formed_json(const std::string& text) {
         }
     }
     return !in_string && brace_depth == 0 && bracket_depth == 0;
+}
+
+// Direct unit coverage for is_well_formed_json itself. This checker is the
+// only defense against a custom_fields raw-JSON value being malformed (e.g.
+// a string stored unquoted, emitting a bare word); substring assertions
+// cannot detect that defect class. Without these assertions, a future edit
+// that breaks the checker so it always returns true would leave every
+// MSFTS catalog test passing while shipping malformed JSON.
+void test_json_well_formedness_checker() {
+    // Reject cases.
+    expect(!is_well_formed_json(R"({"a":opaque})"),
+           "expected a bareword value to be rejected");
+    expect(!is_well_formed_json(R"({"a":1)"),
+           "expected an unbalanced brace to be rejected");
+    expect(!is_well_formed_json(R"({"a":[1,2})"),
+           "expected an unbalanced bracket to be rejected");
+    expect(!is_well_formed_json(R"({"a":truex})"),
+           "expected a literal-prefixed bareword to be rejected");
+
+    // Accept cases - a checker that rejects everything would also "catch"
+    // the bareword above, so these matter as much as the reject cases.
+    expect(is_well_formed_json(R"({"a":"{not a brace}"})"),
+           "expected a brace inside a string literal to be accepted");
+    expect(is_well_formed_json(R"({"a":"say \"hi\""})"),
+           "expected an escaped quote inside a string to be accepted");
+    expect(is_well_formed_json(R"({"a":1,"b":-2,"c":"s","d":true,"e":false,"f":null,"g":[1],"h":{"i":2}})"),
+           "expected every valid JSON value type to be accepted");
 }
 
 std::vector<std::uint8_t> make_packet(std::uint16_t pid, std::uint8_t marker = 0xff) {
@@ -456,6 +499,7 @@ void test_command_line_contract() {
 }  // namespace
 
 int main() {
+    test_json_well_formedness_checker();
     test_source_catalog_and_filtering(188);
     test_source_catalog_and_filtering(192);
     test_ambiguous_m2ts_prefix_is_detected_as_192_bytes();
