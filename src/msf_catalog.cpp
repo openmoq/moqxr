@@ -446,8 +446,19 @@ MsfTrack make_msf_track(const TrackDescription& track,
 
     if (track.handler_type == "vide") {
         out.render_group = 1;
-        out.width = track.width;
-        out.height = track.height;
+        // Sections 5.2.26/5.2.27: width/height are optional ("SHOULD accompany
+        // tracks which have a visual representation"), so 0 (unknown, e.g. an
+        // av01/vp09 sample entry extract_tracks does not yet decode dimensions
+        // for) must be omitted rather than published as a literal 0x0. This is
+        // deliberately asymmetric with samplerate/channelConfig below, which
+        // validate_track makes MUST-present for audio and so must stay
+        // unconditional even when the value is unknown.
+        if (track.width != 0) {
+            out.width = track.width;
+        }
+        if (track.height != 0) {
+            out.height = track.height;
+        }
         if (track.frame_rate > 0.0) {
             out.framerate = track.frame_rate;
         }

@@ -423,5 +423,54 @@ int main() {
     ok &= expect_not_contains(built_meta_json, "\"renderGroup\"",
                               "expected no renderGroup in the serialized meta-handler track");
 
+    // Fix round 1: width/height are optional (5.2.26/5.2.27) and must be
+    // omitted when unknown (0), not published as a literal 0x0. This matters
+    // for codecs such as av01/vp09 that extract_tracks does not yet decode
+    // dimensions for.
+    TrackDescription source_video_no_dims;
+    source_video_no_dims.track_name = "video_av1";
+    source_video_no_dims.handler_type = "vide";
+    source_video_no_dims.packaging = "cmaf";
+    source_video_no_dims.codec = "av01.0.08M.10.0.110.09";
+    source_video_no_dims.max_bitrate = 3000000;
+    // width/height default to 0 (unknown).
+
+    const MsfTrack built_no_dims = make_msf_track(source_video_no_dims, /*is_live=*/true);
+    ok &= expect(!built_no_dims.width.has_value(), "expected no width when the source dimension is unknown");
+    ok &= expect(!built_no_dims.height.has_value(), "expected no height when the source dimension is unknown");
+
+    MsfCatalog no_dims_catalog;
+    no_dims_catalog.tracks.push_back(built_no_dims);
+    const std::string no_dims_json = serialize_catalog(no_dims_catalog);
+    ok &= expect_not_contains(no_dims_json, "\"width\"", "expected no width key when the source dimension is unknown");
+    ok &= expect_not_contains(no_dims_json, "\"height\"", "expected no height key when the source dimension is unknown");
+
+    // A video track with known dimensions still emits both, with the actual values.
+    ok &= expect(built_live.width.value_or(0) == 1920, "expected width mapped for a track with known dimensions");
+    ok &= expect(built_live.height.value_or(0) == 1080, "expected height mapped for a track with known dimensions");
+    ok &= expect_contains(built_video_json, "\"width\":1920", "expected width value in the serialized track");
+    ok &= expect_contains(built_video_json, "\"height\":1080", "expected height value in the serialized track");
+
+    // samplerate/channelConfig stay unconditional even when the sample rate is
+    // unknown: validate_track makes both MUST-present for audio, so gating
+    // them (unlike width/height) would turn a genuinely-unknown value into a
+    // serialization throw instead of a graceful (if uninformative) 0.
+    TrackDescription source_audio_no_rate;
+    source_audio_no_rate.track_name = "audio_no_rate";
+    source_audio_no_rate.handler_type = "soun";
+    source_audio_no_rate.packaging = "cmaf";
+    source_audio_no_rate.codec = "mp4a.40.2";
+    source_audio_no_rate.channel_count = 2;
+    // sample_rate defaults to 0 (unknown).
+
+    const MsfTrack built_audio_no_rate = make_msf_track(source_audio_no_rate, /*is_live=*/true);
+    MsfCatalog no_rate_catalog;
+    no_rate_catalog.tracks.push_back(built_audio_no_rate);
+    const std::string no_rate_json = serialize_catalog(no_rate_catalog);
+    ok &= expect_contains(no_rate_json, "\"samplerate\":0",
+                          "expected samplerate:0 to serialize rather than throw when the rate is unknown");
+    ok &= expect_contains(no_rate_json, "\"channelConfig\":\"2\"",
+                          "expected channelConfig to still serialize alongside an unknown samplerate");
+
     return ok ? 0 : 1;
 }
