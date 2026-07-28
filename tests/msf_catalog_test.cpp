@@ -1,6 +1,7 @@
 #include "openmoq/publisher/msf_catalog.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -113,6 +114,206 @@ int main() {
     uri_track.custom_fields["connectionUri"] = "\"moqt://example.com\"";
     uri_collision.tracks.push_back(uri_track);
     ok &= throws_runtime_error(uri_collision, "custom field \"connectionUri\" should collide with spec name");
+
+    // CMSF section 5.1: simulcast video with a shared altGroup, plus audio,
+    // with initialization data carried by initDataList and referenced by initRef.
+    MsfCatalog simulcast;
+    simulcast.generated_at_ms = 1746104606044ULL;
+
+    for (const auto& quality : {std::string("hd"), std::string("md"), std::string("sd")}) {
+        MsfTrack alt;
+        alt.name = quality;
+        alt.packaging = "cmaf";
+        alt.role = "video";
+        alt.is_live = true;
+        alt.render_group = 1;
+        alt.alt_group = 1;
+        alt.target_latency_ms = 2000;
+        alt.init_ref = "init-" + quality;
+        alt.codec = "avc1.640028";
+        alt.bitrate = 5000000;
+        alt.framerate = 30.0;
+        alt.width = 1920;
+        alt.height = 1080;
+        simulcast.tracks.push_back(alt);
+        simulcast.init_data_list.push_back(MsfInitData{.id = "init-" + quality,
+                                                       .type = "inline",
+                                                       .data = "AAAAHGZ0eXBjbWYy"});
+    }
+
+    MsfTrack audio;
+    audio.name = "audio";
+    audio.packaging = "cmaf";
+    audio.role = "audio";
+    audio.is_live = true;
+    audio.render_group = 1;
+    audio.target_latency_ms = 2000;
+    audio.init_ref = "init-audio";
+    audio.codec = "mp4a.40.5";
+    audio.bitrate = 67071;
+    audio.samplerate = 48000;
+    audio.channel_config = "2";
+    simulcast.tracks.push_back(audio);
+    simulcast.init_data_list.push_back(MsfInitData{.id = "init-audio",
+                                                   .type = "inline",
+                                                   .data = "AAAAHGZ0eXBjbWYy"});
+
+    const std::string simulcast_json = serialize_catalog(simulcast);
+    ok &= expect_contains(simulcast_json, "\"generatedAt\":1746104606044", "expected generatedAt");
+    ok &= expect_contains(simulcast_json, "\"altGroup\":1", "expected shared altGroup");
+    ok &= expect_contains(simulcast_json, "\"initRef\":\"init-hd\"", "expected initRef");
+    ok &= expect_contains(simulcast_json, "\"channelConfig\":\"2\"", "expected channelConfig as a string");
+    ok &= expect_not_contains(simulcast_json, "\"channelCount\"", "expected no legacy channelCount");
+    ok &= expect_contains(simulcast_json, "\"samplerate\":48000", "expected spec samplerate spelling");
+    ok &= expect_not_contains(simulcast_json, "\"sampleRate\"", "expected no legacy sampleRate spelling");
+    ok &= expect_not_contains(simulcast_json, "\"initData\"", "expected no legacy inline initData");
+
+    // MSF section 5.1.7: initDataList MUST be located after the tracks array.
+    const std::size_t tracks_pos = simulcast_json.find("\"tracks\"");
+    const std::size_t init_list_pos = simulcast_json.find("\"initDataList\"");
+    ok &= expect(tracks_pos != std::string::npos && init_list_pos != std::string::npos,
+                 "expected both tracks and initDataList present");
+    ok &= expect(tracks_pos < init_list_pos, "expected initDataList to follow tracks");
+
+    // MSF section 5.1.3: isComplete MUST NOT be included when false.
+    MsfCatalog not_complete = simulcast;
+    not_complete.is_complete = false;
+    ok &= expect_not_contains(serialize_catalog(not_complete), "\"isComplete\"",
+                              "expected isComplete omitted when false");
+
+    // CMSF section 3.6: SAP event timeline track carries eventType and the
+    // CMSF max SAP starting types (section 3.5.2).
+    MsfCatalog with_sap;
+    MsfTrack sap;
+    sap.name = "video_sap";
+    sap.packaging = "eventtimeline";
+    sap.role = "eventtimeline";
+    sap.is_live = true;
+    sap.event_type = "org.ietf.moq.cmsf.sap";
+    sap.mime_type = "application/json";
+    sap.depends = {"video"};
+    with_sap.tracks.push_back(sap);
+
+    MsfTrack sapped_video;
+    sapped_video.name = "video";
+    sapped_video.packaging = "cmaf";
+    sapped_video.role = "video";
+    sapped_video.is_live = true;
+    sapped_video.codec = "avc1.640028";
+    sapped_video.bitrate = 5000000;
+    sapped_video.max_grp_sap_starting_type = 2;
+    sapped_video.max_obj_sap_starting_type = 3;
+    with_sap.tracks.push_back(sapped_video);
+
+    const std::string sap_json = serialize_catalog(with_sap);
+    ok &= expect_contains(sap_json, "\"eventType\":\"org.ietf.moq.cmsf.sap\"", "expected SAP eventType");
+    ok &= expect_contains(sap_json, "\"depends\":[\"video\"]", "expected depends array");
+    ok &= expect_contains(sap_json, "\"maxGrpSapStartingType\":2", "expected maxGrpSapStartingType");
+    ok &= expect_contains(sap_json, "\"maxObjSapStartingType\":3", "expected maxObjSapStartingType");
+
+    // Validation: bitrate is a MUST for audio and video (section 5.2.22).
+    MsfCatalog no_bitrate;
+    MsfTrack bare_video;
+    bare_video.name = "video";
+    bare_video.packaging = "cmaf";
+    bare_video.role = "video";
+    bare_video.is_live = true;
+    bare_video.codec = "avc1.640028";
+    no_bitrate.tracks.push_back(bare_video);
+    ok &= throws_runtime_error(no_bitrate, "expected throw when video track omits bitrate");
+
+    // Validation: eventType outside eventtimeline packaging (section 5.2.5).
+    MsfCatalog stray_event_type;
+    MsfTrack stray = sapped_video;
+    stray.event_type = "com.example.bogus";
+    stray_event_type.tracks.push_back(stray);
+    ok &= throws_runtime_error(stray_event_type, "expected throw for eventType on cmaf packaging");
+
+    // Validation: trackDuration on a live track (section 5.2.35).
+    MsfCatalog live_with_duration;
+    MsfTrack durated = sapped_video;
+    durated.track_duration_ms = 60000;
+    live_with_duration.tracks.push_back(durated);
+    ok &= throws_runtime_error(live_with_duration, "expected throw for trackDuration on a live track");
+
+    // Validation: audio requires samplerate and channelConfig (5.2.28, 5.2.29).
+    MsfCatalog bare_audio_catalog;
+    MsfTrack bare_audio;
+    bare_audio.name = "audio";
+    bare_audio.packaging = "cmaf";
+    bare_audio.role = "audio";
+    bare_audio.is_live = true;
+    bare_audio.codec = "mp4a.40.2";
+    bare_audio.bitrate = 128000;
+    bare_audio_catalog.tracks.push_back(bare_audio);
+    ok &= throws_runtime_error(bare_audio_catalog, "expected throw when audio omits samplerate");
+
+    // Validation: targetLatency and buffers are mutually exclusive (5.2.8, 5.2.9).
+    MsfCatalog both_latency_forms;
+    MsfTrack conflicted = sapped_video;
+    conflicted.target_latency_ms = 2000;
+    conflicted.buffers = MsfBuffers{.target_ms = 1500, .min_ms = std::nullopt, .max_ms = std::nullopt};
+    both_latency_forms.tracks.push_back(conflicted);
+    ok &= throws_runtime_error(both_latency_forms, "expected throw for targetLatency alongside buffers");
+
+    // Validation: initRef must resolve to an initDataList entry (5.2.13).
+    MsfCatalog dangling_ref;
+    MsfTrack unresolved = sapped_video;
+    unresolved.init_ref = "missing-init";
+    dangling_ref.tracks.push_back(unresolved);
+    ok &= throws_runtime_error(dangling_ref, "expected throw for initRef with no initDataList entry");
+
+    // Validation: track names must be unique per namespace (5.2.3).
+    MsfCatalog duplicated;
+    duplicated.tracks.push_back(sapped_video);
+    duplicated.tracks.push_back(sapped_video);
+    ok &= throws_runtime_error(duplicated, "expected throw for duplicate track names in one namespace");
+
+    // The same name in a different namespace is legal.
+    MsfCatalog distinct_namespaces;
+    MsfTrack ns_a = sapped_video;
+    ns_a.name_space = "example.com/a";
+    MsfTrack ns_b = sapped_video;
+    ns_b.name_space = "example.com/b";
+    distinct_namespaces.tracks.push_back(ns_a);
+    distinct_namespaces.tracks.push_back(ns_b);
+    ok &= expect_contains(serialize_catalog(distinct_namespaces), "\"namespace\":\"example.com/b\"",
+                          "expected identical names in distinct namespaces to serialize");
+
+    // Buffers serialize as an object with only the keys that are set.
+    MsfCatalog buffered;
+    MsfTrack with_buffers = sapped_video;
+    with_buffers.buffers = MsfBuffers{.target_ms = 1500, .min_ms = 800, .max_ms = std::nullopt};
+    buffered.tracks.push_back(with_buffers);
+    const std::string buffered_json = serialize_catalog(buffered);
+    ok &= expect_contains(buffered_json, "\"buffers\":{\"target\":1500,\"min\":800}",
+                          "expected buffers object with only the set keys");
+
+    // Section 5: custom fields are permitted and emitted as raw JSON.
+    MsfCatalog with_custom;
+    MsfTrack custom_track = sapped_video;
+    custom_track.custom_fields["m2tsPacketSize"] = "188";
+    custom_track.custom_fields["m2tsTimestampMode"] = "\"opaque\"";
+    with_custom.tracks.push_back(custom_track);
+    const std::string custom_json = serialize_catalog(with_custom);
+    ok &= expect_contains(custom_json, "\"m2tsPacketSize\":188", "expected numeric custom field");
+    ok &= expect_contains(custom_json, "\"m2tsTimestampMode\":\"opaque\"", "expected quoted custom field");
+
+    // Section 5: custom field names MUST NOT collide with spec field names.
+    MsfCatalog colliding;
+    MsfTrack collider = sapped_video;
+    collider.custom_fields["bitrate"] = "99";
+    colliding.tracks.push_back(collider);
+    ok &= throws_runtime_error(colliding, "expected throw for a custom field colliding with a spec name");
+
+    // JSON escaping: control characters and quotes must not corrupt the document.
+    MsfCatalog escaped;
+    MsfTrack quoted = sapped_video;
+    quoted.label = "cam \"A\"\n\x01";
+    escaped.tracks.push_back(quoted);
+    const std::string escaped_json = serialize_catalog(escaped);
+    ok &= expect_contains(escaped_json, "\\\"A\\\"", "expected escaped quotes in label");
+    ok &= expect_contains(escaped_json, "\\u0001", "expected escaped control character in label");
 
     return ok ? 0 : 1;
 }
