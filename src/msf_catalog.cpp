@@ -148,7 +148,7 @@ void validate_track(const MsfTrack& track) {
         "spatialId", "displayWidth", "displayHeight", "parentName",
         "parentNamespace", "template", "authInfo", "accessibility",
         "encryptionScheme", "cipherSuite", "keyId", "trackBaseKey",
-        "connectionURI", "token", "contentProtectionRefIDs",
+        "connectionUri", "token", "contentProtectionRefIDs",
     };
     for (const auto& [key, value] : track.custom_fields) {
         if (kSpecFieldNames.count(key) != 0) {
@@ -172,8 +172,24 @@ void validate_catalog(const MsfCatalog& catalog) {
     }
 
     // Section 5.2.3: track names MUST be unique per namespace.
+    // Both tracks and publishTracks must be checked together for uniqueness.
     std::set<std::pair<std::string, std::string>> seen;
+
     for (const auto& track : catalog.tracks) {
+        const std::string ns = track.name_space.value_or(std::string{});
+        if (!seen.insert({ns, track.name}).second) {
+            throw std::runtime_error("MSF catalog has a duplicate track name \"" + track.name +
+                                     "\" within one namespace");
+        }
+        // Section 5.2.13: initRef points at an id in the initDataList.
+        if (track.init_ref.has_value() && init_ids.count(*track.init_ref) == 0) {
+            throw std::runtime_error("MSF catalog initRef \"" + *track.init_ref +
+                                     "\" has no matching initDataList entry (track \"" + track.name + "\")");
+        }
+    }
+
+    // Section 5.1.5: publishTracks follow the same structure as tracks.
+    for (const auto& track : catalog.publish_tracks) {
         const std::string ns = track.name_space.value_or(std::string{});
         if (!seen.insert({ns, track.name}).second) {
             throw std::runtime_error("MSF catalog has a duplicate track name \"" + track.name +
