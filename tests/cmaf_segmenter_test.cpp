@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <array>
 #include <sstream>
@@ -17,6 +18,12 @@ void append_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
     out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
     out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+}
+
+void append_be64(std::vector<std::uint8_t>& out, std::uint64_t value) {
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xFFU));
+    }
 }
 
 void append_ascii(std::vector<std::uint8_t>& out, const std::string& value) {
@@ -120,26 +127,36 @@ std::vector<std::uint8_t> make_fragmented_test_mp4() {
 }
 
 // Fragmented single-track MP4 whose mdhd carries the given timescale,
-// duration, and packed language, and whose video sample entry optionally
-// carries a btrt box (MSF section 5.2.22 bitrate).
+// duration, and packed language (mdhd version 0 or 1, selectable so both
+// 32-bit and 64-bit duration layouts are exercised), and whose video sample
+// entry optionally carries a btrt box (MSF section 5.2.22 bitrate).
 std::vector<std::uint8_t> make_track_metadata_test_mp4(bool include_btrt,
                                                        std::uint16_t packed_language,
                                                        std::uint32_t timescale,
-                                                       std::uint32_t duration) {
+                                                       std::uint64_t duration,
+                                                       std::uint8_t mdhd_version = 0) {
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
     const auto tkhd = make_full_box("tkhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
 
     std::vector<std::uint8_t> mdhd_payload;
-    append_be32(mdhd_payload, 0);  // creation_time
-    append_be32(mdhd_payload, 0);  // modification_time
-    append_be32(mdhd_payload, timescale);
-    append_be32(mdhd_payload, duration);
+    if (mdhd_version == 1) {
+        append_be64(mdhd_payload, 0);  // creation_time
+        append_be64(mdhd_payload, 0);  // modification_time
+        append_be32(mdhd_payload, timescale);
+        append_be64(mdhd_payload, duration);
+    } else {
+        append_be32(mdhd_payload, 0);  // creation_time
+        append_be32(mdhd_payload, 0);  // modification_time
+        append_be32(mdhd_payload, timescale);
+        append_be32(mdhd_payload, static_cast<std::uint32_t>(duration));
+    }
     mdhd_payload.push_back(static_cast<std::uint8_t>((packed_language >> 8U) & 0xFFU));
     mdhd_payload.push_back(static_cast<std::uint8_t>(packed_language & 0xFFU));
     mdhd_payload.push_back(0);  // pre_defined
     mdhd_payload.push_back(0);
-    const auto mdhd = make_full_box("mdhd", mdhd_payload);
+    const auto mdhd = mdhd_version == 1 ? make_full_box_with_flags("mdhd", 1, 0, mdhd_payload)
+                                       : make_full_box("mdhd", mdhd_payload);
 
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
     auto visual_header = std::vector<std::uint8_t>(70, 0);
@@ -931,8 +948,11 @@ int main() {
 
     // MSF section 5.2.22 requires bitrate; it comes from btrt when present.
     // MSF section 5.2.32 requires language, decoded from the packed mdhd field.
+    // Timescale/duration are deliberately non-identity (2000/5000 -> 2500ms)
+    // so a conversion that ignored timescale entirely could not pass by
+    // accident (a bug caught in review round 1).
     {
-        const auto btrt_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("eng"), 1000, 2500);
+        const auto btrt_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("eng"), 2000, 5000);
         const auto btrt_tracks = extract_tracks(parse_mp4_boxes(btrt_bytes), btrt_bytes);
         ok &= expect(btrt_tracks.size() == 1, "expected one track in btrt fixture");
         ok &= expect(btrt_tracks.front().max_bitrate == 5000000,
@@ -942,21 +962,52 @@ int main() {
         ok &= expect(btrt_tracks.front().language == "eng",
                      "expected ISO-639-2 language decoded from mdhd");
         ok &= expect(btrt_tracks.front().duration_ms == 2500,
-                     "expected mdhd duration converted to milliseconds using track timescale");
+                     "expected v0 mdhd duration converted to milliseconds using track timescale");
 
-        const auto und_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("und"), 1000, 2500);
+        const auto und_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("und"), 2000, 5000);
         const auto und_tracks = extract_tracks(parse_mp4_boxes(und_bytes), und_bytes);
         ok &= expect(und_tracks.size() == 1, "expected one track in und-language fixture");
         ok &= expect(und_tracks.front().language.empty(),
                      "expected und language code to decode to an empty string");
 
-        const auto no_btrt_bytes = make_track_metadata_test_mp4(false, pack_mdhd_language("eng"), 1000, 2500);
+        const auto no_btrt_bytes = make_track_metadata_test_mp4(false, pack_mdhd_language("eng"), 2000, 5000);
         const auto no_btrt_tracks = extract_tracks(parse_mp4_boxes(no_btrt_bytes), no_btrt_bytes);
         ok &= expect(no_btrt_tracks.size() == 1, "expected one track in no-btrt fixture");
         ok &= expect(no_btrt_tracks.front().max_bitrate == 0,
                      "expected zero maxBitrate when btrt is absent");
         ok &= expect(no_btrt_tracks.front().avg_bitrate == 0,
                      "expected zero avgBitrate when btrt is absent");
+
+        // Garbage-packed language bits (all 15 bits set -> three 0x1F groups,
+        // decoding to '\x7F' which is outside 'a'..'z') must be rejected
+        // rather than surfacing as garbage characters.
+        const auto garbage_lang_bytes = make_track_metadata_test_mp4(false, 0x7FFF, 2000, 5000);
+        const auto garbage_lang_tracks = extract_tracks(parse_mp4_boxes(garbage_lang_bytes), garbage_lang_bytes);
+        ok &= expect(garbage_lang_tracks.size() == 1, "expected one track in garbage-language fixture");
+        ok &= expect(garbage_lang_tracks.front().language.empty(),
+                     "expected non-letter packed language bits to decode to an empty string");
+
+        // mdhd version 1 (64-bit duration) was previously untested; exercise
+        // its language and duration-conversion branches with a distinct,
+        // non-identity timescale/duration pair (3000/9000 -> 3000ms).
+        const auto v1_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("fra"), 3000, 9000, 1);
+        const auto v1_tracks = extract_tracks(parse_mp4_boxes(v1_bytes), v1_bytes);
+        ok &= expect(v1_tracks.size() == 1, "expected one track in v1 mdhd fixture");
+        ok &= expect(v1_tracks.front().language == "fra",
+                     "expected version-1 mdhd language to decode correctly");
+        ok &= expect(v1_tracks.front().duration_ms == 3000,
+                     "expected version-1 mdhd duration converted to milliseconds using track timescale");
+
+        // A pathological version-1 duration near UINT64_MAX with a small
+        // timescale must not silently wrap uint64_t during the *1000
+        // conversion; it must fall back to the "unknown" (0) sentinel.
+        const auto v1_overflow_bytes =
+            make_track_metadata_test_mp4(true, pack_mdhd_language("eng"), 1,
+                                         std::numeric_limits<std::uint64_t>::max(), 1);
+        const auto v1_overflow_tracks = extract_tracks(parse_mp4_boxes(v1_overflow_bytes), v1_overflow_bytes);
+        ok &= expect(v1_overflow_tracks.size() == 1, "expected one track in v1 overflow fixture");
+        ok &= expect(v1_overflow_tracks.front().duration_ms == 0,
+                     "expected pathological v1 duration*1000 overflow to fall back to 0, not wrap");
     }
 
     return ok ? 0 : 1;

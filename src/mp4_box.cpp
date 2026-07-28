@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -629,6 +630,13 @@ std::uint64_t duration_ms_from_mdhd(const Mp4Box& mdhd,
             return 0;
         }
         duration = read_be32(bytes, duration_offset);
+    }
+    // duration * 1000 can overflow uint64_t for a pathological version-1
+    // duration (up to 2^64-1); bail out to the "unknown" sentinel rather than
+    // silently wrapping and reporting a bogus duration.
+    constexpr std::uint64_t kMaxDurationForMsConversion = std::numeric_limits<std::uint64_t>::max() / 1000ULL;
+    if (duration > kMaxDurationForMsConversion) {
+        return 0;
     }
     return duration * 1000ULL / timescale;
 }
