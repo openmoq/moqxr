@@ -6,6 +6,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace openmoq::publisher {
@@ -367,6 +368,102 @@ std::string serialize_catalog(const MsfCatalog& catalog) {
 
     out << '}';
     return out.str();
+}
+
+namespace {
+
+constexpr std::uint64_t kDefaultVideoBitrate = 2000000;
+constexpr std::uint64_t kDefaultAudioBitrate = 128000;
+
+std::uint64_t codec_class_default(const TrackDescription& track) {
+    return track.handler_type == "soun" ? kDefaultAudioBitrate : kDefaultVideoBitrate;
+}
+
+}  // namespace
+
+std::uint64_t resolve_bitrate(const TrackDescription& track,
+                              std::optional<std::uint64_t> configured,
+                              std::uint64_t computed) {
+    if (track.max_bitrate != 0) {
+        return track.max_bitrate;
+    }
+    if (configured.has_value() && *configured != 0) {
+        return *configured;
+    }
+    if (computed != 0) {
+        return computed;
+    }
+    return codec_class_default(track);
+}
+
+bool bitrate_is_estimated(const TrackDescription& track,
+                          std::optional<std::uint64_t> configured,
+                          std::uint64_t computed) {
+    return track.max_bitrate == 0 && !(configured.has_value() && *configured != 0) && computed == 0;
+}
+
+MsfTrack make_msf_track(const TrackDescription& track,
+                        bool is_live,
+                        std::optional<std::uint64_t> configured_bitrate,
+                        std::uint64_t computed_bitrate) {
+    MsfTrack out;
+    out.name = track.track_name;
+    out.packaging = track.packaging;
+    out.is_live = is_live;
+
+    if (track.handler_type == "vide") {
+        out.role = "video";
+    } else if (track.handler_type == "soun") {
+        out.role = "audio";
+    } else if (track.packaging == "mediatimeline") {
+        out.role = "mediatimeline";
+    } else if (track.packaging == "eventtimeline") {
+        out.role = "eventtimeline";
+    }
+
+    if (!track.codec.empty()) {
+        out.codec = track.codec;
+    }
+    if (!track.mime_type.empty()) {
+        out.mime_type = track.mime_type;
+    }
+    if (!track.event_type.empty()) {
+        out.event_type = track.event_type;
+    }
+    if (!track.depends.empty()) {
+        out.depends = track.depends;
+    }
+    if (!track.language.empty()) {
+        out.lang = track.language;
+    }
+    if (track.timescale != 0) {
+        out.timescale = track.timescale;
+    }
+    // Section 5.2.35 forbids trackDuration on a live track.
+    if (!is_live && track.duration_ms != 0) {
+        out.track_duration_ms = track.duration_ms;
+    }
+
+    if (track.handler_type == "vide") {
+        out.render_group = 1;
+        out.width = track.width;
+        out.height = track.height;
+        if (track.frame_rate > 0.0) {
+            out.framerate = track.frame_rate;
+        }
+        out.bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
+    } else if (track.handler_type == "soun") {
+        out.render_group = 1;
+        out.samplerate = track.sample_rate;
+        out.channel_config = std::to_string(track.channel_count);
+        out.bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
+    }
+
+    if (track.avg_bitrate != 0) {
+        out.avg_bitrate = track.avg_bitrate;
+    }
+
+    return out;
 }
 
 }  // namespace openmoq::publisher

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "openmoq/publisher/mp4_box.h"
+
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -79,5 +81,29 @@ struct MsfCatalog {
 // Serialize to a JSON catalog document. Throws std::runtime_error when a
 // draft invariant is violated; the message names the offending track.
 std::string serialize_catalog(const MsfCatalog& catalog);
+
+// Resolve the bitrate MSF section 5.2.22 requires for audio and video, in
+// precedence order: the track's btrt value, then a configured override, then
+// a value computed from sample sizes, then a codec-class default. The default
+// keeps the catalog conformant on live paths where no measurement exists; the
+// caller is expected to log when it is used.
+std::uint64_t resolve_bitrate(const TrackDescription& track,
+                              std::optional<std::uint64_t> configured,
+                              std::uint64_t computed);
+
+// True when resolve_bitrate would fall through to a codec-class default, so
+// callers can warn the operator that the published figure is an estimate.
+bool bitrate_is_estimated(const TrackDescription& track,
+                          std::optional<std::uint64_t> configured,
+                          std::uint64_t computed);
+
+// Build the MSF track object for a parsed MP4 track. Shared by every emitter
+// so the four publish paths cannot drift apart again. The caller still sets
+// init_ref, alt_group, and the CMSF max SAP starting types, which depend on
+// catalog-level and segmentation context this function does not see.
+MsfTrack make_msf_track(const TrackDescription& track,
+                        bool is_live,
+                        std::optional<std::uint64_t> configured_bitrate = std::nullopt,
+                        std::uint64_t computed_bitrate = 0);
 
 }  // namespace openmoq::publisher

@@ -1,4 +1,5 @@
 #include "openmoq/publisher/msf_catalog.h"
+#include "openmoq/publisher/mp4_box.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -314,6 +315,113 @@ int main() {
     const std::string escaped_json = serialize_catalog(escaped);
     ok &= expect_contains(escaped_json, "\\\"A\\\"", "expected escaped quotes in label");
     ok &= expect_contains(escaped_json, "\\u0001", "expected escaped control character in label");
+
+    // Bitrate precedence: btrt, then configured override, then computed,
+    // then a codec-class default (design decision, Phase 1).
+    TrackDescription btrt_track;
+    btrt_track.handler_type = "vide";
+    btrt_track.max_bitrate = 5000000;
+    ok &= expect(resolve_bitrate(btrt_track, 900000, 700000) == 5000000,
+                 "expected btrt to win over override and computed");
+
+    TrackDescription no_btrt;
+    no_btrt.handler_type = "vide";
+    ok &= expect(resolve_bitrate(no_btrt, 900000, 700000) == 900000,
+                 "expected configured override to win over computed");
+    ok &= expect(resolve_bitrate(no_btrt, std::nullopt, 700000) == 700000,
+                 "expected computed bitrate when no btrt or override");
+    ok &= expect(resolve_bitrate(no_btrt, std::nullopt, 0) == 2000000,
+                 "expected 2 Mbps video default as last resort");
+
+    TrackDescription bare_sound;
+    bare_sound.handler_type = "soun";
+    ok &= expect(resolve_bitrate(bare_sound, std::nullopt, 0) == 128000,
+                 "expected 128 kbps audio default as last resort");
+    ok &= expect(bitrate_is_estimated(bare_sound, std::nullopt, 0),
+                 "expected the codec-class default to report as estimated");
+    ok &= expect(!bitrate_is_estimated(btrt_track, std::nullopt, 0),
+                 "expected a btrt-derived bitrate not to report as estimated");
+
+    // make_msf_track maps a parsed MP4 track onto the MSF track object.
+    TrackDescription source_video;
+    source_video.track_name = "video";
+    source_video.handler_type = "vide";
+    source_video.packaging = "cmaf";
+    source_video.codec = "avc1.640028";
+    source_video.width = 1920;
+    source_video.height = 1080;
+    source_video.frame_rate = 30.0;
+    source_video.timescale = 90000;
+    source_video.max_bitrate = 5000000;
+    source_video.language = "eng";
+    source_video.duration_ms = 60000;
+
+    const MsfTrack built_live = make_msf_track(source_video, /*is_live=*/true);
+    ok &= expect(built_live.role.value_or("") == "video", "expected vide handler to map to the video role");
+    ok &= expect(built_live.bitrate.value_or(0) == 5000000, "expected btrt bitrate on the built track");
+    ok &= expect(built_live.lang.value_or("") == "eng", "expected language mapped to lang");
+    ok &= expect(built_live.render_group.value_or(0) == 1, "expected media tracks in render group 1");
+    ok &= expect(!built_live.track_duration_ms.has_value(),
+                 "expected no trackDuration on a live track");
+
+    const MsfTrack built_vod = make_msf_track(source_video, /*is_live=*/false);
+    ok &= expect(built_vod.track_duration_ms.value_or(0) == 60000,
+                 "expected trackDuration on a non-live track");
+
+    TrackDescription source_audio;
+    source_audio.track_name = "audio";
+    source_audio.handler_type = "soun";
+    source_audio.packaging = "cmaf";
+    source_audio.codec = "mp4a.40.2";
+    source_audio.sample_rate = 48000;
+    source_audio.channel_count = 2;
+
+    const MsfTrack built_audio = make_msf_track(source_audio, /*is_live=*/true);
+    ok &= expect(built_audio.role.value_or("") == "audio", "expected soun handler to map to the audio role");
+    ok &= expect(built_audio.channel_config.value_or("") == "2",
+                 "expected channelConfig rendered as a string");
+    ok &= expect(built_audio.samplerate.value_or(0) == 48000, "expected samplerate mapped");
+    ok &= expect(built_audio.bitrate.value_or(0) == 128000,
+                 "expected the audio codec-class default when no rate is known");
+
+    // Integration: a video track built by make_msf_track must satisfy
+    // validate_track's invariants (bitrate is set for a/v roles).
+    MsfCatalog built_video_catalog;
+    built_video_catalog.tracks.push_back(built_live);
+    const std::string built_video_json = serialize_catalog(built_video_catalog);
+    ok &= expect_contains(built_video_json, "\"bitrate\":5000000",
+                          "expected the builder's video track to serialize with its resolved bitrate");
+
+    // Integration: a live track built from a source with a non-zero duration
+    // must not carry trackDuration (5.2.35 forbids it on live tracks), and
+    // the catalog must still serialize without throwing.
+    MsfCatalog built_live_catalog;
+    built_live_catalog.tracks.push_back(built_live);
+    const std::string built_live_json = serialize_catalog(built_live_catalog);
+    ok &= expect_not_contains(built_live_json, "\"trackDuration\"",
+                              "expected no trackDuration in the serialized live track");
+
+    // A meta-handler track (neither vide nor soun) gets no bitrate and no
+    // renderGroup, and must still serialize -- timeline tracks take this
+    // path in Task 5.
+    TrackDescription source_meta;
+    source_meta.track_name = "timeline";
+    source_meta.handler_type = "meta";
+    source_meta.packaging = "mediatimeline";
+
+    const MsfTrack built_meta = make_msf_track(source_meta, /*is_live=*/true);
+    ok &= expect(!built_meta.bitrate.has_value(), "expected no bitrate for a meta-handler track");
+    ok &= expect(!built_meta.render_group.has_value(), "expected no renderGroup for a meta-handler track");
+    ok &= expect(built_meta.role.value_or("") == "mediatimeline",
+                 "expected mediatimeline packaging to map to the mediatimeline role");
+
+    MsfCatalog built_meta_catalog;
+    built_meta_catalog.tracks.push_back(built_meta);
+    const std::string built_meta_json = serialize_catalog(built_meta_catalog);
+    ok &= expect_not_contains(built_meta_json, "\"bitrate\"",
+                              "expected no bitrate in the serialized meta-handler track");
+    ok &= expect_not_contains(built_meta_json, "\"renderGroup\"",
+                              "expected no renderGroup in the serialized meta-handler track");
 
     return ok ? 0 : 1;
 }
