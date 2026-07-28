@@ -543,6 +543,8 @@ std::size_t find_after(std::string_view haystack, std::string_view needle, std::
     return pos == std::string_view::npos ? pos : pos + needle.size();
 }
 
+// Legacy inline-initData lookup. Still needed for build_live_catalog(), which
+// Task 5 does not migrate -- it keeps emitting the pre-MSF ad hoc format.
 std::string catalog_init_data(std::string_view catalog, std::string_view track_name) {
     const std::string name_key = std::string("\"name\":\"") + std::string(track_name) + "\"";
     const std::size_t name_pos = catalog.find(name_key);
@@ -558,6 +560,100 @@ std::string catalog_init_data(std::string_view catalog, std::string_view track_n
         return {};
     }
     return std::string(catalog.substr(init_pos, end_pos - init_pos));
+}
+
+// MSF v1 (build_publish_plan) initData lookup: resolve a track's initRef into
+// the root initDataList and return that entry's Base64 "data" value.
+std::string msf_track_init_data(std::string_view catalog, std::string_view track_name) {
+    const std::string name_key = std::string("\"name\":\"") + std::string(track_name) + "\"";
+    const std::size_t name_pos = catalog.find(name_key);
+    if (name_pos == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t ref_pos = find_after(catalog, "\"initRef\":\"", name_pos);
+    if (ref_pos == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t ref_end = catalog.find('"', ref_pos);
+    if (ref_end == std::string_view::npos) {
+        return {};
+    }
+    const std::string init_id(catalog.substr(ref_pos, ref_end - ref_pos));
+
+    const std::string id_key = "\"id\":\"" + init_id + "\"";
+    const std::size_t id_pos = catalog.find(id_key);
+    if (id_pos == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t data_pos = find_after(catalog, "\"data\":\"", id_pos);
+    if (data_pos == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t data_end = catalog.find('"', data_pos);
+    if (data_end == std::string_view::npos) {
+        return {};
+    }
+    return std::string(catalog.substr(data_pos, data_end - data_pos));
+}
+
+// Collect every value that follows a given "key":" prefix, e.g. every
+// "initRef":"..." or "id":"..." value in a serialized catalog.
+std::vector<std::string> extract_all_values(std::string_view catalog, std::string_view key_prefix) {
+    std::vector<std::string> values;
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t found = catalog.find(key_prefix, pos);
+        if (found == std::string_view::npos) {
+            break;
+        }
+        const std::size_t value_start = found + key_prefix.size();
+        const std::size_t value_end = catalog.find('"', value_start);
+        if (value_end == std::string_view::npos) {
+            break;
+        }
+        values.emplace_back(catalog.substr(value_start, value_end - value_start));
+        pos = value_end + 1;
+    }
+    return values;
+}
+
+// True when every "initRef":"..." value in the catalog also appears as an
+// "id":"..." value (i.e. an initDataList entry). Guards against a future
+// refactor loosening the serializer's own dangling-reference check.
+bool all_init_refs_resolve(std::string_view catalog) {
+    const std::vector<std::string> init_refs = extract_all_values(catalog, "\"initRef\":\"");
+    const std::vector<std::string> init_ids = extract_all_values(catalog, "\"id\":\"");
+    for (const auto& ref : init_refs) {
+        bool found = false;
+        for (const auto& id : init_ids) {
+            if (id == ref) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// True when the catalog text has no non-spec numeric "id" field on a track
+// object. MSF's initDataList entries legitimately have a quoted string "id",
+// so this only rejects a bare (unquoted, i.e. numeric) "id" value.
+bool no_numeric_id_field(std::string_view catalog) {
+    std::size_t pos = 0;
+    while (true) {
+        pos = catalog.find("\"id\":", pos);
+        if (pos == std::string_view::npos) {
+            return true;
+        }
+        const std::size_t value_pos = pos + 5;
+        if (value_pos < catalog.size() && catalog[value_pos] != '"') {
+            return false;
+        }
+        pos = value_pos;
+    }
 }
 
 std::vector<std::uint8_t> base64_decode(std::string_view text) {
@@ -636,6 +732,25 @@ int main() {
     ok &= expect(segmented.fragments.size() == 1, "expected one fragmented media fragment");
     ok &= expect(plan.objects.size() == 2, "expected catalog and one fragmented media object when SAP is disabled");
     ok &= expect(plan.objects.front().track_name == "catalog", "expected catalog object first");
+
+    const std::string plan_catalog_text = object_text(plan.objects.front());
+    ok &= expect_contains(plan_catalog_text, "\"version\":\"1\"",
+                          "expected MSF v1 string version in publish plan catalog");
+    ok &= expect_not_contains(plan_catalog_text, "\"format\"",
+                              "expected no legacy format field");
+    ok &= expect_not_contains(plan_catalog_text, "\"initData\":",
+                              "expected initDataList instead of inline initData");
+    ok &= expect_contains(plan_catalog_text, "\"initDataList\"",
+                          "expected root initDataList");
+    ok &= expect_contains(plan_catalog_text, "\"initRef\"",
+                          "expected per-track initRef");
+    ok &= expect(no_numeric_id_field(plan_catalog_text),
+                "expected no non-spec numeric track id field");
+    ok &= expect_not_contains(plan_catalog_text, "\"name\":\"catalog\"",
+                              "expected the synthetic catalog track to be absent from its own tracks array");
+    ok &= expect(all_init_refs_resolve(plan_catalog_text),
+                "expected every initRef to resolve to an initDataList id");
+
     ok &= expect(sap_plan.objects.size() == 3, "expected SAP-enabled plan to add one SAP timeline object");
     ok &= expect(sap_plan.objects.back().track_name == "vide_1_sap", "expected SAP timeline object for fragmented video");
     ok &= expect_contains(object_text(sap_plan.objects.back()), "\"l\":[0,0]", "expected fragmented SAP timeline location");
@@ -803,8 +918,8 @@ int main() {
                                        multitrack_sap_plan.objects.front().owned_payload.end());
     const std::string msf_timeline_catalog_text(multitrack_msf_timeline_plan.objects.front().owned_payload.begin(),
                                                 multitrack_msf_timeline_plan.objects.front().owned_payload.end());
-    const std::string video_init_data = catalog_init_data(catalog_text, "vide_1");
-    const std::string audio_init_data = catalog_init_data(catalog_text, "soun_2");
+    const std::string video_init_data = msf_track_init_data(catalog_text, "vide_1");
+    const std::string audio_init_data = msf_track_init_data(catalog_text, "soun_2");
     ok &= expect(!video_init_data.empty(), "expected video initData in catalog");
     ok &= expect(!audio_init_data.empty(), "expected audio initData in catalog");
     ok &= expect(video_init_data != audio_init_data, "expected per-track initData entries to differ");
@@ -814,10 +929,16 @@ int main() {
     ok &= expect_contains(catalog_text, "\"codec\":\"mp4a.40.2\"", "expected audio codec string in catalog");
     ok &= expect_contains(catalog_text, "\"width\":320", "expected video width in catalog");
     ok &= expect_contains(catalog_text, "\"height\":240", "expected video height in catalog");
-    ok &= expect_contains(catalog_text, "\"sampleRate\":48000", "expected audio sample rate in catalog");
-    ok &= expect_contains(catalog_text, "\"channelCount\":2", "expected audio channel count in catalog");
+    ok &= expect_contains(catalog_text, "\"samplerate\":48000", "expected audio sample rate in catalog");
+    ok &= expect_contains(catalog_text, "\"channelConfig\":\"2\"", "expected audio channel count in catalog");
     ok &= expect_contains(catalog_text, "\"renderGroup\":1", "expected renderGroup in catalog");
     ok &= expect_contains(catalog_text, "\"isLive\":false", "expected VOD isLive flag in catalog");
+    ok &= expect_contains(catalog_text, "\"bitrate\":2000000", "expected non-zero default video bitrate in catalog");
+    ok &= expect_contains(catalog_text, "\"bitrate\":128000", "expected non-zero default audio bitrate in catalog");
+    ok &= expect_not_contains(catalog_text, "\"name\":\"catalog\"",
+                              "expected the synthetic catalog track to be absent from the batch catalog");
+    ok &= expect(all_init_refs_resolve(catalog_text),
+                "expected every initRef in the batch catalog to resolve to an initDataList id");
     ok &= expect_not_contains(catalog_text, "\"name\":\"vide_1_sap\"", "expected video SAP track to be absent from the default catalog");
     ok &= expect_not_contains(catalog_text, "\"name\":\"soun_2_sap\"", "expected audio SAP track to be absent from the default catalog");
     ok &= expect_not_contains(catalog_text, "\"name\":\"timeline\"", "expected MSF timeline track to be absent from the default catalog");
