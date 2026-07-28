@@ -543,26 +543,7 @@ std::size_t find_after(std::string_view haystack, std::string_view needle, std::
     return pos == std::string_view::npos ? pos : pos + needle.size();
 }
 
-// Legacy inline-initData lookup. Still needed for build_live_catalog(), which
-// Task 5 does not migrate -- it keeps emitting the pre-MSF ad hoc format.
-std::string catalog_init_data(std::string_view catalog, std::string_view track_name) {
-    const std::string name_key = std::string("\"name\":\"") + std::string(track_name) + "\"";
-    const std::size_t name_pos = catalog.find(name_key);
-    if (name_pos == std::string_view::npos) {
-        return {};
-    }
-    const std::size_t init_pos = find_after(catalog, "\"initData\":\"", name_pos);
-    if (init_pos == std::string_view::npos) {
-        return {};
-    }
-    const std::size_t end_pos = catalog.find('"', init_pos);
-    if (end_pos == std::string_view::npos) {
-        return {};
-    }
-    return std::string(catalog.substr(init_pos, end_pos - init_pos));
-}
-
-// MSF v1 (build_publish_plan) initData lookup: resolve a track's initRef into
+// MSF v1 initData lookup: resolve a track's initRef into
 // the root initDataList and return that entry's Base64 "data" value.
 std::string msf_track_init_data(std::string_view catalog, std::string_view track_name) {
     const std::string name_key = std::string("\"name\":\"") + std::string(track_name) + "\"";
@@ -992,14 +973,29 @@ int main() {
 
     const auto live_catalog = build_live_catalog(multitrack_segmented.tracks, multitrack_init_bytes, true);
     const std::string live_catalog_text(live_catalog.catalog_payload.begin(), live_catalog.catalog_payload.end());
-    const std::string live_video_init_data = catalog_init_data(live_catalog_text, "vide_1");
-    const std::string live_audio_init_data = catalog_init_data(live_catalog_text, "soun_2");
+    const std::string live_video_init_data = msf_track_init_data(live_catalog_text, "vide_1");
+    const std::string live_audio_init_data = msf_track_init_data(live_catalog_text, "soun_2");
     const auto live_video_init_bytes = base64_decode(live_video_init_data);
     const auto live_audio_init_bytes = base64_decode(live_audio_init_data);
     const auto live_video_init_tracks = extract_tracks(parse_mp4_boxes(live_video_init_bytes), live_video_init_bytes);
     const auto live_audio_init_tracks = extract_tracks(parse_mp4_boxes(live_audio_init_bytes), live_audio_init_bytes);
     ok &= expect(live_catalog.track_initializations.size() == 2, "expected live catalog to expose per-track init payloads");
-    ok &= expect_contains(live_catalog_text, "\"isLive\":true", "expected live catalog isLive flag");
+    ok &= expect_contains(live_catalog_text, "\"version\":\"1\"",
+                          "expected MSF v1 string version in live catalog");
+    ok &= expect_contains(live_catalog_text, "\"isLive\":true",
+                          "expected live tracks marked isLive");
+    ok &= expect_contains(live_catalog_text, "\"generatedAt\":",
+                          "expected generatedAt on a live catalog");
+    ok &= expect_contains(live_catalog_text, "\"initDataList\"",
+                          "expected root initDataList in live catalog");
+    ok &= expect_not_contains(live_catalog_text, "\"format\"",
+                              "expected no legacy format field in live catalog");
+    ok &= expect_not_contains(live_catalog_text, "\"initData\":",
+                              "expected no inline initData in live catalog");
+    ok &= expect_not_contains(live_catalog_text, "\"trackDuration\"",
+                              "expected no trackDuration in a live catalog");
+    ok &= expect(all_init_refs_resolve(live_catalog_text),
+                "expected every initRef in the live catalog to resolve to an initDataList id");
     ok &= expect(!live_video_init_data.empty(), "expected live video initData in catalog");
     ok &= expect(!live_audio_init_data.empty(), "expected live audio initData in catalog");
     ok &= expect(live_video_init_data != live_audio_init_data, "expected live per-track initData entries to differ");

@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <set>
 #include <sstream>
@@ -589,46 +590,6 @@ void emit_plan_objects(const PublishPlan& plan,
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
                                bool is_live) {
-    // Local base64 encoder
-    auto local_base64_encode = [](std::span<const std::uint8_t> bytes) -> std::string {
-        static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        std::string result;
-        result.reserve(((bytes.size() + 2) / 3) * 4);
-        for (std::size_t i = 0; i < bytes.size(); i += 3) {
-            const std::uint32_t b0 = bytes[i];
-            const std::uint32_t b1 = i + 1 < bytes.size() ? bytes[i + 1] : 0;
-            const std::uint32_t b2 = i + 2 < bytes.size() ? bytes[i + 2] : 0;
-            result.push_back(kAlphabet[b0 >> 2]);
-            result.push_back(kAlphabet[((b0 & 0x3) << 4) | (b1 >> 4)]);
-            result.push_back(i + 1 < bytes.size() ? kAlphabet[((b1 & 0xf) << 2) | (b2 >> 6)] : '=');
-            result.push_back(i + 2 < bytes.size() ? kAlphabet[b2 & 0x3f] : '=');
-        }
-        return result;
-    };
-
-    auto local_json_escape = [](std::string_view s) -> std::string {
-        std::string result;
-        result.reserve(s.size());
-        for (char c : s) {
-            switch (c) {
-                case '"': result += "\\\""; break;
-                case '\\': result += "\\\\"; break;
-                case '\n': result += "\\n"; break;
-                case '\r': result += "\\r"; break;
-                case '\t': result += "\\t"; break;
-                default: result += c; break;
-            }
-        }
-        return result;
-    };
-
-    auto local_track_role = [](std::string_view handler_type) -> std::string_view {
-        if (handler_type == "vide") return "video";
-        if (handler_type == "soun") return "audio";
-        if (handler_type == "meta") return "data";
-        return "data";
-    };
-
     LiveCatalog result;
 
     // Build per-track init segments (single-track moov), matching the static file publish path.
@@ -637,7 +598,7 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
     for (std::size_t index = 0; index < tracks.size(); ++index) {
         const auto& track = tracks[index];
         std::vector<std::uint8_t> track_init = build_track_specific_init_segment(init_segment, track, index);
-        init_data_by_track.emplace(track.track_name, local_base64_encode(track_init));
+        init_data_by_track.emplace(track.track_name, base64_encode(track_init));
         result.track_initializations.push_back({
             .track_name = track.track_name,
             .codec_payload = {},
@@ -645,50 +606,34 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
         });
     }
 
-    // Build catalog JSON
-    std::ostringstream catalog;
-    catalog << "{";
-    catalog << "\"version\":1,";
-    catalog << "\"format\":\"cmsf\",";
-    catalog << "\"tracks\":[";
-    bool first_track = true;
-    for (const auto& track : tracks) {
-        if (!first_track) {
-            catalog << ',';
-        }
-        first_track = false;
+    MsfCatalog msf_catalog;
+    if (is_live) {
+        // Section 5.1.2: SHOULD NOT be included when isLive is false.
+        msf_catalog.generated_at_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    }
 
-        catalog << '{'
-                << "\"name\":\"" << local_json_escape(track.track_name) << "\","
-                << "\"id\":" << track.track_id << ','
-                << "\"role\":\"" << local_track_role(track.handler_type) << "\","
-                << "\"packaging\":\"" << local_json_escape(track.packaging) << "\","
-                << "\"renderGroup\":1,"
-                << "\"isLive\":" << (is_live ? "true" : "false");
-        if (!track.codec.empty()) {
-            catalog << ",\"codec\":\"" << local_json_escape(track.codec) << '"';
-        }
-        if (track.handler_type == "vide") {
-            catalog << ",\"width\":" << track.width
-                    << ",\"height\":" << track.height;
-            if (track.frame_rate > 0.0) {
-                catalog << std::fixed << std::setprecision(2) << ",\"frameRate\":" << track.frame_rate;
-            }
-        } else if (track.handler_type == "soun") {
-            catalog << ",\"sampleRate\":" << track.sample_rate
-                    << ",\"channelCount\":" << track.channel_count;
-        }
+    for (const auto& track : tracks) {
+        MsfTrack msf_track = make_msf_track(track, is_live);
+
         const auto init_it = init_data_by_track.find(track.track_name);
         if (init_it != init_data_by_track.end()) {
-            catalog << ",\"initData\":\"" << init_it->second << '"';
+            const std::string init_id = track.track_name + "-init";
+            msf_track.init_ref = init_id;
+            msf_catalog.init_data_list.push_back(MsfInitData{
+                .id = init_id,
+                .type = "inline",
+                .data = init_it->second,
+            });
         }
-        catalog << '}';
+
+        msf_catalog.tracks.push_back(std::move(msf_track));
     }
-    catalog << "]}";
 
-    const std::string catalog_text = catalog.str();
+    const std::string catalog_text = serialize_catalog(msf_catalog);
     result.catalog_payload = std::vector<std::uint8_t>(catalog_text.begin(), catalog_text.end());
-
     return result;
 }
 
