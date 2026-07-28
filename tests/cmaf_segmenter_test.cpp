@@ -127,6 +127,53 @@ std::vector<std::uint8_t> make_fragmented_test_mp4() {
     return concat({ftyp, moov, moof, mdat});
 }
 
+// Regression for a heap over-read in find_child_box_offset (mp4_box.cpp):
+// its scan was bounded only by the stsd sample-entry's own declared box
+// size, which extract_tracks reads from the file with no validation
+// (read_be32 at the stsd's first child offset). A fabricated size far
+// larger than the file drove the scan past the end of the buffer once a
+// searched-for child box was absent. avcC is present here and found within
+// the first ~80 bytes (as in a real file), so the avcC lookup terminates
+// early; btrt is absent, as in most real files, so the unconditional
+// per-track bitrate lookup is the one left scanning to the fabricated
+// bound. Reverting the clamp in find_child_box_offset makes this fixture
+// heap-buffer-overflow under ASAN; with the clamp, extract_tracks returns
+// cleanly and reports no bitrate.
+std::vector<std::uint8_t> make_oversized_sample_entry_test_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+
+    std::vector<std::uint8_t> file = concat({ftyp, moov});
+
+    // The avc1 sample entry's own box-size field is the first 4 bytes of its
+    // box, reached by walking past every box header/sibling that precedes it:
+    // ftyp, then the moov header, the trak header, tkhd, the mdia header,
+    // mdhd, hdlr, the minf header, the stbl header, and finally the stsd
+    // header plus its 4-byte version/flags and 4-byte entry-count fields.
+    const std::size_t sample_entry_size_offset =
+        ftyp.size() + 8 + 8 + tkhd.size() + 8 + mdhd.size() + hdlr.size() + 8 + 8 + 16;
+    // Matches the reviewer's ASAN repro: a small file with a declared
+    // sample-entry size of 0x40000000 (1 GiB).
+    patch_be32(file, sample_entry_size_offset, 0x40000000);
+    return file;
+}
+
 // Fragmented single-track MP4 whose mdhd carries the given timescale,
 // duration, and packed language (mdhd version 0 or 1, selectable so both
 // 32-bit and 64-bit duration layouts are exercised), and whose video sample
@@ -1156,6 +1203,21 @@ int main() {
         ok &= expect(v1_overflow_tracks.size() == 1, "expected one track in v1 overflow fixture");
         ok &= expect(v1_overflow_tracks.front().duration_ms == 0,
                      "expected pathological v1 duration*1000 overflow to fall back to 0, not wrap");
+    }
+
+    // C1 regression: find_child_box_offset must not trust a fabricated
+    // sample-entry size and scan past the end of the buffer when the
+    // searched-for child box (btrt) is absent. See
+    // make_oversized_sample_entry_test_mp4 for the full explanation.
+    {
+        const auto oversized_bytes = make_oversized_sample_entry_test_mp4();
+        const auto oversized_tracks = extract_tracks(parse_mp4_boxes(oversized_bytes), oversized_bytes);
+        ok &= expect(oversized_tracks.size() == 1,
+                    "expected extract_tracks to survive a fabricated oversized sample-entry size");
+        ok &= expect(oversized_tracks.front().codec == "avc1.64000C",
+                    "expected avcC (found early) to still decode correctly despite the fabricated bound");
+        ok &= expect(oversized_tracks.front().max_bitrate == 0,
+                    "expected no bitrate parsed when btrt is unreachable inside the fabricated bound");
     }
 
     // CMSF section 3.5.2: maxGrpSapStartingType is a maximum over only the

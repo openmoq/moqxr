@@ -1,5 +1,6 @@
 #include "openmoq/publisher/mp4_box.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <fstream>
@@ -411,10 +412,25 @@ std::size_t find_child_box_offset(const Mp4Box& sample_entry,
                                   std::span<const std::uint8_t> bytes,
                                   std::size_t child_offset,
                                   std::string_view type) {
-    for (std::size_t scan_offset = child_offset; scan_offset + 8 <= sample_entry.span.size; ++scan_offset) {
-        const std::size_t cursor = sample_entry.span.offset + scan_offset;
+    // sample_entry.span.size comes from an unchecked 32-bit box-size field in
+    // the stsd entry (extract_tracks), so it cannot be trusted to bound the
+    // scan: a fabricated huge value must not drive reads past the end of
+    // `bytes`. Clamp to the real buffer, and clamp defensively against
+    // size_t overflow in the offset+size sum itself (and in offset+child_offset).
+    std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
+    if (entry_end < sample_entry.span.offset) {
+        entry_end = bytes.size();
+    }
+    const std::size_t limit = std::min(entry_end, bytes.size());
+
+    const std::size_t start = sample_entry.span.offset + child_offset;
+    if (start < sample_entry.span.offset) {
+        return 0;
+    }
+
+    for (std::size_t cursor = start; cursor + 8 <= limit; ++cursor) {
         const std::uint32_t box_size = read_be32(bytes, cursor);
-        if (box_size < 8 || cursor + box_size > sample_entry.span.offset + sample_entry.span.size) {
+        if (box_size < 8 || cursor + box_size > limit) {
             continue;
         }
         if (std::string_view(reinterpret_cast<const char*>(bytes.data() + cursor + 4), 4) == type) {
