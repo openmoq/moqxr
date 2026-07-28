@@ -1074,6 +1074,8 @@ int main() {
                               "expected no trackDuration in a live catalog");
     ok &= expect(all_init_refs_resolve(live_catalog_text),
                 "expected every initRef in the live catalog to resolve to an initDataList id");
+    ok &= expect(no_numeric_id_field(live_catalog_text),
+                "expected no non-spec numeric id field in the live catalog");
     ok &= expect(!live_video_init_data.empty(), "expected live video initData in catalog");
     ok &= expect(!live_audio_init_data.empty(), "expected live audio initData in catalog");
     ok &= expect(live_video_init_data != live_audio_init_data, "expected live per-track initData entries to differ");
@@ -1154,8 +1156,8 @@ int main() {
                      "expected maxBitrate parsed from btrt");
         ok &= expect(btrt_tracks.front().avg_bitrate == 4000000,
                      "expected avgBitrate parsed from btrt");
-        ok &= expect(btrt_tracks.front().language == "eng",
-                     "expected ISO-639-2 language decoded from mdhd");
+        ok &= expect(btrt_tracks.front().language == "en",
+                     "expected ISO-639-2/T mdhd language mapped to its BCP 47 (ISO 639-1) form");
         ok &= expect(btrt_tracks.front().duration_ms == 2500,
                      "expected v0 mdhd duration converted to milliseconds using track timescale");
 
@@ -1188,10 +1190,19 @@ int main() {
         const auto v1_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("fra"), 3000, 9000, 1);
         const auto v1_tracks = extract_tracks(parse_mp4_boxes(v1_bytes), v1_bytes);
         ok &= expect(v1_tracks.size() == 1, "expected one track in v1 mdhd fixture");
-        ok &= expect(v1_tracks.front().language == "fra",
-                     "expected version-1 mdhd language to decode correctly");
+        ok &= expect(v1_tracks.front().language == "fr",
+                     "expected version-1 mdhd language to decode and map fra (639-2/T) to fr (BCP 47)");
         ok &= expect(v1_tracks.front().duration_ms == 3000,
                      "expected version-1 mdhd duration converted to milliseconds using track timescale");
+
+        // A language with no ISO 639-1 two-letter code (Hawaiian) must pass
+        // through unchanged: RFC 5646 permits a three-letter code when no
+        // shorter form exists, so this is not a bug in the mapping.
+        const auto no_two_letter_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("haw"), 2000, 5000);
+        const auto no_two_letter_tracks = extract_tracks(parse_mp4_boxes(no_two_letter_bytes), no_two_letter_bytes);
+        ok &= expect(no_two_letter_tracks.size() == 1, "expected one track in no-two-letter-code fixture");
+        ok &= expect(no_two_letter_tracks.front().language == "haw",
+                     "expected a language with no ISO 639-1 code (haw) to pass through unchanged");
 
         // A pathological version-1 duration near UINT64_MAX with a small
         // timescale must not silently wrap uint64_t during the *1000

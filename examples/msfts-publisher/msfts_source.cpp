@@ -4,9 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
-#include <iomanip>
 #include <limits>
-#include <sstream>
 #include <utility>
 
 namespace openmoq::examples::msfts {
@@ -399,6 +397,10 @@ std::vector<std::uint8_t> MsftsSource::make_catalog() const {
     MsfTrack track;
     track.name = config_.track_name;
     track.name_space = config_.track_namespace;
+    // "m2ts" is not an MSF v1 (draft-ietf-moq-msf-01) packaging value; it is
+    // defined by draft-gregoire-moq-msfts-00 section 6 ("Catalog"), which
+    // this example implements. See docs/protocol-mapping.md "MSF v1 catalog"
+    // for the caveat.
     track.packaging = "m2ts";
     track.role = "video";
     track.is_live = true;

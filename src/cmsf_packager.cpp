@@ -4,7 +4,6 @@
 
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <algorithm>
 #include <chrono>
 #include <map>
@@ -465,13 +464,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
 
         const auto init_it = init_data_by_track.find(track.track_name);
         if (init_it != init_data_by_track.end()) {
-            const std::string init_id = track.track_name + "-init";
-            msf_track.init_ref = init_id;
-            msf_catalog.init_data_list.push_back(MsfInitData{
-                .id = init_id,
-                .type = "inline",
-                .data = init_it->second,
-            });
+            attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
         msf_catalog.tracks.push_back(std::move(msf_track));
@@ -643,13 +636,7 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
 
         const auto init_it = init_data_by_track.find(track.track_name);
         if (init_it != init_data_by_track.end()) {
-            const std::string init_id = track.track_name + "-init";
-            msf_track.init_ref = init_id;
-            msf_catalog.init_data_list.push_back(MsfInitData{
-                .id = init_id,
-                .type = "inline",
-                .data = init_it->second,
-            });
+            attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
         msf_catalog.tracks.push_back(std::move(msf_track));

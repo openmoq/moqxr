@@ -38,6 +38,9 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
 - Not implemented: MSF section 5.3 delta updates, MSF sections 9/10 log and
   metrics tracks, MSF section 11.1 URL parsing, and CMSF section 4 content
   protection.
+- The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
+  which is not an MSF v1 packaging value; it is defined by
+  `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.
 
 ## Implementation consequence
 

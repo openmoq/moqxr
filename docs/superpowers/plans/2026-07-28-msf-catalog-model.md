@@ -364,7 +364,7 @@ void validate_track(const MsfTrack& track) {
         "spatialId", "displayWidth", "displayHeight", "parentName",
         "parentNamespace", "template", "authInfo", "accessibility",
         "encryptionScheme", "cipherSuite", "keyId", "trackBaseKey",
-        "connectionURI", "token", "contentProtectionRefIDs",
+        "connectionUri", "token", "contentProtectionRefIDs",
     };
     for (const auto& [key, value] : track.custom_fields) {
         if (kSpecFieldNames.count(key) != 0) {

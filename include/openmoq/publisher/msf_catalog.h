@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace openmoq::publisher {
@@ -105,5 +106,11 @@ MsfTrack make_msf_track(const TrackDescription& track,
                         bool is_live,
                         std::optional<std::uint64_t> configured_bitrate = std::nullopt,
                         std::uint64_t computed_bitrate = 0);
+
+// Attach a Base64-encoded init segment to a track: sets track.init_ref and
+// appends the matching MsfInitData entry to the catalog's initDataList,
+// using "<track_name>-init" as the shared id convention. Centralizes the
+// initRef/initDataList wiring that every MP4 emitter otherwise repeats.
+void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name, std::string base64_data);
 
 }  // namespace openmoq::publisher

@@ -11,7 +11,6 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <set>
@@ -511,19 +510,16 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
             .count());
 
     for (const auto& registered : tracks_) {
-        const TrackDescription& track = registered.description;
+        // CTE ingest always produces CMAF regardless of the parsed value;
+        // coerce before make_msf_track so the role it derives from
+        // track.packaging cannot end up mismatched with the packaging value
+        // actually published.
+        TrackDescription track = registered.description;
+        track.packaging = "cmaf";
         MsfTrack msf_track = make_msf_track(track, /*is_live=*/true);
-        // CTE ingest always produces CMAF regardless of the parsed value.
-        msf_track.packaging = "cmaf";
 
         if (!registered.init_data_base64.empty()) {
-            const std::string init_id = track.track_name + "-init";
-            msf_track.init_ref = init_id;
-            msf_catalog.init_data_list.push_back(MsfInitData{
-                .id = init_id,
-                .type = "inline",
-                .data = registered.init_data_base64,
-            });
+            attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);
         }
 
         msf_catalog.tracks.push_back(std::move(msf_track));

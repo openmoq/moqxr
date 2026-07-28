@@ -249,6 +249,16 @@ int main() {
     bare_audio_catalog.tracks.push_back(bare_audio);
     ok &= throws_runtime_error(bare_audio_catalog, "expected throw when audio omits samplerate");
 
+    // Same check, but with samplerate present and only channelConfig absent,
+    // so a regression that dropped only the channelConfig half of the check
+    // (5.2.29) could not pass by leaving samplerate absent too.
+    MsfCatalog audio_missing_channel_config_catalog;
+    MsfTrack audio_missing_channel_config = bare_audio;
+    audio_missing_channel_config.samplerate = 48000;
+    audio_missing_channel_config_catalog.tracks.push_back(audio_missing_channel_config);
+    ok &= throws_runtime_error(audio_missing_channel_config_catalog,
+                               "expected throw when audio has samplerate but omits channelConfig");
+
     // Validation: targetLatency and buffers are mutually exclusive (5.2.8, 5.2.9).
     MsfCatalog both_latency_forms;
     MsfTrack conflicted = sapped_video;

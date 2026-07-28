@@ -600,8 +600,35 @@ BitrateInfo bitrate_from_sample_entry(const Mp4Box& sample_entry,
     };
 }
 
+// MSF section 5.2.32 requires "standard Tags for Identifying Languages as
+// defined by [LANG]", which resolves to BCP 47 / RFC 5646; section 2.2.1 of
+// RFC 5646 requires the SHORTEST ISO 639 code ("en", not "eng"). mdhd stores
+// ISO 639-2/T, so map the common codes to their ISO 639-1 two-letter form,
+// covering both the bibliographic and terminological 639-2 spellings where
+// they differ (e.g. "fre"/"fra" both map to "fr"). A language with no
+// two-letter code (e.g. "haw", "mis") passes through unchanged, which is
+// also spec-conformant BCP 47 usage.
+std::string bcp47_from_iso639_2(const std::string& code) {
+    static const std::vector<std::pair<std::string_view, std::string_view>> kToTwoLetter = {
+        {"eng", "en"}, {"fra", "fr"}, {"fre", "fr"}, {"deu", "de"}, {"ger", "de"},
+        {"spa", "es"}, {"ita", "it"}, {"por", "pt"}, {"rus", "ru"}, {"jpn", "ja"},
+        {"kor", "ko"}, {"zho", "zh"}, {"chi", "zh"}, {"nld", "nl"}, {"dut", "nl"},
+        {"swe", "sv"}, {"nor", "no"}, {"dan", "da"}, {"fin", "fi"}, {"pol", "pl"},
+        {"tur", "tr"}, {"ara", "ar"}, {"hin", "hi"}, {"tha", "th"}, {"vie", "vi"},
+        {"ell", "el"}, {"gre", "el"}, {"heb", "he"}, {"ces", "cs"}, {"cze", "cs"},
+        {"hun", "hu"}, {"ron", "ro"}, {"rum", "ro"}, {"ukr", "uk"}, {"ind", "id"},
+    };
+    for (const auto& [three, two] : kToTwoLetter) {
+        if (code == three) {
+            return std::string(two);
+        }
+    }
+    return code;
+}
+
 // mdhd language is three 5-bit values, each offset by 0x60, packed into 16
-// bits. Returns an empty string for the "und" (undetermined) code.
+// bits. Returns an empty string for the "und" (undetermined) code, and maps
+// the decoded ISO 639-2/T code to its shortest BCP 47 form.
 std::string language_from_mdhd(const Mp4Box& mdhd, std::span<const std::uint8_t> bytes) {
     if (mdhd.payload.size < 4) {
         return {};
@@ -623,7 +650,7 @@ std::string language_from_mdhd(const Mp4Box& mdhd, std::span<const std::uint8_t>
         }
         language.push_back(code);
     }
-    return language == "und" ? std::string{} : language;
+    return language == "und" ? std::string{} : bcp47_from_iso639_2(language);
 }
 
 std::uint64_t duration_ms_from_mdhd(const Mp4Box& mdhd,

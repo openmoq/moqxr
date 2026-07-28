@@ -24,7 +24,10 @@ Draft status:
    (delta updates), CMSF content protection, and MSF URL parsing; see
    `docs/superpowers/specs/2026-07-28-msf-cmsf-v1-design.md`. MSF section 12
    compression signaling is blocked on transport draft-19 Track and Object
-   Properties.
+   Properties. Bitrate (MSF 5.2.22) currently resolves from the `btrt` box
+   when present, else a codec-class default (with an operator warning); the
+   stsz-based computed fallback described in the design document is not yet
+   implemented.
 6. Add DRM/CENC-aware packaging support: detect and preserve encrypted CMAF boxes such as `sinf`, `tenc`, `pssh`, `saiz`, `saio`, and `senc`, expose the needed catalog signaling, and validate encrypted sample forwarding without attempting decryption.
 7. Create an M2TS packaging example based on `draft-gregoire-moq-msfts-00`, using the draft's `m2ts` packaging value to carry MPEG-2 Transport Stream or M2TS source packets directly over MOQT.
 8. Keep Linux, macOS, and Windows CI/release builds green, including the psychedelic FFmpeg live-publisher example.

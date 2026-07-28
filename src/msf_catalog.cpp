@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iomanip>
 #include <ios>
+#include <iostream>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -381,6 +382,25 @@ std::uint64_t codec_class_default(const TrackDescription& track) {
 
 }  // namespace
 
+namespace {
+
+// resolve_bitrate's codec-class-default rung keeps the catalog conformant
+// (MSF 5.2.22 requires bitrate) when no btrt box and no measurement is
+// available, but the resulting figure is fabricated. Warn the operator so
+// the estimate is visible rather than silently published as fact.
+void warn_if_bitrate_estimated(const TrackDescription& track,
+                               std::optional<std::uint64_t> configured,
+                               std::uint64_t computed,
+                               std::uint64_t resolved) {
+    if (bitrate_is_estimated(track, configured, computed)) {
+        std::cerr << "[msf-catalog] warning: track \"" << track.track_name
+                  << "\" has no btrt and no configured bitrate; advertising estimated "
+                  << resolved << " bps" << std::endl;
+    }
+}
+
+}  // namespace
+
 std::uint64_t resolve_bitrate(const TrackDescription& track,
                               std::optional<std::uint64_t> configured,
                               std::uint64_t computed) {
@@ -462,12 +482,16 @@ MsfTrack make_msf_track(const TrackDescription& track,
         if (track.frame_rate > 0.0) {
             out.framerate = track.frame_rate;
         }
-        out.bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
+        const std::uint64_t bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
+        out.bitrate = bitrate;
+        warn_if_bitrate_estimated(track, configured_bitrate, computed_bitrate, bitrate);
     } else if (track.handler_type == "soun") {
         out.render_group = 1;
         out.samplerate = track.sample_rate;
         out.channel_config = std::to_string(track.channel_count);
-        out.bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
+        const std::uint64_t bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
+        out.bitrate = bitrate;
+        warn_if_bitrate_estimated(track, configured_bitrate, computed_bitrate, bitrate);
     }
 
     if (track.avg_bitrate != 0) {
@@ -475,6 +499,17 @@ MsfTrack make_msf_track(const TrackDescription& track,
     }
 
     return out;
+}
+
+void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name, std::string base64_data) {
+    std::string init_id(track_name);
+    init_id += "-init";
+    track.init_ref = init_id;
+    catalog.init_data_list.push_back(MsfInitData{
+        .id = std::move(init_id),
+        .type = "inline",
+        .data = std::move(base64_data),
+    });
 }
 
 }  // namespace openmoq::publisher
