@@ -2,6 +2,7 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/mp4_box.h"
 
+#include <cctype>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -619,6 +620,24 @@ bool all_init_refs_resolve(std::string_view catalog) {
     return true;
 }
 
+// Parse the unsigned integer that follows a raw (unquoted) "key": prefix,
+// e.g. "maxGrpSapStartingType":2. Returns -1 when the key is absent.
+long long extract_uint_value(std::string_view catalog, std::string_view key_prefix) {
+    const std::size_t found = catalog.find(key_prefix);
+    if (found == std::string_view::npos) {
+        return -1;
+    }
+    std::size_t value_start = found + key_prefix.size();
+    std::size_t value_end = value_start;
+    while (value_end < catalog.size() && std::isdigit(static_cast<unsigned char>(catalog[value_end]))) {
+        ++value_end;
+    }
+    if (value_end == value_start) {
+        return -1;
+    }
+    return std::stoll(std::string(catalog.substr(value_start, value_end - value_start)));
+}
+
 // True when the catalog text has no non-spec numeric "id" field on a track
 // object. MSF's initDataList entries legitimately have a quoted string "id",
 // so this only rejects a bare (unquoted, i.e. numeric) "id" value.
@@ -731,6 +750,12 @@ int main() {
                               "expected the synthetic catalog track to be absent from its own tracks array");
     ok &= expect(all_init_refs_resolve(plan_catalog_text),
                 "expected every initRef to resolve to an initDataList id");
+
+    // CMSF section 3.5.2: the max SAP type Groups and Objects start with.
+    ok &= expect_contains(plan_catalog_text, "\"maxGrpSapStartingType\":",
+                          "expected maxGrpSapStartingType on a CMAF media track");
+    ok &= expect_contains(plan_catalog_text, "\"maxObjSapStartingType\":",
+                          "expected maxObjSapStartingType on a CMAF media track");
 
     ok &= expect(sap_plan.objects.size() == 3, "expected SAP-enabled plan to add one SAP timeline object");
     ok &= expect(sap_plan.objects.back().track_name == "vide_1_sap", "expected SAP timeline object for fragmented video");
@@ -923,6 +948,12 @@ int main() {
     ok &= expect_not_contains(catalog_text, "\"name\":\"vide_1_sap\"", "expected video SAP track to be absent from the default catalog");
     ok &= expect_not_contains(catalog_text, "\"name\":\"soun_2_sap\"", "expected audio SAP track to be absent from the default catalog");
     ok &= expect_not_contains(catalog_text, "\"name\":\"timeline\"", "expected MSF timeline track to be absent from the default catalog");
+    // CMSF section 3.5.2: both fields are Optional and neither track here has
+    // any fragments, so no SAP information exists to report.
+    ok &= expect_not_contains(catalog_text, "\"maxGrpSapStartingType\":",
+                              "expected no maxGrpSapStartingType on a track with no SAP information");
+    ok &= expect_not_contains(catalog_text, "\"maxObjSapStartingType\":",
+                              "expected no maxObjSapStartingType on a track with no SAP information");
     ok &= expect_contains(sap_catalog_text, "\"name\":\"vide_1_sap\"", "expected video SAP timeline track in SAP-enabled catalog");
     ok &= expect_contains(sap_catalog_text, "\"name\":\"soun_2_sap\"", "expected audio SAP timeline track in SAP-enabled catalog");
     ok &= expect_contains(sap_catalog_text, "\"packaging\":\"eventtimeline\"", "expected event timeline packaging in SAP-enabled catalog");
@@ -1125,6 +1156,76 @@ int main() {
         ok &= expect(v1_overflow_tracks.size() == 1, "expected one track in v1 overflow fixture");
         ok &= expect(v1_overflow_tracks.front().duration_ms == 0,
                      "expected pathological v1 duration*1000 overflow to fall back to 0, not wrap");
+    }
+
+    // CMSF section 3.5.2: maxGrpSapStartingType is a maximum over only the
+    // first Object of each Group (object_id == 0), while maxObjSapStartingType
+    // is a maximum over every Object of the track. Use a fixture where a
+    // mid-group Object's SAP type exceeds the group-starting Object's SAP type
+    // so the two fields genuinely differ -- if they were transposed, this is
+    // the case that would catch it.
+    {
+        const SegmentedMp4 sap_levels_segmented{
+            .initialization_segment = {.span = {}, .owned_bytes = multitrack_init_bytes},
+            .fragments =
+                {
+                    MediaFragment{
+                        .group_id = 0,
+                        .object_id = 0,
+                        .track_name = "vide_1",
+                        .sap_type = 2,
+                        .has_sap_type = true,
+                    },
+                    MediaFragment{
+                        .group_id = 0,
+                        .object_id = 1,
+                        .track_name = "vide_1",
+                        .sap_type = 3,
+                        .has_sap_type = true,
+                    },
+                },
+            .tracks =
+                {
+                    TrackDescription{.track_id = 1,
+                                     .handler_type = "vide",
+                                     .codec = "avc1.64000C",
+                                     .sample_entry_type = "avc1",
+                                     .track_name = "vide_1",
+                                     .width = 320,
+                                     .height = 240},
+                    TrackDescription{.track_id = 2,
+                                     .handler_type = "soun",
+                                     .codec = "mp4a.40.2",
+                                     .sample_entry_type = "mp4a",
+                                     .track_name = "soun_2",
+                                     .channel_count = 2,
+                                     .sample_rate = 48000},
+                },
+        };
+        const auto sap_levels_plan = build_publish_plan(sap_levels_segmented, DraftVersion::kDraft14);
+        const std::string sap_levels_catalog_text = object_text(sap_levels_plan.objects.front());
+
+        ok &= expect_contains(sap_levels_catalog_text, "\"maxGrpSapStartingType\":2",
+                              "expected maxGrpSapStartingType to reflect only the first Object of each Group");
+        ok &= expect_contains(sap_levels_catalog_text, "\"maxObjSapStartingType\":3",
+                              "expected maxObjSapStartingType to reflect the maximum across all Objects");
+
+        const long long grp_value = extract_uint_value(sap_levels_catalog_text, "\"maxGrpSapStartingType\":");
+        const long long obj_value = extract_uint_value(sap_levels_catalog_text, "\"maxObjSapStartingType\":");
+        ok &= expect(grp_value >= 0 && obj_value >= 0,
+                    "expected both SAP starting type fields to be present in the emitted catalog");
+        ok &= expect(grp_value <= obj_value,
+                    "expected maxGrpSapStartingType <= maxObjSapStartingType since Grp is a maximum over a "
+                    "subset of the fragments Obj maximizes over");
+
+        // soun_2 has no fragments at all, so it must carry neither field --
+        // both are Optional per CMSF section 3.5.2 and MUST NOT default to 0.
+        const std::string soun_track_text =
+            sap_levels_catalog_text.substr(sap_levels_catalog_text.find("\"name\":\"soun_2\""));
+        ok &= expect_not_contains(soun_track_text, "\"maxGrpSapStartingType\":",
+                                  "expected no maxGrpSapStartingType on a track with no SAP information");
+        ok &= expect_not_contains(soun_track_text, "\"maxObjSapStartingType\":",
+                                  "expected no maxObjSapStartingType on a track with no SAP information");
     }
 
     return ok ? 0 : 1;

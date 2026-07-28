@@ -440,6 +440,29 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
         }
         MsfTrack msf_track = make_msf_track(track, /*is_live=*/false);
 
+        // CMSF section 3.5.2: maxObjSapStartingType is the maximum SAP type
+        // across every fragment of the track; maxGrpSapStartingType is the
+        // maximum across only the first Object of each Group (object_id ==
+        // 0), so it is always <= maxObjSapStartingType. Both are Optional --
+        // leave them unset when the track has no SAP information at all.
+        bool has_sap_info = false;
+        std::uint32_t max_obj_sap_starting_type = 0;
+        std::uint32_t max_grp_sap_starting_type = 0;
+        for (const auto& fragment : segmented_mp4.fragments) {
+            if (fragment.track_name != track.track_name || !fragment.has_sap_type) {
+                continue;
+            }
+            has_sap_info = true;
+            max_obj_sap_starting_type = std::max(max_obj_sap_starting_type, static_cast<std::uint32_t>(fragment.sap_type));
+            if (fragment.object_id == 0) {
+                max_grp_sap_starting_type = std::max(max_grp_sap_starting_type, static_cast<std::uint32_t>(fragment.sap_type));
+            }
+        }
+        if (has_sap_info) {
+            msf_track.max_grp_sap_starting_type = max_grp_sap_starting_type;
+            msf_track.max_obj_sap_starting_type = max_obj_sap_starting_type;
+        }
+
         const auto init_it = init_data_by_track.find(track.track_name);
         if (init_it != init_data_by_track.end()) {
             const std::string init_id = track.track_name + "-init";

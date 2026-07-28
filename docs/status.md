@@ -19,7 +19,12 @@ Draft status:
 2. Continue draft-17/18 request-stream interop validation, especially stream retention, close/reset behavior, fragmented delivery, and relay-specific response timing.
 3. Continue Red5 relay and player interop validation, including catalog publication, downstream subscription discovery, and Red5 Pro playback behavior.
 4. Expand CMAF packaging coverage for fragmented and progressive inputs, including Opus, AAC, H.264, HEVC, edit lists, and less common sample-table layouts.
-5. Track CMSF catalog/schema changes and keep emitted catalog metadata, init segments, SAP timeline tracks, and per-track roles aligned with the current packaging draft.
+5. MSF/CMSF version 1: the catalog model conforms to `draft-ietf-moq-msf-01`
+   and `draft-ietf-moq-cmsf-01`. Remaining phases are catalog track lifecycle
+   (delta updates), CMSF content protection, and MSF URL parsing; see
+   `docs/superpowers/specs/2026-07-28-msf-cmsf-v1-design.md`. MSF section 12
+   compression signaling is blocked on transport draft-19 Track and Object
+   Properties.
 6. Add DRM/CENC-aware packaging support: detect and preserve encrypted CMAF boxes such as `sinf`, `tenc`, `pssh`, `saiz`, `saio`, and `senc`, expose the needed catalog signaling, and validate encrypted sample forwarding without attempting decryption.
 7. Create an M2TS packaging example based on `draft-gregoire-moq-msfts-00`, using the draft's `m2ts` packaging value to carry MPEG-2 Transport Stream or M2TS source packets directly over MOQT.
 8. Keep Linux, macOS, and Windows CI/release builds green, including the psychedelic FFmpeg live-publisher example.
