@@ -563,6 +563,76 @@ double frame_rate_from_stts(const Mp4Box* stts, std::uint32_t timescale, std::sp
     return static_cast<double>(sample_count) * static_cast<double>(timescale) / static_cast<double>(duration_sum);
 }
 
+// ISO 14496-12 BitRateBox inside a sample entry: bufferSizeDB, maxBitrate,
+// avgBitrate, each 32-bit big-endian.
+struct BitrateInfo {
+    std::uint64_t max_bitrate = 0;
+    std::uint64_t avg_bitrate = 0;
+};
+
+BitrateInfo bitrate_from_sample_entry(const Mp4Box& sample_entry,
+                                      std::span<const std::uint8_t> bytes,
+                                      std::size_t child_offset) {
+    const std::size_t btrt_offset = find_child_box_offset(sample_entry, bytes, child_offset, "btrt");
+    if (btrt_offset == 0 || btrt_offset + 20 > bytes.size()) {
+        return {};
+    }
+    return BitrateInfo{
+        .max_bitrate = read_be32(bytes, btrt_offset + 12),
+        .avg_bitrate = read_be32(bytes, btrt_offset + 16),
+    };
+}
+
+// mdhd language is three 5-bit values, each offset by 0x60, packed into 16
+// bits. Returns an empty string for the "und" (undetermined) code.
+std::string language_from_mdhd(const Mp4Box& mdhd, std::span<const std::uint8_t> bytes) {
+    if (mdhd.payload.size < 4) {
+        return {};
+    }
+    const std::uint8_t version = bytes[mdhd.payload.offset];
+    // v0: version+flags(4) + created(4) + modified(4) + timescale(4) + duration(4)
+    // v1: version+flags(4) + created(8) + modified(8) + timescale(4) + duration(8)
+    const std::size_t language_offset = mdhd.payload.offset + (version == 1 ? 32 : 20);
+    if (language_offset + 2 > bytes.size()) {
+        return {};
+    }
+    const std::uint16_t packed =
+        static_cast<std::uint16_t>((bytes[language_offset] << 8U) | bytes[language_offset + 1]);
+    std::string language;
+    for (int shift = 10; shift >= 0; shift -= 5) {
+        const auto code = static_cast<char>(((packed >> shift) & 0x1FU) + 0x60);
+        if (code < 'a' || code > 'z') {
+            return {};
+        }
+        language.push_back(code);
+    }
+    return language == "und" ? std::string{} : language;
+}
+
+std::uint64_t duration_ms_from_mdhd(const Mp4Box& mdhd,
+                                    std::uint32_t timescale,
+                                    std::span<const std::uint8_t> bytes) {
+    if (timescale == 0 || mdhd.payload.size < 4) {
+        return 0;
+    }
+    const std::uint8_t version = bytes[mdhd.payload.offset];
+    const std::size_t duration_offset = mdhd.payload.offset + (version == 1 ? 24 : 16);
+    std::uint64_t duration = 0;
+    if (version == 1) {
+        if (duration_offset + 8 > bytes.size()) {
+            return 0;
+        }
+        duration = (static_cast<std::uint64_t>(read_be32(bytes, duration_offset)) << 32U) |
+                   read_be32(bytes, duration_offset + 4);
+    } else {
+        if (duration_offset + 4 > bytes.size()) {
+            return 0;
+        }
+        duration = read_be32(bytes, duration_offset);
+    }
+    return duration * 1000ULL / timescale;
+}
+
 }  // namespace
 
 ParsedMp4 parse_mp4_file(const std::string& path) {
@@ -706,6 +776,20 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             sample_rate = read_be16(bytes, sample_entry.payload.offset + 24);
         }
 
+        // MSF 5.2.22 requires bitrate; ISO 14496-12 puts it in an optional
+        // btrt box inside the sample entry. Same header offsets
+        // build_track_codec_init_data uses: 8 + 70 past a VisualSampleEntry,
+        // 8 + 28 past an AudioSampleEntry.
+        const std::size_t sample_entry_child_offset = handler_type == "vide" ? 8 + 70 : 8 + 28;
+        const BitrateInfo bitrate = bitrate_from_sample_entry(sample_entry, bytes, sample_entry_child_offset);
+
+        std::string language;
+        std::uint64_t duration_ms = 0;
+        if (mdhd != nullptr) {
+            language = language_from_mdhd(*mdhd, bytes);
+            duration_ms = duration_ms_from_mdhd(*mdhd, timescale, bytes);
+        }
+
         tracks.push_back({
             .track_id = track_id,
             .handler_type = handler_type,
@@ -722,6 +806,10 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             .channel_count = channel_count,
             .sample_rate = sample_rate,
             .frame_rate = frame_rate,
+            .max_bitrate = bitrate.max_bitrate,
+            .avg_bitrate = bitrate.avg_bitrate,
+            .duration_ms = duration_ms,
+            .language = language,
         });
         ++track_index;
     }

@@ -39,6 +39,10 @@ struct TrackDescription {
     std::uint32_t channel_count = 0;
     std::uint32_t sample_rate = 0;
     double frame_rate = 0.0;
+    std::uint64_t max_bitrate = 0;   // bits per second, 0 when unknown
+    std::uint64_t avg_bitrate = 0;   // bits per second, 0 when unknown
+    std::uint64_t duration_ms = 0;   // track duration, 0 when unknown
+    std::string language;            // ISO-639-2/T, empty when unknown or "und"
     std::vector<std::uint8_t> codec_private;  // avcC, hvcC, or esds box bytes (including box header)
 };
 

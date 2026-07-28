@@ -38,6 +38,27 @@ std::vector<std::uint8_t> make_box(const std::string& type, const std::vector<st
     return out;
 }
 
+// ISO 14496-12 BitRateBox: bufferSizeDB, maxBitrate, avgBitrate.
+std::vector<std::uint8_t> make_btrt(std::uint32_t buffer_size_db,
+                                    std::uint32_t max_bitrate,
+                                    std::uint32_t avg_bitrate) {
+    std::vector<std::uint8_t> payload;
+    append_be32(payload, buffer_size_db);
+    append_be32(payload, max_bitrate);
+    append_be32(payload, avg_bitrate);
+    return make_box("btrt", payload);
+}
+
+// Packs an ISO-639-2/T language code the same way mdhd does: three 5-bit
+// values (each letter minus 0x60) packed into the low 15 bits.
+std::uint16_t pack_mdhd_language(const std::string& code) {
+    std::uint16_t packed = 0;
+    for (const char c : code) {
+        packed = static_cast<std::uint16_t>((packed << 5U) | (static_cast<std::uint8_t>(c) - 0x60U));
+    }
+    return packed;
+}
+
 std::vector<std::uint8_t> be32_bytes(std::uint32_t value) {
     return {
         static_cast<std::uint8_t>((value >> 24U) & 0xFFU),
@@ -87,6 +108,49 @@ std::vector<std::uint8_t> make_fragmented_test_mp4() {
     visual_header[26] = 0x00;
     visual_header[27] = 0xf0;
     const auto sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+    const auto moof = make_box("moof", {'m', 'f', 'h', 'd'});
+    const auto mdat = make_box("mdat", {1, 2, 3, 4, 5, 6});
+    return concat({ftyp, moov, moof, mdat});
+}
+
+// Fragmented single-track MP4 whose mdhd carries the given timescale,
+// duration, and packed language, and whose video sample entry optionally
+// carries a btrt box (MSF section 5.2.22 bitrate).
+std::vector<std::uint8_t> make_track_metadata_test_mp4(bool include_btrt,
+                                                       std::uint16_t packed_language,
+                                                       std::uint32_t timescale,
+                                                       std::uint32_t duration) {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+
+    std::vector<std::uint8_t> mdhd_payload;
+    append_be32(mdhd_payload, 0);  // creation_time
+    append_be32(mdhd_payload, 0);  // modification_time
+    append_be32(mdhd_payload, timescale);
+    append_be32(mdhd_payload, duration);
+    mdhd_payload.push_back(static_cast<std::uint8_t>((packed_language >> 8U) & 0xFFU));
+    mdhd_payload.push_back(static_cast<std::uint8_t>(packed_language & 0xFFU));
+    mdhd_payload.push_back(0);  // pre_defined
+    mdhd_payload.push_back(0);
+    const auto mdhd = make_full_box("mdhd", mdhd_payload);
+
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
+    const auto btrt = make_btrt(0, 5000000, 4000000);
+    const auto sample_entry = include_btrt ? make_box("avc1", concat({visual_header, avcc, btrt}))
+                                           : make_box("avc1", concat({visual_header, avcc}));
     const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
     const auto stbl = make_box("stbl", stsd);
     const auto minf = make_box("minf", stbl);
@@ -864,6 +928,36 @@ int main() {
                  "expected in-band parameter sets to preserve hev1");
     ok &= expect(parsed_hevc_inband_param.tracks.front().codec == "hev1.1.6.L90.B0",
                  "expected in-band parameter set stream to keep hev1 codec string");
+
+    // MSF section 5.2.22 requires bitrate; it comes from btrt when present.
+    // MSF section 5.2.32 requires language, decoded from the packed mdhd field.
+    {
+        const auto btrt_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("eng"), 1000, 2500);
+        const auto btrt_tracks = extract_tracks(parse_mp4_boxes(btrt_bytes), btrt_bytes);
+        ok &= expect(btrt_tracks.size() == 1, "expected one track in btrt fixture");
+        ok &= expect(btrt_tracks.front().max_bitrate == 5000000,
+                     "expected maxBitrate parsed from btrt");
+        ok &= expect(btrt_tracks.front().avg_bitrate == 4000000,
+                     "expected avgBitrate parsed from btrt");
+        ok &= expect(btrt_tracks.front().language == "eng",
+                     "expected ISO-639-2 language decoded from mdhd");
+        ok &= expect(btrt_tracks.front().duration_ms == 2500,
+                     "expected mdhd duration converted to milliseconds using track timescale");
+
+        const auto und_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("und"), 1000, 2500);
+        const auto und_tracks = extract_tracks(parse_mp4_boxes(und_bytes), und_bytes);
+        ok &= expect(und_tracks.size() == 1, "expected one track in und-language fixture");
+        ok &= expect(und_tracks.front().language.empty(),
+                     "expected und language code to decode to an empty string");
+
+        const auto no_btrt_bytes = make_track_metadata_test_mp4(false, pack_mdhd_language("eng"), 1000, 2500);
+        const auto no_btrt_tracks = extract_tracks(parse_mp4_boxes(no_btrt_bytes), no_btrt_bytes);
+        ok &= expect(no_btrt_tracks.size() == 1, "expected one track in no-btrt fixture");
+        ok &= expect(no_btrt_tracks.front().max_bitrate == 0,
+                     "expected zero maxBitrate when btrt is absent");
+        ok &= expect(no_btrt_tracks.front().avg_bitrate == 0,
+                     "expected zero avgBitrate when btrt is absent");
+    }
 
     return ok ? 0 : 1;
 }
