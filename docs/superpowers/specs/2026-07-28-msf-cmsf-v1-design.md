@@ -214,9 +214,30 @@ protected content. The repository has no CENC box handling today.
 **Catalog layer.** Emit the root `contentProtections` array, one entry per DRM
 system ID discovered, and per-track `contentProtectionRefIDs`. Per CMSF section
 4.1.1, protection information is never duplicated at track level; tracks only
-reference root entries. Per section 4.2, the `initDataList` entry for a
-protected track must retain its `sinf`/`schm`/`schi`/`tenc` boxes, which the
-existing per-track init segment builder must be verified to preserve.
+reference root entries.
+
+Section 4.2 requires the `initDataList` entry for a protected track to retain
+its `sinf`/`schm`/`schi`/`tenc` boxes. This already holds:
+`build_track_specific_init_segment` copies the matched `trak` verbatim via
+`slice_bytes(init_bytes, child.span)` (`src/cmsf_packager.cpp:344`), so every
+descendant survives byte-for-byte, and non-`trak` `moov` children are likewise
+copied verbatim (`src/cmsf_packager.cpp:376`), preserving `pssh` in its standard
+ISO 23001-7 location. No work is needed here.
+
+One caveat and one real defect:
+
+- Only `ftyp` and the rebuilt `moov` are emitted
+  (`src/cmsf_packager.cpp:387`), so a top-level `pssh` outside `moov` would be
+  dropped. That placement is non-standard; handle it only if a real input
+  exhibits it.
+- `extract_codec_init_data` (`src/cmsf_packager.cpp:396`) finds the codec
+  configuration box by an unanchored sliding byte scan validating only
+  `box_size >= 8` and containment, not box-chain alignment. On encrypted tracks
+  that scan crosses `tenc` key IDs and embedded PSSH payloads, where a
+  coincidental four-byte type match with a plausible size field yields a false
+  positive. Phase 3 must replace the scan with a proper child-box walk from the
+  sample entry, which also removes the fixed `8 + 70` and `8 + 28` handler
+  offsets at `src/cmsf_packager.cpp:456`.
 
 Encrypted samples pass through untouched. moqxr never decrypts.
 
@@ -275,7 +296,11 @@ Per-phase coverage:
   add, remove, and clone diff generation; both end-of-broadcast modes.
 - Phase 3: `sinf`/`tenc`/`pssh` extraction from an encrypted fixture; `frma`
   unwrapping of codec strings; correct root-level protection entries with no
-  track-level duplication.
+  track-level duplication; a regression asserting that a protected track's
+  `initDataList` entry still contains `sinf`, `schm`, `schi`, and `tenc`; and a
+  codec-config lookup case over an `encv` sample entry whose `tenc` key ID
+  contains bytes spelling a codec box type, which the current sliding scan
+  would mis-detect.
 - Phase 4: tuple encode and decode round-trips including period-hex escapes;
   each reserved parameter; range union; substitution allowlist rejection.
 
