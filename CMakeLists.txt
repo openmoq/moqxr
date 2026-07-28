@@ -260,6 +260,7 @@ add_library(openmoq_publisher_lib STATIC
     src/live_srt_config.cpp
     src/live_dash_ingest.cpp
     src/moq_draft.cpp
+    src/msf_catalog.cpp
     src/mp4_box.cpp
     src/publisher_api.cpp
     src/transport/libmoq_publisher.cpp
@@ -360,6 +361,12 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-packaging-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-packaging-tests COMMAND openmoq-publisher-packaging-tests)
+
+    add_executable(openmoq-publisher-msf-catalog-tests
+        tests/msf_catalog_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-msf-catalog-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-msf-catalog-tests COMMAND openmoq-publisher-msf-catalog-tests)
 
     add_executable(openmoq-publisher-cli-tests
         tests/cli_options_test.cpp
