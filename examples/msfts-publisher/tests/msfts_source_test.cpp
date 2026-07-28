@@ -26,6 +26,80 @@ void expect(bool condition, const std::string& message) {
     }
 }
 
+// A structural well-formedness check for JSON text. MsfTrack::custom_fields
+// (used here for the m2ts* fields) are raw JSON inserted verbatim by the
+// serializer, so a bug there (e.g. a string value stored unquoted, emitting
+// a bare word where a value belongs) would not be caught by substring
+// assertions alone. This walks the text once, tracking whether it is inside
+// a string literal, verifying that braces/brackets balance outside of
+// strings, and that every value position immediately following a
+// non-string ':' begins with a valid JSON value start token.
+bool is_well_formed_json(const std::string& text) {
+    int brace_depth = 0;
+    int bracket_depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char ch = text[index];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (ch) {
+            case '"':
+                in_string = true;
+                break;
+            case '{':
+                ++brace_depth;
+                break;
+            case '}':
+                if (--brace_depth < 0) {
+                    return false;
+                }
+                break;
+            case '[':
+                ++bracket_depth;
+                break;
+            case ']':
+                if (--bracket_depth < 0) {
+                    return false;
+                }
+                break;
+            case ':': {
+                std::size_t next = index + 1;
+                while (next < text.size() &&
+                       (text[next] == ' ' || text[next] == '\t' || text[next] == '\n' ||
+                        text[next] == '\r')) {
+                    ++next;
+                }
+                if (next >= text.size()) {
+                    return false;
+                }
+                const char value_start = text[next];
+                const bool valid_start = value_start == '"' || value_start == '{' ||
+                                         value_start == '[' || value_start == '-' ||
+                                         (value_start >= '0' && value_start <= '9') ||
+                                         text.compare(next, 4, "true") == 0 ||
+                                         text.compare(next, 5, "false") == 0 ||
+                                         text.compare(next, 4, "null") == 0;
+                if (!valid_start) {
+                    return false;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return !in_string && brace_depth == 0 && bracket_depth == 0;
+}
+
 std::vector<std::uint8_t> make_packet(std::uint16_t pid, std::uint8_t marker = 0xff) {
     std::vector<std::uint8_t> packet(188, 0xff);
     packet[0] = 0x47;
@@ -141,8 +215,19 @@ void test_source_catalog_and_filtering(std::size_t packet_size) {
         expect((packet_size == 192) ==
                    (text.find("\"m2tsTimestampMode\":\"opaque\"") != std::string::npos),
                "expected opaque timestamp mode only for M2TS source packets");
-        expect(text.find("\"initData\":\"") != std::string::npos,
-               "expected base64 initData");
+        expect(text.find("\"version\":\"1\"") != std::string::npos,
+               "expected MSF v1 string version in MSFTS catalog");
+        expect(text.find("\"initDataList\"") != std::string::npos,
+               "expected root initDataList in MSFTS catalog");
+        expect(text.find("\"initRef\"") != std::string::npos,
+               "expected per-track initRef in MSFTS catalog");
+        expect(text.find("\"format\"") == std::string::npos,
+               "expected no legacy format field in MSFTS catalog");
+        expect(text.find("\"initData\":\"") == std::string::npos,
+               "expected no inline initData field in MSFTS catalog");
+        expect(text.find("\"isLive\":true") != std::string::npos,
+               "expected isLive true in MSFTS catalog");
+        expect(is_well_formed_json(text), "expected MSFTS catalog to be well-formed JSON");
     }
 
     const auto media = live.next_object();

@@ -463,8 +463,18 @@ int main() {
                      "expected catalog object for initData test");
         if (catalog.has_value()) {
             const std::string catalog_text = as_string(catalog->payload);
-            ok &= expect(catalog_text.find("\"initData\":\"") != std::string::npos,
-                         "expected catalog to embed base64 initData for the track");
+            ok &= expect(catalog_text.find("\"version\":\"1\"") != std::string::npos,
+                         "expected MSF v1 string version in CTE catalog");
+            ok &= expect(catalog_text.find("\"initDataList\"") != std::string::npos,
+                         "expected root initDataList in CTE catalog");
+            ok &= expect(catalog_text.find("\"initRef\"") != std::string::npos,
+                         "expected per-track initRef in CTE catalog");
+            ok &= expect(catalog_text.find("\"format\"") == std::string::npos,
+                         "expected no legacy format field in CTE catalog");
+            ok &= expect(catalog_text.find("\"initData\":\"") == std::string::npos,
+                         "expected no inline initData field in CTE catalog");
+            ok &= expect(catalog_text.find("\"isLive\":true") != std::string::npos,
+                         "expected isLive true in CTE catalog");
             ok &= expect(catalog_text.find("\"renderGroup\":1") != std::string::npos,
                          "expected DASH catalog track to declare its render group");
             ok &= expect(catalog_text.find("\"width\":320") != std::string::npos &&

@@ -2,12 +2,14 @@
 
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/mp4_box.h"
+#include "openmoq/publisher/msf_catalog.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -45,31 +47,6 @@ std::string path_slug(std::string_view path) {
         }
     }
     return slug;
-}
-
-std::string json_escape(std::string_view value) {
-    std::string out;
-    for (const char ch : value) {
-        switch (ch) {
-            case '\\': out += "\\\\"; break;
-            case '"': out += "\\\""; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default: out.push_back(ch); break;
-        }
-    }
-    return out;
-}
-
-std::string role_for_handler(std::string_view handler_type) {
-    if (handler_type == "vide") {
-        return "video";
-    }
-    if (handler_type == "soun") {
-        return "audio";
-    }
-    return "data";
 }
 
 bool starts_with(std::string_view value, std::string_view prefix) {
@@ -527,41 +504,32 @@ std::vector<LiveTrack> LiveDashIngestSession::snapshot_tracks_locked() const {
 }
 
 LiveObject LiveDashIngestSession::build_catalog_locked() {
-    std::ostringstream catalog;
-    catalog << "{\"version\":1,\"format\":\"cmsf\",\"tracks\":[";
-    bool first = true;
+    MsfCatalog msf_catalog;
+    msf_catalog.generated_at_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+
     for (const auto& registered : tracks_) {
         const TrackDescription& track = registered.description;
-        if (!first) {
-            catalog << ',';
-        }
-        first = false;
-        catalog << "{\"name\":\"" << json_escape(track.track_name) << "\","
-                << "\"id\":" << track.track_id << ','
-                << "\"role\":\"" << role_for_handler(track.handler_type) << "\","
-                << "\"packaging\":\"cmaf\","
-                << "\"renderGroup\":1,"
-                << "\"isLive\":true";
-        if (!track.codec.empty()) {
-            catalog << ",\"codec\":\"" << json_escape(track.codec) << "\"";
-        }
-        if (track.handler_type == "vide") {
-            catalog << ",\"width\":" << track.width
-                    << ",\"height\":" << track.height;
-            if (track.frame_rate > 0.0) {
-                catalog << ",\"frameRate\":" << std::setprecision(6) << track.frame_rate;
-            }
-        } else if (track.handler_type == "soun") {
-            catalog << ",\"sampleRate\":" << track.sample_rate
-                    << ",\"channelCount\":" << track.channel_count;
-        }
+        MsfTrack msf_track = make_msf_track(track, /*is_live=*/true);
+        // CTE ingest always produces CMAF regardless of the parsed value.
+        msf_track.packaging = "cmaf";
+
         if (!registered.init_data_base64.empty()) {
-            catalog << ",\"initData\":\"" << registered.init_data_base64 << "\"";
+            const std::string init_id = track.track_name + "-init";
+            msf_track.init_ref = init_id;
+            msf_catalog.init_data_list.push_back(MsfInitData{
+                .id = init_id,
+                .type = "inline",
+                .data = registered.init_data_base64,
+            });
         }
-        catalog << '}';
+
+        msf_catalog.tracks.push_back(std::move(msf_track));
     }
-    catalog << "]}";
-    const std::string payload = catalog.str();
+
+    const std::string payload = serialize_catalog(msf_catalog);
     // A fresh group per emission keeps re-published catalogs (a new track set)
     // from colliding with the object IDs of an already-delivered catalog.
     return LiveObject{
