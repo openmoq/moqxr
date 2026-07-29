@@ -602,5 +602,14 @@ int main() {
     }
     ok &= expect(threw_after_end, "expected publishing after end_broadcast to throw");
 
+    // end_broadcast is itself a one-way transition: a second call must also throw.
+    bool threw_second_end = false;
+    try {
+        (void)pub.end_broadcast(EndBroadcastMode::kTerminate, {});
+    } catch (const std::runtime_error&) {
+        threw_second_end = true;
+    }
+    ok &= expect(threw_second_end, "expected a second end_broadcast call to throw");
+
     return ok ? 0 : 1;
 }
