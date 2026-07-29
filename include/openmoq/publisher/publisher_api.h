@@ -17,6 +17,7 @@
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/moq_draft.h"
+#include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
 namespace openmoq::publisher {
@@ -39,6 +40,13 @@ struct PublisherConfig {
     bool live_stream_per_object = false;
     bool paced = false;
     bool loop = false;
+    // This publisher is live, or simulating live, unless explicitly told
+    // otherwise. VOD semantics are never inferred from the input.
+    bool vod = false;
+    // Section 5: a catalog SHOULD be republished after enough time has passed
+    // that it might fall out of a relay cache. Zero disables republication,
+    // which is the historical behaviour.
+    std::chrono::seconds catalog_republish_interval{0};
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     cat4moq::AuthorizationConfig authorization;
 };
@@ -126,6 +134,17 @@ public:
                                                     const transport::TlsConfig& tls = {},
                                                     bool endpoint_alpn_overridden = false) const;
     transport::TransportStatus disconnect(std::uint64_t application_error_code = 0) const;
+    // End the broadcast per MSF section 11.3: publish the final independent
+    // catalog (kConvertToVod marks every track not live and adds
+    // trackDuration where known; kTerminate marks isComplete true with an
+    // empty tracks array), then send PUBLISH_DONE with status 0x2 Track
+    // Ended for all requests this session still tracks. Returns a failure
+    // status when no session is active. The final catalog write only
+    // happens for a session driven through publish_live(): a session driven
+    // through the batch publish() plan path or publish_live_objects() never
+    // populates MoqtSession's CatalogPublisher, so end_broadcast() skips that
+    // write rather than guess which track alias is "catalog".
+    transport::TransportStatus end_broadcast(EndBroadcastMode mode) const;
     PublisherStats stats() const;
     [[deprecated("Use stats(); live polling is not supported by the blocking publish API.")]]
     std::string stats_json() const;

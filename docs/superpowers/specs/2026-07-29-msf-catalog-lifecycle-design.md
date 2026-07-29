@@ -124,6 +124,19 @@ section 11.3.
 Both modes first send `SUBSCRIBE_DONE` with status code `0x2 Track Ended` for
 all active tracks, then publish one final independent catalog.
 
+**Deviation recorded (final review, finding M6):** the shipped implementation
+does the reverse of this ordering -- it writes the final catalog object
+first and sends the catalog subscription's PUBLISH_DONE afterward. That is
+deliberate, not a bug: MOQT draft-ietf-moq-transport-19 section 10.11
+forbids sending PUBLISH_DONE for a subscription until every stream it will
+ever open has closed, and the final catalog write is one such stream. MSF
+section 11.3's bullet order (`SUBSCRIBE_DONE`/PUBLISH_DONE, then the final
+catalog) is therefore not achievable without violating the transport draft's
+MUST NOT. Where the two drafts disagree, the transport draft governs what
+may legally appear on the wire, so the code follows 10.11's ordering instead
+of 11.3's. See `docs/protocol-mapping.md`'s "Draft conflict on ordering"
+note for the wire-level writeup.
+
 **`kConvertToVod`** — the live stream becomes a VOD asset. The final catalog
 sets `isLive` to false on every track and adds a `trackDuration`.
 

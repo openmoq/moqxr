@@ -20,14 +20,47 @@ Draft status:
 3. Continue Red5 relay and player interop validation, including catalog publication, downstream subscription discovery, and Red5 Pro playback behavior.
 4. Expand CMAF packaging coverage for fragmented and progressive inputs, including Opus, AAC, H.264, HEVC, edit lists, and less common sample-table layouts.
 5. MSF/CMSF version 1: the catalog model conforms to `draft-ietf-moq-msf-01`
-   and `draft-ietf-moq-cmsf-01`. Remaining phases are catalog track lifecycle
-   (delta updates), CMSF content protection, and MSF URL parsing; see
-   `docs/superpowers/specs/2026-07-28-msf-cmsf-v1-design.md`. MSF section 12
-   compression signaling is blocked on transport draft-19 Track and Object
-   Properties. Bitrate (MSF 5.2.22) currently resolves from the `btrt` box
-   when present, else a codec-class default (with an operator warning); the
-   stsz-based computed fallback described in the design document is not yet
-   implemented.
+   and `draft-ietf-moq-cmsf-01`. Phase 2, catalog track lifecycle, has
+   shipped: live-by-default catalogs with an explicit VOD opt-in, end-of-
+   broadcast signalling per MSF section 11.3 (`isComplete` for a terminated
+   broadcast, `isLive: false` with `trackDuration` for a VOD conversion),
+   optional periodic republication of an independent catalog (disabled by
+   default, see `PublisherConfig::catalog_republish_interval`), and `add`/
+   `remove` delta updates bounded by a configurable max-deltas-per-group.
+   **Scope qualifier:** all three of those (end-of-broadcast signalling,
+   periodic republication, and delta updates) are wired only inside
+   `MoqtSession`'s two `publish_live()` overloads (the SRT-ingest and
+   stdin-ingest live paths) -- they are the only callers that populate the
+   session's `CatalogPublisher`. `publish_live_objects()`, also a live
+   streaming entry point, and the batch `publish()` plan path do not use
+   `CatalogPublisher` at all today: a broadcast run through either of those
+   still gets a static, one-shot catalog with none of Phase 2's lifecycle
+   behavior, and `end_broadcast()` correctly no-ops its final-catalog write
+   for them rather than guess at scope it does not have.
+   **Delta updates specifically do not fire on the wire today, on either
+   `publish_live()` path:** `add`/`remove` delta support is fully implemented
+   and unit-tested in `CatalogPublisher::publish()`, but both call sites
+   build one `LiveCatalog`/`MsfCatalog` snapshot up front and pass that same
+   immutable value to `catalog_publisher_.publish()` on every SUBSCRIBE and
+   republish tick. Nothing in the live-ingest paths ever mutates it after
+   startup, so `catalogs_equal()` matches on every call after the first and
+   `publish()` always returns an empty vector -- never a delta. Reaching a
+   delta on the wire needs a live producer that detects a track add/remove
+   mid-broadcast (e.g. SRT ingest noticing a track appear or disappear, or a
+   DASH ingest reconfiguration) and calls `catalog_publisher_.publish()`
+   again with an updated `MsfCatalog` reflecting that change; no such
+   producer exists yet. See
+   `docs/protocol-mapping.md` for the full wire-level contract and per-path
+   breakdown, and
+   `docs/superpowers/specs/2026-07-28-msf-cmsf-v1-design.md` for the original
+   design. `clone` delta operations are not implemented -- no producer in
+   this project generates a track matching another on every field except
+   name -- and Phases 3 and 4, CMSF content protection and MSF URL parsing,
+   remain. MSF section 12 compression signaling is blocked on transport
+   draft-19 Track and Object Properties. Bitrate (MSF 5.2.22) currently
+   resolves from the `btrt` box when present, else a codec-class default
+   (with an operator warning); the stsz-based computed fallback described in
+   the design document is not yet implemented.
 6. Add DRM/CENC-aware packaging support: detect and preserve encrypted CMAF boxes such as `sinf`, `tenc`, `pssh`, `saiz`, `saio`, and `senc`, expose the needed catalog signaling, and validate encrypted sample forwarding without attempting decryption.
 7. Create an M2TS packaging example based on `draft-gregoire-moq-msfts-00`, using the draft's `m2ts` packaging value to carry MPEG-2 Transport Stream or M2TS source packets directly over MOQT.
 8. Keep Linux, macOS, and Windows CI/release builds green, including the psychedelic FFmpeg live-publisher example.

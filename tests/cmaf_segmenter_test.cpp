@@ -814,7 +814,7 @@ int main() {
         .bytes = fragmented_bytes,
         .top_level_boxes = parse_mp4_boxes(fragmented_bytes),
         .tracks = {
-            TrackDescription{.track_id = 1, .handler_type = "vide", .codec = "avc1.64000C", .sample_entry_type = "avc1", .track_name = "vide_1", .timescale = 24000},
+            TrackDescription{.track_id = 1, .handler_type = "vide", .codec = "avc1.64000C", .sample_entry_type = "avc1", .track_name = "vide_1", .timescale = 24000, .duration_ms = 5000},
         },
     };
 
@@ -1035,7 +1035,26 @@ int main() {
     ok &= expect_contains(catalog_text, "\"samplerate\":48000", "expected audio sample rate in catalog");
     ok &= expect_contains(catalog_text, "\"channelConfig\":\"2\"", "expected audio channel count in catalog");
     ok &= expect_contains(catalog_text, "\"renderGroup\":1", "expected renderGroup in catalog");
-    ok &= expect_contains(catalog_text, "\"isLive\":false", "expected VOD isLive flag in catalog");
+    // The publisher is live, or simulating live, unless configured otherwise.
+    ok &= expect_contains(catalog_text, "\"isLive\":true",
+                          "expected batch publish to default to live");
+    ok &= expect_contains(catalog_text, "\"generatedAt\":",
+                          "expected generatedAt on a live batch catalog");
+    ok &= expect_not_contains(catalog_text, "\"trackDuration\"",
+                              "expected no trackDuration on a live batch catalog (MSF 5.2.35)");
+
+    // Opt-in VOD retains the previous semantics.
+    const auto vod_plan = build_publish_plan(segmented, DraftVersion::kDraft14,
+                                             /*include_sap=*/false,
+                                             /*include_msf_timeline=*/false,
+                                             /*vod=*/true);
+    const std::string vod_catalog_text = object_text(vod_plan.objects.front());
+    ok &= expect_contains(vod_catalog_text, "\"isLive\":false",
+                          "expected opt-in VOD to mark tracks not live");
+    ok &= expect_not_contains(vod_catalog_text, "\"generatedAt\":",
+                              "expected no generatedAt on a VOD catalog (MSF 5.1.2)");
+    ok &= expect_contains(vod_catalog_text, "\"trackDuration\":5000",
+                          "expected VOD catalog to include trackDuration with the test fixture value (MSF 5.2.35)");
     ok &= expect_contains(catalog_text, "\"bitrate\":2000000", "expected non-zero default video bitrate in catalog");
     ok &= expect_contains(catalog_text, "\"bitrate\":128000", "expected non-zero default audio bitrate in catalog");
     ok &= expect_not_contains(catalog_text, "\"name\":\"catalog\"",

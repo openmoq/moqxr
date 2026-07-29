@@ -360,7 +360,8 @@ std::vector<std::uint8_t> build_track_codec_init_data(std::span<const std::uint8
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap,
-                               bool include_msf_timeline) {
+                               bool include_msf_timeline,
+                               bool vod) {
     std::vector<TrackDescription> tracks = segmented_mp4.tracks;
     std::uint32_t synthetic_track_id = next_synthetic_track_id(tracks);
     if (include_msf_timeline) {
@@ -431,13 +432,18 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
     }
 
     MsfCatalog msf_catalog;
-    // Section 5.1.2: generatedAt SHOULD NOT be included when isLive is false,
-    // which is always the case for a batch publish plan.
+    // Section 5.1.2: generatedAt SHOULD NOT be included when isLive is false.
+    if (!vod) {
+        msf_catalog.generated_at_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    }
     for (const auto& track : plan.tracks) {
         if (track.track_name == "catalog") {
             continue;
         }
-        MsfTrack msf_track = make_msf_track(track, /*is_live=*/false);
+        MsfTrack msf_track = make_msf_track(track, /*is_live=*/!vod);
 
         // CMSF section 3.5.2: maxObjSapStartingType is the maximum SAP type
         // across every fragment of the track; maxGrpSapStartingType is the
@@ -644,6 +650,7 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
 
     const std::string catalog_text = serialize_catalog(msf_catalog);
     result.catalog_payload = std::vector<std::uint8_t>(catalog_text.begin(), catalog_text.end());
+    result.msf_catalog = std::move(msf_catalog);
     return result;
 }
 

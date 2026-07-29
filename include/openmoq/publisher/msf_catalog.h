@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -69,6 +70,15 @@ struct MsfTrack {
     std::map<std::string, std::string> custom_fields;
 };
 
+// One operation in a delta update (MSF section 5.1.6). This version emits
+// "add" and "remove" only. "clone" is deliberately unimplemented: it applies
+// when a new track matches an existing one on every field except name, which
+// no producer in this project generates.
+struct MsfDeltaOp {
+    std::string op;
+    std::vector<MsfTrack> tracks;
+};
+
 // The root catalog object (MSF section 5.1).
 struct MsfCatalog {
     std::string version = "1";                    // 5.1.1, a String
@@ -77,6 +87,10 @@ struct MsfCatalog {
     std::vector<MsfTrack> tracks;                 // 5.1.4
     std::vector<MsfTrack> publish_tracks;         // 5.1.5
     std::vector<MsfInitData> init_data_list;      // 5.1.7, emitted after tracks
+
+    // When non-empty this catalog is a DELTA: section 5.3 requires it to
+    // carry neither tracks nor version.
+    std::vector<MsfDeltaOp> delta_update;
 };
 
 // Serialize to a JSON catalog document. Throws std::runtime_error when a
@@ -112,5 +126,99 @@ MsfTrack make_msf_track(const TrackDescription& track,
 // using "<track_name>-init" as the shared id convention. Centralizes the
 // initRef/initDataList wiring that every MP4 emitter otherwise repeats.
 void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name, std::string base64_data);
+
+// How a live broadcast ends (MSF section 11.3).
+enum class EndBroadcastMode {
+    // The stream becomes a VOD asset: isLive false, trackDuration added.
+    kConvertToVod,
+    // The stream ends permanently: isComplete true, empty tracks array.
+    kTerminate,
+};
+
+// Build the final independent catalog for a broadcast that is ending.
+//
+// kConvertToVod clears is_live and applies track_durations_ms in one rebuild.
+// Both must change together: validate_track rejects a track that is live and
+// also carries a duration, so flipping one field at a time would throw.
+// generatedAt is dropped because MSF 5.1.2 says it SHOULD NOT appear when
+// isLive is false.
+//
+// kTerminate returns a catalog with isComplete true and no tracks at all;
+// track_durations_ms is ignored.
+MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
+                                      EndBroadcastMode mode,
+                                      const std::map<std::string, std::uint64_t>& track_durations_ms);
+
+// One catalog object ready for the wire. MSF section 5 requires all catalog
+// objects to map to MOQT sub-group 0.
+struct CatalogObject {
+    std::uint64_t group_id = 0;
+    std::uint64_t object_id = 0;
+    std::uint64_t subgroup_id = 0;
+    std::string payload;
+};
+
+// Owns the catalog track's group and object counters and the last published
+// catalog, and decides what to emit (MSF section 5).
+//
+// Object 0 of every group holds a full independent catalog. Producing an
+// independent catalog always starts a new group.
+//
+// Thread safety: Publisher::end_broadcast() is documented to invoke
+// MoqtSession::end_broadcast() (and, transitively, this class's own
+// end_broadcast()) without holding Publisher's state_mutex_, specifically so
+// it can run concurrently with an in-progress publish()/publish_live() call
+// on the same session -- see publisher_api.h and moqt_session.h. That in-
+// progress call may be inside publish() reading `last_` (via catalogs_equal)
+// at the same moment end_broadcast() reassigns it. mutex_ serializes every
+// entry point below so that read and the reassignment can never overlap.
+class CatalogPublisher {
+public:
+    // Emit whatever is needed to move subscribers to `desired`. Returns an
+    // empty vector when nothing changed. Throws std::runtime_error if the
+    // broadcast has already ended.
+    std::vector<CatalogObject> publish(const MsfCatalog& desired);
+
+    // Emit the final catalog for a broadcast that is ending (MSF 11.3).
+    // After this, publish() throws: section 5.1.3 forbids removing
+    // isComplete, and 5.2.7 forbids a true isLive following a false one.
+    std::vector<CatalogObject> end_broadcast(
+        EndBroadcastMode mode,
+        const std::map<std::string, std::uint64_t>& track_durations_ms);
+
+    // Re-emit the last published catalog as a fresh independent copy in a new
+    // group, for section 5's cache-expiry republication. Returns an empty
+    // vector if nothing has been published yet.
+    std::vector<CatalogObject> force_independent();
+
+    bool ended() const;
+
+    // Section 5.3: producers publishing frequent deltas SHOULD periodically
+    // publish a new independent catalog to bound the delta processing a
+    // joining subscriber must perform. Default 8.
+    void set_max_deltas_per_group(std::size_t max_deltas) { max_deltas_per_group_ = max_deltas; }
+
+    // Reset all per-broadcast state (the last published catalog, the group
+    // and object counters, and the ended flag) back to how a freshly
+    // constructed CatalogPublisher starts. max_deltas_per_group_ is left
+    // alone, since it is a standing configuration knob rather than
+    // per-broadcast state. A caller that reuses one MoqtSession instance
+    // across more than one publish()/publish_live() call must call this
+    // first, or the second broadcast's first publish() would see `last_`
+    // already set from the previous broadcast and (via catalogs_equal)
+    // silently send no catalog at all to the new broadcast's subscribers.
+    void reset();
+
+private:
+    CatalogObject emit_independent(const MsfCatalog& catalog);
+
+    mutable std::mutex mutex_;
+    std::optional<MsfCatalog> last_;
+    std::uint64_t next_group_id_ = 0;
+    std::uint64_t next_object_id_ = 0;
+    bool ended_ = false;
+    std::size_t max_deltas_per_group_ = 8;
+    std::size_t deltas_in_group_ = 0;
+};
 
 }  // namespace openmoq::publisher

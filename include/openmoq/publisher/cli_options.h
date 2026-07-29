@@ -53,6 +53,14 @@ struct CliOptions {
     bool loop = false;
     bool dump_plan = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
+    // This publisher is live, or simulating live, unless explicitly told
+    // otherwise (PublisherConfig::vod's own rule). --vod is the only way to
+    // opt into VOD from the moqxr binary.
+    bool vod = false;
+    // Section 5: a catalog SHOULD be republished after enough time has
+    // passed that it might fall out of a relay cache. Zero (the default)
+    // disables republication.
+    std::chrono::seconds catalog_republish_interval{0};
 };
 
 CliOptions parse_cli_options(int argc, char** argv);

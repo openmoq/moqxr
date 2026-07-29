@@ -102,7 +102,8 @@ PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const
         .plan = build_publish_plan(segmented_mp4,
                                    config_.draft_version,
                                    config_.include_sap,
-                                   config_.include_msf_timeline),
+                                   config_.include_msf_timeline,
+                                   config_.vod),
     };
 }
 
@@ -115,7 +116,8 @@ PreparedPublish Publisher::prepare_stream(std::istream& input, std::string_view 
         .plan = build_publish_plan(segmented_mp4,
                                    config_.draft_version,
                                    config_.include_sap,
-                                   config_.include_msf_timeline),
+                                   config_.include_msf_timeline,
+                                   config_.vod),
     };
 }
 
@@ -186,6 +188,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         config_.loop,
         config_.subscriber_timeout,
         config_.authorization);
+    active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, false);
@@ -352,6 +355,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         config_.loop,
         config_.subscriber_timeout,
         config_.authorization);
+    active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);
@@ -485,6 +489,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         config_.loop,
         config_.subscriber_timeout,
         config_.authorization);
+    active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);
@@ -551,6 +556,26 @@ transport::TransportStatus Publisher::disconnect(std::uint64_t application_error
         stats_.last_error = "disconnect failed: " + status.message;
     }
     return status;
+}
+
+transport::TransportStatus Publisher::end_broadcast(EndBroadcastMode mode) const {
+    std::shared_ptr<ActiveSession> active;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        active = active_session_;
+    }
+    if (!active || !active->session) {
+        return transport::TransportStatus::failure("end_broadcast requires an active session");
+    }
+    // Held without the lock: end_broadcast blocks on the wire, and holding
+    // state_mutex_ across a write would deadlock a concurrent stats() call,
+    // which is why disconnect() releases it before calling close().
+    //
+    // config_.draft_version is threaded through explicitly because
+    // MoqtSession does not persist the draft used by its in-progress publish
+    // call (it is only ever a parameter to publish()/publish_live()); there
+    // is nothing for end_broadcast to read it back from otherwise.
+    return active->session->end_broadcast(mode, config_.draft_version);
 }
 
 PublisherStats Publisher::stats() const {

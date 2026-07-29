@@ -2537,6 +2537,334 @@ int main() {
     }
 
     {
+        // MSF section 11.3: after a live catalog has actually been published
+        // through publish_live(), end_broadcast() must write a genuine final
+        // catalog object onto the wire (not just send PUBLISH_DONE for media).
+        //
+        // C1 (final review): a prior round deferred the catalog
+        // subscription's PUBLISH_DONE only when catalog_republish_interval_
+        // was set (> 0). end_broadcast() can open a further catalog stream
+        // on the same alias regardless of that knob, so at the DEFAULT
+        // config (as configured here) the deferral must be unconditional --
+        // section 10.11 forbids PUBLISH_DONE before every stream a
+        // subscription will ever open has closed. This is verified two ways
+        // below: (a) via on_read, observing mid-flight that the catalog
+        // object goes out before PUBLISH_DONE does -- proving PUBLISH_DONE
+        // is deferred to publish_live()'s own exit rather than sent
+        // synchronously while processing the catalog SUBSCRIBE, which is
+        // exactly the gap end_broadcast() could otherwise land a stream
+        // into; and (b) the original assertion, retargeted: PUBLISH_DONE
+        // must still be sent by the time publish_live() returns, just not
+        // "immediately" in the old, unsafe sense.
+        MockTransport end_broadcast_transport;
+        end_broadcast_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        end_broadcast_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        end_broadcast_transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0));
+
+        bool catalog_object_seen = false;
+        bool observed_catalog_object_before_publish_done = false;
+        end_broadcast_transport.on_read = [&](MockTransport& transport, std::uint64_t) {
+            bool has_catalog_object = false;
+            bool has_publish_done = false;
+            for (const auto& write : transport.writes) {
+                if (write.stream_id != 0) {
+                    has_catalog_object = true;
+                } else if (message_type(write.bytes) == 0x0b) {
+                    has_publish_done = true;
+                }
+            }
+            if (has_catalog_object) {
+                catalog_object_seen = true;
+                if (!has_publish_done) {
+                    observed_catalog_object_before_publish_done = true;
+                }
+            }
+        };
+
+        // auto_forward=true so the loop keeps polling control (and calling
+        // read_stream, which fires on_read above) for subscriber_timeout_
+        // after EOF instead of exiting on the very next tick -- that grace
+        // window is what gives on_read a chance to observe the wire between
+        // send_catalog() and the deferred PUBLISH_DONE.
+        MoqtSession end_broadcast_session(
+            end_broadcast_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = end_broadcast_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected end-broadcast live session connect to succeed");
+
+        const auto live_bytes = make_live_init_mp4();
+        std::string live_input_bytes(live_bytes.begin(), live_bytes.end());
+        std::istringstream live_input(live_input_bytes);
+        status = end_broadcast_session.publish_live(live_input, DraftVersion::kDraft14, false);
+        ok &= expect(status.ok, "expected end-broadcast live publish to succeed");
+        ok &= expect(catalog_object_seen, "expected the catalog object to actually be sent");
+        ok &= expect(observed_catalog_object_before_publish_done,
+                     "expected at least one moment where the catalog object had gone out but "
+                     "PUBLISH_DONE had not -- proving PUBLISH_DONE is deferred to publish_live()'s "
+                     "own exit rather than sent synchronously while processing the catalog "
+                     "SUBSCRIBE, even at the default catalog_republish_interval_ (section 10.11 "
+                     "MUST NOT: end_broadcast() must still be free to open a further catalog "
+                     "stream without racing an already-sent PUBLISH_DONE)");
+        ok &= expect(control_message_count(end_broadcast_transport, 0x0b) >= 1,
+                     "expected the live catalog subscription to still eventually receive "
+                     "PUBLISH_DONE by the time publish_live() returns");
+
+        const std::size_t writes_before_end = end_broadcast_transport.writes.size();
+        status = end_broadcast_session.end_broadcast(
+            openmoq::publisher::EndBroadcastMode::kTerminate, DraftVersion::kDraft14);
+        ok &= expect(status.ok, "expected end_broadcast to succeed after a live catalog publish");
+        ok &= expect(end_broadcast_transport.writes.size() > writes_before_end,
+                     "expected end_broadcast to write the final catalog onto the wire");
+
+        bool found_final_catalog = false;
+        for (std::size_t i = writes_before_end; i < end_broadcast_transport.writes.size(); ++i) {
+            std::uint64_t stream_type = 0;
+            std::uint64_t track_alias = 0;
+            std::uint64_t group_id = 0;
+            std::uint64_t object_id_delta = 0;
+            std::uint64_t payload_length = 0;
+            std::vector<std::uint8_t> payload;
+            if (decode_object_stream_fields(end_broadcast_transport.writes[i].bytes,
+                                            stream_type,
+                                            track_alias,
+                                            group_id,
+                                            object_id_delta,
+                                            payload_length,
+                                            payload)) {
+                const std::string text(payload.begin(), payload.end());
+                if (text.find("\"isComplete\":true") != std::string::npos) {
+                    found_final_catalog = true;
+                    ok &= expect(track_alias == 0, "expected the final catalog on the catalog track alias");
+                    ok &= expect(group_id == 1,
+                                 "expected the final catalog in a new group after the initial one");
+                    ok &= expect(text.find("\"tracks\":[]") != std::string::npos,
+                                 "expected the final catalog to carry an empty tracks array");
+                }
+            }
+        }
+        ok &= expect(found_final_catalog,
+                     "expected end_broadcast to publish an isComplete final catalog on the wire");
+    }
+
+    {
+        // Fix round 1, Finding 1: draft-ietf-moq-transport-19 section 10.11
+        // forbids sending PUBLISH_DONE for a subscription until every stream
+        // it will ever open has closed. With catalog_republish_interval set,
+        // more independent-catalog streams can open after the first one, so
+        // PUBLISH_DONE for the catalog subscription must be deferred rather
+        // than sent immediately (as it still correctly is when the interval
+        // is zero, per the test above and the many other catalog-subscribe
+        // tests in this file).
+        //
+        // Catalog object writes and control writes are disambiguated by
+        // stream_id rather than by decoding message contents: a catalog
+        // object write always lands on a freshly opened, non-control
+        // stream_id (see SubgroupSenderState::serve), while PUBLISH_DONE is
+        // always written to control_stream_id_ (0 here, since draft-14 does
+        // not use request streams). Decoding PUBLISH_DONE's bytes with
+        // decode_object_stream_fields can spuriously "succeed" (both are
+        // varint sequences), so stream_id is the only reliable signal.
+        //
+        // auto-forward mode is used (rather than await-subscribe) so the
+        // loop keeps polling for subscriber_timeout_ after EOF (see
+        // eof_deadline in the auto-forward loop) instead of exiting on the
+        // very next tick -- that grace window is what gives
+        // maybe_republish_catalog() a chance to actually fire more than
+        // once before the loop, and the deferred PUBLISH_DONE, exit.
+        MockTransport republish_transport;
+        republish_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        republish_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        republish_transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0));
+
+        MoqtSession republish_session(
+            republish_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(2));
+        republish_session.set_catalog_republish_interval(std::chrono::seconds(1));
+        status = republish_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected republish-interval session connect to succeed");
+
+        const auto live_bytes = make_live_init_mp4();
+        std::string live_input_bytes(live_bytes.begin(), live_bytes.end());
+        std::istringstream live_input(live_input_bytes);
+        status = republish_session.publish_live(live_input, DraftVersion::kDraft14, false);
+        ok &= expect(status.ok, "expected republish-interval live publish to succeed");
+
+        std::vector<std::size_t> catalog_object_indices;
+        std::vector<std::size_t> catalog_publish_done_indices;
+        for (std::size_t i = 0; i < republish_transport.writes.size(); ++i) {
+            const auto& write = republish_transport.writes[i];
+            if (write.stream_id != 0) {
+                // Every non-control-stream write in this test is a catalog
+                // object write: no media track was subscribed.
+                catalog_object_indices.push_back(i);
+                continue;
+            }
+            if (message_type(write.bytes) == 0x0b) {
+                catalog_publish_done_indices.push_back(i);
+            }
+        }
+
+        ok &= expect(!catalog_object_indices.empty(),
+                     "expected at least the initial catalog object to have been written");
+        ok &= expect(catalog_object_indices.size() >= 2,
+                     "expected catalog_republish_interval to cause at least one republish before "
+                     "the 2-second subscriber_timeout grace window closed");
+        ok &= expect(catalog_publish_done_indices.size() == 1,
+                     "expected exactly one PUBLISH_DONE for the catalog subscription");
+
+        if (!catalog_object_indices.empty() && catalog_publish_done_indices.size() == 1) {
+            ok &= expect(catalog_publish_done_indices.front() > catalog_object_indices.back(),
+                         "expected PUBLISH_DONE to be deferred until after every catalog object "
+                         "write, not sent immediately after the first one (section 10.11 MUST NOT)");
+        }
+    }
+
+    {
+        // Fix round 2, Finding 1 residual: the deferred catalog PUBLISH_DONE
+        // must still be sent when publish_live() exits via an error path
+        // (drain_queue()/process_control_messages()/maybe_republish_catalog()/
+        // read_stream() failing partway through the loop), not just via the
+        // graceful end-of-loop cleanup -- that is exactly what
+        // DeferredCatalogPublishDoneGuard exists for.
+        //
+        // Getting a *deterministic* error exit out of MockTransport took two
+        // discarded attempts, recorded here since each cost real debugging
+        // time: (1) forcing the error via MockTransport::missing_read_error
+        // alone races the await-subscribe loop's own graceful is_eof exit
+        // check, which (with no media in this test's input) usually wins,
+        // making the test flaky and, in several runs, unable to reach the
+        // error path at all; (2) delaying queue->eof with a custom
+        // sleep-before-EOF streambuf to try to win that race predictably
+        // still did not reliably reach a second control read in practice.
+        //
+        // This version sidesteps the race entirely: a second, malformed
+        // control message (type 0x03 SUBSCRIBE with a 1-byte payload, too
+        // short for decode_subscribe_message to parse) is delivered in the
+        // *same* chunk as the valid catalog SUBSCRIBE, so both are processed
+        // within process_control_messages()'s first pass over that chunk,
+        // before the loop ever re-checks is_eof. This deterministically
+        // reaches `return {protocol_violation(transport_, "received invalid
+        // SUBSCRIBE"), 0};` -- one of the early-return sites the reviewer
+        // enumerated.
+        //
+        // What this test can and cannot observe: protocol_violation() calls
+        // transport.close() before returning the failure, so by the time
+        // DeferredCatalogPublishDoneGuard's destructor tries to write the
+        // deferred PUBLISH_DONE, the mock transport is already closed and
+        // the write correctly, silently fails (logged, not propagated, per
+        // the guard's contract) -- there is no way to observe a
+        // *successful* wire write here, because a real connection closed by
+        // a protocol violation genuinely cannot carry any more data,
+        // deferred or not. What this test verifies instead: (a) the catalog
+        // object was actually sent before the error (proving send_catalog()
+        // ran), (b) publish_live() truly exited via the error path and not
+        // the graceful one, and (c) the guard's destructor actually *ran and
+        // attempted* the deferred send -- observed via its warning
+        // diagnostic on stderr, which only fires from inside the guard when
+        // catalog_publish_done_deferred was still true at function exit.
+        // I could not find, within reasonable effort, a MockTransport-
+        // drivable error path that both reaches one of the early-return
+        // sites and leaves the transport open enough to observe a
+        // subsequent successful write; every reproducible decode-triggered
+        // failure in this code goes through protocol_violation().
+        MockTransport error_exit_transport;
+        error_exit_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        error_exit_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        std::vector<std::uint8_t> subscribe_then_malformed =
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0);
+        const std::vector<std::uint8_t> malformed_subscribe{0x03, 0x00, 0x01, 0xff};
+        subscribe_then_malformed.insert(subscribe_then_malformed.end(), malformed_subscribe.begin(),
+                                        malformed_subscribe.end());
+        error_exit_transport.reads[0].push_back(subscribe_then_malformed);
+
+        MoqtSession error_exit_session(
+            error_exit_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        error_exit_session.set_catalog_republish_interval(std::chrono::seconds(1));
+        status = error_exit_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected error-exit session connect to succeed");
+
+        const auto live_bytes = make_live_init_mp4();
+        std::string live_input_bytes(live_bytes.begin(), live_bytes.end());
+        std::istringstream live_input(live_input_bytes);
+
+        std::ostringstream captured_stderr;
+        std::streambuf* real_cerr_buf = std::cerr.rdbuf(captured_stderr.rdbuf());
+        status = error_exit_session.publish_live(live_input, DraftVersion::kDraft14, false);
+        std::cerr.rdbuf(real_cerr_buf);
+
+        ok &= expect(!status.ok && status.message == "received invalid SUBSCRIBE",
+                     "expected the malformed SUBSCRIBE to surface as an error from publish_live, "
+                     "proving this test actually exercises an error-exit path and not the graceful one");
+
+        bool saw_catalog_object = false;
+        for (const auto& write : error_exit_transport.writes) {
+            if (write.stream_id != 0) {
+                saw_catalog_object = true;
+            }
+        }
+        ok &= expect(saw_catalog_object, "expected the catalog object to have been sent before the error");
+        ok &= expect(captured_stderr.str().find("failed to send deferred catalog PUBLISH_DONE") != std::string::npos,
+                     "expected DeferredCatalogPublishDoneGuard's destructor to run and attempt the "
+                     "deferred send on this error-exit path, logging its failure since the transport "
+                     "is already closed by protocol_violation() by that point");
+    }
+
+    {
+        // Regression: a session driven entirely through the batch publish()
+        // path never calls catalog_publisher_.publish(), so it never learns
+        // which track alias is "catalog" (build_published_tracks() assigns
+        // alias 0 to whichever track appears first in the plan, which need
+        // not be catalog). end_broadcast() must not guess: it should send
+        // only the media PUBLISH_DONE and never inject a catalog JSON
+        // payload onto some other track's alias.
+        MockTransport batch_transport;
+        batch_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        queue_publish_ok_responses(batch_transport, DraftVersion::kDraft14, {2, 4});
+        MoqtSession batch_session(batch_transport, std::string(kTestTrackNamespace), true);
+
+        status = batch_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected batch-only session connect to succeed");
+        status = batch_session.publish(
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft14), source_bytes));
+        ok &= expect(status.ok, "expected batch-only publish to succeed");
+
+        status = batch_session.end_broadcast(
+            openmoq::publisher::EndBroadcastMode::kTerminate, DraftVersion::kDraft14);
+        ok &= expect(status.ok, "expected end_broadcast to succeed on a batch-only session");
+
+        bool leaked_catalog_write = false;
+        for (const auto& write : batch_transport.writes) {
+            std::uint64_t stream_type = 0;
+            std::uint64_t track_alias = 0;
+            std::uint64_t group_id = 0;
+            std::uint64_t object_id_delta = 0;
+            std::uint64_t payload_length = 0;
+            std::vector<std::uint8_t> payload;
+            if (decode_object_stream_fields(write.bytes, stream_type, track_alias, group_id, object_id_delta,
+                                            payload_length, payload)) {
+                const std::string text(payload.begin(), payload.end());
+                if (text.find("\"isComplete\":true") != std::string::npos) {
+                    leaked_catalog_write = true;
+                }
+            }
+        }
+        ok &= expect(!leaked_catalog_write,
+                     "expected end_broadcast on a batch-only session to skip the unverified catalog alias");
+    }
+
+    {
         MockTransport object_live_transport;
         object_live_transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,

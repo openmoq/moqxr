@@ -35,9 +35,89 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
   `src/msf_catalog.cpp`. Do not hand-assemble catalog JSON.
 - The `MsfCatalog::publish_tracks` field models the root `publishTracks` array
   (MSF section 5.1.5), but no emitter populates it yet.
-- Not implemented: MSF section 5.3 delta updates, MSF sections 9/10 log and
-  metrics tracks, MSF section 11.1 URL parsing, and CMSF section 4 content
-  protection.
+- Catalog track lifecycle (MSF sections 5 and 11.3), owned by
+  `CatalogPublisher` in `src/msf_catalog.cpp`:
+  - Object 0 of every group holds a full independent catalog; producing an
+    independent catalog always starts a new group.
+  - Delta updates occupy object IDs 1 and above within the *current* group
+    (they never start a new group), and only `add` and `remove` operations
+    are emitted -- `clone` is not implemented, since it applies when a new
+    track matches an existing one on every field except name, which no
+    producer in this project generates. **Scope:** delta updates only happen
+    at all inside `MoqtSession`'s two `publish_live()` overloads (the
+    SRT-ingest and stdin-ingest live paths), the only callers that ever call
+    `CatalogPublisher::publish()` more than once for a session. The batch
+    `publish()` plan path and `publish_live_objects()` do not populate
+    `CatalogPublisher`, so a broadcast run through either always gets a
+    single static, one-shot catalog with no deltas.
+    **No delta is emitted on the wire today, even on the two `publish_live()`
+    paths:** both build one `LiveCatalog`/`MsfCatalog` snapshot at startup
+    and call `catalog_publisher_.publish()` with that same immutable value on
+    every SUBSCRIBE and republish tick, so `catalogs_equal()` short-circuits
+    after the first call and `publish()` always returns `{}` afterward. The
+    add/remove differ and its object-ID/group-ID bookkeeping are exercised
+    only from unit tests (`tests/msf_catalog_test.cpp`), not from any
+    production code path. Making a delta actually reach the wire needs a
+    live producer that detects a track add/remove mid-broadcast (SRT ingest
+    noticing a track appear/disappear, or a DASH ingest reconfiguration) and
+    calls `catalog_publisher_.publish()` again with an updated `MsfCatalog`;
+    wiring that producer is out of scope for the current phase.
+  - Every catalog object, independent or delta, maps to MOQT sub-group 0.
+  - Section 5.3 freezes a track's attributes once its namespace-and-name
+    tuple has been declared: an attribute change on an existing track cannot
+    be expressed as a delta, so `CatalogPublisher::publish()` falls back to a
+    full independent catalog whenever it detects one, rather than silently
+    dropping the change or emitting an invalid delta.
+  - `CatalogPublisher::force_independent()` re-emits the last published
+    catalog as a fresh independent copy in a new group, for section 5.3's
+    "periodically publish a new independent catalog" guidance and for
+    section 5's cache-expiry republication; `MoqtSession` calls it on
+    `PublisherConfig::catalog_republish_interval` when configured non-zero
+    (default zero preserves one-shot delivery). **Scope:** as with deltas,
+    this is wired only inside the two `publish_live()` overloads; the batch
+    `publish()` path and `publish_live_objects()` never republish.
+    **Operator note:** draft-ietf-moq-transport-19 section 10.11 states "A
+    sender MUST NOT send PUBLISH_DONE until it has closed all streams it
+    will ever open ... for a subscription." `MoqtSession::end_broadcast()`
+    can open a further independent-catalog stream on the catalog track's
+    alias at any point before the session ends, on every live session,
+    regardless of `catalog_republish_interval` -- so `MoqtSession` **always**
+    defers PUBLISH_DONE for the catalog subscription, not only when
+    republication is enabled. It is sent once, when the `publish_live()`
+    polling loop actually winds down (natural end-of-input, or after
+    `end_broadcast()` has ended `CatalogPublisher` and no further stream can
+    open), never immediately at SUBSCRIBE time. (An earlier revision of this
+    document, and of the code, gated the deferral on
+    `catalog_republish_interval` being non-zero; that left the default
+    configuration -- republication off -- sending PUBLISH_DONE immediately,
+    which `end_broadcast()` could then violate by opening one more stream
+    afterward. Fixed: the deferral no longer depends on that setting.)
+    Operators should expect the catalog subscription to stay open, from the
+    receiver's point of view, for the life of the broadcast rather than
+    close immediately after the first catalog object.
+  - `MoqtSession::end_broadcast()` (MSF section 11.3) uses the same
+    `CatalogPublisher` to publish the final independent catalog when a live
+    broadcast ends: `isComplete: true` with an empty `tracks` array for
+    `kTerminate`, or `isLive: false` (with `trackDuration` for tracks whose
+    duration is known) for `kConvertToVod`. This is wired only for the two
+    `MoqtSession::publish_live()` overloads, which are the only callers that
+    populate `CatalogPublisher` in the first place; a session driven through
+    the batch `publish()` plan path or through `publish_live_objects()` does
+    not populate it, and `end_broadcast()` correctly skips the final-catalog
+    write there rather than guess which track alias is "catalog".
+    **Draft conflict on ordering:** MSF section 11.3 lists SUBSCRIBE_DONE
+    (i.e. PUBLISH_DONE, in transport terms) before the final catalog object
+    in its end-of-broadcast bullet order. This implementation sends the
+    final catalog object first and the catalog subscription's PUBLISH_DONE
+    afterward -- the reverse of MSF's order -- because MOQT
+    draft-ietf-moq-transport-19 section 10.11 forbids sending PUBLISH_DONE
+    before every stream a subscription will ever open has closed, and the
+    final catalog stream is one such stream. Where the two drafts disagree,
+    the transport draft governs what may legally appear on the wire, so its
+    ordering wins.
+- Not implemented: `clone` delta operations, MSF sections 9/10 log and
+  metrics tracks, MSF section 11.1 URL parsing, MSF section 12 compression
+  signalling, and CMSF section 4 content protection.
 - The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
   which is not an MSF v1 packaging value; it is defined by
   `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.

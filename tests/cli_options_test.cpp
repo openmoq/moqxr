@@ -144,6 +144,48 @@ int main() {
     }
 
     {
+        const CliOptions options = parse({"openmoq-publisher", "--input", "sample.mp4"});
+        ok &= expect(!options.vod, "expected live to remain the default (no --vod)");
+        ok &= expect(options.catalog_republish_interval == std::chrono::seconds(0),
+                     "expected catalog republication to be disabled by default");
+    }
+
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--vod"});
+        ok &= expect(options.vod, "expected --vod to opt into VOD semantics");
+    }
+
+    {
+        const CliOptions options = parse(
+            {"openmoq-publisher", "--input", "sample.mp4", "--catalog-republish-interval", "45"});
+        ok &= expect(options.catalog_republish_interval == std::chrono::seconds(45),
+                     "expected --catalog-republish-interval to override the republish interval");
+    }
+
+    {
+        bool threw = false;
+        try {
+            static_cast<void>(parse(
+                {"openmoq-publisher", "--input", "sample.mp4", "--catalog-republish-interval", "-1"}));
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--catalog-republish-interval must be zero or greater";
+        }
+        ok &= expect(threw, "expected negative --catalog-republish-interval to be rejected");
+    }
+
+    {
+        bool threw = false;
+        try {
+            static_cast<void>(parse(
+                {"openmoq-publisher", "--input", "sample.mp4", "--catalog-republish-interval", "abc"}));
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()) == "--catalog-republish-interval must be a valid integer";
+        }
+        ok &= expect(threw, "expected a non-numeric --catalog-republish-interval to be rejected");
+    }
+
+    {
         const CliOptions options = parse({"openmoq-publisher", "--input", "-"});
         ok &= expect(options.input_source.kind == openmoq::publisher::InputSourceKind::kStdin,
                      "expected --input - to select stdin");

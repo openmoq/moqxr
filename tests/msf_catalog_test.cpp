@@ -2,6 +2,7 @@
 #include "openmoq/publisher/mp4_box.h"
 
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -481,6 +482,552 @@ int main() {
                           "expected samplerate:0 to serialize rather than throw when the rate is unknown");
     ok &= expect_contains(no_rate_json, "\"channelConfig\":\"2\"",
                           "expected channelConfig to still serialize alongside an unknown samplerate");
+
+    // MSF 11.3: ending a live broadcast.
+    MsfCatalog live_now;
+    live_now.generated_at_ms = 1751000000000ULL;
+    MsfTrack live_v;
+    live_v.name = "video";
+    live_v.packaging = "cmaf";
+    live_v.role = "video";
+    live_v.is_live = true;
+    live_v.codec = "avc1.640028";
+    live_v.bitrate = 5000000;
+    live_now.tracks.push_back(live_v);
+    MsfTrack live_a;
+    live_a.name = "audio";
+    live_a.packaging = "cmaf";
+    live_a.role = "audio";
+    live_a.is_live = true;
+    live_a.codec = "mp4a.40.2";
+    live_a.bitrate = 128000;
+    live_a.samplerate = 48000;
+    live_a.channel_config = "2";
+    live_now.tracks.push_back(live_a);
+
+    // Converting to VOD: isLive flips to false AND trackDuration is added in
+    // the same rebuild. Doing it in two steps would throw, because
+    // validate_track rejects is_live together with track_duration_ms.
+    const std::map<std::string, std::uint64_t> durations{{"video", 60000}, {"audio", 60000}};
+    const MsfCatalog vod_cat =
+        make_end_broadcast_catalog(live_now, EndBroadcastMode::kConvertToVod, durations);
+    const std::string vod_json = serialize_catalog(vod_cat);
+    ok &= expect_contains(vod_json, "\"isLive\":false", "expected VOD conversion to clear isLive");
+    ok &= expect_contains(vod_json, "\"trackDuration\":60000", "expected trackDuration on VOD conversion");
+    ok &= expect_not_contains(vod_json, "\"isLive\":true", "expected no track left live after conversion");
+    ok &= expect_not_contains(vod_json, "\"generatedAt\":",
+                              "expected generatedAt dropped on VOD conversion (MSF 5.1.2)");
+    ok &= expect_not_contains(vod_json, "\"isComplete\"",
+                              "expected no isComplete on a VOD conversion");
+
+    // Terminating permanently: isComplete true and an EMPTY tracks array.
+    const MsfCatalog term_cat =
+        make_end_broadcast_catalog(live_now, EndBroadcastMode::kTerminate, {});
+    const std::string term_json = serialize_catalog(term_cat);
+    ok &= expect_contains(term_json, "\"isComplete\":true", "expected isComplete on termination");
+    ok &= expect_contains(term_json, "\"tracks\":[]", "expected an empty tracks array on termination");
+    ok &= expect_not_contains(term_json, "\"video\"", "expected no track entries after termination");
+
+    // A track with no duration supplied still converts, just without the field.
+    const MsfCatalog partial_cat = make_end_broadcast_catalog(
+        live_now, EndBroadcastMode::kConvertToVod, {{"video", 60000}});
+    const std::string partial_json = serialize_catalog(partial_cat);
+    // Verify each track's properties specifically, not just that they exist somewhere.
+    // Find the audio track object by locating its name field and extracting the
+    // surrounding braces. The audio track is after the video track in the array.
+    const size_t audio_name_pos = partial_json.find("\"name\":\"audio\"");
+    ok &= expect(audio_name_pos != std::string::npos, "expected audio track in partial catalog");
+    if (audio_name_pos != std::string::npos) {
+        // Find the start of this track object by searching backward for an opening brace.
+        size_t track_start = partial_json.rfind('{', audio_name_pos);
+        // Find the end by searching forward for a closing brace.
+        size_t track_end = partial_json.find('}', audio_name_pos);
+        ok &= expect(track_start != std::string::npos && track_end != std::string::npos,
+                     "expected to locate the audio track object braces");
+        if (track_start != std::string::npos && track_end != std::string::npos) {
+            std::string audio_track = partial_json.substr(track_start, track_end - track_start + 1);
+            // Audio track must have isLive:false
+            ok &= expect_contains(audio_track, "\"isLive\":false",
+                                  "expected audio track marked isLive:false");
+            // Audio track must NOT have trackDuration (it was not in the map)
+            ok &= expect_not_contains(audio_track, "\"trackDuration\"",
+                                      "expected audio track to have no trackDuration (not in map)");
+        }
+    }
+    // Video track must have trackDuration:60000 (it was in the map)
+    ok &= expect_contains(partial_json, "\"name\":\"video\"", "expected video track present");
+    const size_t video_name_pos = partial_json.find("\"name\":\"video\"");
+    if (video_name_pos != std::string::npos) {
+        // Extract the video track similarly
+        size_t track_start = partial_json.rfind('{', video_name_pos);
+        size_t track_end = partial_json.find('}', video_name_pos);
+        ok &= expect(track_start != std::string::npos && track_end != std::string::npos,
+                     "expected to locate the video track object braces");
+        if (track_start != std::string::npos && track_end != std::string::npos) {
+            std::string video_track = partial_json.substr(track_start, track_end - track_start + 1);
+            ok &= expect_contains(video_track, "\"trackDuration\":60000",
+                                  "expected video track to have trackDuration:60000");
+            ok &= expect_contains(video_track, "\"isLive\":false",
+                                  "expected video track marked isLive:false");
+        }
+    }
+    // Globally: no "isLive":true should remain anywhere
+    ok &= expect_not_contains(partial_json, "\"isLive\":true",
+                              "expected no live tracks in partial VOD conversion");
+
+    // MSF section 5: object 0 of every group holds an independent catalog,
+    // and all catalog objects map to sub-group 0.
+    CatalogPublisher pub;
+    const auto first = pub.publish(live_now);
+    ok &= expect(first.size() == 1, "expected one object for the first catalog");
+    ok &= expect(first[0].group_id == 0, "expected the first catalog in group 0");
+    ok &= expect(first[0].object_id == 0, "expected the first catalog at object 0");
+    ok &= expect(first[0].subgroup_id == 0, "expected all catalog objects in sub-group 0");
+    ok &= expect_contains(first[0].payload, "\"version\":\"1\"", "expected a serialized catalog");
+
+    // Republishing an unchanged catalog emits nothing.
+    const auto unchanged = pub.publish(live_now);
+    ok &= expect(unchanged.empty(), "expected no objects when the catalog is unchanged");
+
+    // Ending the broadcast emits one independent catalog in a NEW group.
+    const auto ended = pub.end_broadcast(EndBroadcastMode::kTerminate, {});
+    ok &= expect(ended.size() == 1, "expected one object for the end-of-broadcast catalog");
+    ok &= expect(ended[0].group_id == 1, "expected the final catalog in a new group");
+    ok &= expect(ended[0].object_id == 0, "expected the final catalog at object 0");
+    ok &= expect_contains(ended[0].payload, "\"isComplete\":true", "expected isComplete on termination");
+    ok &= expect(pub.ended(), "expected the publisher to report the broadcast ended");
+
+    // Section 5.1.3 and 5.2.7 are one-way transitions: nothing may follow.
+    bool threw_after_end = false;
+    try {
+        (void)pub.publish(live_now);
+    } catch (const std::runtime_error&) {
+        threw_after_end = true;
+    }
+    ok &= expect(threw_after_end, "expected publishing after end_broadcast to throw");
+
+    // end_broadcast is itself a one-way transition: a second call must also throw.
+    bool threw_second_end = false;
+    try {
+        (void)pub.end_broadcast(EndBroadcastMode::kTerminate, {});
+    } catch (const std::runtime_error&) {
+        threw_second_end = true;
+    }
+    ok &= expect(threw_second_end, "expected a second end_broadcast call to throw");
+
+    // Section 5: cache-expiry republication re-emits the SAME catalog as a
+    // fresh independent copy in a new group, at object 0.
+    CatalogPublisher rpub;
+    const auto r1 = rpub.publish(live_now);
+    ok &= expect(r1.size() == 1, "expected the initial catalog");
+    ok &= expect(r1[0].group_id == 0 && r1[0].object_id == 0,
+                 "expected the initial catalog at group 0 object 0");
+
+    const auto r2 = rpub.force_independent();
+    ok &= expect(r2.size() == 1, "expected a republished catalog");
+    ok &= expect(r2[0].group_id == 1, "expected the republished catalog in the next group");
+    ok &= expect(r2[0].object_id == 0, "expected the republished catalog at object 0");
+    ok &= expect(r2[0].subgroup_id == 0, "expected all catalog objects in sub-group 0");
+    ok &= expect(r2[0].payload == r1[0].payload,
+                 "expected republication to re-send identical content");
+
+    // A republish before anything has been published emits nothing rather
+    // than serializing an empty catalog.
+    CatalogPublisher empty_pub;
+    ok &= expect(empty_pub.force_independent().empty(),
+                 "expected no republication before the first publish");
+
+    // force_independent is refused after the broadcast ends, like publish().
+    CatalogPublisher done_pub;
+    (void)done_pub.publish(live_now);
+    (void)done_pub.end_broadcast(EndBroadcastMode::kTerminate, {});
+    bool threw_force = false;
+    try {
+        (void)done_pub.force_independent();
+    } catch (const std::runtime_error&) {
+        threw_force = true;
+    }
+    ok &= expect(threw_force, "expected force_independent to throw after end_broadcast");
+
+    // Fix round 2: prove tracks_equal is sensitive to fields that a hand-rolled
+    // comparison could easily omit. Each case publishes a catalog, then
+    // publishes a copy differing in exactly one field, and expects a new
+    // object -- a silent no-op here would mean a real change never reaches
+    // subscribers, which is the worst failure mode this class has.
+    {
+        // buffers.target_ms changed, with the optional engaged on both sides:
+        // this specifically catches a comparison that only checks has_value().
+        CatalogPublisher buffers_pub;
+        MsfCatalog buffers_a;
+        MsfTrack buffers_track_a = sapped_video;
+        buffers_track_a.buffers = MsfBuffers{.target_ms = 1500, .min_ms = 800, .max_ms = std::nullopt};
+        buffers_a.tracks.push_back(buffers_track_a);
+        const auto buffers_first = buffers_pub.publish(buffers_a);
+        ok &= expect(buffers_first.size() == 1, "expected the first buffers catalog to publish");
+
+        MsfCatalog buffers_b = buffers_a;
+        buffers_b.tracks[0].buffers->target_ms = 2000;
+        const auto buffers_second = buffers_pub.publish(buffers_b);
+        ok &= expect(!buffers_second.empty(),
+                     "expected a change to buffers.target_ms to trigger a republish");
+    }
+
+    {
+        // A custom_fields entry's value changed.
+        CatalogPublisher custom_pub;
+        MsfCatalog custom_a;
+        MsfTrack custom_track_a = sapped_video;
+        custom_track_a.custom_fields["m2tsPacketSize"] = "188";
+        custom_a.tracks.push_back(custom_track_a);
+        const auto custom_first = custom_pub.publish(custom_a);
+        ok &= expect(custom_first.size() == 1, "expected the first custom_fields catalog to publish");
+
+        MsfCatalog custom_b = custom_a;
+        custom_b.tracks[0].custom_fields["m2tsPacketSize"] = "204";
+        const auto custom_second = custom_pub.publish(custom_b);
+        ok &= expect(!custom_second.empty(),
+                     "expected a change to a custom_fields value to trigger a republish");
+    }
+
+    {
+        // A depends entry changed.
+        CatalogPublisher depends_pub;
+        MsfCatalog depends_a;
+        depends_a.tracks.push_back(sap);  // sap.depends == {"video"}
+        const auto depends_first = depends_pub.publish(depends_a);
+        ok &= expect(depends_first.size() == 1, "expected the first depends catalog to publish");
+
+        MsfCatalog depends_b = depends_a;
+        depends_b.tracks[0].depends = {"audio"};
+        const auto depends_second = depends_pub.publish(depends_b);
+        ok &= expect(!depends_second.empty(),
+                     "expected a change to a depends entry to trigger a republish");
+    }
+
+    {
+        // max_grp_sap_starting_type changed.
+        CatalogPublisher sap_pub;
+        MsfCatalog sap_a;
+        sap_a.tracks.push_back(sapped_video);  // max_grp_sap_starting_type == 2
+        const auto sap_first = sap_pub.publish(sap_a);
+        ok &= expect(sap_first.size() == 1, "expected the first SAP-type catalog to publish");
+
+        MsfCatalog sap_b = sap_a;
+        sap_b.tracks[0].max_grp_sap_starting_type = 3;
+        const auto sap_second = sap_pub.publish(sap_b);
+        ok &= expect(!sap_second.empty(),
+                     "expected a change to max_grp_sap_starting_type to trigger a republish");
+    }
+
+    // Adding a track produces a delta at object ID 1 of the CURRENT group.
+    CatalogPublisher dpub;
+    (void)dpub.publish(live_now);
+    MsfCatalog plus_one = live_now;
+    MsfTrack extra;
+    extra.name = "video-low";
+    extra.packaging = "cmaf";
+    extra.role = "video";
+    extra.is_live = true;
+    extra.codec = "avc1.64000d";
+    extra.bitrate = 500000;
+    plus_one.tracks.push_back(extra);
+
+    const auto added = dpub.publish(plus_one);
+    ok &= expect(added.size() == 1, "expected one object for an add delta");
+    ok &= expect(added[0].group_id == 0, "expected the delta to stay in the current group");
+    ok &= expect(added[0].object_id == 1, "expected the delta at object ID 1");
+    ok &= expect_contains(added[0].payload, "\"deltaUpdate\"", "expected a deltaUpdate field");
+    ok &= expect_contains(added[0].payload, "\"op\":\"add\"", "expected an add operation");
+    ok &= expect_contains(added[0].payload, "\"video-low\"", "expected the added track name");
+    // Section 5.3 forbids a ROOT-level tracks field (5.1.4) and a version
+    // field (5.1.1). It does NOT forbid the per-operation "tracks" array,
+    // which section 5.1.6 REQUIRES inside every delta operation. So assert
+    // the root has no tracks, not that the string never appears.
+    ok &= expect(added[0].payload.rfind("{\"deltaUpdate\":[", 0) == 0,
+                 "expected a delta payload to open directly with deltaUpdate");
+    const std::size_t delta_pos = added[0].payload.find("\"deltaUpdate\":");
+    const std::size_t first_tracks_pos = added[0].payload.find("\"tracks\":");
+    ok &= expect(delta_pos != std::string::npos && first_tracks_pos != std::string::npos &&
+                     first_tracks_pos > delta_pos,
+                 "expected every tracks field to sit inside deltaUpdate, never at the root");
+    ok &= expect_not_contains(added[0].payload, "\"version\":", "expected no version field in a delta");
+
+    // Removing a track produces a remove carrying only name (and namespace).
+    const auto removed = dpub.publish(live_now);
+    ok &= expect(removed.size() == 1, "expected one object for a remove delta");
+    ok &= expect(removed[0].object_id == 2, "expected the second delta at object ID 2");
+    ok &= expect_contains(removed[0].payload, "\"op\":\"remove\"", "expected a remove operation");
+    ok &= expect_contains(removed[0].payload, "\"video-low\"", "expected the removed track name");
+    ok &= expect_not_contains(removed[0].payload, "\"bitrate\"",
+                              "expected a remove entry to carry no attributes (MSF 5.1.6)");
+
+    // Section 5.1.6: a remove entry's track object MUST include name, MAY
+    // include namespace, and MUST NOT hold any other field. The differ
+    // builds remove ops from previously-published tracks, which are
+    // complete, so it is the serializer's narrowing (not the input) that
+    // enforces this. Slice the remove op's track object out of the payload
+    // and check its exact contents.
+    {
+        const std::size_t name_pos = removed[0].payload.find("\"name\":\"video-low\"");
+        ok &= expect(name_pos != std::string::npos, "expected the removed track's name in the payload");
+        const std::size_t track_start = removed[0].payload.rfind('{', name_pos);
+        const std::size_t track_end = removed[0].payload.find('}', name_pos);
+        ok &= expect(track_start != std::string::npos && track_end != std::string::npos,
+                     "expected to locate the remove entry's track object braces");
+        if (track_start != std::string::npos && track_end != std::string::npos) {
+            const std::string remove_track =
+                removed[0].payload.substr(track_start, track_end - track_start + 1);
+            ok &= expect_contains(remove_track, "\"name\":\"video-low\"",
+                                  "expected the remove entry to carry its track name");
+            ok &= expect_not_contains(remove_track, "\"bitrate\"",
+                                      "expected the remove entry to carry no bitrate");
+            ok &= expect_not_contains(remove_track, "\"codec\"",
+                                      "expected the remove entry to carry no codec");
+            ok &= expect_not_contains(remove_track, "\"packaging\"",
+                                      "expected the remove entry to carry no packaging");
+        }
+    }
+
+    // Section 5.3 freezes attributes once a tuple is declared, so an attribute
+    // change CANNOT be a delta. It must fall back to a full independent
+    // catalog in a new group; emitting nothing would strand subscribers.
+    MsfCatalog changed = live_now;
+    changed.tracks[0].bitrate = 9000000;
+    const auto rebuilt = dpub.publish(changed);
+    ok &= expect(rebuilt.size() == 1, "expected one object for an attribute change");
+    ok &= expect(rebuilt[0].object_id == 0, "expected an independent catalog, not a delta");
+    ok &= expect(rebuilt[0].group_id == 1, "expected the rebuild in a new group");
+    ok &= expect_contains(rebuilt[0].payload, "\"tracks\":", "expected a full catalog");
+    ok &= expect_contains(rebuilt[0].payload, "\"bitrate\":9000000", "expected the new attribute");
+
+    // Coordinator review finding: the test above changes ONLY an existing
+    // track's attribute, with no simultaneous add or remove. If the section
+    // 5.3 fallback branch were deleted outright, that track would be counted
+    // as neither added nor removed, so `added` and `removed` would both stay
+    // empty, and control would reach the unrelated
+    // "(added.empty() && removed.empty())" branch -- which emits the SAME
+    // full independent catalog at the same object_id/group_id. The test
+    // above cannot distinguish the fallback existing from it being deleted.
+    // Combine an attribute change with a simultaneous add so the two code
+    // paths diverge: without the fallback, `added` is non-empty, so this
+    // would emit a delta carrying only the add -- silently dropping the
+    // bitrate change and stranding subscribers on stale attributes.
+    CatalogPublisher dpub2;
+    (void)dpub2.publish(live_now);
+    MsfCatalog changed_and_added = live_now;
+    changed_and_added.tracks[0].bitrate = 9000000;
+    changed_and_added.tracks.push_back(extra);
+    const auto combined = dpub2.publish(changed_and_added);
+    ok &= expect(combined.size() == 1, "expected one object");
+    ok &= expect(combined[0].object_id == 0,
+                 "expected a full independent catalog, not a delta carrying only the add");
+    ok &= expect_contains(combined[0].payload, "\"tracks\":",
+                          "expected a full catalog with a root tracks array");
+    ok &= expect_contains(combined[0].payload, "\"bitrate\":9000000",
+                          "expected the changed attribute to reach the wire");
+    ok &= expect_not_contains(combined[0].payload, "\"deltaUpdate\"",
+                              "expected no delta when an attribute changed");
+
+    // Section 5.3: bound the deltas a joining subscriber must process.
+    CatalogPublisher bounded;
+    bounded.set_max_deltas_per_group(1);
+    (void)bounded.publish(live_now);
+    MsfCatalog b2 = live_now;
+    b2.tracks.push_back(extra);
+    const auto b_delta = bounded.publish(b2);
+    ok &= expect(b_delta[0].object_id == 1, "expected the first delta at object 1");
+    MsfCatalog b3 = b2;
+    MsfTrack extra2 = extra;
+    extra2.name = "video-mid";
+    b3.tracks.push_back(extra2);
+    const auto b_forced = bounded.publish(b3);
+    ok &= expect(b_forced[0].object_id == 0, "expected the bound to force an independent catalog");
+    ok &= expect(b_forced[0].group_id == 1, "expected the forced catalog in a new group");
+
+    // Final review finding M2: neither counter reset in emit_independent was
+    // covered for a SUBSEQUENT independent catalog (only the very first
+    // independent catalog of a fresh CatalogPublisher was exercised
+    // elsewhere, where both counters start at their already-correct default
+    // values, so a missing reset there is invisible). Force a SECOND
+    // independent catalog via force_independent() after a delta has already
+    // advanced both next_object_id_ and deltas_in_group_ off their defaults,
+    // then take one more delta and check where it lands. Using
+    // set_max_deltas_per_group(1) makes a single assertion close both
+    // mutations the reviewer found pass the suite unmodified: object_id == 2
+    // would mean next_object_id_ was not reset to 1, and object_id == 0
+    // (forced to another independent catalog instead of a delta) would mean
+    // deltas_in_group_ was not reset to 0 -- either mutation is caught by
+    // asserting object_id == 1 alone.
+    {
+        CatalogPublisher m2_pub;
+        m2_pub.set_max_deltas_per_group(1);
+        (void)m2_pub.publish(live_now);  // group 0, object 0
+        MsfCatalog m2_plus_one = live_now;
+        m2_plus_one.tracks.push_back(extra);
+        const auto m2_delta1 = m2_pub.publish(m2_plus_one);  // delta: group 0, object 1
+        ok &= expect(m2_delta1.size() == 1 && m2_delta1[0].group_id == 0 && m2_delta1[0].object_id == 1,
+                     "expected the first delta at group 0, object 1");
+
+        const auto m2_forced = m2_pub.force_independent();  // re-emit as independent in group 1
+        ok &= expect(m2_forced.size() == 1 && m2_forced[0].group_id == 1 && m2_forced[0].object_id == 0,
+                     "expected force_independent to start a new group at object 0");
+
+        MsfCatalog m2_plus_two = m2_plus_one;
+        MsfTrack extra2 = extra;
+        extra2.name = "video-low2";
+        m2_plus_two.tracks.push_back(extra2);
+        const auto m2_delta2 = m2_pub.publish(m2_plus_two);
+        ok &= expect(m2_delta2.size() == 1, "expected one object for the delta after the forced group");
+        if (m2_delta2.size() == 1) {
+            ok &= expect(m2_delta2[0].group_id == 1,
+                         "expected the post-force delta to stay in the forced group");
+            ok &= expect(m2_delta2[0].object_id == 1,
+                         "expected the post-force delta at object ID 1, proving both "
+                         "next_object_id_ and deltas_in_group_ were reset when force_independent "
+                         "started the new group");
+        }
+    }
+
+    // Self-review finding: the delta path diffs desired.tracks through a
+    // std::map keyed by namespace+name, which never runs desired through
+    // validate_catalog the way the full-independent path does via
+    // serialize_catalog. A desired catalog with a duplicate namespace+name
+    // tuple must still throw, not be silently coalesced by std::map::emplace
+    // into a single entry. The duplicate is paired with a genuinely new
+    // track so the diff's added list is non-empty and the "no diff at all"
+    // fallback (which happens to validate too, masking this bug) is not
+    // what catches it -- only an explicit validate_catalog(desired) call
+    // does.
+    {
+        CatalogPublisher dup_pub;
+        (void)dup_pub.publish(live_now);
+        MsfCatalog dup_desired = live_now;
+        MsfTrack dup_of_video = live_now.tracks[0];
+        dup_desired.tracks.push_back(dup_of_video);  // duplicate "video" entry, no namespace
+        dup_desired.tracks.push_back(extra);         // plus a genuinely new track ("video-low")
+        bool threw_on_duplicate = false;
+        try {
+            (void)dup_pub.publish(dup_desired);
+        } catch (const std::runtime_error&) {
+            threw_on_duplicate = true;
+        }
+        ok &= expect(threw_on_duplicate,
+                     "expected a duplicate namespace+name tuple to throw even on the delta path");
+    }
+
+    // Self-review finding: a same-size publishTracks change happening in the
+    // SAME publish() call as a track add/remove must still force a full
+    // catalog. A size-only or track-only check would silently drop the
+    // publishTracks change while still advancing `last_`, so it would never
+    // reach the wire.
+    {
+        CatalogPublisher pt_pub;
+        MsfCatalog pt_a = live_now;
+        MsfTrack pub_v1;
+        pub_v1.name = "upload";
+        pub_v1.packaging = "cmaf";
+        pub_v1.is_live = true;
+        pt_a.publish_tracks.push_back(pub_v1);
+        (void)pt_pub.publish(pt_a);
+
+        MsfCatalog pt_b = pt_a;
+        pt_b.tracks.push_back(extra);          // a track add, which alone would be a valid delta
+        pt_b.publish_tracks[0].label = "new";  // same-size publishTracks, different content
+        const auto pt_result = pt_pub.publish(pt_b);
+        ok &= expect(pt_result.size() == 1, "expected one object when tracks and publishTracks both change");
+        ok &= expect(pt_result[0].object_id == 0,
+                     "expected a publishTracks content change to force a full catalog, not a delta");
+        ok &= expect_contains(pt_result[0].payload, "\"label\":\"new\"",
+                              "expected the publishTracks change to actually reach the wire");
+    }
+
+    // Self-review finding: same as above, but for a same-size initDataList
+    // whose content differs.
+    {
+        CatalogPublisher id_pub;
+        MsfCatalog id_a = live_now;
+        id_a.tracks[0].init_ref = "init-video";
+        id_a.init_data_list.push_back(MsfInitData{.id = "init-video", .type = "inline", .data = "AAAA"});
+        (void)id_pub.publish(id_a);
+
+        MsfCatalog id_b = id_a;
+        id_b.tracks.push_back(extra);           // a track add, which alone would be a valid delta
+        id_b.init_data_list[0].data = "BBBB";   // same-size initDataList, different content
+        const auto id_result = id_pub.publish(id_b);
+        ok &= expect(id_result.size() == 1, "expected one object when tracks and initDataList both change");
+        ok &= expect(id_result[0].object_id == 0,
+                     "expected an initDataList content change to force a full catalog, not a delta");
+        ok &= expect_contains(id_result[0].payload, "\"data\":\"BBBB\"",
+                              "expected the initDataList change to actually reach the wire");
+    }
+
+    // Final review finding I4: emit_independent used to advance
+    // next_group_id_ (and reset next_object_id_/deltars_in_group_) BEFORE
+    // calling serialize_catalog, which can throw (write_track's per-track
+    // checks run inside the serializer; validate_catalog does not call
+    // validate_track). A throw there used to leave next_group_id_ advanced
+    // past a group whose object 0 was never actually sent, so the next
+    // successful delta would land in that phantom group -- violating MSF
+    // section 5. Force the failing publish() call onto the emit_independent
+    // path (not the delta path) by pairing the bad add with a simultaneous
+    // initDataList change, since a pure track add/remove alone takes the
+    // delta path instead, which has the same counter-ordering bug for
+    // next_object_id_ (also fixed) but does not touch next_group_id_.
+    {
+        CatalogPublisher i4_pub;
+        (void)i4_pub.publish(live_now);  // group 0, successfully sent
+
+        MsfTrack bad_video;
+        bad_video.name = "video-bad";
+        bad_video.packaging = "cmaf";
+        bad_video.role = "video";
+        bad_video.is_live = true;
+        bad_video.codec = "avc1.64000e";
+        // Deliberately no bitrate: a media role without one is rejected by
+        // validate_track (MSF 5.2.22), which only runs inside write_track --
+        // validate_catalog (called earlier in publish()) does not catch it.
+
+        MsfCatalog bad_catalog = live_now;
+        bad_catalog.tracks.push_back(bad_video);
+        bad_catalog.init_data_list.push_back(
+            MsfInitData{.id = "unrelated-init", .type = "inline", .data = "AAAA"});
+
+        bool threw_on_missing_bitrate = false;
+        try {
+            (void)i4_pub.publish(bad_catalog);
+        } catch (const std::runtime_error&) {
+            threw_on_missing_bitrate = true;
+        }
+        ok &= expect(threw_on_missing_bitrate,
+                     "expected the missing-bitrate media track to throw");
+
+        MsfCatalog good_add = live_now;
+        good_add.tracks.push_back(extra);  // a genuinely valid new track: a pure delta add
+        const auto after_throw = i4_pub.publish(good_add);
+        ok &= expect(after_throw.size() == 1, "expected one object for the delta after the throw");
+        if (after_throw.size() == 1) {
+            ok &= expect(after_throw[0].group_id == 0,
+                         "expected the post-throw delta to land in the last successfully-emitted "
+                         "group (0), not a phantom group next_group_id_ would have skipped to had "
+                         "the failed emit_independent call already advanced the counter");
+            ok &= expect(after_throw[0].object_id == 1,
+                         "expected the post-throw delta at object ID 1, proving "
+                         "deltas_in_group_/next_object_id_ were not disturbed by the failed attempt");
+        }
+    }
+
+    // Coordinator review finding: "clone" is a deliberate non-goal (this
+    // implementation emits only "add" and "remove"), and validate_catalog
+    // rejects any other operation name, but nothing exercised that path.
+    MsfCatalog clone_catalog;
+    clone_catalog.delta_update.push_back(MsfDeltaOp{.op = "clone", .tracks = {extra}});
+    ok &= throws_runtime_error(clone_catalog, "expected a \"clone\" operation to throw (unimplemented)");
+
+    // Coordinator review finding: validate_catalog also rejects a delta
+    // operation with no tracks at all.
+    MsfCatalog empty_op_catalog;
+    empty_op_catalog.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {}});
+    ok &= throws_runtime_error(empty_op_catalog, "expected a delta operation with no tracks to throw");
 
     return ok ? 0 : 1;
 }

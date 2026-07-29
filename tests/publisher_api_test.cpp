@@ -11,6 +11,7 @@
 namespace {
 
 using openmoq::publisher::DraftVersion;
+using openmoq::publisher::EndBroadcastMode;
 using openmoq::publisher::LiveCatalogMode;
 using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
@@ -334,6 +335,19 @@ int main() {
                      "expected source-catalog mode to bypass the libmoq metadata gate");
     }
 #endif
+
+    // The republish interval is off by default: existing deployments keep
+    // their current wire behaviour.
+    PublisherConfig default_config;
+    ok &= expect(default_config.catalog_republish_interval == std::chrono::seconds(0),
+                 "expected catalog republication disabled by default");
+    ok &= expect(!default_config.vod, "expected the publisher to default to live");
+
+    // end_broadcast on a publisher that never connected reports failure
+    // rather than throwing, matching how disconnect() behaves.
+    Publisher idle_publisher;
+    const auto end_status = idle_publisher.end_broadcast(EndBroadcastMode::kTerminate);
+    ok &= expect(!end_status.ok, "expected end_broadcast without a session to fail cleanly");
 
     return ok ? 0 : 1;
 }
