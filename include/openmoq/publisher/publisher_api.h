@@ -134,16 +134,16 @@ public:
                                                     const transport::TlsConfig& tls = {},
                                                     bool endpoint_alpn_overridden = false) const;
     transport::TransportStatus disconnect(std::uint64_t application_error_code = 0) const;
-    // End the broadcast per MSF section 11.3: send PUBLISH_DONE with status
-    // 0x2 Track Ended for all requests this session still tracks. Returns a
-    // failure status when no session is active.
-    // NOTE: this does not yet publish the final independent catalog
-    // (kConvertToVod marking every track not live plus duration, or
-    // kTerminate's isComplete-with-no-tracks). MoqtSession has no persistent
-    // CatalogPublisher or catalog-stream bookkeeping today; that wiring is
-    // planned for Task 6, which also replaces the current one-shot catalog
-    // delivery with a republishable one. `mode` is accepted now for the
-    // stable public signature but has no effect yet.
+    // End the broadcast per MSF section 11.3: publish the final independent
+    // catalog (kConvertToVod marks every track not live and adds
+    // trackDuration where known; kTerminate marks isComplete true with an
+    // empty tracks array), then send PUBLISH_DONE with status 0x2 Track
+    // Ended for all requests this session still tracks. Returns a failure
+    // status when no session is active. The final catalog write only
+    // happens for a session driven through publish_live(): a session driven
+    // through the batch publish() plan path or publish_live_objects() never
+    // populates MoqtSession's CatalogPublisher, so end_broadcast() skips that
+    // write rather than guess which track alias is "catalog".
     transport::TransportStatus end_broadcast(EndBroadcastMode mode) const;
     PublisherStats stats() const;
     [[deprecated("Use stats(); live polling is not supported by the blocking publish API.")]]

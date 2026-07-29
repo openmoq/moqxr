@@ -650,6 +650,7 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
 
     const std::string catalog_text = serialize_catalog(msf_catalog);
     result.catalog_payload = std::vector<std::uint8_t>(catalog_text.begin(), catalog_text.end());
+    result.msf_catalog = std::move(msf_catalog);
     return result;
 }
 

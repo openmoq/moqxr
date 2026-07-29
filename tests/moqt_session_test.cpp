@@ -2537,6 +2537,115 @@ int main() {
     }
 
     {
+        // MSF section 11.3: after a live catalog has actually been published
+        // through publish_live(), end_broadcast() must write a genuine final
+        // catalog object onto the wire (not just send PUBLISH_DONE for media).
+        MockTransport end_broadcast_transport;
+        end_broadcast_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        end_broadcast_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        end_broadcast_transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0));
+
+        MoqtSession end_broadcast_session(
+            end_broadcast_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        status = end_broadcast_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected end-broadcast live session connect to succeed");
+
+        const auto live_bytes = make_live_init_mp4();
+        std::string live_input_bytes(live_bytes.begin(), live_bytes.end());
+        std::istringstream live_input(live_input_bytes);
+        status = end_broadcast_session.publish_live(live_input, DraftVersion::kDraft14, false);
+        ok &= expect(status.ok, "expected end-broadcast live publish to succeed");
+        ok &= expect(control_message_count(end_broadcast_transport, 0x0b) >= 1,
+                     "expected the live catalog subscribe to receive its immediate PUBLISH_DONE");
+
+        const std::size_t writes_before_end = end_broadcast_transport.writes.size();
+        status = end_broadcast_session.end_broadcast(
+            openmoq::publisher::EndBroadcastMode::kTerminate, DraftVersion::kDraft14);
+        ok &= expect(status.ok, "expected end_broadcast to succeed after a live catalog publish");
+        ok &= expect(end_broadcast_transport.writes.size() > writes_before_end,
+                     "expected end_broadcast to write the final catalog onto the wire");
+
+        bool found_final_catalog = false;
+        for (std::size_t i = writes_before_end; i < end_broadcast_transport.writes.size(); ++i) {
+            std::uint64_t stream_type = 0;
+            std::uint64_t track_alias = 0;
+            std::uint64_t group_id = 0;
+            std::uint64_t object_id_delta = 0;
+            std::uint64_t payload_length = 0;
+            std::vector<std::uint8_t> payload;
+            if (decode_object_stream_fields(end_broadcast_transport.writes[i].bytes,
+                                            stream_type,
+                                            track_alias,
+                                            group_id,
+                                            object_id_delta,
+                                            payload_length,
+                                            payload)) {
+                const std::string text(payload.begin(), payload.end());
+                if (text.find("\"isComplete\":true") != std::string::npos) {
+                    found_final_catalog = true;
+                    ok &= expect(track_alias == 0, "expected the final catalog on the catalog track alias");
+                    ok &= expect(group_id == 1,
+                                 "expected the final catalog in a new group after the initial one");
+                    ok &= expect(text.find("\"tracks\":[]") != std::string::npos,
+                                 "expected the final catalog to carry an empty tracks array");
+                }
+            }
+        }
+        ok &= expect(found_final_catalog,
+                     "expected end_broadcast to publish an isComplete final catalog on the wire");
+    }
+
+    {
+        // Regression: a session driven entirely through the batch publish()
+        // path never calls catalog_publisher_.publish(), so it never learns
+        // which track alias is "catalog" (build_published_tracks() assigns
+        // alias 0 to whichever track appears first in the plan, which need
+        // not be catalog). end_broadcast() must not guess: it should send
+        // only the media PUBLISH_DONE and never inject a catalog JSON
+        // payload onto some other track's alias.
+        MockTransport batch_transport;
+        batch_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        queue_publish_ok_responses(batch_transport, DraftVersion::kDraft14, {2, 4});
+        MoqtSession batch_session(batch_transport, std::string(kTestTrackNamespace), true);
+
+        status = batch_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected batch-only session connect to succeed");
+        status = batch_session.publish(
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft14), source_bytes));
+        ok &= expect(status.ok, "expected batch-only publish to succeed");
+
+        status = batch_session.end_broadcast(
+            openmoq::publisher::EndBroadcastMode::kTerminate, DraftVersion::kDraft14);
+        ok &= expect(status.ok, "expected end_broadcast to succeed on a batch-only session");
+
+        bool leaked_catalog_write = false;
+        for (const auto& write : batch_transport.writes) {
+            std::uint64_t stream_type = 0;
+            std::uint64_t track_alias = 0;
+            std::uint64_t group_id = 0;
+            std::uint64_t object_id_delta = 0;
+            std::uint64_t payload_length = 0;
+            std::vector<std::uint8_t> payload;
+            if (decode_object_stream_fields(write.bytes, stream_type, track_alias, group_id, object_id_delta,
+                                            payload_length, payload)) {
+                const std::string text(payload.begin(), payload.end());
+                if (text.find("\"isComplete\":true") != std::string::npos) {
+                    leaked_catalog_write = true;
+                }
+            }
+        }
+        ok &= expect(!leaked_catalog_write,
+                     "expected end_broadcast on a batch-only session to skip the unverified catalog alias");
+    }
+
+    {
         MockTransport object_live_transport;
         object_live_transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,

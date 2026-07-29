@@ -79,7 +79,11 @@ public:
                                          openmoq::publisher::DraftVersion draft_version);
     TransportStatus close(std::uint64_t application_error_code = 0);
 
-    // MSF section 11.3. Sends PUBLISH_DONE (status 0x2 Track Ended, already
+    // MSF section 11.3. Publishes the final independent catalog via the
+    // persistent catalog_publisher_ member -- isComplete with empty tracks
+    // for kTerminate, or isLive false (with per-track trackDuration when
+    // known) for kConvertToVod -- on a fresh subgroup stream for the catalog
+    // track, then sends PUBLISH_DONE (status 0x2 Track Ended, already
     // hardcoded by encode_publish_done_message) for every request ID this
     // session still has bookkeeping for (publish_stream_id_by_request_id_) --
     // the only per-request state that survives outside the blocking
@@ -88,23 +92,28 @@ public:
     // call; it is only ever a parameter to publish()/publish_live(), never a
     // member, so there is nothing to read it back from here.
     //
-    // `mode` is accepted for the stable public signature but currently has
-    // no effect: NOT YET IMPLEMENTED is publishing the final independent
-    // catalog object (kConvertToVod vs. kTerminate only change that
-    // catalog's contents). Doing so needs a persistent CatalogPublisher plus
-    // catalog track/stream bookkeeping that MoqtSession does not have --
-    // today the catalog track is a one-shot delivery local to each publish
-    // call (see the "Catalog is a one-shot track" comment further down this
-    // file). That plumbing, and making this method actually use `mode`, is
-    // planned for Task 6.
+    // Per-track media durations are not tracked as persistent per-track
+    // state on MoqtSession (see catalog_publisher_'s own comment), so
+    // kConvertToVod is always called with an empty duration map: every track
+    // is still correctly marked not live, it simply omits trackDuration
+    // rather than reporting a fabricated figure.
     //
     // Per-track stream_count (the real count belongs to the per-track
     // SubgroupSenderState that lives inside the blocking publish loop, not
-    // on MoqtSession) is not available here either, so every PUBLISH_DONE
-    // reports stream_count 0 rather than a fabricated number.
+    // on MoqtSession) is not available here either, so every media
+    // PUBLISH_DONE reports stream_count 0 rather than a fabricated number.
     TransportStatus end_broadcast(openmoq::publisher::EndBroadcastMode mode,
                                   openmoq::publisher::DraftVersion draft_version);
     PublishStats publish_stats() const;
+
+    // MSF section 5.3: when non-zero, publish_live() periodically re-emits an
+    // independent catalog (via CatalogPublisher::force_independent) even when
+    // its content has not changed, bounding how many deltas a joining
+    // subscriber must replay. Zero (the default) disables this and preserves
+    // today's one-shot catalog delivery exactly.
+    void set_catalog_republish_interval(std::chrono::seconds interval) {
+        catalog_republish_interval_ = interval;
+    }
 
 private:
     void reset_publish_stats();
@@ -115,6 +124,14 @@ private:
     TransportStatus ensure_setup(openmoq::publisher::DraftVersion draft);
     TransportStatus ensure_control_stream(openmoq::publisher::DraftVersion draft);
     TransportStatus write_frame(std::uint64_t stream_id, std::span<const std::uint8_t> frame, bool fin);
+
+    // Write each CatalogObject onto its own fresh subgroup stream for
+    // track_alias (a new group always means a new stream, so there is never
+    // a previously-open stream to reuse here). Shared by the live catalog
+    // send/republish path and by end_broadcast's final catalog write.
+    TransportStatus send_catalog_objects(openmoq::publisher::DraftVersion draft_version,
+                                         std::uint64_t track_alias,
+                                         const std::vector<openmoq::publisher::CatalogObject>& objects);
 
     PublisherTransport& transport_;
     std::string track_namespace_;
@@ -138,6 +155,31 @@ private:
     PublishStats publish_stats_{};
     std::unordered_map<std::string, std::uint64_t> last_group_by_track_;
     std::atomic<bool> stop_requested_{false};
+
+    // Persistent catalog lifecycle state (MSF section 5 and 11.3). This is
+    // the plumbing the "Catalog is a one-shot track" comments elsewhere in
+    // moqt_session.cpp used to say MoqtSession lacked: it now survives across
+    // the SUBSCRIBE handling closures inside publish_live() and is still here
+    // when end_broadcast() is called, whether from the same call or (as
+    // Publisher::end_broadcast does) from a different thread after it.
+    //
+    // catalog_track_alias_ is only meaningful once catalog_track_alias_known_
+    // is true, which the two publish_live() overloads set right after they
+    // compute the real alias. Only they run catalog_publisher_.publish() at
+    // all, so a session driven through publish() (the batch/plan path) or
+    // publish_live_objects() never sets this flag; end_broadcast() must
+    // check it before writing a "final catalog" object, because alias 0 is
+    // only guaranteed to mean "catalog" inside publish_live()'s own alias
+    // map -- build_published_tracks() (used by the batch path) assigns
+    // alias 0 to whichever track happens to appear first in the plan, which
+    // need not be catalog. Without this guard, end_broadcast() on such a
+    // session would inject a catalog JSON payload onto some other track's
+    // alias.
+    openmoq::publisher::CatalogPublisher catalog_publisher_;
+    std::chrono::seconds catalog_republish_interval_{0};
+    std::chrono::steady_clock::time_point last_catalog_published_at_{};
+    std::uint64_t catalog_track_alias_ = 0;
+    bool catalog_track_alias_known_ = false;
 };
 
 }  // namespace openmoq::publisher::transport

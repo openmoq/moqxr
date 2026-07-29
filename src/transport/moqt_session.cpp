@@ -2782,6 +2782,40 @@ MoqtSession::PublishStats MoqtSession::publish_stats() const {
     return publish_stats_;
 }
 
+TransportStatus MoqtSession::send_catalog_objects(
+    openmoq::publisher::DraftVersion draft_version,
+    std::uint64_t track_alias,
+    const std::vector<openmoq::publisher::CatalogObject>& objects) {
+    for (const auto& object : objects) {
+        const openmoq::publisher::CmsfObject catalog_object{
+            .kind = openmoq::publisher::CmsfObjectKind::kInitialization,
+            .track_name = "catalog",
+            .group_id = object.group_id,
+            .subgroup_id = object.subgroup_id,
+            .object_id = object.object_id,
+            .media_time_us = 0,
+            .media_duration_us = 0,
+            .payload = {},
+            .owned_payload = std::vector<std::uint8_t>(object.payload.begin(), object.payload.end()),
+        };
+        // A fresh SubgroupSenderState per call is correct, not merely
+        // convenient: object.group_id is always new here (emit_independent
+        // increments the group counter on every independent catalog), so
+        // there is never a previously-open stream for this (group, subgroup)
+        // key to reuse.
+        SubgroupSenderState catalog_sender;
+        const TransportStatus status = catalog_sender.serve(
+            transport_, draft_version, track_alias, 0,
+            catalog_object, true, true,
+            std::span<const std::uint8_t>(catalog_object.owned_payload));
+        if (!status.ok) {
+            return status;
+        }
+        record_published_object("catalog", object.group_id, object.payload.size());
+    }
+    return TransportStatus::success();
+}
+
 std::optional<std::vector<std::uint8_t>> MoqtSession::setup_authorization_token() const {
     if (!authorization_.setup_token.has_value()) {
         return std::nullopt;
@@ -3095,34 +3129,69 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     for (const auto& track : tracks) {
         alias_by_track.emplace(track.track_name, next_alias++);
     }
+    catalog_track_alias_ = alias_by_track.at("catalog");
+    catalog_track_alias_known_ = true;
 
-    bool catalog_sent = false;
+    // Replaces the old one-shot `catalog_sent` latch: catalog_publisher_ owns
+    // the group/object sequencing (MSF section 5) and, on the first call,
+    // returns exactly the one independent-catalog object the old code sent by
+    // hand; on any later call with an unchanged catalog it returns nothing,
+    // which is what keeps repeat SUBSCRIBEs across the branches below a
+    // no-op without needing their own latch.
     auto send_catalog = [&](std::uint64_t track_alias) -> TransportStatus {
-        if (catalog_sent) {
+        std::vector<openmoq::publisher::CatalogObject> objects;
+        try {
+            objects = catalog_publisher_.publish(live_catalog.msf_catalog);
+        } catch (const std::runtime_error&) {
+            // Publisher::end_broadcast() is documented to call
+            // MoqtSession::end_broadcast() without holding a lock across it,
+            // specifically so it can run concurrently with an in-progress
+            // publish_live() -- so catalog_publisher_ may have already ended
+            // on another thread. Treat that as "nothing to send" rather than
+            // let the exception escape this TransportStatus-returning path.
             return TransportStatus::success();
         }
-        const openmoq::publisher::CmsfObject catalog_object{
-            .kind = openmoq::publisher::CmsfObjectKind::kInitialization,
-            .track_name = "catalog",
-            .group_id = 0,
-            .subgroup_id = 0,
-            .object_id = 0,
-            .media_time_us = 0,
-            .media_duration_us = 0,
-            .payload = {},
-            .owned_payload = live_catalog.catalog_payload,
-        };
-        SubgroupSenderState catalog_sender;
-        TransportStatus cat_status = catalog_sender.serve(
-            transport_, draft_version, track_alias, 0,
-            catalog_object, true, true,
-            std::span<const std::uint8_t>(live_catalog.catalog_payload));
-        if (!cat_status.ok) {
-            return cat_status;
+        if (objects.empty()) {
+            return TransportStatus::success();
         }
-        record_published_object("catalog", 0, live_catalog.catalog_payload.size());
-        catalog_sent = true;
-        return TransportStatus::success();
+        const TransportStatus status = send_catalog_objects(draft_version, track_alias, objects);
+        if (status.ok) {
+            last_catalog_published_at_ = std::chrono::steady_clock::now();
+        }
+        return status;
+    };
+
+    // MSF section 5.3 cache-expiry republication: when configured, re-emit
+    // an independent catalog on its own interval regardless of whether the
+    // content changed. A no-op until the first send_catalog() call sets
+    // last_catalog_published_at_.
+    auto maybe_republish_catalog = [&]() -> TransportStatus {
+        if (catalog_republish_interval_.count() <= 0) {
+            return TransportStatus::success();
+        }
+        if (last_catalog_published_at_.time_since_epoch().count() == 0) {
+            return TransportStatus::success();
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_catalog_published_at_ < catalog_republish_interval_) {
+            return TransportStatus::success();
+        }
+        std::vector<openmoq::publisher::CatalogObject> objects;
+        try {
+            objects = catalog_publisher_.force_independent();
+        } catch (const std::runtime_error&) {
+            // See send_catalog's identical guard: a concurrent
+            // end_broadcast() may have already ended catalog_publisher_.
+            return TransportStatus::success();
+        }
+        if (objects.empty()) {
+            return TransportStatus::success();
+        }
+        const TransportStatus status = send_catalog_objects(draft_version, catalog_track_alias_, objects);
+        if (status.ok) {
+            last_catalog_published_at_ = now;
+        }
+        return status;
     };
 
     std::map<std::string, SubgroupSenderState> sender_by_track;
@@ -3277,6 +3346,11 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         auto [ctrl_status, _new_subs] = process_control_messages();
         if (!ctrl_status.ok) {
             status = ctrl_status;
+            break;
+        }
+
+        status = maybe_republish_catalog();
+        if (!status.ok) {
             break;
         }
 
@@ -3468,6 +3542,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     for (const auto& track : tracks) {
         alias_by_track.emplace(track.track_name, next_alias++);
     }
+    catalog_track_alias_ = alias_by_track.at("catalog");
+    catalog_track_alias_known_ = true;
 
     // Map PUBLISH request_ids to track names so we can handle PUBLISH_OK from
     // relays that accept tracks via PUBLISH_OK without forwarding SUBSCRIBE.
@@ -3510,35 +3586,68 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // Phase 3: Catalog will be sent when a SUBSCRIBE arrives for it.
     // The relay forwards SUBSCRIBE to us; we respond with SUBSCRIBE_OK,
     // send data, then PUBLISH_DONE -- matching the legacy serve_subscriptions flow.
-    bool catalog_sent = false;
-
+    //
+    // Replaces the old one-shot `catalog_sent` latch: catalog_publisher_ owns
+    // the group/object sequencing (MSF section 5) and, on the first call,
+    // returns exactly the one independent-catalog object the old code sent by
+    // hand; on any later call with an unchanged catalog it returns nothing,
+    // which is what keeps repeat SUBSCRIBEs across the branches below a
+    // no-op without needing their own latch.
     auto send_catalog = [&](std::uint64_t track_alias) -> TransportStatus {
-        if (catalog_sent) {
+        std::vector<openmoq::publisher::CatalogObject> objects;
+        try {
+            objects = catalog_publisher_.publish(live_catalog.msf_catalog);
+        } catch (const std::runtime_error&) {
+            // Publisher::end_broadcast() is documented to call
+            // MoqtSession::end_broadcast() without holding a lock across it,
+            // specifically so it can run concurrently with an in-progress
+            // publish_live() -- so catalog_publisher_ may have already ended
+            // on another thread. Treat that as "nothing to send" rather than
+            // let the exception escape this TransportStatus-returning path.
             return TransportStatus::success();
         }
-        const openmoq::publisher::CmsfObject catalog_object{
-            .kind = openmoq::publisher::CmsfObjectKind::kInitialization,
-            .track_name = "catalog",
-            .group_id = 0,
-            .subgroup_id = 0,
-            .object_id = 0,
-            .media_time_us = 0,
-            .media_duration_us = 0,
-            .payload = {},
-            .owned_payload = live_catalog.catalog_payload,
-        };
-        SubgroupSenderState catalog_sender;
-        TransportStatus cat_status = catalog_sender.serve(
-            transport_, draft_version, track_alias, 0,
-            catalog_object, true, true,
-            std::span<const std::uint8_t>(live_catalog.catalog_payload));
-        if (!cat_status.ok) {
-            return cat_status;
+        if (objects.empty()) {
+            return TransportStatus::success();
         }
-        record_published_object("catalog", 0, live_catalog.catalog_payload.size());
-        catalog_sent = true;
-        std::cerr << "[moqt-session] live: catalog published (" << live_catalog.catalog_payload.size() << " bytes)\n";
-        return TransportStatus::success();
+        const TransportStatus status = send_catalog_objects(draft_version, track_alias, objects);
+        if (status.ok) {
+            last_catalog_published_at_ = std::chrono::steady_clock::now();
+            std::cerr << "[moqt-session] live: catalog published (" << objects.back().payload.size() << " bytes)\n";
+        }
+        return status;
+    };
+
+    // MSF section 5.3 cache-expiry republication: when configured, re-emit
+    // an independent catalog on its own interval regardless of whether the
+    // content changed. A no-op until the first send_catalog() call sets
+    // last_catalog_published_at_.
+    auto maybe_republish_catalog = [&]() -> TransportStatus {
+        if (catalog_republish_interval_.count() <= 0) {
+            return TransportStatus::success();
+        }
+        if (last_catalog_published_at_.time_since_epoch().count() == 0) {
+            return TransportStatus::success();
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_catalog_published_at_ < catalog_republish_interval_) {
+            return TransportStatus::success();
+        }
+        std::vector<openmoq::publisher::CatalogObject> objects;
+        try {
+            objects = catalog_publisher_.force_independent();
+        } catch (const std::runtime_error&) {
+            // See send_catalog's identical guard: a concurrent
+            // end_broadcast() may have already ended catalog_publisher_.
+            return TransportStatus::success();
+        }
+        if (objects.empty()) {
+            return TransportStatus::success();
+        }
+        const TransportStatus status = send_catalog_objects(draft_version, catalog_track_alias_, objects);
+        if (status.ok) {
+            last_catalog_published_at_ = now;
+        }
+        return status;
     };
 
     // Phase 4: Stream media from stdin.
@@ -3991,7 +4100,15 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     std::cerr << "[moqt-session] live: accepted subscribe track=" << subscribe.track_name
                               << " request_id=" << subscribe.request_id << '\n';
 
-                    // Catalog is a one-shot track: send data + PUBLISH_DONE immediately
+                    // The subscription still gets PUBLISH_DONE right after the
+                    // first catalog object, matching the one-shot behavior
+                    // this code always had. catalog_republish_interval_
+                    // therefore does not change what a subscriber sees at
+                    // SUBSCRIBE time; it only controls whether
+                    // maybe_republish_catalog() (called from the polling
+                    // loop below) later opens further independent-catalog
+                    // streams on the same track_alias for as long as this
+                    // session keeps running.
                     if (subscribe.track_name == "catalog") {
                         ws = send_catalog(track_it->second);
                         if (!ws.ok) {
@@ -4088,6 +4205,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 return ctrl_status;
             }
 
+            status = maybe_republish_catalog();
+            if (!status.ok) {
+                join_stdin_thread();
+                return status;
+            }
+
             // Keep polling control briefly after EOF so downstream can still request
             // one-shot tracks (catalog) before we tear down the session.
             if (is_eof) {
@@ -4181,6 +4304,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!ctrl_status.ok) {
                 join_stdin_thread();
                 return ctrl_status;
+            }
+
+            status = maybe_republish_catalog();
+            if (!status.ok) {
+                join_stdin_thread();
+                return status;
             }
 
             if (fin) {
@@ -4920,9 +5049,33 @@ TransportStatus MoqtSession::close(std::uint64_t application_error_code) {
 
 TransportStatus MoqtSession::end_broadcast(openmoq::publisher::EndBroadcastMode mode,
                                            openmoq::publisher::DraftVersion draft_version) {
-    // `mode` will select between kConvertToVod and kTerminate once the final
-    // catalog object is wired up (Task 6); it has no effect yet.
-    static_cast<void>(mode);
+    TransportStatus status = TransportStatus::success();
+
+    // Publish the final independent catalog (MSF 11.3) via the persistent
+    // catalog_publisher_ member: isComplete with empty tracks for kTerminate,
+    // or isLive false for kConvertToVod. Per-track media durations are not
+    // tracked as persistent per-track state on MoqtSession, so this always
+    // passes an empty duration map -- every track is still correctly marked
+    // not live, it simply omits trackDuration rather than reporting a
+    // fabricated figure.
+    //
+    // Guarded by catalog_track_alias_known_: only publish_live()'s two
+    // overloads ever call catalog_publisher_.publish(), so only they can
+    // know catalog_track_alias_ actually names the catalog track (see the
+    // member's own comment). A session driven through publish() or
+    // publish_live_objects() skips this write entirely rather than risk
+    // injecting a catalog payload onto an arbitrary track's alias.
+    // Additionally guarded by ended() rather than a try/catch: a second
+    // end_broadcast() call should still send media PUBLISH_DONE below
+    // instead of bailing out entirely.
+    if (catalog_track_alias_known_ && !catalog_publisher_.ended()) {
+        const auto catalog_objects = catalog_publisher_.end_broadcast(mode, {});
+        const TransportStatus catalog_status =
+            send_catalog_objects(draft_version, catalog_track_alias_, catalog_objects);
+        if (!catalog_status.ok) {
+            status = catalog_status;
+        }
+    }
 
     // publish_stream_id_by_request_id_ is the only per-request state that
     // survives outside the blocking publish_*() loop, so it is also the only
@@ -4935,7 +5088,6 @@ TransportStatus MoqtSession::end_broadcast(openmoq::publisher::EndBroadcastMode 
         request_ids.push_back(entry.first);
     }
 
-    TransportStatus status = TransportStatus::success();
     for (const std::uint64_t request_id : request_ids) {
         // stream_count is real per-track state owned by SubgroupSenderState
         // inside the blocking publish loop, not persisted on MoqtSession.

@@ -7,6 +7,7 @@
 
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/moq_draft.h"
+#include "openmoq/publisher/msf_catalog.h"
 
 namespace openmoq::publisher {
 
@@ -62,6 +63,11 @@ void emit_plan_objects(const PublishPlan& plan,
 struct LiveCatalog {
     std::vector<std::uint8_t> catalog_payload;
     std::vector<TrackInitialization> track_initializations;
+    // The MsfCatalog struct catalog_payload was serialized from, exposed so
+    // callers that need to re-publish (e.g. CatalogPublisher-driven
+    // republication or end-of-broadcast signalling) do not have to re-parse
+    // catalog_payload or reconstruct the catalog from TrackDescription by hand.
+    MsfCatalog msf_catalog;
 };
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,

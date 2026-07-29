@@ -35,9 +35,40 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
   `src/msf_catalog.cpp`. Do not hand-assemble catalog JSON.
 - The `MsfCatalog::publish_tracks` field models the root `publishTracks` array
   (MSF section 5.1.5), but no emitter populates it yet.
-- Not implemented: MSF section 5.3 delta updates, MSF sections 9/10 log and
-  metrics tracks, MSF section 11.1 URL parsing, and CMSF section 4 content
-  protection.
+- Catalog track lifecycle (MSF sections 5 and 11.3), owned by
+  `CatalogPublisher` in `src/msf_catalog.cpp`:
+  - Object 0 of every group holds a full independent catalog; producing an
+    independent catalog always starts a new group.
+  - Delta updates occupy object IDs 1 and above within the *current* group
+    (they never start a new group), and only `add` and `remove` operations
+    are emitted -- `clone` is not implemented, since it applies when a new
+    track matches an existing one on every field except name, which no
+    producer in this project generates.
+  - Every catalog object, independent or delta, maps to MOQT sub-group 0.
+  - Section 5.3 freezes a track's attributes once its namespace-and-name
+    tuple has been declared: an attribute change on an existing track cannot
+    be expressed as a delta, so `CatalogPublisher::publish()` falls back to a
+    full independent catalog whenever it detects one, rather than silently
+    dropping the change or emitting an invalid delta.
+  - `CatalogPublisher::force_independent()` re-emits the last published
+    catalog as a fresh independent copy in a new group, for section 5.3's
+    "periodically publish a new independent catalog" guidance and for
+    section 5's cache-expiry republication; `MoqtSession` calls it on
+    `PublisherConfig::catalog_republish_interval` when configured non-zero
+    (default zero preserves one-shot delivery).
+  - `MoqtSession::end_broadcast()` (MSF section 11.3) uses the same
+    `CatalogPublisher` to publish the final independent catalog when a live
+    broadcast ends: `isComplete: true` with an empty `tracks` array for
+    `kTerminate`, or `isLive: false` (with `trackDuration` for tracks whose
+    duration is known) for `kConvertToVod`. This is wired only for the two
+    `MoqtSession::publish_live()` overloads, which are the only callers that
+    populate `CatalogPublisher` in the first place; a session driven through
+    the batch `publish()` plan path or through `publish_live_objects()` does
+    not populate it, and `end_broadcast()` correctly skips the final-catalog
+    write there rather than guess which track alias is "catalog".
+- Not implemented: `clone` delta operations, MSF sections 9/10 log and
+  metrics tracks, MSF section 11.1 URL parsing, MSF section 12 compression
+  signalling, and CMSF section 4 content protection.
 - The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
   which is not an MSF v1 packaging value; it is defined by
   `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.
