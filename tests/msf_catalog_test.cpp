@@ -778,5 +778,78 @@ int main() {
     ok &= expect(b_forced[0].object_id == 0, "expected the bound to force an independent catalog");
     ok &= expect(b_forced[0].group_id == 1, "expected the forced catalog in a new group");
 
+    // Self-review finding: the delta path diffs desired.tracks through a
+    // std::map keyed by namespace+name, which never runs desired through
+    // validate_catalog the way the full-independent path does via
+    // serialize_catalog. A desired catalog with a duplicate namespace+name
+    // tuple must still throw, not be silently coalesced by std::map::emplace
+    // into a single entry. The duplicate is paired with a genuinely new
+    // track so the diff's added list is non-empty and the "no diff at all"
+    // fallback (which happens to validate too, masking this bug) is not
+    // what catches it -- only an explicit validate_catalog(desired) call
+    // does.
+    {
+        CatalogPublisher dup_pub;
+        (void)dup_pub.publish(live_now);
+        MsfCatalog dup_desired = live_now;
+        MsfTrack dup_of_video = live_now.tracks[0];
+        dup_desired.tracks.push_back(dup_of_video);  // duplicate "video" entry, no namespace
+        dup_desired.tracks.push_back(extra);         // plus a genuinely new track ("video-low")
+        bool threw_on_duplicate = false;
+        try {
+            (void)dup_pub.publish(dup_desired);
+        } catch (const std::runtime_error&) {
+            threw_on_duplicate = true;
+        }
+        ok &= expect(threw_on_duplicate,
+                     "expected a duplicate namespace+name tuple to throw even on the delta path");
+    }
+
+    // Self-review finding: a same-size publishTracks change happening in the
+    // SAME publish() call as a track add/remove must still force a full
+    // catalog. A size-only or track-only check would silently drop the
+    // publishTracks change while still advancing `last_`, so it would never
+    // reach the wire.
+    {
+        CatalogPublisher pt_pub;
+        MsfCatalog pt_a = live_now;
+        MsfTrack pub_v1;
+        pub_v1.name = "upload";
+        pub_v1.packaging = "cmaf";
+        pub_v1.is_live = true;
+        pt_a.publish_tracks.push_back(pub_v1);
+        (void)pt_pub.publish(pt_a);
+
+        MsfCatalog pt_b = pt_a;
+        pt_b.tracks.push_back(extra);          // a track add, which alone would be a valid delta
+        pt_b.publish_tracks[0].label = "new";  // same-size publishTracks, different content
+        const auto pt_result = pt_pub.publish(pt_b);
+        ok &= expect(pt_result.size() == 1, "expected one object when tracks and publishTracks both change");
+        ok &= expect(pt_result[0].object_id == 0,
+                     "expected a publishTracks content change to force a full catalog, not a delta");
+        ok &= expect_contains(pt_result[0].payload, "\"label\":\"new\"",
+                              "expected the publishTracks change to actually reach the wire");
+    }
+
+    // Self-review finding: same as above, but for a same-size initDataList
+    // whose content differs.
+    {
+        CatalogPublisher id_pub;
+        MsfCatalog id_a = live_now;
+        id_a.tracks[0].init_ref = "init-video";
+        id_a.init_data_list.push_back(MsfInitData{.id = "init-video", .type = "inline", .data = "AAAA"});
+        (void)id_pub.publish(id_a);
+
+        MsfCatalog id_b = id_a;
+        id_b.tracks.push_back(extra);           // a track add, which alone would be a valid delta
+        id_b.init_data_list[0].data = "BBBB";   // same-size initDataList, different content
+        const auto id_result = id_pub.publish(id_b);
+        ok &= expect(id_result.size() == 1, "expected one object when tracks and initDataList both change");
+        ok &= expect(id_result[0].object_id == 0,
+                     "expected an initDataList content change to force a full catalog, not a delta");
+        ok &= expect_contains(id_result[0].payload, "\"data\":\"BBBB\"",
+                              "expected the initDataList change to actually reach the wire");
+    }
+
     return ok ? 0 : 1;
 }

@@ -683,6 +683,14 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
         return {};
     }
 
+    // Section 5.3's freeze rule and the differ below only reason about
+    // `desired.tracks`; they never run `desired` through the catalog-wide
+    // checks (duplicate names, dangling initRef, ...) the way the
+    // full-independent path does via serialize_catalog. Validate explicitly
+    // so a malformed `desired` still throws instead of silently producing a
+    // delta from an invalid catalog.
+    validate_catalog(desired);
+
     // Key tracks by the namespace and name tuple, which section 5.3 treats as
     // the identity of a track.
     const auto key_of = [](const MsfTrack& track) {
@@ -721,9 +729,24 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     }
 
     // Anything other than a pure add/remove of whole tracks, including a
-    // change to initDataList or publishTracks, needs a full catalog.
-    const bool init_data_changed = last_->init_data_list.size() != desired.init_data_list.size();
-    if ((added.empty() && removed.empty()) || init_data_changed ||
+    // change to initDataList or publishTracks, needs a full catalog. This
+    // must be a full equality check, not just a size comparison: a same-size
+    // initDataList or publishTracks whose *content* differs is exactly as
+    // inexpressible as a delta, and if it coincides with a track add/remove
+    // in the same publish() call, the "added/removed both empty" branch
+    // below would not catch it -- the content change would be silently
+    // dropped even though `last_` gets updated to reflect it.
+    bool init_data_changed = last_->init_data_list.size() != desired.init_data_list.size();
+    for (std::size_t i = 0; !init_data_changed && i < last_->init_data_list.size(); ++i) {
+        const auto& a = last_->init_data_list[i];
+        const auto& b = desired.init_data_list[i];
+        init_data_changed = a.id != b.id || a.type != b.type || a.data != b.data;
+    }
+    bool publish_tracks_changed = last_->publish_tracks.size() != desired.publish_tracks.size();
+    for (std::size_t i = 0; !publish_tracks_changed && i < last_->publish_tracks.size(); ++i) {
+        publish_tracks_changed = !tracks_equal(last_->publish_tracks[i], desired.publish_tracks[i]);
+    }
+    if ((added.empty() && removed.empty()) || init_data_changed || publish_tracks_changed ||
         deltas_in_group_ >= max_deltas_per_group_) {
         std::vector<CatalogObject> out;
         out.push_back(emit_independent(desired));
