@@ -542,6 +542,8 @@ int main() {
         size_t track_start = partial_json.rfind('{', audio_name_pos);
         // Find the end by searching forward for a closing brace.
         size_t track_end = partial_json.find('}', audio_name_pos);
+        ok &= expect(track_start != std::string::npos && track_end != std::string::npos,
+                     "expected to locate the audio track object braces");
         if (track_start != std::string::npos && track_end != std::string::npos) {
             std::string audio_track = partial_json.substr(track_start, track_end - track_start + 1);
             // Audio track must have isLive:false
@@ -559,6 +561,8 @@ int main() {
         // Extract the video track similarly
         size_t track_start = partial_json.rfind('{', video_name_pos);
         size_t track_end = partial_json.find('}', video_name_pos);
+        ok &= expect(track_start != std::string::npos && track_end != std::string::npos,
+                     "expected to locate the video track object braces");
         if (track_start != std::string::npos && track_end != std::string::npos) {
             std::string video_track = partial_json.substr(track_start, track_end - track_start + 1);
             ok &= expect_contains(video_track, "\"trackDuration\":60000",
@@ -840,6 +844,50 @@ int main() {
     ok &= expect(b_forced[0].object_id == 0, "expected the bound to force an independent catalog");
     ok &= expect(b_forced[0].group_id == 1, "expected the forced catalog in a new group");
 
+    // Final review finding M2: neither counter reset in emit_independent was
+    // covered for a SUBSEQUENT independent catalog (only the very first
+    // independent catalog of a fresh CatalogPublisher was exercised
+    // elsewhere, where both counters start at their already-correct default
+    // values, so a missing reset there is invisible). Force a SECOND
+    // independent catalog via force_independent() after a delta has already
+    // advanced both next_object_id_ and deltas_in_group_ off their defaults,
+    // then take one more delta and check where it lands. Using
+    // set_max_deltas_per_group(1) makes a single assertion close both
+    // mutations the reviewer found pass the suite unmodified: object_id == 2
+    // would mean next_object_id_ was not reset to 1, and object_id == 0
+    // (forced to another independent catalog instead of a delta) would mean
+    // deltas_in_group_ was not reset to 0 -- either mutation is caught by
+    // asserting object_id == 1 alone.
+    {
+        CatalogPublisher m2_pub;
+        m2_pub.set_max_deltas_per_group(1);
+        (void)m2_pub.publish(live_now);  // group 0, object 0
+        MsfCatalog m2_plus_one = live_now;
+        m2_plus_one.tracks.push_back(extra);
+        const auto m2_delta1 = m2_pub.publish(m2_plus_one);  // delta: group 0, object 1
+        ok &= expect(m2_delta1.size() == 1 && m2_delta1[0].group_id == 0 && m2_delta1[0].object_id == 1,
+                     "expected the first delta at group 0, object 1");
+
+        const auto m2_forced = m2_pub.force_independent();  // re-emit as independent in group 1
+        ok &= expect(m2_forced.size() == 1 && m2_forced[0].group_id == 1 && m2_forced[0].object_id == 0,
+                     "expected force_independent to start a new group at object 0");
+
+        MsfCatalog m2_plus_two = m2_plus_one;
+        MsfTrack extra2 = extra;
+        extra2.name = "video-low2";
+        m2_plus_two.tracks.push_back(extra2);
+        const auto m2_delta2 = m2_pub.publish(m2_plus_two);
+        ok &= expect(m2_delta2.size() == 1, "expected one object for the delta after the forced group");
+        if (m2_delta2.size() == 1) {
+            ok &= expect(m2_delta2[0].group_id == 1,
+                         "expected the post-force delta to stay in the forced group");
+            ok &= expect(m2_delta2[0].object_id == 1,
+                         "expected the post-force delta at object ID 1, proving both "
+                         "next_object_id_ and deltas_in_group_ were reset when force_independent "
+                         "started the new group");
+        }
+    }
+
     // Self-review finding: the delta path diffs desired.tracks through a
     // std::map keyed by namespace+name, which never runs desired through
     // validate_catalog the way the full-independent path does via
@@ -911,6 +959,61 @@ int main() {
                      "expected an initDataList content change to force a full catalog, not a delta");
         ok &= expect_contains(id_result[0].payload, "\"data\":\"BBBB\"",
                               "expected the initDataList change to actually reach the wire");
+    }
+
+    // Final review finding I4: emit_independent used to advance
+    // next_group_id_ (and reset next_object_id_/deltars_in_group_) BEFORE
+    // calling serialize_catalog, which can throw (write_track's per-track
+    // checks run inside the serializer; validate_catalog does not call
+    // validate_track). A throw there used to leave next_group_id_ advanced
+    // past a group whose object 0 was never actually sent, so the next
+    // successful delta would land in that phantom group -- violating MSF
+    // section 5. Force the failing publish() call onto the emit_independent
+    // path (not the delta path) by pairing the bad add with a simultaneous
+    // initDataList change, since a pure track add/remove alone takes the
+    // delta path instead, which has the same counter-ordering bug for
+    // next_object_id_ (also fixed) but does not touch next_group_id_.
+    {
+        CatalogPublisher i4_pub;
+        (void)i4_pub.publish(live_now);  // group 0, successfully sent
+
+        MsfTrack bad_video;
+        bad_video.name = "video-bad";
+        bad_video.packaging = "cmaf";
+        bad_video.role = "video";
+        bad_video.is_live = true;
+        bad_video.codec = "avc1.64000e";
+        // Deliberately no bitrate: a media role without one is rejected by
+        // validate_track (MSF 5.2.22), which only runs inside write_track --
+        // validate_catalog (called earlier in publish()) does not catch it.
+
+        MsfCatalog bad_catalog = live_now;
+        bad_catalog.tracks.push_back(bad_video);
+        bad_catalog.init_data_list.push_back(
+            MsfInitData{.id = "unrelated-init", .type = "inline", .data = "AAAA"});
+
+        bool threw_on_missing_bitrate = false;
+        try {
+            (void)i4_pub.publish(bad_catalog);
+        } catch (const std::runtime_error&) {
+            threw_on_missing_bitrate = true;
+        }
+        ok &= expect(threw_on_missing_bitrate,
+                     "expected the missing-bitrate media track to throw");
+
+        MsfCatalog good_add = live_now;
+        good_add.tracks.push_back(extra);  // a genuinely valid new track: a pure delta add
+        const auto after_throw = i4_pub.publish(good_add);
+        ok &= expect(after_throw.size() == 1, "expected one object for the delta after the throw");
+        if (after_throw.size() == 1) {
+            ok &= expect(after_throw[0].group_id == 0,
+                         "expected the post-throw delta to land in the last successfully-emitted "
+                         "group (0), not a phantom group next_group_id_ would have skipped to had "
+                         "the failed emit_independent call already advanced the counter");
+            ok &= expect(after_throw[0].object_id == 1,
+                         "expected the post-throw delta at object ID 1, proving "
+                         "deltas_in_group_/next_object_id_ were not disturbed by the failed attempt");
+        }
     }
 
     // Coordinator review finding: "clone" is a deliberate non-goal (this

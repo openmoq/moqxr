@@ -659,17 +659,41 @@ bool catalogs_equal(const MsfCatalog& a, const MsfCatalog& b) {
 }  // namespace
 
 CatalogObject CatalogPublisher::emit_independent(const MsfCatalog& catalog) {
+    // serialize_catalog can throw (validate_catalog, and per-track checks
+    // inside write_track -- validate_catalog does not call validate_track).
+    // Serialize into a local first and only touch the counters once it has
+    // succeeded: assigning next_group_id_++ before serializing would leave
+    // the counter advanced past a group whose object 0 was never actually
+    // sent on a throw, and a later delta would land in that phantom group,
+    // violating MSF section 5.
+    std::string payload = serialize_catalog(catalog);
+
     CatalogObject object;
     object.group_id = next_group_id_++;
     object.object_id = 0;
     object.subgroup_id = 0;
-    object.payload = serialize_catalog(catalog);
+    object.payload = std::move(payload);
     next_object_id_ = 1;
     deltas_in_group_ = 0;
     return object;
 }
 
+bool CatalogPublisher::ended() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ended_;
+}
+
+void CatalogPublisher::reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_.reset();
+    next_group_id_ = 0;
+    next_object_id_ = 0;
+    ended_ = false;
+    deltas_in_group_ = 0;
+}
+
 std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (ended_) {
         throw std::runtime_error("MSF catalog publish after end_broadcast");
     }
@@ -762,6 +786,13 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
         delta.delta_update.push_back(MsfDeltaOp{.op = "remove", .tracks = std::move(removed)});
     }
 
+    // serialize_catalog can throw (write_track's per-track checks run for
+    // "add" ops). Serialize into a local first: assigning next_object_id_++
+    // before serializing would leave the counter advanced past an object
+    // that was never actually sent on a throw, and the next successful delta
+    // would then skip an object_id, violating MSF section 5's sequencing.
+    std::string payload = serialize_catalog(delta);
+
     CatalogObject object;
     // Stay in the current group. next_group_id_ is at least 1 here: this
     // branch is only reachable when last_ has a value, which means
@@ -770,7 +801,7 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     object.group_id = next_group_id_ - 1;
     object.object_id = next_object_id_++;
     object.subgroup_id = 0;
-    object.payload = serialize_catalog(delta);
+    object.payload = std::move(payload);
 
     last_ = desired;
     ++deltas_in_group_;
@@ -778,6 +809,7 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
 }
 
 std::vector<CatalogObject> CatalogPublisher::force_independent() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (ended_) {
         throw std::runtime_error("MSF catalog force_independent after end_broadcast");
     }
@@ -792,6 +824,7 @@ std::vector<CatalogObject> CatalogPublisher::force_independent() {
 std::vector<CatalogObject> CatalogPublisher::end_broadcast(
     EndBroadcastMode mode,
     const std::map<std::string, std::uint64_t>& track_durations_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (ended_) {
         throw std::runtime_error("MSF catalog end_broadcast called twice");
     }

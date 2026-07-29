@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -162,6 +163,15 @@ struct CatalogObject {
 //
 // Object 0 of every group holds a full independent catalog. Producing an
 // independent catalog always starts a new group.
+//
+// Thread safety: Publisher::end_broadcast() is documented to invoke
+// MoqtSession::end_broadcast() (and, transitively, this class's own
+// end_broadcast()) without holding Publisher's state_mutex_, specifically so
+// it can run concurrently with an in-progress publish()/publish_live() call
+// on the same session -- see publisher_api.h and moqt_session.h. That in-
+// progress call may be inside publish() reading `last_` (via catalogs_equal)
+// at the same moment end_broadcast() reassigns it. mutex_ serializes every
+// entry point below so that read and the reassignment can never overlap.
 class CatalogPublisher {
 public:
     // Emit whatever is needed to move subscribers to `desired`. Returns an
@@ -181,16 +191,28 @@ public:
     // vector if nothing has been published yet.
     std::vector<CatalogObject> force_independent();
 
-    bool ended() const { return ended_; }
+    bool ended() const;
 
     // Section 5.3: producers publishing frequent deltas SHOULD periodically
     // publish a new independent catalog to bound the delta processing a
     // joining subscriber must perform. Default 8.
     void set_max_deltas_per_group(std::size_t max_deltas) { max_deltas_per_group_ = max_deltas; }
 
+    // Reset all per-broadcast state (the last published catalog, the group
+    // and object counters, and the ended flag) back to how a freshly
+    // constructed CatalogPublisher starts. max_deltas_per_group_ is left
+    // alone, since it is a standing configuration knob rather than
+    // per-broadcast state. A caller that reuses one MoqtSession instance
+    // across more than one publish()/publish_live() call must call this
+    // first, or the second broadcast's first publish() would see `last_`
+    // already set from the previous broadcast and (via catalogs_equal)
+    // silently send no catalog at all to the new broadcast's subscribers.
+    void reset();
+
 private:
     CatalogObject emit_independent(const MsfCatalog& catalog);
 
+    mutable std::mutex mutex_;
     std::optional<MsfCatalog> last_;
     std::uint64_t next_group_id_ = 0;
     std::uint64_t next_object_id_ = 0;
