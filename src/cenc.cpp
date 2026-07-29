@@ -38,7 +38,13 @@ std::optional<ByteSpan> find_child_box_span(std::span<const std::uint8_t> bytes,
         return std::nullopt;
     }
 
-    while (cursor + 8 <= limit) {
+    // Written as limit >= 8 && cursor <= limit - 8 rather than
+    // cursor + 8 <= limit: the latter can wrap if cursor is ever within 8 of
+    // SIZE_MAX, which would falsely look "in bounds". Unreachable from
+    // today's callers (real parsed offsets plus small constants), but this
+    // function exists to defend against untrusted offsets, so it must not
+    // depend on callers staying that way.
+    while (limit >= 8 && cursor <= limit - 8) {
         const std::uint32_t box_size = read_be32_at(bytes, cursor);
         // A length below the 8-byte header, or one running past the limit,
         // means the remaining bytes are not a valid box chain. Stop rather

@@ -65,7 +65,20 @@ int main() {
 
     // A container size larger than the buffer must not drive reads past the
     // end. This is the memory-safety case: the declared size is fabricated.
-    const auto oversized = find_child_box_span(payload, 0, 0x40000000, 0, "zzzz");
+    //
+    // `payload` above is built by `insert`-based growth, which leaves
+    // capacity slack past its logical size (measured: 33 logical / 44
+    // capacity) -- a read just past `size()` can land in that allocated-but-
+    // unused slack without ASAN flagging it, silently defeating this case as
+    // a regression guard. Reconstructing from a begin/end iterator pair
+    // (random-access iterators) makes libstdc++ allocate exactly the
+    // required size with no slack, the same way `parse_mp4_stream` builds
+    // real file buffers via `resize()` in src/mp4_box.cpp. This is the
+    // buffer shape that must be used here so that, under ASAN, dropping the
+    // clamp in find_child_box_span turns this case into an observed
+    // heap-buffer-overflow rather than a silent pass.
+    const std::vector<std::uint8_t> exact_sized_payload(payload.begin(), payload.end());
+    const auto oversized = find_child_box_span(exact_sized_payload, 0, 0x40000000, 0, "zzzz");
     ok &= expect(!oversized.has_value(), "expected a fabricated container size to be clamped");
 
     // A child whose declared length runs past the container terminates the
