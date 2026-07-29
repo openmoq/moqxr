@@ -75,6 +75,46 @@ The batch and live paths latch a `catalog_sent` flag
 5. **Joining FETCH is out of scope.** Section 5's "Subscribers accessing the
    catalog MUST use SUBSCRIBE with a Joining FETCH" binds subscribers. moqxr is
    a publisher. Stated explicitly so the omission is not read as an oversight.
+6. **Live is the default; VOD is opt-in.** This publisher is expected to be
+   live, or simulating live, unless explicitly configured otherwise. VOD
+   semantics are never inferred. See Part A0.
+
+## Part A0: Correct the live-versus-VOD default
+
+Phase 1 got this backwards on the batch path and this phase fixes it.
+
+`build_publish_plan` hardcodes `make_msf_track(track, /*is_live=*/false)`
+(`src/cmsf_packager.cpp:440`), so every file publish advertises itself as VOD.
+That is wrong for this project: the batch path carries `--paced` and `--loop`
+(`include/openmoq/publisher/cli_options.h:52-53`), which exist specifically to
+simulate a live broadcast from a file. A looping, paced publish currently
+declares `isLive: false`.
+
+Two consequences follow from the flag, and both are wrong for a simulated-live
+broadcast:
+
+- `trackDuration` is emitted, which is only legal when `isLive` is false
+  (section 5.2.35). A live broadcast has no fixed duration to declare.
+- `generatedAt` is suppressed, because section 5.1.2 says it SHOULD NOT be
+  included when `isLive` is false. A live broadcast loses its generation
+  timestamp, which subscribers use to reason about latency.
+
+The fix:
+
+- `PublisherConfig` gains a `vod` flag, `bool`, defaulting to `false`.
+- `build_publish_plan` threads that flag through as `is_live = !vod`, rather
+  than hardcoding false.
+- When live (the default), `generatedAt` is emitted and `trackDuration` is
+  omitted, matching what `build_live_catalog` already does.
+- When `vod` is set, the existing behavior is retained.
+
+This changes the batch path's emitted catalog by default. The existing
+assertion at `tests/cmaf_segmenter_test.cpp:1038`
+(`"expected VOD isLive flag in catalog"`) is updated to expect
+`"isLive":true`, with a separate case covering the opt-in VOD path.
+
+`end_broadcast(kConvertToVod)` remains the other route into VOD semantics, and
+is likewise never entered implicitly.
 
 ## Part A1: End-of-broadcast
 
@@ -195,6 +235,15 @@ in `tests/msf_catalog_test.cpp` (`expect`, `expect_contains`,
 `expect_not_contains`, `throws_runtime_error`) and in
 `tests/cmaf_segmenter_test.cpp` (`no_numeric_id_field`,
 `all_init_refs_resolve`) that this phase reuses rather than redefines.
+
+Part A0:
+
+- A batch publish with default configuration emits `isLive: true`, carries a
+  `generatedAt`, and carries no `trackDuration` on any track.
+- A batch publish with `vod` set emits `isLive: false`, carries a
+  `trackDuration`, and carries no `generatedAt`.
+- Neither configuration throws at serialization, which is the pairing Phase 1's
+  `validate_track` enforces.
 
 Part A1:
 
