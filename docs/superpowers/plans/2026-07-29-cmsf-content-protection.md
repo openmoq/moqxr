@@ -844,6 +844,11 @@ In `include/openmoq/publisher/msf_catalog.h`, add before `MsfCatalog`:
 ```cpp
 // A URL with an optional type, used by the DRM system fields in CMSF 4.1.1.4.
 // Declared before MsfContentProtection, which holds these by value.
+//
+// Note: CMSF 4.1.1.4.4 describes an Authorization URL but never names its JSON
+// key, and the draft's examples show only laURL and certURL. It is therefore
+// NOT modelled here -- emitting an invented key would be guessing at the spec,
+// and nothing in DrmSystemConfig could populate it anyway.
 struct MsfUrlEntry {
     std::string url;
     std::optional<std::string> type;
@@ -858,7 +863,6 @@ struct MsfContentProtection {
     std::string system_id;                    // 4.1.1.4.1, required
     std::optional<MsfUrlEntry> la_url;        // 4.1.1.4.2
     std::optional<MsfUrlEntry> cert_url;      // 4.1.1.4.3
-    std::optional<MsfUrlEntry> auth_url;      // 4.1.1.4.4
     std::optional<std::string> pssh_base64;   // 4.1.1.4.5
     std::optional<std::string> robustness;    // 4.1.1.4.6
 };
@@ -922,7 +926,6 @@ In `src/msf_catalog.cpp`, inside `serialize_catalog`, emit `contentProtections` 
             };
             write_url("laURL", cp.la_url);
             write_url("certURL", cp.cert_url);
-            write_url("authzURL", cp.auth_url);
             if (cp.pssh_base64.has_value()) {
                 write_string(out, ds, "pssh", *cp.pssh_base64);
             }
