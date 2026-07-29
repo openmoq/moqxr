@@ -50,6 +50,18 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     `publish()` plan path and `publish_live_objects()` do not populate
     `CatalogPublisher`, so a broadcast run through either always gets a
     single static, one-shot catalog with no deltas.
+    **No delta is emitted on the wire today, even on the two `publish_live()`
+    paths:** both build one `LiveCatalog`/`MsfCatalog` snapshot at startup
+    and call `catalog_publisher_.publish()` with that same immutable value on
+    every SUBSCRIBE and republish tick, so `catalogs_equal()` short-circuits
+    after the first call and `publish()` always returns `{}` afterward. The
+    add/remove differ and its object-ID/group-ID bookkeeping are exercised
+    only from unit tests (`tests/msf_catalog_test.cpp`), not from any
+    production code path. Making a delta actually reach the wire needs a
+    live producer that detects a track add/remove mid-broadcast (SRT ingest
+    noticing a track appear/disappear, or a DASH ingest reconfiguration) and
+    calls `catalog_publisher_.publish()` again with an updated `MsfCatalog`;
+    wiring that producer is out of scope for the current phase.
   - Every catalog object, independent or delta, maps to MOQT sub-group 0.
   - Section 5.3 freezes a track's attributes once its namespace-and-name
     tuple has been declared: an attribute change on an existing track cannot
@@ -66,17 +78,23 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     `publish()` path and `publish_live_objects()` never republish.
     **Operator note:** draft-ietf-moq-transport-19 section 10.11 states "A
     sender MUST NOT send PUBLISH_DONE until it has closed all streams it
-    will ever open ... for a subscription." Because republication can open
-    further independent-catalog streams for as long as the session runs,
-    `MoqtSession` defers PUBLISH_DONE for the catalog subscription while
-    `catalog_republish_interval` is non-zero: it is sent once, when the
-    `publish_live()` polling loop actually winds down (natural end-of-input,
-    or after `end_broadcast()` has ended `CatalogPublisher` and no further
-    republish can occur), instead of immediately after the first catalog
-    object as it is when the interval is zero (the one-shot default).
-    Operators enabling this interval should expect the catalog subscription
-    to stay open, from the receiver's point of view, for the life of the
-    broadcast rather than close immediately.
+    will ever open ... for a subscription." `MoqtSession::end_broadcast()`
+    can open a further independent-catalog stream on the catalog track's
+    alias at any point before the session ends, on every live session,
+    regardless of `catalog_republish_interval` -- so `MoqtSession` **always**
+    defers PUBLISH_DONE for the catalog subscription, not only when
+    republication is enabled. It is sent once, when the `publish_live()`
+    polling loop actually winds down (natural end-of-input, or after
+    `end_broadcast()` has ended `CatalogPublisher` and no further stream can
+    open), never immediately at SUBSCRIBE time. (An earlier revision of this
+    document, and of the code, gated the deferral on
+    `catalog_republish_interval` being non-zero; that left the default
+    configuration -- republication off -- sending PUBLISH_DONE immediately,
+    which `end_broadcast()` could then violate by opening one more stream
+    afterward. Fixed: the deferral no longer depends on that setting.)
+    Operators should expect the catalog subscription to stay open, from the
+    receiver's point of view, for the life of the broadcast rather than
+    close immediately after the first catalog object.
   - `MoqtSession::end_broadcast()` (MSF section 11.3) uses the same
     `CatalogPublisher` to publish the final independent catalog when a live
     broadcast ends: `isComplete: true` with an empty `tracks` array for
@@ -87,6 +105,16 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     the batch `publish()` plan path or through `publish_live_objects()` does
     not populate it, and `end_broadcast()` correctly skips the final-catalog
     write there rather than guess which track alias is "catalog".
+    **Draft conflict on ordering:** MSF section 11.3 lists SUBSCRIBE_DONE
+    (i.e. PUBLISH_DONE, in transport terms) before the final catalog object
+    in its end-of-broadcast bullet order. This implementation sends the
+    final catalog object first and the catalog subscription's PUBLISH_DONE
+    afterward -- the reverse of MSF's order -- because MOQT
+    draft-ietf-moq-transport-19 section 10.11 forbids sending PUBLISH_DONE
+    before every stream a subscription will ever open has closed, and the
+    final catalog stream is one such stream. Where the two drafts disagree,
+    the transport draft governs what may legally appear on the wire, so its
+    ordering wins.
 - Not implemented: `clone` delta operations, MSF sections 9/10 log and
   metrics tracks, MSF section 11.1 URL parsing, MSF section 12 compression
   signalling, and CMSF section 4 content protection.

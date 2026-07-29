@@ -36,7 +36,20 @@ Draft status:
    `CatalogPublisher` at all today: a broadcast run through either of those
    still gets a static, one-shot catalog with none of Phase 2's lifecycle
    behavior, and `end_broadcast()` correctly no-ops its final-catalog write
-   for them rather than guess at scope it does not have. See
+   for them rather than guess at scope it does not have.
+   **Delta updates specifically do not fire on the wire today, on either
+   `publish_live()` path:** `add`/`remove` delta support is fully implemented
+   and unit-tested in `CatalogPublisher::publish()`, but both call sites
+   build one `LiveCatalog`/`MsfCatalog` snapshot up front and pass that same
+   immutable value to `catalog_publisher_.publish()` on every SUBSCRIBE and
+   republish tick. Nothing in the live-ingest paths ever mutates it after
+   startup, so `catalogs_equal()` matches on every call after the first and
+   `publish()` always returns an empty vector -- never a delta. Reaching a
+   delta on the wire needs a live producer that detects a track add/remove
+   mid-broadcast (e.g. SRT ingest noticing a track appear or disappear, or a
+   DASH ingest reconfiguration) and calls `catalog_publisher_.publish()`
+   again with an updated `MsfCatalog` reflecting that change; no such
+   producer exists yet. See
    `docs/protocol-mapping.md` for the full wire-level contract and per-path
    breakdown, and
    `docs/superpowers/specs/2026-07-28-msf-cmsf-v1-design.md` for the original
