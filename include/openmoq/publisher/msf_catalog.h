@@ -69,6 +69,15 @@ struct MsfTrack {
     std::map<std::string, std::string> custom_fields;
 };
 
+// One operation in a delta update (MSF section 5.1.6). This version emits
+// "add" and "remove" only. "clone" is deliberately unimplemented: it applies
+// when a new track matches an existing one on every field except name, which
+// no producer in this project generates.
+struct MsfDeltaOp {
+    std::string op;
+    std::vector<MsfTrack> tracks;
+};
+
 // The root catalog object (MSF section 5.1).
 struct MsfCatalog {
     std::string version = "1";                    // 5.1.1, a String
@@ -77,6 +86,10 @@ struct MsfCatalog {
     std::vector<MsfTrack> tracks;                 // 5.1.4
     std::vector<MsfTrack> publish_tracks;         // 5.1.5
     std::vector<MsfInitData> init_data_list;      // 5.1.7, emitted after tracks
+
+    // When non-empty this catalog is a DELTA: section 5.3 requires it to
+    // carry neither tracks nor version.
+    std::vector<MsfDeltaOp> delta_update;
 };
 
 // Serialize to a JSON catalog document. Throws std::runtime_error when a
@@ -165,6 +178,11 @@ public:
 
     bool ended() const { return ended_; }
 
+    // Section 5.3: producers publishing frequent deltas SHOULD periodically
+    // publish a new independent catalog to bound the delta processing a
+    // joining subscriber must perform. Default 8.
+    void set_max_deltas_per_group(std::size_t max_deltas) { max_deltas_per_group_ = max_deltas; }
+
 private:
     CatalogObject emit_independent(const MsfCatalog& catalog);
 
@@ -172,6 +190,8 @@ private:
     std::uint64_t next_group_id_ = 0;
     std::uint64_t next_object_id_ = 0;
     bool ended_ = false;
+    std::size_t max_deltas_per_group_ = 8;
+    std::size_t deltas_in_group_ = 0;
 };
 
 }  // namespace openmoq::publisher

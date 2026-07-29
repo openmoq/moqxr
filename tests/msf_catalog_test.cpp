@@ -681,5 +681,102 @@ int main() {
                      "expected a change to max_grp_sap_starting_type to trigger a republish");
     }
 
+    // Adding a track produces a delta at object ID 1 of the CURRENT group.
+    CatalogPublisher dpub;
+    (void)dpub.publish(live_now);
+    MsfCatalog plus_one = live_now;
+    MsfTrack extra;
+    extra.name = "video-low";
+    extra.packaging = "cmaf";
+    extra.role = "video";
+    extra.is_live = true;
+    extra.codec = "avc1.64000d";
+    extra.bitrate = 500000;
+    plus_one.tracks.push_back(extra);
+
+    const auto added = dpub.publish(plus_one);
+    ok &= expect(added.size() == 1, "expected one object for an add delta");
+    ok &= expect(added[0].group_id == 0, "expected the delta to stay in the current group");
+    ok &= expect(added[0].object_id == 1, "expected the delta at object ID 1");
+    ok &= expect_contains(added[0].payload, "\"deltaUpdate\"", "expected a deltaUpdate field");
+    ok &= expect_contains(added[0].payload, "\"op\":\"add\"", "expected an add operation");
+    ok &= expect_contains(added[0].payload, "\"video-low\"", "expected the added track name");
+    // Section 5.3 forbids a ROOT-level tracks field (5.1.4) and a version
+    // field (5.1.1). It does NOT forbid the per-operation "tracks" array,
+    // which section 5.1.6 REQUIRES inside every delta operation. So assert
+    // the root has no tracks, not that the string never appears.
+    ok &= expect(added[0].payload.rfind("{\"deltaUpdate\":[", 0) == 0,
+                 "expected a delta payload to open directly with deltaUpdate");
+    const std::size_t delta_pos = added[0].payload.find("\"deltaUpdate\":");
+    const std::size_t first_tracks_pos = added[0].payload.find("\"tracks\":");
+    ok &= expect(delta_pos != std::string::npos && first_tracks_pos != std::string::npos &&
+                     first_tracks_pos > delta_pos,
+                 "expected every tracks field to sit inside deltaUpdate, never at the root");
+    ok &= expect_not_contains(added[0].payload, "\"version\":", "expected no version field in a delta");
+
+    // Removing a track produces a remove carrying only name (and namespace).
+    const auto removed = dpub.publish(live_now);
+    ok &= expect(removed.size() == 1, "expected one object for a remove delta");
+    ok &= expect(removed[0].object_id == 2, "expected the second delta at object ID 2");
+    ok &= expect_contains(removed[0].payload, "\"op\":\"remove\"", "expected a remove operation");
+    ok &= expect_contains(removed[0].payload, "\"video-low\"", "expected the removed track name");
+    ok &= expect_not_contains(removed[0].payload, "\"bitrate\"",
+                              "expected a remove entry to carry no attributes (MSF 5.1.6)");
+
+    // Section 5.1.6: a remove entry's track object MUST include name, MAY
+    // include namespace, and MUST NOT hold any other field. The differ
+    // builds remove ops from previously-published tracks, which are
+    // complete, so it is the serializer's narrowing (not the input) that
+    // enforces this. Slice the remove op's track object out of the payload
+    // and check its exact contents.
+    {
+        const std::size_t name_pos = removed[0].payload.find("\"name\":\"video-low\"");
+        ok &= expect(name_pos != std::string::npos, "expected the removed track's name in the payload");
+        const std::size_t track_start = removed[0].payload.rfind('{', name_pos);
+        const std::size_t track_end = removed[0].payload.find('}', name_pos);
+        ok &= expect(track_start != std::string::npos && track_end != std::string::npos,
+                     "expected to locate the remove entry's track object braces");
+        if (track_start != std::string::npos && track_end != std::string::npos) {
+            const std::string remove_track =
+                removed[0].payload.substr(track_start, track_end - track_start + 1);
+            ok &= expect_contains(remove_track, "\"name\":\"video-low\"",
+                                  "expected the remove entry to carry its track name");
+            ok &= expect_not_contains(remove_track, "\"bitrate\"",
+                                      "expected the remove entry to carry no bitrate");
+            ok &= expect_not_contains(remove_track, "\"codec\"",
+                                      "expected the remove entry to carry no codec");
+            ok &= expect_not_contains(remove_track, "\"packaging\"",
+                                      "expected the remove entry to carry no packaging");
+        }
+    }
+
+    // Section 5.3 freezes attributes once a tuple is declared, so an attribute
+    // change CANNOT be a delta. It must fall back to a full independent
+    // catalog in a new group; emitting nothing would strand subscribers.
+    MsfCatalog changed = live_now;
+    changed.tracks[0].bitrate = 9000000;
+    const auto rebuilt = dpub.publish(changed);
+    ok &= expect(rebuilt.size() == 1, "expected one object for an attribute change");
+    ok &= expect(rebuilt[0].object_id == 0, "expected an independent catalog, not a delta");
+    ok &= expect(rebuilt[0].group_id == 1, "expected the rebuild in a new group");
+    ok &= expect_contains(rebuilt[0].payload, "\"tracks\":", "expected a full catalog");
+    ok &= expect_contains(rebuilt[0].payload, "\"bitrate\":9000000", "expected the new attribute");
+
+    // Section 5.3: bound the deltas a joining subscriber must process.
+    CatalogPublisher bounded;
+    bounded.set_max_deltas_per_group(1);
+    (void)bounded.publish(live_now);
+    MsfCatalog b2 = live_now;
+    b2.tracks.push_back(extra);
+    const auto b_delta = bounded.publish(b2);
+    ok &= expect(b_delta[0].object_id == 1, "expected the first delta at object 1");
+    MsfCatalog b3 = b2;
+    MsfTrack extra2 = extra;
+    extra2.name = "video-mid";
+    b3.tracks.push_back(extra2);
+    const auto b_forced = bounded.publish(b3);
+    ok &= expect(b_forced[0].object_id == 0, "expected the bound to force an independent catalog");
+    ok &= expect(b_forced[0].group_id == 1, "expected the forced catalog in a new group");
+
     return ok ? 0 : 1;
 }

@@ -166,6 +166,24 @@ void validate_track(const MsfTrack& track) {
 
 // Catalog-wide invariants that cannot be checked from a single track.
 void validate_catalog(const MsfCatalog& catalog) {
+    // Section 5.3: a delta update MUST include at least one operation and
+    // MUST NOT carry tracks. Only "add" and "remove" are emitted by this
+    // implementation.
+    if (!catalog.delta_update.empty()) {
+        if (!catalog.tracks.empty()) {
+            throw std::runtime_error("MSF delta catalog must not carry a tracks array");
+        }
+        for (const auto& op : catalog.delta_update) {
+            if (op.op != "add" && op.op != "remove") {
+                throw std::runtime_error("MSF delta catalog has unsupported operation \"" + op.op + "\"");
+            }
+            if (op.tracks.empty()) {
+                throw std::runtime_error("MSF delta operation \"" + op.op + "\" has no tracks");
+            }
+        }
+        return;
+    }
+
     std::set<std::string> init_ids;
     for (const auto& entry : catalog.init_data_list) {
         if (!init_ids.insert(entry.id).second) {
@@ -331,27 +349,64 @@ void write_track_array(std::ostringstream& out,
 std::string serialize_catalog(const MsfCatalog& catalog) {
     validate_catalog(catalog);
 
+    const bool is_delta = !catalog.delta_update.empty();
+
     std::ostringstream out;
     out << '{';
     JsonSeq seq(out);
 
-    write_string(out, seq, "version", catalog.version);
+    // Section 5.3: a delta update MUST NOT contain a Tracks field or an MSF
+    // version field.
+    if (!is_delta) {
+        write_string(out, seq, "version", catalog.version);
+    }
     if (catalog.generated_at_ms.has_value()) {
         write_uint(out, seq, "generatedAt", *catalog.generated_at_ms);
     }
-    // Section 5.1.3: this field MUST NOT be included if it is FALSE.
     if (catalog.is_complete.has_value() && *catalog.is_complete) {
         write_bool(out, seq, "isComplete", true);
     }
 
-    write_track_array(out, seq, "tracks", catalog.tracks);
+    if (is_delta) {
+        seq.separate();
+        out << "\"deltaUpdate\":[";
+        JsonSeq ops(out);
+        for (const auto& op : catalog.delta_update) {
+            ops.separate();
+            out << "{\"op\":\"" << json_escape(op.op) << "\",\"tracks\":[";
+            JsonSeq op_tracks(out);
+            for (const auto& track : op.tracks) {
+                op_tracks.separate();
+                if (op.op == "remove") {
+                    // Section 5.1.6: a remove entry MUST include the track
+                    // name, MAY include the namespace, and MUST NOT hold any
+                    // other field. The differ builds remove operations from
+                    // the previously published tracks, which are complete, so
+                    // narrowing to name and namespace HERE is deliberate and
+                    // required -- it is not a lossy accident. Validating the
+                    // input instead would reject the differ's own output.
+                    out << "{\"name\":\"" << json_escape(track.name) << '"';
+                    if (track.name_space.has_value()) {
+                        out << ",\"namespace\":\"" << json_escape(*track.name_space) << '"';
+                    }
+                    out << '}';
+                } else {
+                    write_track(out, track);
+                }
+            }
+            out << "]}";
+        }
+        out << ']';
+    } else {
+        write_track_array(out, seq, "tracks", catalog.tracks);
+    }
 
-    if (!catalog.publish_tracks.empty()) {
+    if (!is_delta && !catalog.publish_tracks.empty()) {
         write_track_array(out, seq, "publishTracks", catalog.publish_tracks);
     }
 
     // Section 5.1.7: initDataList MUST be located after the tracks array.
-    if (!catalog.init_data_list.empty()) {
+    if (!is_delta && !catalog.init_data_list.empty()) {
         seq.separate();
         out << "\"initDataList\":[";
         JsonSeq inner(out);
@@ -610,6 +665,7 @@ CatalogObject CatalogPublisher::emit_independent(const MsfCatalog& catalog) {
     object.subgroup_id = 0;
     object.payload = serialize_catalog(catalog);
     next_object_id_ = 1;
+    deltas_in_group_ = 0;
     return object;
 }
 
@@ -617,13 +673,85 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     if (ended_) {
         throw std::runtime_error("MSF catalog publish after end_broadcast");
     }
-    if (last_.has_value() && catalogs_equal(*last_, desired)) {
+    if (!last_.has_value()) {
+        std::vector<CatalogObject> out;
+        out.push_back(emit_independent(desired));
+        last_ = desired;
+        return out;
+    }
+    if (catalogs_equal(*last_, desired)) {
         return {};
     }
-    std::vector<CatalogObject> out;
-    out.push_back(emit_independent(desired));
+
+    // Key tracks by the namespace and name tuple, which section 5.3 treats as
+    // the identity of a track.
+    const auto key_of = [](const MsfTrack& track) {
+        return std::pair<std::string, std::string>(track.name_space.value_or(std::string{}), track.name);
+    };
+    std::map<std::pair<std::string, std::string>, const MsfTrack*> before;
+    for (const auto& track : last_->tracks) {
+        before.emplace(key_of(track), &track);
+    }
+    std::map<std::pair<std::string, std::string>, const MsfTrack*> after;
+    for (const auto& track : desired.tracks) {
+        after.emplace(key_of(track), &track);
+    }
+
+    std::vector<MsfTrack> added;
+    std::vector<MsfTrack> removed;
+    for (const auto& [key, track] : after) {
+        const auto it = before.find(key);
+        if (it == before.end()) {
+            added.push_back(*track);
+        } else if (!tracks_equal(*it->second, *track)) {
+            // Section 5.3 freezes a track's attributes once its tuple is
+            // declared, so an attribute change cannot be expressed as a
+            // delta. Fall back to a full independent catalog: emitting
+            // nothing would leave subscribers on stale attributes.
+            std::vector<CatalogObject> out;
+            out.push_back(emit_independent(desired));
+            last_ = desired;
+            return out;
+        }
+    }
+    for (const auto& [key, track] : before) {
+        if (after.find(key) == after.end()) {
+            removed.push_back(*track);
+        }
+    }
+
+    // Anything other than a pure add/remove of whole tracks, including a
+    // change to initDataList or publishTracks, needs a full catalog.
+    const bool init_data_changed = last_->init_data_list.size() != desired.init_data_list.size();
+    if ((added.empty() && removed.empty()) || init_data_changed ||
+        deltas_in_group_ >= max_deltas_per_group_) {
+        std::vector<CatalogObject> out;
+        out.push_back(emit_independent(desired));
+        last_ = desired;
+        return out;
+    }
+
+    MsfCatalog delta;
+    if (!added.empty()) {
+        delta.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = std::move(added)});
+    }
+    if (!removed.empty()) {
+        delta.delta_update.push_back(MsfDeltaOp{.op = "remove", .tracks = std::move(removed)});
+    }
+
+    CatalogObject object;
+    // Stay in the current group. next_group_id_ is at least 1 here: this
+    // branch is only reachable when last_ has a value, which means
+    // emit_independent already ran and incremented it. Do not hoist this
+    // expression above that guard.
+    object.group_id = next_group_id_ - 1;
+    object.object_id = next_object_id_++;
+    object.subgroup_id = 0;
+    object.payload = serialize_catalog(delta);
+
     last_ = desired;
-    return out;
+    ++deltas_in_group_;
+    return {object};
 }
 
 std::vector<CatalogObject> CatalogPublisher::end_broadcast(
