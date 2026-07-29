@@ -1,4 +1,5 @@
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/cenc.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/msf_catalog.h"
 
@@ -282,17 +283,20 @@ std::vector<std::uint8_t> build_track_specific_init_segment(std::span<const std:
 std::vector<std::uint8_t> extract_codec_init_data(const Mp4Box& sample_entry,
                                                   std::span<const std::uint8_t> bytes,
                                                   std::size_t child_offset) {
-    for (std::size_t scan_offset = child_offset; scan_offset + 8 <= sample_entry.span.size; ++scan_offset) {
-        const std::size_t cursor = sample_entry.span.offset + scan_offset;
-        const std::uint32_t box_size = read_be32(bytes, cursor);
-        if (box_size < 8 || cursor + box_size > sample_entry.span.offset + sample_entry.span.size) {
-            continue;
-        }
-
-        const std::string type(reinterpret_cast<const char*>(bytes.data() + cursor + 4), 4);
-        if (type == "avcC" || type == "hvcC" || type == "esds" || type == "dOps") {
-            return std::vector<std::uint8_t>(bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
-                                             bytes.begin() + static_cast<std::ptrdiff_t>(cursor + box_size));
+    // Previously a sliding byte scan bounded by the RAW, unvalidated
+    // sample_entry.span.size -- a memory-safety bug and a false-positive
+    // hazard. find_child_box_span walks by declared length and clamps to the
+    // real buffer.
+    for (const std::string_view type : {"avcC", "hvcC", "esds", "dOps"}) {
+        const auto span = find_child_box_span(bytes,
+                                              sample_entry.span.offset,
+                                              sample_entry.span.size,
+                                              child_offset,
+                                              type);
+        if (span.has_value()) {
+            return std::vector<std::uint8_t>(
+                bytes.begin() + static_cast<std::ptrdiff_t>(span->offset),
+                bytes.begin() + static_cast<std::ptrdiff_t>(span->offset + span->size));
         }
     }
 
