@@ -2726,6 +2726,63 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
     return TransportStatus::success();
 }
 
+// RAII guard ensuring the catalog subscription's deferred PUBLISH_DONE (see
+// each publish_live() overload's catalog_publish_done_deferred /
+// catalog_publish_done_sender local variables) is sent on every exit path
+// from publish_live() -- not just the graceful end-of-loop cleanup, but also
+// the roughly dozen early `return status;` sites triggered by
+// drain_queue()/process_control_messages()/maybe_republish_catalog()/
+// read_stream() failures partway through the loop. Before this guard
+// existed, those early returns skipped the catalog cleanup entirely,
+// silently dropping the completion signal -- exactly the "worse than the
+// one-shot default" outcome the deferral was meant to avoid, not cause.
+// Hand-editing each early-return site was rejected deliberately: that is
+// how one gets missed, and a future `return` added to the loop would
+// silently reintroduce the bug. A scope guard, constructed once before the
+// loop, fires unconditionally when the enclosing function returns by any
+// path -- normal, error, or exception unwinding -- so there is nothing left
+// to miss.
+class DeferredCatalogPublishDoneGuard {
+public:
+    DeferredCatalogPublishDoneGuard(bool& deferred, std::function<TransportStatus()>& sender)
+        : deferred_(deferred), sender_(sender) {}
+
+    DeferredCatalogPublishDoneGuard(const DeferredCatalogPublishDoneGuard&) = delete;
+    DeferredCatalogPublishDoneGuard& operator=(const DeferredCatalogPublishDoneGuard&) = delete;
+
+    // Must not throw: this can run during stack unwinding, and a throwing
+    // destructor there would call std::terminate. Any failure sending the
+    // PUBLISH_DONE is logged, not propagated -- there is no TransportStatus
+    // for a destructor to return to begin with.
+    ~DeferredCatalogPublishDoneGuard() {
+        if (!deferred_) {
+            return;
+        }
+        try {
+            if (sender_) {
+                const TransportStatus status = sender_();
+                if (!status.ok) {
+                    std::cerr << "[moqt-session] warning: failed to send deferred catalog "
+                                 "PUBLISH_DONE while exiting: "
+                              << status.message << '\n';
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[moqt-session] warning: exception sending deferred catalog PUBLISH_DONE "
+                         "while exiting: "
+                      << e.what() << '\n';
+        } catch (...) {
+            std::cerr << "[moqt-session] warning: unknown exception sending deferred catalog "
+                         "PUBLISH_DONE while exiting\n";
+        }
+        deferred_ = false;
+    }
+
+private:
+    bool& deferred_;
+    std::function<TransportStatus()>& sender_;
+};
+
 }  // namespace
 
 MoqtSession::MoqtSession(PublisherTransport& transport,
@@ -3142,9 +3199,18 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     // no longer open a new stream (either genuinely finished, or ended via a
     // concurrent end_broadcast()). catalog_stream_count accumulates the
     // total number of catalog streams opened, for that deferred
-    // PUBLISH_DONE's stream_count field.
+    // PUBLISH_DONE's stream_count field. catalog_publish_done_sender holds
+    // how to actually send it (set alongside catalog_publish_done_deferred
+    // below, once the catalog subscription's request id and response stream
+    // are known); catalog_publish_done_guard is what actually fires it on
+    // every exit from this function, not just the graceful cleanup further
+    // down -- see the guard class's own comment for why a scope guard is used
+    // instead of hand-editing every early return.
     bool catalog_publish_done_deferred = false;
     std::uint64_t catalog_stream_count = 0;
+    std::function<TransportStatus()> catalog_publish_done_sender;
+    DeferredCatalogPublishDoneGuard catalog_publish_done_guard(catalog_publish_done_deferred,
+                                                               catalog_publish_done_sender);
 
     // Replaces the old one-shot `catalog_sent` latch: catalog_publisher_ owns
     // the group/object sequencing (MSF section 5) and, on the first call,
@@ -3328,8 +3394,15 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                         } else {
                             // section 10.11 MUST NOT: more catalog streams
                             // can still open later, so PUBLISH_DONE is
-                            // deferred to this loop's own exit.
+                            // deferred to this loop's own exit (or, on an
+                            // early error return, to catalog_publish_done_guard).
                             catalog_publish_done_deferred = true;
+                            catalog_publish_done_sender = [&, request_id = subscribe.request_id]() -> TransportStatus {
+                                return transport_.write_stream(
+                                    control_stream_id_,
+                                    encode_publish_done_message(draft_version, request_id, catalog_stream_count),
+                                    false);
+                            };
                         }
                     } else {
                         subscribed_tracks.insert(subscribe.track_name);
@@ -3423,6 +3496,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 if (!status.ok) {
                     return status;
                 }
+                catalog_publish_done_deferred = false;
             }
             continue;
         }
@@ -3640,9 +3714,18 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // no longer open a new stream (either genuinely finished, or ended via a
     // concurrent end_broadcast()). catalog_stream_count accumulates the
     // total number of catalog streams opened, for that deferred
-    // PUBLISH_DONE's stream_count field.
+    // PUBLISH_DONE's stream_count field. catalog_publish_done_sender holds
+    // how to actually send it (set alongside catalog_publish_done_deferred at
+    // whichever of the three SUBSCRIBE-handling branches below defers it);
+    // catalog_publish_done_guard is what actually fires it on every exit from
+    // this function, not just the graceful cleanup further down -- see the
+    // guard class's own comment for why a scope guard is used instead of
+    // hand-editing every early return.
     bool catalog_publish_done_deferred = false;
     std::uint64_t catalog_stream_count = 0;
+    std::function<TransportStatus()> catalog_publish_done_sender;
+    DeferredCatalogPublishDoneGuard catalog_publish_done_guard(catalog_publish_done_deferred,
+                                                               catalog_publish_done_sender);
 
     auto send_catalog = [&](std::uint64_t track_alias) -> TransportStatus {
         std::vector<openmoq::publisher::CatalogObject> objects;
@@ -4022,8 +4105,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         } else {
                             // section 10.11 MUST NOT: more catalog streams
                             // can still open later, so PUBLISH_DONE is
-                            // deferred to this loop's own exit.
+                            // deferred to this loop's own exit (or, on an
+                            // early error return, to catalog_publish_done_guard).
                             catalog_publish_done_deferred = true;
+                            catalog_publish_done_sender = [&, request_id = subscribe.request_id,
+                                                           response_stream_id = request_stream_id]() -> TransportStatus {
+                                return transport_.write_stream(
+                                    response_stream_id,
+                                    encode_publish_done_message(draft_version, request_id, catalog_stream_count),
+                                    false);
+                            };
                         }
                     } else {
                         subscribed_tracks.insert(subscribe.track_name);
@@ -4112,8 +4203,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     } else {
                         // section 10.11 MUST NOT: deferred to this loop's own
                         // exit, via the subscribe_tracks_publish_request_ids
-                        // cleanup below.
+                        // cleanup below (or, on an early error return, to
+                        // catalog_publish_done_guard).
                         catalog_publish_done_deferred = true;
+                        catalog_publish_done_sender = [&, request_id = catalog_request_id->second]() -> TransportStatus {
+                            return write_publish_done_for_request(transport_, draft_version, control_stream_id_,
+                                                                  publish_stream_id_by_request_id_, request_id,
+                                                                  catalog_stream_count);
+                        };
                     }
                 }
                 for (const auto& track : tracks) {
@@ -4195,7 +4292,24 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                 return {ws, 0};
                             }
                         } else {
+                            // section 10.11 MUST NOT: more catalog streams
+                            // can still open later, so PUBLISH_DONE is
+                            // deferred to this loop's own exit (or, on an
+                            // early error return, to catalog_publish_done_guard).
+                            const auto stream_it = active_subscription_stream_ids.find(subscribe.request_id);
+                            const std::uint64_t response_stream_id =
+                                uses_request_streams(draft_version) &&
+                                        stream_it != active_subscription_stream_ids.end()
+                                    ? stream_it->second
+                                    : control_stream_id_;
                             catalog_publish_done_deferred = true;
+                            catalog_publish_done_sender = [&, request_id = subscribe.request_id,
+                                                           response_stream_id]() -> TransportStatus {
+                                return transport_.write_stream(
+                                    response_stream_id,
+                                    encode_publish_done_message(draft_version, request_id, catalog_stream_count),
+                                    false);
+                            };
                         }
                     } else {
                         // Only add media tracks to subscribed_tracks (not catalog).

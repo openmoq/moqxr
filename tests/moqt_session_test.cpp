@@ -2676,6 +2676,99 @@ int main() {
     }
 
     {
+        // Fix round 2, Finding 1 residual: the deferred catalog PUBLISH_DONE
+        // must still be sent when publish_live() exits via an error path
+        // (drain_queue()/process_control_messages()/maybe_republish_catalog()/
+        // read_stream() failing partway through the loop), not just via the
+        // graceful end-of-loop cleanup -- that is exactly what
+        // DeferredCatalogPublishDoneGuard exists for.
+        //
+        // Getting a *deterministic* error exit out of MockTransport took two
+        // discarded attempts, recorded here since each cost real debugging
+        // time: (1) forcing the error via MockTransport::missing_read_error
+        // alone races the await-subscribe loop's own graceful is_eof exit
+        // check, which (with no media in this test's input) usually wins,
+        // making the test flaky and, in several runs, unable to reach the
+        // error path at all; (2) delaying queue->eof with a custom
+        // sleep-before-EOF streambuf to try to win that race predictably
+        // still did not reliably reach a second control read in practice.
+        //
+        // This version sidesteps the race entirely: a second, malformed
+        // control message (type 0x03 SUBSCRIBE with a 1-byte payload, too
+        // short for decode_subscribe_message to parse) is delivered in the
+        // *same* chunk as the valid catalog SUBSCRIBE, so both are processed
+        // within process_control_messages()'s first pass over that chunk,
+        // before the loop ever re-checks is_eof. This deterministically
+        // reaches `return {protocol_violation(transport_, "received invalid
+        // SUBSCRIBE"), 0};` -- one of the early-return sites the reviewer
+        // enumerated.
+        //
+        // What this test can and cannot observe: protocol_violation() calls
+        // transport.close() before returning the failure, so by the time
+        // DeferredCatalogPublishDoneGuard's destructor tries to write the
+        // deferred PUBLISH_DONE, the mock transport is already closed and
+        // the write correctly, silently fails (logged, not propagated, per
+        // the guard's contract) -- there is no way to observe a
+        // *successful* wire write here, because a real connection closed by
+        // a protocol violation genuinely cannot carry any more data,
+        // deferred or not. What this test verifies instead: (a) the catalog
+        // object was actually sent before the error (proving send_catalog()
+        // ran), (b) publish_live() truly exited via the error path and not
+        // the graceful one, and (c) the guard's destructor actually *ran and
+        // attempted* the deferred send -- observed via its warning
+        // diagnostic on stderr, which only fires from inside the guard when
+        // catalog_publish_done_deferred was still true at function exit.
+        // I could not find, within reasonable effort, a MockTransport-
+        // drivable error path that both reaches one of the early-return
+        // sites and leaves the transport open enough to observe a
+        // subsequent successful write; every reproducible decode-triggered
+        // failure in this code goes through protocol_violation().
+        MockTransport error_exit_transport;
+        error_exit_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        error_exit_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        std::vector<std::uint8_t> subscribe_then_malformed =
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0);
+        const std::vector<std::uint8_t> malformed_subscribe{0x03, 0x00, 0x01, 0xff};
+        subscribe_then_malformed.insert(subscribe_then_malformed.end(), malformed_subscribe.begin(),
+                                        malformed_subscribe.end());
+        error_exit_transport.reads[0].push_back(subscribe_then_malformed);
+
+        MoqtSession error_exit_session(
+            error_exit_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        error_exit_session.set_catalog_republish_interval(std::chrono::seconds(1));
+        status = error_exit_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected error-exit session connect to succeed");
+
+        const auto live_bytes = make_live_init_mp4();
+        std::string live_input_bytes(live_bytes.begin(), live_bytes.end());
+        std::istringstream live_input(live_input_bytes);
+
+        std::ostringstream captured_stderr;
+        std::streambuf* real_cerr_buf = std::cerr.rdbuf(captured_stderr.rdbuf());
+        status = error_exit_session.publish_live(live_input, DraftVersion::kDraft14, false);
+        std::cerr.rdbuf(real_cerr_buf);
+
+        ok &= expect(!status.ok && status.message == "received invalid SUBSCRIBE",
+                     "expected the malformed SUBSCRIBE to surface as an error from publish_live, "
+                     "proving this test actually exercises an error-exit path and not the graceful one");
+
+        bool saw_catalog_object = false;
+        for (const auto& write : error_exit_transport.writes) {
+            if (write.stream_id != 0) {
+                saw_catalog_object = true;
+            }
+        }
+        ok &= expect(saw_catalog_object, "expected the catalog object to have been sent before the error");
+        ok &= expect(captured_stderr.str().find("failed to send deferred catalog PUBLISH_DONE") != std::string::npos,
+                     "expected DeferredCatalogPublishDoneGuard's destructor to run and attempt the "
+                     "deferred send on this error-exit path, logging its failure since the transport "
+                     "is already closed by protocol_violation() by that point");
+    }
+
+    {
         // Regression: a session driven entirely through the batch publish()
         // path never calls catalog_publisher_.publish(), so it never learns
         // which track alias is "catalog" (build_published_tracks() assigns
