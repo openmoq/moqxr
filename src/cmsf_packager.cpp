@@ -1,5 +1,6 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cenc.h"
+#include "openmoq/publisher/drm_config.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/msf_catalog.h"
 
@@ -359,13 +360,70 @@ std::vector<std::uint8_t> build_track_codec_init_data(std::span<const std::uint8
     throw std::runtime_error("catalog generation could not locate matching trak for codec initData");
 }
 
+// pssh boxes live directly under moov (ISO/IEC 23001-7), as siblings of the
+// trak boxes -- not inside any single track's sinf. Collecting them once for
+// the whole init segment mirrors how CMSF 4.1.1 protection lives at the
+// catalog root and is shared by every track that references it.
+std::vector<CencSystem> collect_pssh_systems(std::span<const std::uint8_t> init_bytes) {
+    const std::vector<Mp4Box> top_level_boxes = parse_mp4_boxes(init_bytes);
+    const Mp4Box* moov = find_first_box(top_level_boxes, "moov");
+    if (moov == nullptr) {
+        return {};
+    }
+
+    std::vector<Mp4Box> pssh_boxes;
+    for (const Mp4Box* box : find_boxes(moov->children, "pssh")) {
+        pssh_boxes.push_back(*box);
+    }
+    return parse_pssh_boxes(init_bytes, pssh_boxes);
+}
+
+// Apply deployment-configured DRM fields (licence/cert URLs, robustness) onto
+// the contentProtections entries attach_content_protection just created or
+// reused for `systems`. A configured system whose system_id does not match
+// any system found in the media is silently skipped -- it describes
+// protection that does not exist in this asset.
+void apply_drm_system_configs(MsfCatalog& catalog,
+                              const std::string& scheme,
+                              const std::vector<CencSystem>& systems,
+                              const std::vector<DrmSystemConfig>& drm_systems) {
+    for (const auto& system : systems) {
+        const auto config_it = std::find_if(
+            drm_systems.begin(), drm_systems.end(),
+            [&](const DrmSystemConfig& config) { return config.system_id == system.system_id; });
+        if (config_it == drm_systems.end()) {
+            continue;
+        }
+
+        const auto entry_it = std::find_if(
+            catalog.content_protections.begin(), catalog.content_protections.end(),
+            [&](const MsfContentProtection& cp) {
+                return cp.system_id == system.system_id && cp.scheme == scheme;
+            });
+        if (entry_it == catalog.content_protections.end()) {
+            continue;
+        }
+
+        if (config_it->la_url.has_value()) {
+            entry_it->la_url = MsfUrlEntry{.url = *config_it->la_url, .type = config_it->la_url_type};
+        }
+        if (config_it->cert_url.has_value()) {
+            entry_it->cert_url = MsfUrlEntry{.url = *config_it->cert_url, .type = config_it->cert_url_type};
+        }
+        if (config_it->robustness.has_value()) {
+            entry_it->robustness = config_it->robustness;
+        }
+    }
+}
+
 }  // namespace
 
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap,
                                bool include_msf_timeline,
-                               bool vod) {
+                               bool vod,
+                               const std::vector<DrmSystemConfig>& drm_systems) {
     std::vector<TrackDescription> tracks = segmented_mp4.tracks;
     std::uint32_t synthetic_track_id = next_synthetic_track_id(tracks);
     if (include_msf_timeline) {
@@ -446,6 +504,18 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                 std::chrono::system_clock::now().time_since_epoch())
                 .count());
     }
+
+    // pssh boxes are collected once for the whole init segment (not
+    // per-track -- see collect_pssh_systems) and only when some track is
+    // actually protected, since parsing the init segment again is otherwise
+    // wasted work for the common unencrypted case.
+    const bool any_track_protected = std::any_of(
+        plan.tracks.begin(), plan.tracks.end(),
+        [](const TrackDescription& track) { return track.protection.has_value(); });
+    const std::vector<CencSystem> pssh_systems =
+        any_track_protected ? collect_pssh_systems(segmented_mp4.initialization_segment.owned_bytes)
+                            : std::vector<CencSystem>{};
+
     for (const auto& track : plan.tracks) {
         if (track.track_name == "catalog") {
             continue;
@@ -478,6 +548,11 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
         const auto init_it = init_data_by_track.find(track.track_name);
         if (init_it != init_data_by_track.end()) {
             attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
+        }
+
+        if (track.protection.has_value()) {
+            attach_content_protection(msf_catalog, msf_track, *track.protection, pssh_systems);
+            apply_drm_system_configs(msf_catalog, track.protection->scheme, pssh_systems, drm_systems);
         }
 
         msf_catalog.tracks.push_back(std::move(msf_track));

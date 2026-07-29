@@ -11,6 +11,12 @@
 
 namespace openmoq::publisher {
 
+// Declared in publisher_api.h. Only forward-declared here: publisher_api.h
+// includes this header, so including publisher_api.h (or drm_config.h) back
+// from here would cycle. A forward declaration is enough for a const
+// reference function parameter with a default-constructed default argument.
+struct DrmSystemConfig;
+
 enum class CmsfObjectKind {
     kInitialization,
     kMetadata,
@@ -48,11 +54,17 @@ struct PublishPlan {
 // trackDuration present, generatedAt omitted per MSF 5.1.2). Defaults to
 // false because this publisher is live, or simulating live, unless
 // explicitly configured otherwise.
+//
+// drm_systems: deployment configuration (licence/cert URLs, robustness) for
+// DRM systems found in the media by system_id. A configured system the media
+// carries no pssh for is ignored. Defaults to empty so every existing call
+// site compiles unchanged.
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap = false,
                                bool include_msf_timeline = false,
-                               bool vod = false);
+                               bool vod = false,
+                               const std::vector<DrmSystemConfig>& drm_systems = {});
 std::string render_publish_plan(const PublishPlan& plan);
 PublishPlan materialize_publish_plan(const PublishPlan& plan, std::span<const std::uint8_t> bytes);
 void emit_plan_objects(const PublishPlan& plan,

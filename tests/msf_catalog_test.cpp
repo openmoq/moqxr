@@ -1104,5 +1104,17 @@ int main() {
     ok &= expect_not_contains(serialize_catalog(unprot), "\"contentProtections\"",
                               "expected no contentProtections when nothing is protected");
 
+    // Task 6 carried-forward fix: validate_catalog checked
+    // contentProtectionRefIDs for dangling references on catalog.tracks but
+    // not on catalog.publish_tracks, mirroring the earlier initRef gap fixed
+    // for publishTracks above.
+    MsfCatalog dangling_publish_track_ref = prot;
+    dangling_publish_track_ref.tracks.clear();
+    MsfTrack dangling_publish_track = prot_video;
+    dangling_publish_track.content_protection_ref_ids = {"missing"};
+    dangling_publish_track_ref.publish_tracks.push_back(dangling_publish_track);
+    ok &= throws_runtime_error(dangling_publish_track_ref,
+                               "expected a dangling contentProtectionRefID on publishTracks to throw");
+
     return ok ? 0 : 1;
 }

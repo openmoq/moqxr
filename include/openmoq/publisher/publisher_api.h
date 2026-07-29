@@ -29,6 +29,18 @@ namespace transport {
 struct LibmoqLiveHandle;
 }  // namespace transport
 
+// Deployment configuration for one DRM system, matched to a system found in
+// the media by system_id. These fields are not present in the MP4 -- a
+// licence URL is deployment data, not media data.
+struct DrmSystemConfig {
+    std::string system_id;                      // UUID string, the match key
+    std::optional<std::string> la_url;
+    std::optional<std::string> la_url_type;
+    std::optional<std::string> cert_url;
+    std::optional<std::string> cert_url_type;
+    std::optional<std::string> robustness;
+};
+
 struct PublisherConfig {
     DraftVersion draft_version = DraftVersion::kDraft16;
     std::string track_namespace = "media";
@@ -43,6 +55,11 @@ struct PublisherConfig {
     // This publisher is live, or simulating live, unless explicitly told
     // otherwise. VOD semantics are never inferred from the input.
     bool vod = false;
+    // Matched to systems found in the media by system_id. A configured system
+    // the media carries no pssh for is IGNORED, not emitted -- a
+    // contentProtections entry for an absent system would describe protection
+    // that does not exist.
+    std::vector<DrmSystemConfig> drm_systems;
     // Section 5: a catalog SHOULD be republished after enough time has passed
     // that it might fall out of a relay cache. Zero disables republication,
     // which is the historical behaviour.

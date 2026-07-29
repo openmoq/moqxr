@@ -4,7 +4,9 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <vector>
 
+#include "openmoq/publisher/drm_config.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -61,6 +63,10 @@ struct CliOptions {
     // passed that it might fall out of a relay cache. Zero (the default)
     // disables republication.
     std::chrono::seconds catalog_republish_interval{0};
+    // Parsed eagerly by parse_cli_options so a malformed --drm-config file is
+    // reported before publishing begins, rather than publishing with partial
+    // DRM configuration.
+    std::vector<DrmSystemConfig> drm_systems;
 };
 
 CliOptions parse_cli_options(int argc, char** argv);

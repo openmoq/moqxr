@@ -257,6 +257,7 @@ add_library(openmoq_publisher_lib STATIC
     src/cli_options.cpp
     src/cmaf_segmenter.cpp
     src/cmsf_packager.cpp
+    src/drm_config.cpp
     src/live_srt_ingest.cpp
     src/live_srt_config.cpp
     src/live_dash_ingest.cpp

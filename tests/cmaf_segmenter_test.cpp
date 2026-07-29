@@ -1,6 +1,7 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/mp4_box.h"
+#include "openmoq/publisher/publisher_api.h"
 
 #include <cctype>
 #include <cstdint>
@@ -155,6 +156,23 @@ std::vector<std::uint8_t> make_sinf(const std::string& original_format, const st
     return make_box("sinf", concat({make_frma(original_format), make_schm(scheme_type), schi}));
 }
 
+// A pssh box: FullBox header, then a 16-byte SystemID and a trailing 4-byte
+// data-size/data pair, matching the layout parse_pssh_boxes (cenc.cpp) reads
+// (SystemID at header+version/flags = offset 12).
+std::vector<std::uint8_t> make_pssh(const std::vector<std::uint8_t>& system_id) {
+    std::vector<std::uint8_t> payload(system_id.begin(), system_id.end());
+    append_be32(payload, 4);
+    payload.insert(payload.end(), {0xde, 0xad, 0xbe, 0xef});
+    return make_full_box("pssh", payload);
+}
+
+// The Widevine common system ID, edef8ba9-79d6-4ace-a3c8-27dcd51d21ed, as raw
+// bytes -- the same system ID used in msf_catalog_test.cpp.
+std::vector<std::uint8_t> widevine_system_id() {
+    return {0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
+            0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed};
+}
+
 std::vector<std::uint8_t> make_encrypted_fragmented_test_mp4() {
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
     const auto tkhd = make_full_box("tkhd",
@@ -175,7 +193,11 @@ std::vector<std::uint8_t> make_encrypted_fragmented_test_mp4() {
     const auto minf = make_box("minf", stbl);
     const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
     const auto trak = make_box("trak", concat({tkhd, mdia}));
-    const auto moov = make_box("moov", trak);
+    // pssh boxes live directly under moov, as siblings of trak (ISO/IEC
+    // 23001-7) -- this is the DRM system build_publish_plan's
+    // collect_pssh_systems must find to emit a CMSF contentProtections entry.
+    const auto pssh = make_pssh(widevine_system_id());
+    const auto moov = make_box("moov", concat({trak, pssh}));
     const auto moof = make_box("moof", {'m', 'f', 'h', 'd'});
     const auto mdat = make_box("mdat", {1, 2, 3, 4, 5, 6});
     return concat({ftyp, moov, moof, mdat});
@@ -1386,6 +1408,68 @@ int main() {
                      "expected the cenc scheme recorded");
         ok &= expect(enc_tracks.front().protection->original_format == "avc1",
                      "expected the frma original_format recorded");
+    }
+
+    // Task 6: build_publish_plan wires the pssh-derived DRM systems and each
+    // protected track's CencTrackProtection into the catalog's
+    // contentProtections, and applies deployment-configured fields (laURL,
+    // etc.) only to systems the media actually carries a pssh for. A
+    // configured system with no matching pssh must be ignored, not emitted.
+    {
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4();
+        ParsedMp4 encrypted{
+            .bytes = encrypted_bytes,
+            .top_level_boxes = parse_mp4_boxes(encrypted_bytes),
+            .tracks = {},
+        };
+        encrypted.tracks = extract_tracks(encrypted.top_level_boxes, encrypted.bytes);
+        const auto encrypted_segmented = segment_for_cmaf(encrypted);
+
+        DrmSystemConfig widevine_config;
+        widevine_config.system_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
+        widevine_config.la_url = "https://widevine.example.com/proxy";
+        widevine_config.la_url_type = "widevine";
+        widevine_config.robustness = "SW_SECURE_CRYPTO";
+
+        // PlayReady's system ID has no pssh box anywhere in this fixture;
+        // configuring it must not fabricate a contentProtections entry for
+        // protection the media does not carry.
+        DrmSystemConfig playready_config;
+        playready_config.system_id = "9a04f079-9840-4286-ab92-e65be0885f95";
+        playready_config.la_url = "https://playready.example.com/proxy";
+
+        const auto enc_plan = build_publish_plan(encrypted_segmented, DraftVersion::kDraft14,
+                                                 /*include_sap=*/false, /*include_msf_timeline=*/false,
+                                                 /*vod=*/false, {widevine_config, playready_config});
+
+        ok &= expect(enc_plan.objects.front().track_name == "catalog",
+                     "expected the encrypted plan's catalog object first");
+        const std::string enc_catalog_text = object_text(enc_plan.objects.front());
+
+        ok &= expect_contains(enc_catalog_text, "\"contentProtections\"",
+                              "expected an encrypted input to emit contentProtections");
+        ok &= expect_contains(enc_catalog_text, "\"contentProtectionRefIDs\"",
+                              "expected the protected track to reference an entry");
+        ok &= expect_contains(enc_catalog_text, "\"codec\":\"avc1.64000C\"",
+                              "expected the exact frma-resolved codec, not encv or a truncated prefix match");
+        ok &= expect_contains(enc_catalog_text, "\"systemID\":\"edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\"",
+                              "expected the Widevine system ID found via pssh");
+        ok &= expect_contains(enc_catalog_text,
+                              "\"laURL\":{\"url\":\"https://widevine.example.com/proxy\"",
+                              "expected the configured laURL applied to the matched system");
+        ok &= expect_not_contains(enc_catalog_text, "9a04f079-9840-4286-ab92-e65be0885f95",
+                                  "expected the unmatched PlayReady config entry to be ignored, not emitted");
+
+        // Without any drm_systems configuration at all, the pssh-derived
+        // contentProtections entry must still appear (attach_content_protection
+        // does not depend on configuration existing), just without laURL.
+        const auto enc_plan_unconfigured =
+            build_publish_plan(encrypted_segmented, DraftVersion::kDraft14, false, false, false);
+        const std::string enc_catalog_text_unconfigured = object_text(enc_plan_unconfigured.objects.front());
+        ok &= expect_contains(enc_catalog_text_unconfigured, "\"contentProtections\"",
+                              "expected contentProtections even with no DRM deployment configuration");
+        ok &= expect_not_contains(enc_catalog_text_unconfigured, "\"laURL\"",
+                                  "expected no laURL when no DRM configuration was supplied");
     }
 
     // CMSF section 3.5.2: maxGrpSapStartingType is a maximum over only the

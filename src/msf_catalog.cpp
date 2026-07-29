@@ -276,6 +276,13 @@ void validate_catalog(const MsfCatalog& catalog) {
             throw std::runtime_error("MSF catalog initRef \"" + *track.init_ref +
                                      "\" has no matching initDataList entry (track \"" + track.name + "\")");
         }
+        for (const auto& ref : track.content_protection_ref_ids) {
+            if (protection_ids.count(ref) == 0) {
+                throw std::runtime_error("CMSF contentProtectionRefID \"" + ref +
+                                         "\" has no matching contentProtections entry (track \"" +
+                                         track.name + "\")");
+            }
+        }
     }
 }
 
