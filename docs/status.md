@@ -26,8 +26,19 @@ Draft status:
    broadcast, `isLive: false` with `trackDuration` for a VOD conversion),
    optional periodic republication of an independent catalog (disabled by
    default, see `PublisherConfig::catalog_republish_interval`), and `add`/
-   `remove` delta updates bounded by a configurable max-deltas-per-group. See
-   `docs/protocol-mapping.md` for the wire-level contract and
+   `remove` delta updates bounded by a configurable max-deltas-per-group.
+   **Scope qualifier:** all three of those (end-of-broadcast signalling,
+   periodic republication, and delta updates) are wired only inside
+   `MoqtSession`'s two `publish_live()` overloads (the SRT-ingest and
+   stdin-ingest live paths) -- they are the only callers that populate the
+   session's `CatalogPublisher`. `publish_live_objects()`, also a live
+   streaming entry point, and the batch `publish()` plan path do not use
+   `CatalogPublisher` at all today: a broadcast run through either of those
+   still gets a static, one-shot catalog with none of Phase 2's lifecycle
+   behavior, and `end_broadcast()` correctly no-ops its final-catalog write
+   for them rather than guess at scope it does not have. See
+   `docs/protocol-mapping.md` for the full wire-level contract and per-path
+   breakdown, and
    `docs/superpowers/specs/2026-07-28-msf-cmsf-v1-design.md` for the original
    design. `clone` delta operations are not implemented -- no producer in
    this project generates a track matching another on every field except

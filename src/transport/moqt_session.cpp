@@ -3132,6 +3132,20 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     catalog_track_alias_ = alias_by_track.at("catalog");
     catalog_track_alias_known_ = true;
 
+    // draft-ietf-moq-transport-19 section 10.11: "A sender MUST NOT send
+    // PUBLISH_DONE until it has closed all streams it will ever open ... for
+    // a subscription." With republication enabled, more independent-catalog
+    // streams can open after the first one, so PUBLISH_DONE for the catalog
+    // subscription cannot be sent at SUBSCRIBE time in that case -- it is
+    // deferred to this loop's own exit below (search
+    // catalog_publish_done_deferred), by which point catalog_publisher_ can
+    // no longer open a new stream (either genuinely finished, or ended via a
+    // concurrent end_broadcast()). catalog_stream_count accumulates the
+    // total number of catalog streams opened, for that deferred
+    // PUBLISH_DONE's stream_count field.
+    bool catalog_publish_done_deferred = false;
+    std::uint64_t catalog_stream_count = 0;
+
     // Replaces the old one-shot `catalog_sent` latch: catalog_publisher_ owns
     // the group/object sequencing (MSF section 5) and, on the first call,
     // returns exactly the one independent-catalog object the old code sent by
@@ -3157,6 +3171,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         const TransportStatus status = send_catalog_objects(draft_version, track_alias, objects);
         if (status.ok) {
             last_catalog_published_at_ = std::chrono::steady_clock::now();
+            catalog_stream_count += objects.size();
         }
         return status;
     };
@@ -3190,6 +3205,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         const TransportStatus status = send_catalog_objects(draft_version, catalog_track_alias_, objects);
         if (status.ok) {
             last_catalog_published_at_ = now;
+            catalog_stream_count += objects.size();
         }
         return status;
     };
@@ -3303,10 +3319,17 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                         if (!ws.ok) {
                             return {ws, 0};
                         }
-                        ws = transport_.write_stream(control_stream_id_,
-                            encode_publish_done_message(draft_version, subscribe.request_id, 1), false);
-                        if (!ws.ok) {
-                            return {ws, 0};
+                        if (catalog_republish_interval_.count() <= 0) {
+                            ws = transport_.write_stream(control_stream_id_,
+                                encode_publish_done_message(draft_version, subscribe.request_id, 1), false);
+                            if (!ws.ok) {
+                                return {ws, 0};
+                            }
+                        } else {
+                            // section 10.11 MUST NOT: more catalog streams
+                            // can still open later, so PUBLISH_DONE is
+                            // deferred to this loop's own exit.
+                            catalog_publish_done_deferred = true;
                         }
                     } else {
                         subscribed_tracks.insert(subscribe.track_name);
@@ -3388,6 +3411,19 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     for (const auto& [request_id, subscribe] : active_subscriptions) {
         if (subscribe.track_name == "catalog") {
+            // By now catalog_publisher_ can no longer open a new stream for
+            // this subscription -- either the loop above is genuinely done
+            // (no more catalog sends will happen), or a concurrent
+            // end_broadcast() already ended catalog_publisher_ and every
+            // subsequent maybe_republish_catalog()/send_catalog() call has
+            // been a no-op. Section 10.11's MUST NOT is satisfied either way.
+            if (catalog_publish_done_deferred) {
+                status = transport_.write_stream(control_stream_id_,
+                    encode_publish_done_message(draft_version, request_id, catalog_stream_count), false);
+                if (!status.ok) {
+                    return status;
+                }
+            }
             continue;
         }
         status = transport_.write_stream(control_stream_id_,
@@ -3593,6 +3629,21 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // hand; on any later call with an unchanged catalog it returns nothing,
     // which is what keeps repeat SUBSCRIBEs across the branches below a
     // no-op without needing their own latch.
+    //
+    // draft-ietf-moq-transport-19 section 10.11: "A sender MUST NOT send
+    // PUBLISH_DONE until it has closed all streams it will ever open ... for
+    // a subscription." With republication enabled, more independent-catalog
+    // streams can open after the first one, so PUBLISH_DONE for the catalog
+    // subscription cannot be sent at SUBSCRIBE time in that case -- it is
+    // deferred to this loop's own exit below (search
+    // catalog_publish_done_deferred), by which point catalog_publisher_ can
+    // no longer open a new stream (either genuinely finished, or ended via a
+    // concurrent end_broadcast()). catalog_stream_count accumulates the
+    // total number of catalog streams opened, for that deferred
+    // PUBLISH_DONE's stream_count field.
+    bool catalog_publish_done_deferred = false;
+    std::uint64_t catalog_stream_count = 0;
+
     auto send_catalog = [&](std::uint64_t track_alias) -> TransportStatus {
         std::vector<openmoq::publisher::CatalogObject> objects;
         try {
@@ -3612,6 +3663,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         const TransportStatus status = send_catalog_objects(draft_version, track_alias, objects);
         if (status.ok) {
             last_catalog_published_at_ = std::chrono::steady_clock::now();
+            catalog_stream_count += objects.size();
             std::cerr << "[moqt-session] live: catalog published (" << objects.back().payload.size() << " bytes)\n";
         }
         return status;
@@ -3646,6 +3698,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         const TransportStatus status = send_catalog_objects(draft_version, catalog_track_alias_, objects);
         if (status.ok) {
             last_catalog_published_at_ = now;
+            catalog_stream_count += objects.size();
         }
         return status;
     };
@@ -3959,11 +4012,18 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         if (!write_status.ok) {
                             return {write_status, 0};
                         }
-                        write_status = transport_.write_stream(request_stream_id,
-                                                               encode_publish_done_message(draft_version, subscribe.request_id, 1),
-                                                               false);
-                        if (!write_status.ok) {
-                            return {write_status, 0};
+                        if (catalog_republish_interval_.count() <= 0) {
+                            write_status = transport_.write_stream(request_stream_id,
+                                                                   encode_publish_done_message(draft_version, subscribe.request_id, 1),
+                                                                   false);
+                            if (!write_status.ok) {
+                                return {write_status, 0};
+                            }
+                        } else {
+                            // section 10.11 MUST NOT: more catalog streams
+                            // can still open later, so PUBLISH_DONE is
+                            // deferred to this loop's own exit.
+                            catalog_publish_done_deferred = true;
                         }
                     } else {
                         subscribed_tracks.insert(subscribe.track_name);
@@ -4039,14 +4099,21 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     if (!catalog_status.ok) {
                         return {catalog_status, 0};
                     }
-                    catalog_status = write_publish_done_for_request(transport_,
-                                                                    draft_version,
-                                                                    control_stream_id_,
-                                                                    publish_stream_id_by_request_id_,
-                                                                    catalog_request_id->second,
-                                                                    1);
-                    if (!catalog_status.ok) {
-                        return {catalog_status, 0};
+                    if (catalog_republish_interval_.count() <= 0) {
+                        catalog_status = write_publish_done_for_request(transport_,
+                                                                        draft_version,
+                                                                        control_stream_id_,
+                                                                        publish_stream_id_by_request_id_,
+                                                                        catalog_request_id->second,
+                                                                        1);
+                        if (!catalog_status.ok) {
+                            return {catalog_status, 0};
+                        }
+                    } else {
+                        // section 10.11 MUST NOT: deferred to this loop's own
+                        // exit, via the subscribe_tracks_publish_request_ids
+                        // cleanup below.
+                        catalog_publish_done_deferred = true;
                     }
                 }
                 for (const auto& track : tracks) {
@@ -4100,31 +4167,35 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     std::cerr << "[moqt-session] live: accepted subscribe track=" << subscribe.track_name
                               << " request_id=" << subscribe.request_id << '\n';
 
-                    // The subscription still gets PUBLISH_DONE right after the
+                    // With republication disabled (the default), the
+                    // subscription still gets PUBLISH_DONE right after the
                     // first catalog object, matching the one-shot behavior
-                    // this code always had. catalog_republish_interval_
-                    // therefore does not change what a subscriber sees at
-                    // SUBSCRIBE time; it only controls whether
-                    // maybe_republish_catalog() (called from the polling
-                    // loop below) later opens further independent-catalog
-                    // streams on the same track_alias for as long as this
-                    // session keeps running.
+                    // this code always had. With republication enabled,
+                    // draft-ietf-moq-transport-19 section 10.11 forbids that
+                    // (PUBLISH_DONE MUST NOT be sent until every stream the
+                    // subscription will ever open has closed), so PUBLISH_DONE
+                    // is deferred to this loop's own exit instead -- see
+                    // catalog_publish_done_deferred.
                     if (subscribe.track_name == "catalog") {
                         ws = send_catalog(track_it->second);
                         if (!ws.ok) {
                             return {ws, 0};
                         }
-                        const auto stream_it = active_subscription_stream_ids.find(subscribe.request_id);
-                        const std::uint64_t response_stream_id =
-                            uses_request_streams(draft_version) &&
-                                    stream_it != active_subscription_stream_ids.end()
-                                ? stream_it->second
-                                : control_stream_id_;
-                        ws = transport_.write_stream(response_stream_id,
-                                                     encode_publish_done_message(draft_version, subscribe.request_id, 1),
-                                                     false);
-                        if (!ws.ok) {
-                            return {ws, 0};
+                        if (catalog_republish_interval_.count() <= 0) {
+                            const auto stream_it = active_subscription_stream_ids.find(subscribe.request_id);
+                            const std::uint64_t response_stream_id =
+                                uses_request_streams(draft_version) &&
+                                        stream_it != active_subscription_stream_ids.end()
+                                    ? stream_it->second
+                                    : control_stream_id_;
+                            ws = transport_.write_stream(response_stream_id,
+                                                         encode_publish_done_message(draft_version, subscribe.request_id, 1),
+                                                         false);
+                            if (!ws.ok) {
+                                return {ws, 0};
+                            }
+                        } else {
+                            catalog_publish_done_deferred = true;
                         }
                     } else {
                         // Only add media tracks to subscribed_tracks (not catalog).
@@ -4344,10 +4415,30 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         static_cast<void>(track_name);
     }
 
-    // Send PUBLISH_DONE for each subscribed media track (catalog already handled)
+    // Send PUBLISH_DONE for each subscribed media track. The catalog
+    // subscription either already got its PUBLISH_DONE at SUBSCRIBE time
+    // (catalog_republish_interval_ == 0, the one-shot default), or is
+    // deferred here (see catalog_publish_done_deferred's own comment above
+    // for why: section 10.11's MUST NOT). By now catalog_publisher_ can no
+    // longer open a new stream for it, so it is safe to close.
     for (const auto& [request_id, subscribe] : active_subscriptions) {
         if (subscribe.track_name == "catalog") {
-            continue;  // Already sent PUBLISH_DONE for catalog
+            if (catalog_publish_done_deferred) {
+                const auto stream_it = active_subscription_stream_ids.find(request_id);
+                const std::uint64_t response_stream_id =
+                    uses_request_streams(draft_version) && stream_it != active_subscription_stream_ids.end()
+                        ? stream_it->second
+                        : control_stream_id_;
+                status = transport_.write_stream(response_stream_id,
+                                                 encode_publish_done_message(
+                                                     draft_version, request_id, catalog_stream_count),
+                                                 false);
+                if (!status.ok) {
+                    return status;
+                }
+                catalog_publish_done_deferred = false;
+            }
+            continue;
         }
         const auto stream_it = active_subscription_stream_ids.find(request_id);
         const std::uint64_t response_stream_id =
@@ -4363,7 +4454,22 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
     }
     for (const auto& [track_name, request_id] : subscribe_tracks_publish_request_ids) {
-        if (track_name == "catalog" || !subscribed_tracks.contains(track_name)) {
+        if (track_name == "catalog") {
+            if (catalog_publish_done_deferred) {
+                status = write_publish_done_for_request(transport_,
+                                                        draft_version,
+                                                        control_stream_id_,
+                                                        publish_stream_id_by_request_id_,
+                                                        request_id,
+                                                        catalog_stream_count);
+                if (!status.ok) {
+                    return status;
+                }
+                catalog_publish_done_deferred = false;
+            }
+            continue;
+        }
+        if (!subscribed_tracks.contains(track_name)) {
             continue;
         }
         status = write_publish_done_for_request(transport_,
@@ -5075,6 +5181,13 @@ TransportStatus MoqtSession::end_broadcast(openmoq::publisher::EndBroadcastMode 
         if (!catalog_status.ok) {
             status = catalog_status;
         }
+    } else if (!catalog_track_alias_known_) {
+        std::cerr << "[moqt-session] end_broadcast: skipping final catalog write -- this session "
+                     "never populated catalog_publisher_ (not driven through publish_live())\n";
+    } else {
+        std::cerr << "[moqt-session] end_broadcast: skipping final catalog write -- "
+                     "catalog_publisher_ already ended (end_broadcast called before, or a live "
+                     "catalog subscription already closed via publish_live()'s own end)\n";
     }
 
     // publish_stream_id_by_request_id_ is the only per-request state that

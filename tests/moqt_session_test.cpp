@@ -2600,6 +2600,82 @@ int main() {
     }
 
     {
+        // Fix round 1, Finding 1: draft-ietf-moq-transport-19 section 10.11
+        // forbids sending PUBLISH_DONE for a subscription until every stream
+        // it will ever open has closed. With catalog_republish_interval set,
+        // more independent-catalog streams can open after the first one, so
+        // PUBLISH_DONE for the catalog subscription must be deferred rather
+        // than sent immediately (as it still correctly is when the interval
+        // is zero, per the test above and the many other catalog-subscribe
+        // tests in this file).
+        //
+        // Catalog object writes and control writes are disambiguated by
+        // stream_id rather than by decoding message contents: a catalog
+        // object write always lands on a freshly opened, non-control
+        // stream_id (see SubgroupSenderState::serve), while PUBLISH_DONE is
+        // always written to control_stream_id_ (0 here, since draft-14 does
+        // not use request streams). Decoding PUBLISH_DONE's bytes with
+        // decode_object_stream_fields can spuriously "succeed" (both are
+        // varint sequences), so stream_id is the only reliable signal.
+        //
+        // auto-forward mode is used (rather than await-subscribe) so the
+        // loop keeps polling for subscriber_timeout_ after EOF (see
+        // eof_deadline in the auto-forward loop) instead of exiting on the
+        // very next tick -- that grace window is what gives
+        // maybe_republish_catalog() a chance to actually fire more than
+        // once before the loop, and the deferred PUBLISH_DONE, exit.
+        MockTransport republish_transport;
+        republish_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        republish_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        republish_transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0));
+
+        MoqtSession republish_session(
+            republish_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(2));
+        republish_session.set_catalog_republish_interval(std::chrono::seconds(1));
+        status = republish_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected republish-interval session connect to succeed");
+
+        const auto live_bytes = make_live_init_mp4();
+        std::string live_input_bytes(live_bytes.begin(), live_bytes.end());
+        std::istringstream live_input(live_input_bytes);
+        status = republish_session.publish_live(live_input, DraftVersion::kDraft14, false);
+        ok &= expect(status.ok, "expected republish-interval live publish to succeed");
+
+        std::vector<std::size_t> catalog_object_indices;
+        std::vector<std::size_t> catalog_publish_done_indices;
+        for (std::size_t i = 0; i < republish_transport.writes.size(); ++i) {
+            const auto& write = republish_transport.writes[i];
+            if (write.stream_id != 0) {
+                // Every non-control-stream write in this test is a catalog
+                // object write: no media track was subscribed.
+                catalog_object_indices.push_back(i);
+                continue;
+            }
+            if (message_type(write.bytes) == 0x0b) {
+                catalog_publish_done_indices.push_back(i);
+            }
+        }
+
+        ok &= expect(!catalog_object_indices.empty(),
+                     "expected at least the initial catalog object to have been written");
+        ok &= expect(catalog_object_indices.size() >= 2,
+                     "expected catalog_republish_interval to cause at least one republish before "
+                     "the 2-second subscriber_timeout grace window closed");
+        ok &= expect(catalog_publish_done_indices.size() == 1,
+                     "expected exactly one PUBLISH_DONE for the catalog subscription");
+
+        if (!catalog_object_indices.empty() && catalog_publish_done_indices.size() == 1) {
+            ok &= expect(catalog_publish_done_indices.front() > catalog_object_indices.back(),
+                         "expected PUBLISH_DONE to be deferred until after every catalog object "
+                         "write, not sent immediately after the first one (section 10.11 MUST NOT)");
+        }
+    }
+
+    {
         // Regression: a session driven entirely through the batch publish()
         // path never calls catalog_publisher_.publish(), so it never learns
         // which track alias is "catalog" (build_published_tracks() assigns

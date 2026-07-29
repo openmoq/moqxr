@@ -43,7 +43,13 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     (they never start a new group), and only `add` and `remove` operations
     are emitted -- `clone` is not implemented, since it applies when a new
     track matches an existing one on every field except name, which no
-    producer in this project generates.
+    producer in this project generates. **Scope:** delta updates only happen
+    at all inside `MoqtSession`'s two `publish_live()` overloads (the
+    SRT-ingest and stdin-ingest live paths), the only callers that ever call
+    `CatalogPublisher::publish()` more than once for a session. The batch
+    `publish()` plan path and `publish_live_objects()` do not populate
+    `CatalogPublisher`, so a broadcast run through either always gets a
+    single static, one-shot catalog with no deltas.
   - Every catalog object, independent or delta, maps to MOQT sub-group 0.
   - Section 5.3 freezes a track's attributes once its namespace-and-name
     tuple has been declared: an attribute change on an existing track cannot
@@ -55,7 +61,22 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     "periodically publish a new independent catalog" guidance and for
     section 5's cache-expiry republication; `MoqtSession` calls it on
     `PublisherConfig::catalog_republish_interval` when configured non-zero
-    (default zero preserves one-shot delivery).
+    (default zero preserves one-shot delivery). **Scope:** as with deltas,
+    this is wired only inside the two `publish_live()` overloads; the batch
+    `publish()` path and `publish_live_objects()` never republish.
+    **Operator note:** draft-ietf-moq-transport-19 section 10.11 states "A
+    sender MUST NOT send PUBLISH_DONE until it has closed all streams it
+    will ever open ... for a subscription." Because republication can open
+    further independent-catalog streams for as long as the session runs,
+    `MoqtSession` defers PUBLISH_DONE for the catalog subscription while
+    `catalog_republish_interval` is non-zero: it is sent once, when the
+    `publish_live()` polling loop actually winds down (natural end-of-input,
+    or after `end_broadcast()` has ended `CatalogPublisher` and no further
+    republish can occur), instead of immediately after the first catalog
+    object as it is when the interval is zero (the one-shot default).
+    Operators enabling this interval should expect the catalog subscription
+    to stay open, from the receiver's point of view, for the life of the
+    broadcast rather than close immediately.
   - `MoqtSession::end_broadcast()` (MSF section 11.3) uses the same
     `CatalogPublisher` to publish the final independent catalog when a live
     broadcast ends: `isComplete: true` with an empty `tracks` array for
