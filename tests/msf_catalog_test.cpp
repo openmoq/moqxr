@@ -611,5 +611,75 @@ int main() {
     }
     ok &= expect(threw_second_end, "expected a second end_broadcast call to throw");
 
+    // Fix round 2: prove tracks_equal is sensitive to fields that a hand-rolled
+    // comparison could easily omit. Each case publishes a catalog, then
+    // publishes a copy differing in exactly one field, and expects a new
+    // object -- a silent no-op here would mean a real change never reaches
+    // subscribers, which is the worst failure mode this class has.
+    {
+        // buffers.target_ms changed, with the optional engaged on both sides:
+        // this specifically catches a comparison that only checks has_value().
+        CatalogPublisher buffers_pub;
+        MsfCatalog buffers_a;
+        MsfTrack buffers_track_a = sapped_video;
+        buffers_track_a.buffers = MsfBuffers{.target_ms = 1500, .min_ms = 800, .max_ms = std::nullopt};
+        buffers_a.tracks.push_back(buffers_track_a);
+        const auto buffers_first = buffers_pub.publish(buffers_a);
+        ok &= expect(buffers_first.size() == 1, "expected the first buffers catalog to publish");
+
+        MsfCatalog buffers_b = buffers_a;
+        buffers_b.tracks[0].buffers->target_ms = 2000;
+        const auto buffers_second = buffers_pub.publish(buffers_b);
+        ok &= expect(!buffers_second.empty(),
+                     "expected a change to buffers.target_ms to trigger a republish");
+    }
+
+    {
+        // A custom_fields entry's value changed.
+        CatalogPublisher custom_pub;
+        MsfCatalog custom_a;
+        MsfTrack custom_track_a = sapped_video;
+        custom_track_a.custom_fields["m2tsPacketSize"] = "188";
+        custom_a.tracks.push_back(custom_track_a);
+        const auto custom_first = custom_pub.publish(custom_a);
+        ok &= expect(custom_first.size() == 1, "expected the first custom_fields catalog to publish");
+
+        MsfCatalog custom_b = custom_a;
+        custom_b.tracks[0].custom_fields["m2tsPacketSize"] = "204";
+        const auto custom_second = custom_pub.publish(custom_b);
+        ok &= expect(!custom_second.empty(),
+                     "expected a change to a custom_fields value to trigger a republish");
+    }
+
+    {
+        // A depends entry changed.
+        CatalogPublisher depends_pub;
+        MsfCatalog depends_a;
+        depends_a.tracks.push_back(sap);  // sap.depends == {"video"}
+        const auto depends_first = depends_pub.publish(depends_a);
+        ok &= expect(depends_first.size() == 1, "expected the first depends catalog to publish");
+
+        MsfCatalog depends_b = depends_a;
+        depends_b.tracks[0].depends = {"audio"};
+        const auto depends_second = depends_pub.publish(depends_b);
+        ok &= expect(!depends_second.empty(),
+                     "expected a change to a depends entry to trigger a republish");
+    }
+
+    {
+        // max_grp_sap_starting_type changed.
+        CatalogPublisher sap_pub;
+        MsfCatalog sap_a;
+        sap_a.tracks.push_back(sapped_video);  // max_grp_sap_starting_type == 2
+        const auto sap_first = sap_pub.publish(sap_a);
+        ok &= expect(sap_first.size() == 1, "expected the first SAP-type catalog to publish");
+
+        MsfCatalog sap_b = sap_a;
+        sap_b.tracks[0].max_grp_sap_starting_type = 3;
+        const auto sap_second = sap_pub.publish(sap_b);
+        ok &= expect(!sap_second.empty(),
+                     "expected a change to max_grp_sap_starting_type to trigger a republish");
+    }
+
     return ok ? 0 : 1;
 }
