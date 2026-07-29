@@ -102,7 +102,8 @@ PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const
         .plan = build_publish_plan(segmented_mp4,
                                    config_.draft_version,
                                    config_.include_sap,
-                                   config_.include_msf_timeline),
+                                   config_.include_msf_timeline,
+                                   config_.vod),
     };
 }
 
@@ -115,7 +116,8 @@ PreparedPublish Publisher::prepare_stream(std::istream& input, std::string_view 
         .plan = build_publish_plan(segmented_mp4,
                                    config_.draft_version,
                                    config_.include_sap,
-                                   config_.include_msf_timeline),
+                                   config_.include_msf_timeline,
+                                   config_.vod),
     };
 }
 

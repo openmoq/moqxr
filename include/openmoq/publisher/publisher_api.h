@@ -39,6 +39,9 @@ struct PublisherConfig {
     bool live_stream_per_object = false;
     bool paced = false;
     bool loop = false;
+    // This publisher is live, or simulating live, unless explicitly told
+    // otherwise. VOD semantics are never inferred from the input.
+    bool vod = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     cat4moq::AuthorizationConfig authorization;
 };

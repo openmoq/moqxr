@@ -43,10 +43,15 @@ struct PublishPlan {
     std::vector<CmsfObject> objects;
 };
 
+// vod: when true the plan describes a Video-On-Demand asset (isLive false,
+// trackDuration present, generatedAt omitted per MSF 5.1.2). Defaults to
+// false because this publisher is live, or simulating live, unless
+// explicitly configured otherwise.
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap = false,
-                               bool include_msf_timeline = false);
+                               bool include_msf_timeline = false,
+                               bool vod = false);
 std::string render_publish_plan(const PublishPlan& plan);
 PublishPlan materialize_publish_plan(const PublishPlan& plan, std::span<const std::uint8_t> bytes);
 void emit_plan_objects(const PublishPlan& plan,
