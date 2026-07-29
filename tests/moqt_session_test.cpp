@@ -2540,6 +2540,22 @@ int main() {
         // MSF section 11.3: after a live catalog has actually been published
         // through publish_live(), end_broadcast() must write a genuine final
         // catalog object onto the wire (not just send PUBLISH_DONE for media).
+        //
+        // C1 (final review): a prior round deferred the catalog
+        // subscription's PUBLISH_DONE only when catalog_republish_interval_
+        // was set (> 0). end_broadcast() can open a further catalog stream
+        // on the same alias regardless of that knob, so at the DEFAULT
+        // config (as configured here) the deferral must be unconditional --
+        // section 10.11 forbids PUBLISH_DONE before every stream a
+        // subscription will ever open has closed. This is verified two ways
+        // below: (a) via on_read, observing mid-flight that the catalog
+        // object goes out before PUBLISH_DONE does -- proving PUBLISH_DONE
+        // is deferred to publish_live()'s own exit rather than sent
+        // synchronously while processing the catalog SUBSCRIBE, which is
+        // exactly the gap end_broadcast() could otherwise land a stream
+        // into; and (b) the original assertion, retargeted: PUBLISH_DONE
+        // must still be sent by the time publish_live() returns, just not
+        // "immediately" in the old, unsafe sense.
         MockTransport end_broadcast_transport;
         end_broadcast_transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
@@ -2549,8 +2565,33 @@ int main() {
         end_broadcast_transport.reads[0].push_back(
             encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0));
 
+        bool catalog_object_seen = false;
+        bool observed_catalog_object_before_publish_done = false;
+        end_broadcast_transport.on_read = [&](MockTransport& transport, std::uint64_t) {
+            bool has_catalog_object = false;
+            bool has_publish_done = false;
+            for (const auto& write : transport.writes) {
+                if (write.stream_id != 0) {
+                    has_catalog_object = true;
+                } else if (message_type(write.bytes) == 0x0b) {
+                    has_publish_done = true;
+                }
+            }
+            if (has_catalog_object) {
+                catalog_object_seen = true;
+                if (!has_publish_done) {
+                    observed_catalog_object_before_publish_done = true;
+                }
+            }
+        };
+
+        // auto_forward=true so the loop keeps polling control (and calling
+        // read_stream, which fires on_read above) for subscriber_timeout_
+        // after EOF instead of exiting on the very next tick -- that grace
+        // window is what gives on_read a chance to observe the wire between
+        // send_catalog() and the deferred PUBLISH_DONE.
         MoqtSession end_broadcast_session(
-            end_broadcast_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+            end_broadcast_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
         status = end_broadcast_session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected end-broadcast live session connect to succeed");
 
@@ -2559,8 +2600,17 @@ int main() {
         std::istringstream live_input(live_input_bytes);
         status = end_broadcast_session.publish_live(live_input, DraftVersion::kDraft14, false);
         ok &= expect(status.ok, "expected end-broadcast live publish to succeed");
+        ok &= expect(catalog_object_seen, "expected the catalog object to actually be sent");
+        ok &= expect(observed_catalog_object_before_publish_done,
+                     "expected at least one moment where the catalog object had gone out but "
+                     "PUBLISH_DONE had not -- proving PUBLISH_DONE is deferred to publish_live()'s "
+                     "own exit rather than sent synchronously while processing the catalog "
+                     "SUBSCRIBE, even at the default catalog_republish_interval_ (section 10.11 "
+                     "MUST NOT: end_broadcast() must still be free to open a further catalog "
+                     "stream without racing an already-sent PUBLISH_DONE)");
         ok &= expect(control_message_count(end_broadcast_transport, 0x0b) >= 1,
-                     "expected the live catalog subscribe to receive its immediate PUBLISH_DONE");
+                     "expected the live catalog subscription to still eventually receive "
+                     "PUBLISH_DONE by the time publish_live() returns");
 
         const std::size_t writes_before_end = end_broadcast_transport.writes.size();
         status = end_broadcast_session.end_broadcast(
