@@ -190,8 +190,16 @@ emitting either the VOD conversion (`isLive: false` plus `trackDuration` on each
 track) or the permanent termination (`isComplete: true` with an empty `tracks`
 array), after `SUBSCRIBE_DONE` with status `0x2 Track Ended`.
 
-This phase requires reading JSON, not just writing it, in order to diff a prior
-catalog. A minimal reader is added here rather than in Phase 1.
+CORRECTION (2026-07-29): this section claimed the phase "requires reading JSON,
+not just writing it, in order to diff a prior catalog". That is wrong. A
+publisher owns its catalog state and holds the previous `MsfCatalog` as a
+struct in memory, so diffing is struct-to-struct and no reader is needed.
+
+A second correction: this section implied the section 5 lifecycle was wholly
+unimplemented. In fact the CTE path already satisfies every MUST in section 5,
+and delta updates are a MAY rather than a requirement. See
+`docs/superpowers/specs/2026-07-29-msf-catalog-lifecycle-design.md`, which
+supersedes this section.
 
 Current behavior for reference: the catalog is sent once at group 0, object 0
 and never republished (`src/transport/moqt_session.cpp:3099`).
