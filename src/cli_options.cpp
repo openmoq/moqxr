@@ -165,6 +165,14 @@ std::size_t parse_queue_depth(std::string_view value) {
     return static_cast<std::size_t>(depth);
 }
 
+std::chrono::seconds parse_catalog_republish_interval(std::string_view value) {
+    const int seconds = parse_strict_int(value, "--catalog-republish-interval");
+    if (seconds < 0) {
+        throw std::runtime_error("--catalog-republish-interval must be zero or greater");
+    }
+    return std::chrono::seconds(seconds);
+}
+
 }  // namespace
 
 CliOptions parse_cli_options(int argc, char** argv) {
@@ -246,6 +254,11 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.paced = true;
         } else if (argument == "--loop") {
             options.loop = true;
+        } else if (argument == "--vod") {
+            options.vod = true;
+        } else if (argument == "--catalog-republish-interval") {
+            options.catalog_republish_interval =
+                parse_catalog_republish_interval(require_value("--catalog-republish-interval"));
         } else if (argument == "--emit-dir") {
             options.emit_dir = std::filesystem::path(require_value("--emit-dir"));
         } else if (argument == "--dump-plan") {
@@ -325,6 +338,7 @@ std::string build_usage(const char* argv0) {
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
            " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
+           " [--vod] [--catalog-republish-interval <seconds>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";
 }

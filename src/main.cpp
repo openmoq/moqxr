@@ -40,6 +40,8 @@ int main(int argc, char** argv) {
             .live_stream_per_object = options.stream_per_object,
             .paced = options.paced,
             .loop = options.loop,
+            .vod = options.vod,
+            .catalog_republish_interval = options.catalog_republish_interval,
             .subscriber_timeout = options.subscriber_timeout,
         };
         Publisher publisher(config);
