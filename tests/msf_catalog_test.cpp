@@ -762,6 +762,34 @@ int main() {
     ok &= expect_contains(rebuilt[0].payload, "\"tracks\":", "expected a full catalog");
     ok &= expect_contains(rebuilt[0].payload, "\"bitrate\":9000000", "expected the new attribute");
 
+    // Coordinator review finding: the test above changes ONLY an existing
+    // track's attribute, with no simultaneous add or remove. If the section
+    // 5.3 fallback branch were deleted outright, that track would be counted
+    // as neither added nor removed, so `added` and `removed` would both stay
+    // empty, and control would reach the unrelated
+    // "(added.empty() && removed.empty())" branch -- which emits the SAME
+    // full independent catalog at the same object_id/group_id. The test
+    // above cannot distinguish the fallback existing from it being deleted.
+    // Combine an attribute change with a simultaneous add so the two code
+    // paths diverge: without the fallback, `added` is non-empty, so this
+    // would emit a delta carrying only the add -- silently dropping the
+    // bitrate change and stranding subscribers on stale attributes.
+    CatalogPublisher dpub2;
+    (void)dpub2.publish(live_now);
+    MsfCatalog changed_and_added = live_now;
+    changed_and_added.tracks[0].bitrate = 9000000;
+    changed_and_added.tracks.push_back(extra);
+    const auto combined = dpub2.publish(changed_and_added);
+    ok &= expect(combined.size() == 1, "expected one object");
+    ok &= expect(combined[0].object_id == 0,
+                 "expected a full independent catalog, not a delta carrying only the add");
+    ok &= expect_contains(combined[0].payload, "\"tracks\":",
+                          "expected a full catalog with a root tracks array");
+    ok &= expect_contains(combined[0].payload, "\"bitrate\":9000000",
+                          "expected the changed attribute to reach the wire");
+    ok &= expect_not_contains(combined[0].payload, "\"deltaUpdate\"",
+                              "expected no delta when an attribute changed");
+
     // Section 5.3: bound the deltas a joining subscriber must process.
     CatalogPublisher bounded;
     bounded.set_max_deltas_per_group(1);
@@ -850,6 +878,19 @@ int main() {
         ok &= expect_contains(id_result[0].payload, "\"data\":\"BBBB\"",
                               "expected the initDataList change to actually reach the wire");
     }
+
+    // Coordinator review finding: "clone" is a deliberate non-goal (this
+    // implementation emits only "add" and "remove"), and validate_catalog
+    // rejects any other operation name, but nothing exercised that path.
+    MsfCatalog clone_catalog;
+    clone_catalog.delta_update.push_back(MsfDeltaOp{.op = "clone", .tracks = {extra}});
+    ok &= throws_runtime_error(clone_catalog, "expected a \"clone\" operation to throw (unimplemented)");
+
+    // Coordinator review finding: validate_catalog also rejects a delta
+    // operation with no tracks at all.
+    MsfCatalog empty_op_catalog;
+    empty_op_catalog.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {}});
+    ok &= throws_runtime_error(empty_op_catalog, "expected a delta operation with no tracks to throw");
 
     return ok ? 0 : 1;
 }
