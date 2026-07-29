@@ -532,8 +532,44 @@ int main() {
     const MsfCatalog partial_cat = make_end_broadcast_catalog(
         live_now, EndBroadcastMode::kConvertToVod, {{"video", 60000}});
     const std::string partial_json = serialize_catalog(partial_cat);
-    ok &= expect_contains(partial_json, "\"trackDuration\":60000", "expected the known duration");
-    ok &= expect_contains(partial_json, "\"isLive\":false", "expected both tracks marked not live");
+    // Verify each track's properties specifically, not just that they exist somewhere.
+    // Find the audio track object by locating its name field and extracting the
+    // surrounding braces. The audio track is after the video track in the array.
+    const size_t audio_name_pos = partial_json.find("\"name\":\"audio\"");
+    ok &= expect(audio_name_pos != std::string::npos, "expected audio track in partial catalog");
+    if (audio_name_pos != std::string::npos) {
+        // Find the start of this track object by searching backward for an opening brace.
+        size_t track_start = partial_json.rfind('{', audio_name_pos);
+        // Find the end by searching forward for a closing brace.
+        size_t track_end = partial_json.find('}', audio_name_pos);
+        if (track_start != std::string::npos && track_end != std::string::npos) {
+            std::string audio_track = partial_json.substr(track_start, track_end - track_start + 1);
+            // Audio track must have isLive:false
+            ok &= expect_contains(audio_track, "\"isLive\":false",
+                                  "expected audio track marked isLive:false");
+            // Audio track must NOT have trackDuration (it was not in the map)
+            ok &= expect_not_contains(audio_track, "\"trackDuration\"",
+                                      "expected audio track to have no trackDuration (not in map)");
+        }
+    }
+    // Video track must have trackDuration:60000 (it was in the map)
+    ok &= expect_contains(partial_json, "\"name\":\"video\"", "expected video track present");
+    const size_t video_name_pos = partial_json.find("\"name\":\"video\"");
+    if (video_name_pos != std::string::npos) {
+        // Extract the video track similarly
+        size_t track_start = partial_json.rfind('{', video_name_pos);
+        size_t track_end = partial_json.find('}', video_name_pos);
+        if (track_start != std::string::npos && track_end != std::string::npos) {
+            std::string video_track = partial_json.substr(track_start, track_end - track_start + 1);
+            ok &= expect_contains(video_track, "\"trackDuration\":60000",
+                                  "expected video track to have trackDuration:60000");
+            ok &= expect_contains(video_track, "\"isLive\":false",
+                                  "expected video track marked isLive:false");
+        }
+    }
+    // Globally: no "isLive":true should remain anywhere
+    ok &= expect_not_contains(partial_json, "\"isLive\":true",
+                              "expected no live tracks in partial VOD conversion");
 
     return ok ? 0 : 1;
 }

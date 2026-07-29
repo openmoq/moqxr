@@ -537,6 +537,9 @@ MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
         }
         out.tracks.push_back(std::move(track));
     }
+    // publishTracks carry subscriber-uploaded logs and metrics (MSF sections 9–10),
+    // not media. They get is_live cleared but never receive trackDuration, because
+    // Section 11.3 mandates duration only for the media Tracks field.
     for (MsfTrack track : current.publish_tracks) {
         track.is_live = false;
         out.publish_tracks.push_back(std::move(track));
