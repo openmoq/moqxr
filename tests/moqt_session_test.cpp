@@ -759,6 +759,47 @@ bool expect(bool condition, const std::string& message) {
     return true;
 }
 
+// Collect every value that follows a given "key":" prefix, e.g. every
+// "initRef":"..." or "id":"..." value in a serialized MSF catalog.
+std::vector<std::string> extract_all_values(std::string_view catalog, std::string_view key_prefix) {
+    std::vector<std::string> values;
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t found = catalog.find(key_prefix, pos);
+        if (found == std::string_view::npos) {
+            break;
+        }
+        const std::size_t value_start = found + key_prefix.size();
+        const std::size_t value_end = catalog.find('"', value_start);
+        if (value_end == std::string_view::npos) {
+            break;
+        }
+        values.emplace_back(catalog.substr(value_start, value_end - value_start));
+        pos = value_end + 1;
+    }
+    return values;
+}
+
+// True when every "initRef":"..." value in the catalog also appears as an
+// "id":"..." value (i.e. an initDataList entry).
+bool all_init_refs_resolve(std::string_view catalog) {
+    const std::vector<std::string> init_refs = extract_all_values(catalog, "\"initRef\":\"");
+    const std::vector<std::string> init_ids = extract_all_values(catalog, "\"id\":\"");
+    for (const auto& ref : init_refs) {
+        bool found = false;
+        for (const auto& id : init_ids) {
+            if (id == ref) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
 PublishPlan make_span_backed_plan() {
     return {
         .draft = openmoq::publisher::draft_profile(DraftVersion::kDraft14),
@@ -1289,7 +1330,9 @@ int main() {
 
         PublishPlan catalog_content_plan = make_span_backed_plan(DraftVersion::kDraft14);
         const std::string catalog_text =
-            "{\"version\":1,\"format\":\"cmsf\",\"tracks\":[{\"name\":\"vide_1\",\"initData\":\"AAAA\"}]}";
+            "{\"version\":\"1\",\"generatedAt\":1751000000000,\"tracks\":[{\"name\":\"vide_1\",\"packaging\":\"cmaf\","
+            "\"role\":\"video\",\"isLive\":true,\"initRef\":\"vide_1-init\",\"bitrate\":2000000}],"
+            "\"initDataList\":[{\"id\":\"vide_1-init\",\"type\":\"inline\",\"data\":\"AAAA\"}]}";
         catalog_content_plan.objects[0].payload = ByteSpan{.offset = 0, .size = catalog_text.size()};
         catalog_content_plan.objects[1].payload = ByteSpan{.offset = catalog_text.size(), .size = 3};
         std::vector<std::uint8_t> catalog_source_bytes(catalog_text.begin(), catalog_text.end());
@@ -1317,12 +1360,32 @@ int main() {
                                             payload),
                 "expected catalog-content object stream fields to decode");
             const std::string served_catalog(payload.begin(), payload.end());
-            ok &= expect(served_catalog.find("\"format\":\"cmsf\"") != std::string::npos,
-                         "expected served catalog payload to include cmsf format");
+            ok &= expect(served_catalog.find("\"version\":\"1\"") != std::string::npos,
+                         "expected served catalog payload to include MSF v1 string version");
             ok &= expect(served_catalog.find("\"name\":\"vide_1\"") != std::string::npos,
                          "expected served catalog payload to include vide_1 track");
-            ok &= expect(served_catalog.find("\"initData\":\"AAAA\"") != std::string::npos,
-                         "expected served catalog payload to include initData");
+            ok &= expect(served_catalog.find("\"isLive\":true") != std::string::npos,
+                         "expected served catalog payload to mark the track isLive");
+            const std::string generated_at_prefix = "\"generatedAt\":";
+            const std::size_t generated_at_pos = served_catalog.find(generated_at_prefix);
+            ok &= expect(generated_at_pos != std::string::npos,
+                         "expected served live catalog payload to include generatedAt");
+            if (generated_at_pos != std::string::npos) {
+                const std::size_t value_start = generated_at_pos + generated_at_prefix.size();
+                const std::size_t value_end = served_catalog.find_first_not_of("0123456789", value_start);
+                const std::string generated_at_value =
+                    served_catalog.substr(value_start, value_end - value_start);
+                ok &= expect(generated_at_value.size() == 13,
+                             "expected generatedAt to be a plausible epoch-milliseconds value");
+                ok &= expect(!generated_at_value.empty() && std::stoull(generated_at_value) != 0,
+                             "expected generatedAt to not be zero");
+            }
+            ok &= expect(served_catalog.find("\"trackDuration\"") == std::string::npos,
+                         "expected no trackDuration in a live catalog");
+            ok &= expect(all_init_refs_resolve(served_catalog),
+                         "expected every initRef in the served live catalog to resolve to an initDataList id");
+            ok &= expect(served_catalog.find("\"data\":\"AAAA\"") != std::string::npos,
+                         "expected served catalog payload to include initDataList data");
         }
     }
 

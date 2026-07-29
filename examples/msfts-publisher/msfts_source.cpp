@@ -1,10 +1,10 @@
 #include "msfts_source.h"
 
+#include "openmoq/publisher/msf_catalog.h"
+
 #include <algorithm>
 #include <chrono>
-#include <iomanip>
 #include <limits>
-#include <sstream>
 #include <utility>
 
 namespace openmoq::examples::msfts {
@@ -199,44 +199,6 @@ std::string base64_encode(const std::vector<std::uint8_t>& input) {
     return output;
 }
 
-std::string json_escape(const std::string& value) {
-    std::ostringstream escaped;
-    for (const unsigned char character : value) {
-        switch (character) {
-            case '"':
-                escaped << "\\\"";
-                break;
-            case '\\':
-                escaped << "\\\\";
-                break;
-            case '\b':
-                escaped << "\\b";
-                break;
-            case '\f':
-                escaped << "\\f";
-                break;
-            case '\n':
-                escaped << "\\n";
-                break;
-            case '\r':
-                escaped << "\\r";
-                break;
-            case '\t':
-                escaped << "\\t";
-                break;
-            default:
-                if (character < 0x20) {
-                    escaped << "\\u" << std::hex << std::setw(4)
-                            << std::setfill('0') << static_cast<int>(character)
-                            << std::dec;
-                } else {
-                    escaped << static_cast<char>(character);
-                }
-        }
-    }
-    return escaped.str();
-}
-
 }  // namespace
 
 MsftsSource::MsftsSource(MsftsSourceConfig config)
@@ -422,29 +384,53 @@ bool MsftsSource::collect_initialization() {
 }
 
 std::vector<std::uint8_t> MsftsSource::make_catalog() const {
-    const auto generated_at =
+    using openmoq::publisher::MsfCatalog;
+    using openmoq::publisher::MsfInitData;
+    using openmoq::publisher::MsfTrack;
+
+    MsfCatalog catalog;
+    catalog.generated_at_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    std::ostringstream catalog;
-    catalog << "{\"version\":1,\"format\":\"msf\",\"generatedAt\":"
-            << generated_at
-            << ",\"tracks\":[{\"name\":\"" << json_escape(config_.track_name)
-            << "\",\"namespace\":\"" << json_escape(config_.track_namespace)
-            << "\",\"packaging\":\"m2ts\",\"isLive\":true,\"role\":\"video\""
-            << ",\"mimeType\":\"video/mp2t\",\"targetLatency\":1000"
-            << ",\"m2tsPacketSize\":" << info_.packet_size
-            << ",\"m2tsPacketsPerObject\":" << config_.packets_per_object
-            << ",\"m2tsProgramNumber\":" << info_.program_number
-            << ",\"m2tsPmtPid\":" << info_.pmt_pid
-            << ",\"m2tsPcrPid\":" << info_.pcr_pid
-            << ",\"m2tsPsiInterval\":" << kPsiIntervalMs
-            << ",\"m2tsRandomAccess\":false";
+            .count());
+
+    MsfTrack track;
+    track.name = config_.track_name;
+    track.name_space = config_.track_namespace;
+    // "m2ts" is not an MSF v1 (draft-ietf-moq-msf-01) packaging value; it is
+    // defined by draft-gregoire-moq-msfts-00 section 6 ("Catalog"), which
+    // this example implements. See docs/protocol-mapping.md "MSF v1 catalog"
+    // for the caveat.
+    track.packaging = "m2ts";
+    track.role = "video";
+    track.is_live = true;
+    track.mime_type = "video/mp2t";
+    track.target_latency_ms = 1000;
+    // No measured rate is available from an M2TS source; 2 Mbps matches the
+    // codec-class default resolve_bitrate applies elsewhere.
+    track.bitrate = 2000000;
+    track.init_ref = "m2ts-init";
+
+    track.custom_fields["m2tsPacketSize"] = std::to_string(info_.packet_size);
+    track.custom_fields["m2tsPacketsPerObject"] = std::to_string(config_.packets_per_object);
+    track.custom_fields["m2tsProgramNumber"] = std::to_string(info_.program_number);
+    track.custom_fields["m2tsPmtPid"] = std::to_string(info_.pmt_pid);
+    track.custom_fields["m2tsPcrPid"] = std::to_string(info_.pcr_pid);
+    track.custom_fields["m2tsPsiInterval"] = std::to_string(kPsiIntervalMs);
+    track.custom_fields["m2tsRandomAccess"] = "false";
     if (info_.packet_size == kM2tsPacketSize) {
-        catalog << ",\"m2tsTimestampMode\":\"opaque\"";
+        // A raw JSON value, so the string must arrive already quoted.
+        track.custom_fields["m2tsTimestampMode"] = "\"opaque\"";
     }
-    catalog << ",\"initData\":\"" << base64_encode(info_.init_data) << "\"}]}";
-    const std::string json = catalog.str();
+    catalog.tracks.push_back(std::move(track));
+
+    catalog.init_data_list.push_back(MsfInitData{
+        .id = "m2ts-init",
+        .type = "inline",
+        .data = base64_encode(info_.init_data),
+    });
+
+    const std::string json = openmoq::publisher::serialize_catalog(catalog);
     return {json.begin(), json.end()};
 }
 

@@ -23,6 +23,25 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
 - Media objects follow the fast path of `styp? + moof + mdat`, with `moof`/`mdat` reused directly from fragmented MP4 input.
 - The current implementation uses one media object per fragment/group, which aligns with the fragment-to-group mapping in the current MOQT CMAF packaging draft.
 
+## MSF v1 catalog
+
+- The catalog is a `draft-ietf-moq-msf-01` version 1 document. `version` is the
+  String `"1"`; there is no root `format` field.
+- Initialization data lives in the root `initDataList` array, referenced from
+  each track by `initRef`, and is serialized after `tracks`.
+- Media tracks carry `packaging` of `cmaf` per `draft-ietf-moq-cmsf-01` section
+  3.5.1, along with `maxGrpSapStartingType` and `maxObjSapStartingType`.
+- All catalog JSON is produced by `serialize_catalog()` in
+  `src/msf_catalog.cpp`. Do not hand-assemble catalog JSON.
+- The `MsfCatalog::publish_tracks` field models the root `publishTracks` array
+  (MSF section 5.1.5), but no emitter populates it yet.
+- Not implemented: MSF section 5.3 delta updates, MSF sections 9/10 log and
+  metrics tracks, MSF section 11.1 URL parsing, and CMSF section 4 content
+  protection.
+- The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
+  which is not an MSF v1 packaging value; it is defined by
+  `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.
+
 ## Implementation consequence
 
 The code in this repository intentionally separates:

@@ -1,9 +1,11 @@
 #include "openmoq/publisher/mp4_box.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -410,10 +412,25 @@ std::size_t find_child_box_offset(const Mp4Box& sample_entry,
                                   std::span<const std::uint8_t> bytes,
                                   std::size_t child_offset,
                                   std::string_view type) {
-    for (std::size_t scan_offset = child_offset; scan_offset + 8 <= sample_entry.span.size; ++scan_offset) {
-        const std::size_t cursor = sample_entry.span.offset + scan_offset;
+    // sample_entry.span.size comes from an unchecked 32-bit box-size field in
+    // the stsd entry (extract_tracks), so it cannot be trusted to bound the
+    // scan: a fabricated huge value must not drive reads past the end of
+    // `bytes`. Clamp to the real buffer, and clamp defensively against
+    // size_t overflow in the offset+size sum itself (and in offset+child_offset).
+    std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
+    if (entry_end < sample_entry.span.offset) {
+        entry_end = bytes.size();
+    }
+    const std::size_t limit = std::min(entry_end, bytes.size());
+
+    const std::size_t start = sample_entry.span.offset + child_offset;
+    if (start < sample_entry.span.offset) {
+        return 0;
+    }
+
+    for (std::size_t cursor = start; cursor + 8 <= limit; ++cursor) {
         const std::uint32_t box_size = read_be32(bytes, cursor);
-        if (box_size < 8 || cursor + box_size > sample_entry.span.offset + sample_entry.span.size) {
+        if (box_size < 8 || cursor + box_size > limit) {
             continue;
         }
         if (std::string_view(reinterpret_cast<const char*>(bytes.data() + cursor + 4), 4) == type) {
@@ -494,19 +511,31 @@ std::string mpeg4_audio_codec_string(const Mp4Box& sample_entry, std::span<const
         return "mp4a.40.2";
     }
 
+    // sample_entry.span.size comes from an unchecked 32-bit box-size field in
+    // the stsd entry (extract_tracks), so it cannot be trusted to bound the
+    // ESDS descriptor scan below: a fabricated huge value must not drive
+    // reads past the end of `bytes`. Clamp to the real buffer once, and
+    // guard against size_t overflow in the offset+size sum itself, the same
+    // way find_child_box_offset does.
+    std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
+    if (entry_end < sample_entry.span.offset) {
+        entry_end = bytes.size();
+    }
+    const std::size_t limit = std::min(entry_end, bytes.size());
+
     std::uint8_t audio_object_type = 2;
-    for (std::size_t cursor = esds_offset + 12; cursor + 2 <= sample_entry.span.offset + sample_entry.span.size; ++cursor) {
+    for (std::size_t cursor = esds_offset + 12; cursor + 2 <= limit; ++cursor) {
         if (bytes[cursor] != 0x05) {
             continue;
         }
         std::size_t length = 0;
         std::size_t length_bytes = 0;
-        if (!decode_descriptor_length(bytes, cursor + 1, sample_entry.span.offset + sample_entry.span.size, length, length_bytes) ||
+        if (!decode_descriptor_length(bytes, cursor + 1, limit, length, length_bytes) ||
             length == 0) {
             continue;
         }
         const std::size_t config_offset = cursor + 1 + length_bytes;
-        if (config_offset + length > sample_entry.span.offset + sample_entry.span.size) {
+        if (config_offset + length > limit) {
             continue;
         }
         const std::uint8_t config = bytes[config_offset];
@@ -561,6 +590,110 @@ double frame_rate_from_stts(const Mp4Box* stts, std::uint32_t timescale, std::sp
         return 0.0;
     }
     return static_cast<double>(sample_count) * static_cast<double>(timescale) / static_cast<double>(duration_sum);
+}
+
+// ISO 14496-12 BitRateBox inside a sample entry: bufferSizeDB, maxBitrate,
+// avgBitrate, each 32-bit big-endian.
+struct BitrateInfo {
+    std::uint64_t max_bitrate = 0;
+    std::uint64_t avg_bitrate = 0;
+};
+
+BitrateInfo bitrate_from_sample_entry(const Mp4Box& sample_entry,
+                                      std::span<const std::uint8_t> bytes,
+                                      std::size_t child_offset) {
+    const std::size_t btrt_offset = find_child_box_offset(sample_entry, bytes, child_offset, "btrt");
+    if (btrt_offset == 0 || btrt_offset + 20 > bytes.size()) {
+        return {};
+    }
+    return BitrateInfo{
+        .max_bitrate = read_be32(bytes, btrt_offset + 12),
+        .avg_bitrate = read_be32(bytes, btrt_offset + 16),
+    };
+}
+
+// MSF section 5.2.32 requires "standard Tags for Identifying Languages as
+// defined by [LANG]", which resolves to BCP 47 / RFC 5646; section 2.2.1 of
+// RFC 5646 requires the SHORTEST ISO 639 code ("en", not "eng"). mdhd stores
+// ISO 639-2/T, so map the common codes to their ISO 639-1 two-letter form,
+// covering both the bibliographic and terminological 639-2 spellings where
+// they differ (e.g. "fre"/"fra" both map to "fr"). A language with no
+// two-letter code (e.g. "haw", "mis") passes through unchanged, which is
+// also spec-conformant BCP 47 usage.
+std::string bcp47_from_iso639_2(const std::string& code) {
+    static const std::vector<std::pair<std::string_view, std::string_view>> kToTwoLetter = {
+        {"eng", "en"}, {"fra", "fr"}, {"fre", "fr"}, {"deu", "de"}, {"ger", "de"},
+        {"spa", "es"}, {"ita", "it"}, {"por", "pt"}, {"rus", "ru"}, {"jpn", "ja"},
+        {"kor", "ko"}, {"zho", "zh"}, {"chi", "zh"}, {"nld", "nl"}, {"dut", "nl"},
+        {"swe", "sv"}, {"nor", "no"}, {"dan", "da"}, {"fin", "fi"}, {"pol", "pl"},
+        {"tur", "tr"}, {"ara", "ar"}, {"hin", "hi"}, {"tha", "th"}, {"vie", "vi"},
+        {"ell", "el"}, {"gre", "el"}, {"heb", "he"}, {"ces", "cs"}, {"cze", "cs"},
+        {"hun", "hu"}, {"ron", "ro"}, {"rum", "ro"}, {"ukr", "uk"}, {"ind", "id"},
+    };
+    for (const auto& [three, two] : kToTwoLetter) {
+        if (code == three) {
+            return std::string(two);
+        }
+    }
+    return code;
+}
+
+// mdhd language is three 5-bit values, each offset by 0x60, packed into 16
+// bits. Returns an empty string for the "und" (undetermined) code, and maps
+// the decoded ISO 639-2/T code to its shortest BCP 47 form.
+std::string language_from_mdhd(const Mp4Box& mdhd, std::span<const std::uint8_t> bytes) {
+    if (mdhd.payload.size < 4) {
+        return {};
+    }
+    const std::uint8_t version = bytes[mdhd.payload.offset];
+    // v0: version+flags(4) + created(4) + modified(4) + timescale(4) + duration(4)
+    // v1: version+flags(4) + created(8) + modified(8) + timescale(4) + duration(8)
+    const std::size_t language_offset = mdhd.payload.offset + (version == 1 ? 32 : 20);
+    if (language_offset + 2 > bytes.size()) {
+        return {};
+    }
+    const std::uint16_t packed =
+        static_cast<std::uint16_t>((bytes[language_offset] << 8U) | bytes[language_offset + 1]);
+    std::string language;
+    for (int shift = 10; shift >= 0; shift -= 5) {
+        const auto code = static_cast<char>(((packed >> shift) & 0x1FU) + 0x60);
+        if (code < 'a' || code > 'z') {
+            return {};
+        }
+        language.push_back(code);
+    }
+    return language == "und" ? std::string{} : bcp47_from_iso639_2(language);
+}
+
+std::uint64_t duration_ms_from_mdhd(const Mp4Box& mdhd,
+                                    std::uint32_t timescale,
+                                    std::span<const std::uint8_t> bytes) {
+    if (timescale == 0 || mdhd.payload.size < 4) {
+        return 0;
+    }
+    const std::uint8_t version = bytes[mdhd.payload.offset];
+    const std::size_t duration_offset = mdhd.payload.offset + (version == 1 ? 24 : 16);
+    std::uint64_t duration = 0;
+    if (version == 1) {
+        if (duration_offset + 8 > bytes.size()) {
+            return 0;
+        }
+        duration = (static_cast<std::uint64_t>(read_be32(bytes, duration_offset)) << 32U) |
+                   read_be32(bytes, duration_offset + 4);
+    } else {
+        if (duration_offset + 4 > bytes.size()) {
+            return 0;
+        }
+        duration = read_be32(bytes, duration_offset);
+    }
+    // duration * 1000 can overflow uint64_t for a pathological version-1
+    // duration (up to 2^64-1); bail out to the "unknown" sentinel rather than
+    // silently wrapping and reporting a bogus duration.
+    constexpr std::uint64_t kMaxDurationForMsConversion = std::numeric_limits<std::uint64_t>::max() / 1000ULL;
+    if (duration > kMaxDurationForMsConversion) {
+        return 0;
+    }
+    return duration * 1000ULL / timescale;
 }
 
 }  // namespace
@@ -706,6 +839,20 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             sample_rate = read_be16(bytes, sample_entry.payload.offset + 24);
         }
 
+        // MSF 5.2.22 requires bitrate; ISO 14496-12 puts it in an optional
+        // btrt box inside the sample entry. Same header offsets
+        // build_track_codec_init_data uses: 8 + 70 past a VisualSampleEntry,
+        // 8 + 28 past an AudioSampleEntry.
+        const std::size_t sample_entry_child_offset = handler_type == "vide" ? 8 + 70 : 8 + 28;
+        const BitrateInfo bitrate = bitrate_from_sample_entry(sample_entry, bytes, sample_entry_child_offset);
+
+        std::string language;
+        std::uint64_t duration_ms = 0;
+        if (mdhd != nullptr) {
+            language = language_from_mdhd(*mdhd, bytes);
+            duration_ms = duration_ms_from_mdhd(*mdhd, timescale, bytes);
+        }
+
         tracks.push_back({
             .track_id = track_id,
             .handler_type = handler_type,
@@ -722,6 +869,10 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             .channel_count = channel_count,
             .sample_rate = sample_rate,
             .frame_rate = frame_rate,
+            .max_bitrate = bitrate.max_bitrate,
+            .avg_bitrate = bitrate.avg_bitrate,
+            .duration_ms = duration_ms,
+            .language = language,
         });
         ++track_index;
     }

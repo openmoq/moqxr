@@ -2,8 +2,10 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/mp4_box.h"
 
+#include <cctype>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <array>
 #include <sstream>
@@ -17,6 +19,12 @@ void append_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
     out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
     out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+}
+
+void append_be64(std::vector<std::uint8_t>& out, std::uint64_t value) {
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xFFU));
+    }
 }
 
 void append_ascii(std::vector<std::uint8_t>& out, const std::string& value) {
@@ -36,6 +44,27 @@ std::vector<std::uint8_t> make_box(const std::string& type, const std::vector<st
     append_ascii(out, type);
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
+}
+
+// ISO 14496-12 BitRateBox: bufferSizeDB, maxBitrate, avgBitrate.
+std::vector<std::uint8_t> make_btrt(std::uint32_t buffer_size_db,
+                                    std::uint32_t max_bitrate,
+                                    std::uint32_t avg_bitrate) {
+    std::vector<std::uint8_t> payload;
+    append_be32(payload, buffer_size_db);
+    append_be32(payload, max_bitrate);
+    append_be32(payload, avg_bitrate);
+    return make_box("btrt", payload);
+}
+
+// Packs an ISO-639-2/T language code the same way mdhd does: three 5-bit
+// values (each letter minus 0x60) packed into the low 15 bits.
+std::uint16_t pack_mdhd_language(const std::string& code) {
+    std::uint16_t packed = 0;
+    for (const char c : code) {
+        packed = static_cast<std::uint16_t>((packed << 5U) | (static_cast<std::uint8_t>(c) - 0x60U));
+    }
+    return packed;
 }
 
 std::vector<std::uint8_t> be32_bytes(std::uint32_t value) {
@@ -87,6 +116,156 @@ std::vector<std::uint8_t> make_fragmented_test_mp4() {
     visual_header[26] = 0x00;
     visual_header[27] = 0xf0;
     const auto sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+    const auto moof = make_box("moof", {'m', 'f', 'h', 'd'});
+    const auto mdat = make_box("mdat", {1, 2, 3, 4, 5, 6});
+    return concat({ftyp, moov, moof, mdat});
+}
+
+// Regression for a heap over-read in find_child_box_offset (mp4_box.cpp):
+// its scan was bounded only by the stsd sample-entry's own declared box
+// size, which extract_tracks reads from the file with no validation
+// (read_be32 at the stsd's first child offset). A fabricated size far
+// larger than the file drove the scan past the end of the buffer once a
+// searched-for child box was absent. avcC is present here and found within
+// the first ~80 bytes (as in a real file), so the avcC lookup terminates
+// early; btrt is absent, as in most real files, so the unconditional
+// per-track bitrate lookup is the one left scanning to the fabricated
+// bound. Reverting the clamp in find_child_box_offset makes this fixture
+// heap-buffer-overflow under ASAN; with the clamp, extract_tracks returns
+// cleanly and reports no bitrate.
+std::vector<std::uint8_t> make_oversized_sample_entry_test_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+
+    std::vector<std::uint8_t> file = concat({ftyp, moov});
+
+    // The avc1 sample entry's own box-size field is the first 4 bytes of its
+    // box, reached by walking past every box header/sibling that precedes it:
+    // ftyp, then the moov header, the trak header, tkhd, the mdia header,
+    // mdhd, hdlr, the minf header, the stbl header, and finally the stsd
+    // header plus its 4-byte version/flags and 4-byte entry-count fields.
+    const std::size_t sample_entry_size_offset =
+        ftyp.size() + 8 + 8 + tkhd.size() + 8 + mdhd.size() + hdlr.size() + 8 + 8 + 16;
+    // Matches the reviewer's ASAN repro: a small file with a declared
+    // sample-entry size of 0x40000000 (1 GiB).
+    patch_be32(file, sample_entry_size_offset, 0x40000000);
+    return file;
+}
+
+// Regression for a heap over-read in mpeg4_audio_codec_string (mp4_box.cpp):
+// its ESDS descriptor scan was bounded only by the stsd sample-entry's own
+// declared box size (sample_entry.span.offset + sample_entry.span.size),
+// which extract_tracks reads from the file with no validation, and unlike
+// find_child_box_offset it used that raw, unclamped sum directly as the
+// scan bound, as the decode_descriptor_length end argument, and in the
+// config-offset bounds check. The esds box below carries no DecSpecificInfo
+// (tag 0x05) byte anywhere in its payload, so the byte-by-byte scan never
+// finds a match and runs all the way to its bound; with the mp4a sample
+// entry's box-size field patched to a size far larger than the file, that
+// bound reaches past the end of the buffer. Reverting the clamp in
+// mpeg4_audio_codec_string makes this fixture heap-buffer-overflow under
+// ASAN; with the clamp, extract_tracks returns cleanly and falls back to
+// the default "mp4a.40.2" codec string.
+std::vector<std::uint8_t> make_oversized_audio_sample_entry_test_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 's', 'o', 'u', 'n', 0, 0, 0, 0});
+    // Fixed-size AudioSampleEntry fields (reserved/data_reference_index,
+    // reserved, channelcount, samplesize, pre_defined, reserved, samplerate):
+    // 28 bytes, matching the "8 + 28" child_offset mpeg4_audio_codec_string
+    // passes to find_child_box_offset when locating the esds box.
+    const auto audio_header = std::vector<std::uint8_t>(28, 0);
+    // A FullBox esds payload with no byte equal to 0x05 (DecSpecificInfoTag)
+    // anywhere, so the scan for it never terminates early.
+    const auto esds = make_full_box("esds", std::vector<std::uint8_t>(20, 0));
+    const auto sample_entry = make_box("mp4a", concat({audio_header, esds}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+
+    std::vector<std::uint8_t> file = concat({ftyp, moov});
+
+    // The mp4a sample entry's own box-size field is the first 4 bytes of its
+    // box, reached the same way as the avc1 case above: ftyp, then the moov
+    // header, the trak header, tkhd, the mdia header, mdhd, hdlr, the minf
+    // header, the stbl header, and finally the stsd header plus its 4-byte
+    // version/flags and 4-byte entry-count fields.
+    const std::size_t sample_entry_size_offset =
+        ftyp.size() + 8 + 8 + tkhd.size() + 8 + mdhd.size() + hdlr.size() + 8 + 8 + 16;
+    patch_be32(file, sample_entry_size_offset, 0x40000000);
+    return file;
+}
+
+// Fragmented single-track MP4 whose mdhd carries the given timescale,
+// duration, and packed language (mdhd version 0 or 1, selectable so both
+// 32-bit and 64-bit duration layouts are exercised), and whose video sample
+// entry optionally carries a btrt box (MSF section 5.2.22 bitrate).
+std::vector<std::uint8_t> make_track_metadata_test_mp4(bool include_btrt,
+                                                       std::uint16_t packed_language,
+                                                       std::uint32_t timescale,
+                                                       std::uint64_t duration,
+                                                       std::uint8_t mdhd_version = 0) {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+
+    std::vector<std::uint8_t> mdhd_payload;
+    if (mdhd_version == 1) {
+        append_be64(mdhd_payload, 0);  // creation_time
+        append_be64(mdhd_payload, 0);  // modification_time
+        append_be32(mdhd_payload, timescale);
+        append_be64(mdhd_payload, duration);
+    } else {
+        append_be32(mdhd_payload, 0);  // creation_time
+        append_be32(mdhd_payload, 0);  // modification_time
+        append_be32(mdhd_payload, timescale);
+        append_be32(mdhd_payload, static_cast<std::uint32_t>(duration));
+    }
+    mdhd_payload.push_back(static_cast<std::uint8_t>((packed_language >> 8U) & 0xFFU));
+    mdhd_payload.push_back(static_cast<std::uint8_t>(packed_language & 0xFFU));
+    mdhd_payload.push_back(0);  // pre_defined
+    mdhd_payload.push_back(0);
+    const auto mdhd = mdhd_version == 1 ? make_full_box_with_flags("mdhd", 1, 0, mdhd_payload)
+                                       : make_full_box("mdhd", mdhd_payload);
+
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
+    const auto btrt = make_btrt(0, 5000000, 4000000);
+    const auto sample_entry = include_btrt ? make_box("avc1", concat({visual_header, avcc, btrt}))
+                                           : make_box("avc1", concat({visual_header, avcc}));
     const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
     const auto stbl = make_box("stbl", stsd);
     const auto minf = make_box("minf", stbl);
@@ -462,21 +641,116 @@ std::size_t find_after(std::string_view haystack, std::string_view needle, std::
     return pos == std::string_view::npos ? pos : pos + needle.size();
 }
 
-std::string catalog_init_data(std::string_view catalog, std::string_view track_name) {
+// MSF v1 initData lookup: resolve a track's initRef into
+// the root initDataList and return that entry's Base64 "data" value.
+std::string msf_track_init_data(std::string_view catalog, std::string_view track_name) {
     const std::string name_key = std::string("\"name\":\"") + std::string(track_name) + "\"";
     const std::size_t name_pos = catalog.find(name_key);
     if (name_pos == std::string_view::npos) {
         return {};
     }
-    const std::size_t init_pos = find_after(catalog, "\"initData\":\"", name_pos);
-    if (init_pos == std::string_view::npos) {
+    const std::size_t ref_pos = find_after(catalog, "\"initRef\":\"", name_pos);
+    if (ref_pos == std::string_view::npos) {
         return {};
     }
-    const std::size_t end_pos = catalog.find('"', init_pos);
-    if (end_pos == std::string_view::npos) {
+    const std::size_t ref_end = catalog.find('"', ref_pos);
+    if (ref_end == std::string_view::npos) {
         return {};
     }
-    return std::string(catalog.substr(init_pos, end_pos - init_pos));
+    const std::string init_id(catalog.substr(ref_pos, ref_end - ref_pos));
+
+    const std::string id_key = "\"id\":\"" + init_id + "\"";
+    const std::size_t id_pos = catalog.find(id_key);
+    if (id_pos == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t data_pos = find_after(catalog, "\"data\":\"", id_pos);
+    if (data_pos == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t data_end = catalog.find('"', data_pos);
+    if (data_end == std::string_view::npos) {
+        return {};
+    }
+    return std::string(catalog.substr(data_pos, data_end - data_pos));
+}
+
+// Collect every value that follows a given "key":" prefix, e.g. every
+// "initRef":"..." or "id":"..." value in a serialized catalog.
+std::vector<std::string> extract_all_values(std::string_view catalog, std::string_view key_prefix) {
+    std::vector<std::string> values;
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t found = catalog.find(key_prefix, pos);
+        if (found == std::string_view::npos) {
+            break;
+        }
+        const std::size_t value_start = found + key_prefix.size();
+        const std::size_t value_end = catalog.find('"', value_start);
+        if (value_end == std::string_view::npos) {
+            break;
+        }
+        values.emplace_back(catalog.substr(value_start, value_end - value_start));
+        pos = value_end + 1;
+    }
+    return values;
+}
+
+// True when every "initRef":"..." value in the catalog also appears as an
+// "id":"..." value (i.e. an initDataList entry). Guards against a future
+// refactor loosening the serializer's own dangling-reference check.
+bool all_init_refs_resolve(std::string_view catalog) {
+    const std::vector<std::string> init_refs = extract_all_values(catalog, "\"initRef\":\"");
+    const std::vector<std::string> init_ids = extract_all_values(catalog, "\"id\":\"");
+    for (const auto& ref : init_refs) {
+        bool found = false;
+        for (const auto& id : init_ids) {
+            if (id == ref) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Parse the unsigned integer that follows a raw (unquoted) "key": prefix,
+// e.g. "maxGrpSapStartingType":2. Returns -1 when the key is absent.
+long long extract_uint_value(std::string_view catalog, std::string_view key_prefix) {
+    const std::size_t found = catalog.find(key_prefix);
+    if (found == std::string_view::npos) {
+        return -1;
+    }
+    std::size_t value_start = found + key_prefix.size();
+    std::size_t value_end = value_start;
+    while (value_end < catalog.size() && std::isdigit(static_cast<unsigned char>(catalog[value_end]))) {
+        ++value_end;
+    }
+    if (value_end == value_start) {
+        return -1;
+    }
+    return std::stoll(std::string(catalog.substr(value_start, value_end - value_start)));
+}
+
+// True when the catalog text has no non-spec numeric "id" field on a track
+// object. MSF's initDataList entries legitimately have a quoted string "id",
+// so this only rejects a bare (unquoted, i.e. numeric) "id" value.
+bool no_numeric_id_field(std::string_view catalog) {
+    std::size_t pos = 0;
+    while (true) {
+        pos = catalog.find("\"id\":", pos);
+        if (pos == std::string_view::npos) {
+            return true;
+        }
+        const std::size_t value_pos = pos + 5;
+        if (value_pos < catalog.size() && catalog[value_pos] != '"') {
+            return false;
+        }
+        pos = value_pos;
+    }
 }
 
 std::vector<std::uint8_t> base64_decode(std::string_view text) {
@@ -555,6 +829,31 @@ int main() {
     ok &= expect(segmented.fragments.size() == 1, "expected one fragmented media fragment");
     ok &= expect(plan.objects.size() == 2, "expected catalog and one fragmented media object when SAP is disabled");
     ok &= expect(plan.objects.front().track_name == "catalog", "expected catalog object first");
+
+    const std::string plan_catalog_text = object_text(plan.objects.front());
+    ok &= expect_contains(plan_catalog_text, "\"version\":\"1\"",
+                          "expected MSF v1 string version in publish plan catalog");
+    ok &= expect_not_contains(plan_catalog_text, "\"format\"",
+                              "expected no legacy format field");
+    ok &= expect_not_contains(plan_catalog_text, "\"initData\":",
+                              "expected initDataList instead of inline initData");
+    ok &= expect_contains(plan_catalog_text, "\"initDataList\"",
+                          "expected root initDataList");
+    ok &= expect_contains(plan_catalog_text, "\"initRef\"",
+                          "expected per-track initRef");
+    ok &= expect(no_numeric_id_field(plan_catalog_text),
+                "expected no non-spec numeric track id field");
+    ok &= expect_not_contains(plan_catalog_text, "\"name\":\"catalog\"",
+                              "expected the synthetic catalog track to be absent from its own tracks array");
+    ok &= expect(all_init_refs_resolve(plan_catalog_text),
+                "expected every initRef to resolve to an initDataList id");
+
+    // CMSF section 3.5.2: the max SAP type Groups and Objects start with.
+    ok &= expect_contains(plan_catalog_text, "\"maxGrpSapStartingType\":",
+                          "expected maxGrpSapStartingType on a CMAF media track");
+    ok &= expect_contains(plan_catalog_text, "\"maxObjSapStartingType\":",
+                          "expected maxObjSapStartingType on a CMAF media track");
+
     ok &= expect(sap_plan.objects.size() == 3, "expected SAP-enabled plan to add one SAP timeline object");
     ok &= expect(sap_plan.objects.back().track_name == "vide_1_sap", "expected SAP timeline object for fragmented video");
     ok &= expect_contains(object_text(sap_plan.objects.back()), "\"l\":[0,0]", "expected fragmented SAP timeline location");
@@ -722,8 +1021,8 @@ int main() {
                                        multitrack_sap_plan.objects.front().owned_payload.end());
     const std::string msf_timeline_catalog_text(multitrack_msf_timeline_plan.objects.front().owned_payload.begin(),
                                                 multitrack_msf_timeline_plan.objects.front().owned_payload.end());
-    const std::string video_init_data = catalog_init_data(catalog_text, "vide_1");
-    const std::string audio_init_data = catalog_init_data(catalog_text, "soun_2");
+    const std::string video_init_data = msf_track_init_data(catalog_text, "vide_1");
+    const std::string audio_init_data = msf_track_init_data(catalog_text, "soun_2");
     ok &= expect(!video_init_data.empty(), "expected video initData in catalog");
     ok &= expect(!audio_init_data.empty(), "expected audio initData in catalog");
     ok &= expect(video_init_data != audio_init_data, "expected per-track initData entries to differ");
@@ -733,13 +1032,25 @@ int main() {
     ok &= expect_contains(catalog_text, "\"codec\":\"mp4a.40.2\"", "expected audio codec string in catalog");
     ok &= expect_contains(catalog_text, "\"width\":320", "expected video width in catalog");
     ok &= expect_contains(catalog_text, "\"height\":240", "expected video height in catalog");
-    ok &= expect_contains(catalog_text, "\"sampleRate\":48000", "expected audio sample rate in catalog");
-    ok &= expect_contains(catalog_text, "\"channelCount\":2", "expected audio channel count in catalog");
+    ok &= expect_contains(catalog_text, "\"samplerate\":48000", "expected audio sample rate in catalog");
+    ok &= expect_contains(catalog_text, "\"channelConfig\":\"2\"", "expected audio channel count in catalog");
     ok &= expect_contains(catalog_text, "\"renderGroup\":1", "expected renderGroup in catalog");
     ok &= expect_contains(catalog_text, "\"isLive\":false", "expected VOD isLive flag in catalog");
+    ok &= expect_contains(catalog_text, "\"bitrate\":2000000", "expected non-zero default video bitrate in catalog");
+    ok &= expect_contains(catalog_text, "\"bitrate\":128000", "expected non-zero default audio bitrate in catalog");
+    ok &= expect_not_contains(catalog_text, "\"name\":\"catalog\"",
+                              "expected the synthetic catalog track to be absent from the batch catalog");
+    ok &= expect(all_init_refs_resolve(catalog_text),
+                "expected every initRef in the batch catalog to resolve to an initDataList id");
     ok &= expect_not_contains(catalog_text, "\"name\":\"vide_1_sap\"", "expected video SAP track to be absent from the default catalog");
     ok &= expect_not_contains(catalog_text, "\"name\":\"soun_2_sap\"", "expected audio SAP track to be absent from the default catalog");
     ok &= expect_not_contains(catalog_text, "\"name\":\"timeline\"", "expected MSF timeline track to be absent from the default catalog");
+    // CMSF section 3.5.2: both fields are Optional and neither track here has
+    // any fragments, so no SAP information exists to report.
+    ok &= expect_not_contains(catalog_text, "\"maxGrpSapStartingType\":",
+                              "expected no maxGrpSapStartingType on a track with no SAP information");
+    ok &= expect_not_contains(catalog_text, "\"maxObjSapStartingType\":",
+                              "expected no maxObjSapStartingType on a track with no SAP information");
     ok &= expect_contains(sap_catalog_text, "\"name\":\"vide_1_sap\"", "expected video SAP timeline track in SAP-enabled catalog");
     ok &= expect_contains(sap_catalog_text, "\"name\":\"soun_2_sap\"", "expected audio SAP timeline track in SAP-enabled catalog");
     ok &= expect_contains(sap_catalog_text, "\"packaging\":\"eventtimeline\"", "expected event timeline packaging in SAP-enabled catalog");
@@ -790,14 +1101,31 @@ int main() {
 
     const auto live_catalog = build_live_catalog(multitrack_segmented.tracks, multitrack_init_bytes, true);
     const std::string live_catalog_text(live_catalog.catalog_payload.begin(), live_catalog.catalog_payload.end());
-    const std::string live_video_init_data = catalog_init_data(live_catalog_text, "vide_1");
-    const std::string live_audio_init_data = catalog_init_data(live_catalog_text, "soun_2");
+    const std::string live_video_init_data = msf_track_init_data(live_catalog_text, "vide_1");
+    const std::string live_audio_init_data = msf_track_init_data(live_catalog_text, "soun_2");
     const auto live_video_init_bytes = base64_decode(live_video_init_data);
     const auto live_audio_init_bytes = base64_decode(live_audio_init_data);
     const auto live_video_init_tracks = extract_tracks(parse_mp4_boxes(live_video_init_bytes), live_video_init_bytes);
     const auto live_audio_init_tracks = extract_tracks(parse_mp4_boxes(live_audio_init_bytes), live_audio_init_bytes);
     ok &= expect(live_catalog.track_initializations.size() == 2, "expected live catalog to expose per-track init payloads");
-    ok &= expect_contains(live_catalog_text, "\"isLive\":true", "expected live catalog isLive flag");
+    ok &= expect_contains(live_catalog_text, "\"version\":\"1\"",
+                          "expected MSF v1 string version in live catalog");
+    ok &= expect_contains(live_catalog_text, "\"isLive\":true",
+                          "expected live tracks marked isLive");
+    ok &= expect_contains(live_catalog_text, "\"generatedAt\":",
+                          "expected generatedAt on a live catalog");
+    ok &= expect_contains(live_catalog_text, "\"initDataList\"",
+                          "expected root initDataList in live catalog");
+    ok &= expect_not_contains(live_catalog_text, "\"format\"",
+                              "expected no legacy format field in live catalog");
+    ok &= expect_not_contains(live_catalog_text, "\"initData\":",
+                              "expected no inline initData in live catalog");
+    ok &= expect_not_contains(live_catalog_text, "\"trackDuration\"",
+                              "expected no trackDuration in a live catalog");
+    ok &= expect(all_init_refs_resolve(live_catalog_text),
+                "expected every initRef in the live catalog to resolve to an initDataList id");
+    ok &= expect(no_numeric_id_field(live_catalog_text),
+                "expected no non-spec numeric id field in the live catalog");
     ok &= expect(!live_video_init_data.empty(), "expected live video initData in catalog");
     ok &= expect(!live_audio_init_data.empty(), "expected live audio initData in catalog");
     ok &= expect(live_video_init_data != live_audio_init_data, "expected live per-track initData entries to differ");
@@ -864,6 +1192,177 @@ int main() {
                  "expected in-band parameter sets to preserve hev1");
     ok &= expect(parsed_hevc_inband_param.tracks.front().codec == "hev1.1.6.L90.B0",
                  "expected in-band parameter set stream to keep hev1 codec string");
+
+    // MSF section 5.2.22 requires bitrate; it comes from btrt when present.
+    // MSF section 5.2.32 requires language, decoded from the packed mdhd field.
+    // Timescale/duration are deliberately non-identity (2000/5000 -> 2500ms)
+    // so a conversion that ignored timescale entirely could not pass by
+    // accident (a bug caught in review round 1).
+    {
+        const auto btrt_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("eng"), 2000, 5000);
+        const auto btrt_tracks = extract_tracks(parse_mp4_boxes(btrt_bytes), btrt_bytes);
+        ok &= expect(btrt_tracks.size() == 1, "expected one track in btrt fixture");
+        ok &= expect(btrt_tracks.front().max_bitrate == 5000000,
+                     "expected maxBitrate parsed from btrt");
+        ok &= expect(btrt_tracks.front().avg_bitrate == 4000000,
+                     "expected avgBitrate parsed from btrt");
+        ok &= expect(btrt_tracks.front().language == "en",
+                     "expected ISO-639-2/T mdhd language mapped to its BCP 47 (ISO 639-1) form");
+        ok &= expect(btrt_tracks.front().duration_ms == 2500,
+                     "expected v0 mdhd duration converted to milliseconds using track timescale");
+
+        const auto und_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("und"), 2000, 5000);
+        const auto und_tracks = extract_tracks(parse_mp4_boxes(und_bytes), und_bytes);
+        ok &= expect(und_tracks.size() == 1, "expected one track in und-language fixture");
+        ok &= expect(und_tracks.front().language.empty(),
+                     "expected und language code to decode to an empty string");
+
+        const auto no_btrt_bytes = make_track_metadata_test_mp4(false, pack_mdhd_language("eng"), 2000, 5000);
+        const auto no_btrt_tracks = extract_tracks(parse_mp4_boxes(no_btrt_bytes), no_btrt_bytes);
+        ok &= expect(no_btrt_tracks.size() == 1, "expected one track in no-btrt fixture");
+        ok &= expect(no_btrt_tracks.front().max_bitrate == 0,
+                     "expected zero maxBitrate when btrt is absent");
+        ok &= expect(no_btrt_tracks.front().avg_bitrate == 0,
+                     "expected zero avgBitrate when btrt is absent");
+
+        // Garbage-packed language bits (all 15 bits set -> three 0x1F groups,
+        // decoding to '\x7F' which is outside 'a'..'z') must be rejected
+        // rather than surfacing as garbage characters.
+        const auto garbage_lang_bytes = make_track_metadata_test_mp4(false, 0x7FFF, 2000, 5000);
+        const auto garbage_lang_tracks = extract_tracks(parse_mp4_boxes(garbage_lang_bytes), garbage_lang_bytes);
+        ok &= expect(garbage_lang_tracks.size() == 1, "expected one track in garbage-language fixture");
+        ok &= expect(garbage_lang_tracks.front().language.empty(),
+                     "expected non-letter packed language bits to decode to an empty string");
+
+        // mdhd version 1 (64-bit duration) was previously untested; exercise
+        // its language and duration-conversion branches with a distinct,
+        // non-identity timescale/duration pair (3000/9000 -> 3000ms).
+        const auto v1_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("fra"), 3000, 9000, 1);
+        const auto v1_tracks = extract_tracks(parse_mp4_boxes(v1_bytes), v1_bytes);
+        ok &= expect(v1_tracks.size() == 1, "expected one track in v1 mdhd fixture");
+        ok &= expect(v1_tracks.front().language == "fr",
+                     "expected version-1 mdhd language to decode and map fra (639-2/T) to fr (BCP 47)");
+        ok &= expect(v1_tracks.front().duration_ms == 3000,
+                     "expected version-1 mdhd duration converted to milliseconds using track timescale");
+
+        // A language with no ISO 639-1 two-letter code (Hawaiian) must pass
+        // through unchanged: RFC 5646 permits a three-letter code when no
+        // shorter form exists, so this is not a bug in the mapping.
+        const auto no_two_letter_bytes = make_track_metadata_test_mp4(true, pack_mdhd_language("haw"), 2000, 5000);
+        const auto no_two_letter_tracks = extract_tracks(parse_mp4_boxes(no_two_letter_bytes), no_two_letter_bytes);
+        ok &= expect(no_two_letter_tracks.size() == 1, "expected one track in no-two-letter-code fixture");
+        ok &= expect(no_two_letter_tracks.front().language == "haw",
+                     "expected a language with no ISO 639-1 code (haw) to pass through unchanged");
+
+        // A pathological version-1 duration near UINT64_MAX with a small
+        // timescale must not silently wrap uint64_t during the *1000
+        // conversion; it must fall back to the "unknown" (0) sentinel.
+        const auto v1_overflow_bytes =
+            make_track_metadata_test_mp4(true, pack_mdhd_language("eng"), 1,
+                                         std::numeric_limits<std::uint64_t>::max(), 1);
+        const auto v1_overflow_tracks = extract_tracks(parse_mp4_boxes(v1_overflow_bytes), v1_overflow_bytes);
+        ok &= expect(v1_overflow_tracks.size() == 1, "expected one track in v1 overflow fixture");
+        ok &= expect(v1_overflow_tracks.front().duration_ms == 0,
+                     "expected pathological v1 duration*1000 overflow to fall back to 0, not wrap");
+    }
+
+    // C1 regression: find_child_box_offset must not trust a fabricated
+    // sample-entry size and scan past the end of the buffer when the
+    // searched-for child box (btrt) is absent. See
+    // make_oversized_sample_entry_test_mp4 for the full explanation.
+    {
+        const auto oversized_bytes = make_oversized_sample_entry_test_mp4();
+        const auto oversized_tracks = extract_tracks(parse_mp4_boxes(oversized_bytes), oversized_bytes);
+        ok &= expect(oversized_tracks.size() == 1,
+                    "expected extract_tracks to survive a fabricated oversized sample-entry size");
+        ok &= expect(oversized_tracks.front().codec == "avc1.64000C",
+                    "expected avcC (found early) to still decode correctly despite the fabricated bound");
+        ok &= expect(oversized_tracks.front().max_bitrate == 0,
+                    "expected no bitrate parsed when btrt is unreachable inside the fabricated bound");
+    }
+
+    // Heap over-read regression: mpeg4_audio_codec_string must not trust a
+    // fabricated sample-entry size and scan past the end of the buffer when
+    // no DecSpecificInfo (tag 0x05) byte is present. See
+    // make_oversized_audio_sample_entry_test_mp4 for the full explanation.
+    {
+        const auto oversized_audio_bytes = make_oversized_audio_sample_entry_test_mp4();
+        const auto oversized_audio_tracks = extract_tracks(parse_mp4_boxes(oversized_audio_bytes), oversized_audio_bytes);
+        ok &= expect(oversized_audio_tracks.size() == 1,
+                    "expected extract_tracks to survive a fabricated oversized mp4a sample-entry size");
+        ok &= expect(oversized_audio_tracks.front().codec == "mp4a.40.2",
+                    "expected the default AAC-LC codec string when no ESDS config is reachable within the fabricated bound");
+    }
+
+    // CMSF section 3.5.2: maxGrpSapStartingType is a maximum over only the
+    // first Object of each Group (object_id == 0), while maxObjSapStartingType
+    // is a maximum over every Object of the track. Use a fixture where a
+    // mid-group Object's SAP type exceeds the group-starting Object's SAP type
+    // so the two fields genuinely differ -- if they were transposed, this is
+    // the case that would catch it.
+    {
+        const SegmentedMp4 sap_levels_segmented{
+            .initialization_segment = {.span = {}, .owned_bytes = multitrack_init_bytes},
+            .fragments =
+                {
+                    MediaFragment{
+                        .group_id = 0,
+                        .object_id = 0,
+                        .track_name = "vide_1",
+                        .sap_type = 2,
+                        .has_sap_type = true,
+                    },
+                    MediaFragment{
+                        .group_id = 0,
+                        .object_id = 1,
+                        .track_name = "vide_1",
+                        .sap_type = 3,
+                        .has_sap_type = true,
+                    },
+                },
+            .tracks =
+                {
+                    TrackDescription{.track_id = 1,
+                                     .handler_type = "vide",
+                                     .codec = "avc1.64000C",
+                                     .sample_entry_type = "avc1",
+                                     .track_name = "vide_1",
+                                     .width = 320,
+                                     .height = 240},
+                    TrackDescription{.track_id = 2,
+                                     .handler_type = "soun",
+                                     .codec = "mp4a.40.2",
+                                     .sample_entry_type = "mp4a",
+                                     .track_name = "soun_2",
+                                     .channel_count = 2,
+                                     .sample_rate = 48000},
+                },
+        };
+        const auto sap_levels_plan = build_publish_plan(sap_levels_segmented, DraftVersion::kDraft14);
+        const std::string sap_levels_catalog_text = object_text(sap_levels_plan.objects.front());
+
+        ok &= expect_contains(sap_levels_catalog_text, "\"maxGrpSapStartingType\":2",
+                              "expected maxGrpSapStartingType to reflect only the first Object of each Group");
+        ok &= expect_contains(sap_levels_catalog_text, "\"maxObjSapStartingType\":3",
+                              "expected maxObjSapStartingType to reflect the maximum across all Objects");
+
+        const long long grp_value = extract_uint_value(sap_levels_catalog_text, "\"maxGrpSapStartingType\":");
+        const long long obj_value = extract_uint_value(sap_levels_catalog_text, "\"maxObjSapStartingType\":");
+        ok &= expect(grp_value >= 0 && obj_value >= 0,
+                    "expected both SAP starting type fields to be present in the emitted catalog");
+        ok &= expect(grp_value <= obj_value,
+                    "expected maxGrpSapStartingType <= maxObjSapStartingType since Grp is a maximum over a "
+                    "subset of the fragments Obj maximizes over");
+
+        // soun_2 has no fragments at all, so it must carry neither field --
+        // both are Optional per CMSF section 3.5.2 and MUST NOT default to 0.
+        const std::string soun_track_text =
+            sap_levels_catalog_text.substr(sap_levels_catalog_text.find("\"name\":\"soun_2\""));
+        ok &= expect_not_contains(soun_track_text, "\"maxGrpSapStartingType\":",
+                                  "expected no maxGrpSapStartingType on a track with no SAP information");
+        ok &= expect_not_contains(soun_track_text, "\"maxObjSapStartingType\":",
+                                  "expected no maxObjSapStartingType on a track with no SAP information");
+    }
 
     return ok ? 0 : 1;
 }

@@ -127,6 +127,7 @@ Create `include/openmoq/publisher/msf_catalog.h`:
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -184,6 +185,11 @@ struct MsfTrack {
     // CMSF section 3.5.2.
     std::optional<std::uint32_t> max_grp_sap_starting_type;
     std::optional<std::uint32_t> max_obj_sap_starting_type;
+
+    // Producer-defined fields. MSF section 5 permits these provided the names
+    // do not collide with spec field names; the serializer enforces that.
+    // Values are raw JSON, so a string value must arrive already quoted.
+    std::map<std::string, std::string> custom_fields;
 };
 
 // The root catalog object (MSF section 5.1).
@@ -347,6 +353,29 @@ void validate_track(const MsfTrack& track) {
     if (track.target_latency_ms.has_value() && track.buffers.has_value()) {
         throw std::runtime_error("MSF catalog forbids both targetLatency and buffers" + where);
     }
+    // Section 5: custom field names MUST NOT collide with spec field names.
+    static const std::set<std::string> kSpecFieldNames = {
+        "name", "namespace", "packaging", "eventType", "role", "isLive",
+        "targetLatency", "buffers", "label", "renderGroup", "altGroup",
+        "initRef", "depends", "codec", "mimeType", "framerate", "timescale",
+        "bitrate", "avgBitrate", "maxGopDuration", "maxGroupDuration", "width",
+        "height", "samplerate", "channelConfig", "lang", "trackDuration",
+        "maxGrpSapStartingType", "maxObjSapStartingType", "temporalId",
+        "spatialId", "displayWidth", "displayHeight", "parentName",
+        "parentNamespace", "template", "authInfo", "accessibility",
+        "encryptionScheme", "cipherSuite", "keyId", "trackBaseKey",
+        "connectionUri", "token", "contentProtectionRefIDs",
+    };
+    for (const auto& [key, value] : track.custom_fields) {
+        if (kSpecFieldNames.count(key) != 0) {
+            throw std::runtime_error("MSF catalog custom field \"" + key +
+                                     "\" collides with a spec field name" + where);
+        }
+        if (value.empty()) {
+            throw std::runtime_error("MSF catalog custom field \"" + key +
+                                     "\" has an empty raw JSON value" + where);
+        }
+    }
 }
 
 // Catalog-wide invariants that cannot be checked from a single track.
@@ -472,6 +501,10 @@ void write_track(std::ostringstream& out, const MsfTrack& track) {
     }
     if (track.max_obj_sap_starting_type.has_value()) {
         write_uint(out, seq, "maxObjSapStartingType", *track.max_obj_sap_starting_type);
+    }
+    // Section 5: producer-defined fields, emitted last. Values are raw JSON.
+    for (const auto& [key, value] : track.custom_fields) {
+        write_raw(out, seq, key, value);
     }
 
     out << '}';
@@ -774,6 +807,23 @@ Then append to `main()`, before `return ok ? 0 : 1;`:
     const std::string buffered_json = serialize_catalog(buffered);
     ok &= expect_contains(buffered_json, "\"buffers\":{\"target\":1500,\"min\":800}",
                           "expected buffers object with only the set keys");
+
+    // Section 5: custom fields are permitted and emitted as raw JSON.
+    MsfCatalog with_custom;
+    MsfTrack custom_track = sapped_video;
+    custom_track.custom_fields["m2tsPacketSize"] = "188";
+    custom_track.custom_fields["m2tsTimestampMode"] = "\"opaque\"";
+    with_custom.tracks.push_back(custom_track);
+    const std::string custom_json = serialize_catalog(with_custom);
+    ok &= expect_contains(custom_json, "\"m2tsPacketSize\":188", "expected numeric custom field");
+    ok &= expect_contains(custom_json, "\"m2tsTimestampMode\":\"opaque\"", "expected quoted custom field");
+
+    // Section 5: custom field names MUST NOT collide with spec field names.
+    MsfCatalog colliding;
+    MsfTrack collider = sapped_video;
+    collider.custom_fields["bitrate"] = "99";
+    colliding.tracks.push_back(collider);
+    ok &= throws_runtime_error(colliding, "expected throw for a custom field colliding with a spec name");
 
     // JSON escaping: control characters and quotes must not corrupt the document.
     MsfCatalog escaped;
@@ -1552,32 +1602,31 @@ In `examples/msfts-publisher/msfts_source.cpp`, add `#include "openmoq/publisher
     });
 ```
 
-The `m2tsPacketSize`, `m2tsPacketsPerObject`, `m2tsProgramNumber`, `m2tsPmtPid`, `m2tsPcrPid`, `m2tsPsiInterval`, `m2tsRandomAccess`, and `m2tsTimestampMode` fields are custom fields from `draft-gregoire-moq-msfts-00`. MSF section 5 permits custom fields provided they do not collide with spec names, and none of these do. `MsfTrack` has no slot for them, so serialize the catalog with `serialize_catalog()` and splice the custom fields into the single track object before its closing brace:
+The `m2tsPacketSize`, `m2tsPacketsPerObject`, `m2tsProgramNumber`, `m2tsPmtPid`, `m2tsPcrPid`, `m2tsPsiInterval`, `m2tsRandomAccess`, and `m2tsTimestampMode` fields are custom fields from `draft-gregoire-moq-msfts-00`. MSF section 5 permits custom fields provided they do not collide with spec names, and none of these do. Carry them in `MsfTrack::custom_fields`, whose values are raw JSON, so insert them before pushing the track:
 
 ```cpp
-    std::string json = serialize_catalog(catalog);
-    std::ostringstream custom;
-    custom << ",\"m2tsPacketSize\":" << info_.packet_size
-           << ",\"m2tsPacketsPerObject\":" << config_.packets_per_object
-           << ",\"m2tsProgramNumber\":" << info_.program_number
-           << ",\"m2tsPmtPid\":" << info_.pmt_pid
-           << ",\"m2tsPcrPid\":" << info_.pcr_pid
-           << ",\"m2tsPsiInterval\":" << kPsiIntervalMs
-           << ",\"m2tsRandomAccess\":false";
+    track.custom_fields["m2tsPacketSize"] = std::to_string(info_.packet_size);
+    track.custom_fields["m2tsPacketsPerObject"] = std::to_string(config_.packets_per_object);
+    track.custom_fields["m2tsProgramNumber"] = std::to_string(info_.program_number);
+    track.custom_fields["m2tsPmtPid"] = std::to_string(info_.pmt_pid);
+    track.custom_fields["m2tsPcrPid"] = std::to_string(info_.pcr_pid);
+    track.custom_fields["m2tsPsiInterval"] = std::to_string(kPsiIntervalMs);
+    track.custom_fields["m2tsRandomAccess"] = "false";
     if (info_.packet_size == kM2tsPacketSize) {
-        custom << ",\"m2tsTimestampMode\":\"opaque\"";
+        // A raw JSON value, so the string must arrive already quoted.
+        track.custom_fields["m2tsTimestampMode"] = "\"opaque\"";
     }
-    // Insert before the closing brace of the sole track object, which is the
-    // last "}" before the "]" that ends the tracks array.
-    const std::size_t tracks_end = json.find("}]");
-    if (tracks_end == std::string::npos) {
-        throw std::runtime_error("MSFTS catalog is missing its track array");
-    }
-    json.insert(tracks_end, custom.str());
+    catalog.tracks.push_back(std::move(track));
+```
+
+This block replaces the `catalog.tracks.push_back(std::move(track));` line shown above, which moves down to the end. Then:
+
+```cpp
+    const std::string json = serialize_catalog(catalog);
     return {json.begin(), json.end()};
 ```
 
-Add `#include <chrono>` and `#include <stdexcept>` if they are not already present. The inline `initData` field at line 446 is gone, replaced by the `initDataList` entry above.
+Add `#include <chrono>` if it is not already present. The inline `initData` field at line 446 is gone, replaced by the `initDataList` entry above.
 
 - [ ] **Step 5: Run tests to verify they pass**
 

@@ -26,6 +26,123 @@ void expect(bool condition, const std::string& message) {
     }
 }
 
+// A structural well-formedness check for JSON text. MsfTrack::custom_fields
+// (used here for the m2ts* fields) are raw JSON inserted verbatim by the
+// serializer, so a bug there (e.g. a string value stored unquoted, emitting
+// a bare word where a value belongs) would not be caught by substring
+// assertions alone. This walks the text once, tracking whether it is inside
+// a string literal, verifying that braces/brackets balance outside of
+// strings, and that every value position immediately following a
+// non-string ':' begins with a valid JSON value start token.
+bool is_well_formed_json(const std::string& text) {
+    int brace_depth = 0;
+    int bracket_depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char ch = text[index];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (ch) {
+            case '"':
+                in_string = true;
+                break;
+            case '{':
+                ++brace_depth;
+                break;
+            case '}':
+                if (--brace_depth < 0) {
+                    return false;
+                }
+                break;
+            case '[':
+                ++bracket_depth;
+                break;
+            case ']':
+                if (--bracket_depth < 0) {
+                    return false;
+                }
+                break;
+            case ':': {
+                std::size_t next = index + 1;
+                while (next < text.size() &&
+                       (text[next] == ' ' || text[next] == '\t' || text[next] == '\n' ||
+                        text[next] == '\r')) {
+                    ++next;
+                }
+                if (next >= text.size()) {
+                    return false;
+                }
+                // A literal (true/false/null) match must be followed by a
+                // delimiter or end of input, not just share a prefix -
+                // otherwise "truex" or "nullish" would false-pass as valid
+                // value starts.
+                const auto matches_literal = [&](const char* literal, std::size_t length) {
+                    if (text.compare(next, length, literal) != 0) {
+                        return false;
+                    }
+                    const std::size_t after = next + length;
+                    if (after >= text.size()) {
+                        return true;
+                    }
+                    const char delim = text[after];
+                    return delim == ',' || delim == '}' || delim == ']' || delim == ' ' ||
+                           delim == '\t' || delim == '\n' || delim == '\r';
+                };
+                const char value_start = text[next];
+                const bool valid_start = value_start == '"' || value_start == '{' ||
+                                         value_start == '[' || value_start == '-' ||
+                                         (value_start >= '0' && value_start <= '9') ||
+                                         matches_literal("true", 4) ||
+                                         matches_literal("false", 5) ||
+                                         matches_literal("null", 4);
+                if (!valid_start) {
+                    return false;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return !in_string && brace_depth == 0 && bracket_depth == 0;
+}
+
+// Direct unit coverage for is_well_formed_json itself. This checker is the
+// only defense against a custom_fields raw-JSON value being malformed (e.g.
+// a string stored unquoted, emitting a bare word); substring assertions
+// cannot detect that defect class. Without these assertions, a future edit
+// that breaks the checker so it always returns true would leave every
+// MSFTS catalog test passing while shipping malformed JSON.
+void test_json_well_formedness_checker() {
+    // Reject cases.
+    expect(!is_well_formed_json(R"({"a":opaque})"),
+           "expected a bareword value to be rejected");
+    expect(!is_well_formed_json(R"({"a":1)"),
+           "expected an unbalanced brace to be rejected");
+    expect(!is_well_formed_json(R"({"a":[1,2})"),
+           "expected an unbalanced bracket to be rejected");
+    expect(!is_well_formed_json(R"({"a":truex})"),
+           "expected a literal-prefixed bareword to be rejected");
+
+    // Accept cases - a checker that rejects everything would also "catch"
+    // the bareword above, so these matter as much as the reject cases.
+    expect(is_well_formed_json(R"({"a":"{not a brace}"})"),
+           "expected a brace inside a string literal to be accepted");
+    expect(is_well_formed_json(R"({"a":"say \"hi\""})"),
+           "expected an escaped quote inside a string to be accepted");
+    expect(is_well_formed_json(R"({"a":1,"b":-2,"c":"s","d":true,"e":false,"f":null,"g":[1],"h":{"i":2}})"),
+           "expected every valid JSON value type to be accepted");
+}
+
 std::vector<std::uint8_t> make_packet(std::uint16_t pid, std::uint8_t marker = 0xff) {
     std::vector<std::uint8_t> packet(188, 0xff);
     packet[0] = 0x47;
@@ -141,8 +258,19 @@ void test_source_catalog_and_filtering(std::size_t packet_size) {
         expect((packet_size == 192) ==
                    (text.find("\"m2tsTimestampMode\":\"opaque\"") != std::string::npos),
                "expected opaque timestamp mode only for M2TS source packets");
-        expect(text.find("\"initData\":\"") != std::string::npos,
-               "expected base64 initData");
+        expect(text.find("\"version\":\"1\"") != std::string::npos,
+               "expected MSF v1 string version in MSFTS catalog");
+        expect(text.find("\"initDataList\"") != std::string::npos,
+               "expected root initDataList in MSFTS catalog");
+        expect(text.find("\"initRef\"") != std::string::npos,
+               "expected per-track initRef in MSFTS catalog");
+        expect(text.find("\"format\"") == std::string::npos,
+               "expected no legacy format field in MSFTS catalog");
+        expect(text.find("\"initData\":\"") == std::string::npos,
+               "expected no inline initData field in MSFTS catalog");
+        expect(text.find("\"isLive\":true") != std::string::npos,
+               "expected isLive true in MSFTS catalog");
+        expect(is_well_formed_json(text), "expected MSFTS catalog to be well-formed JSON");
     }
 
     const auto media = live.next_object();
@@ -371,6 +499,7 @@ void test_command_line_contract() {
 }  // namespace
 
 int main() {
+    test_json_well_formedness_checker();
     test_source_catalog_and_filtering(188);
     test_source_catalog_and_filtering(192);
     test_ambiguous_m2ts_prefix_is_detected_as_192_bytes();
