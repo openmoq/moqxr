@@ -1029,5 +1029,80 @@ int main() {
     empty_op_catalog.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {}});
     ok &= throws_runtime_error(empty_op_catalog, "expected a delta operation with no tracks to throw");
 
+    // CMSF 4.1: protection lives at the catalog root; tracks reference it by
+    // refID and MUST NOT duplicate it.
+    MsfCatalog prot;
+    MsfContentProtection cp;
+    cp.ref_id = "1";
+    cp.default_kids = {"01234567-89ab-cdef-0123-456789abcdef"};
+    cp.scheme = "cbcs";
+    cp.system_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
+    cp.la_url = MsfUrlEntry{.url = "https://widevine.example.com/proxy", .type = std::nullopt};
+    cp.pssh_base64 = "AAAAP3Bzc2gAAAAA";
+    prot.content_protections.push_back(cp);
+
+    MsfTrack prot_video;
+    prot_video.name = "video";
+    prot_video.packaging = "cmaf";
+    prot_video.role = "video";
+    prot_video.is_live = true;
+    prot_video.codec = "avc1.640028";
+    prot_video.bitrate = 5000000;
+    prot_video.content_protection_ref_ids = {"1"};
+    prot.tracks.push_back(prot_video);
+
+    const std::string prot_json = serialize_catalog(prot);
+    ok &= expect_contains(prot_json, "\"contentProtections\"", "expected root contentProtections");
+    ok &= expect_contains(prot_json, "\"refID\":\"1\"", "expected refID");
+    ok &= expect_contains(prot_json, "\"scheme\":\"cbcs\"", "expected the scheme");
+    ok &= expect_contains(prot_json, "\"systemID\":\"edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\"",
+                          "expected the system ID inside drmSystem");
+    ok &= expect_contains(prot_json, "\"laURL\":{\"url\":\"https://widevine.example.com/proxy\"}",
+                          "expected the licence URL object");
+    ok &= expect_contains(prot_json, "\"contentProtectionRefIDs\":[\"1\"]",
+                          "expected the track's reference array");
+    // 4.1.1: protection data MUST NOT be duplicated at track level.
+    const std::size_t cp_pos = prot_json.find("\"contentProtections\"");
+    const std::size_t prot_tracks_pos = prot_json.find("\"tracks\"");
+    ok &= expect(cp_pos != std::string::npos && prot_tracks_pos != std::string::npos &&
+                     cp_pos < prot_tracks_pos,
+                 "expected contentProtections before tracks, matching the CMSF examples");
+    ok &= expect(prot_json.find("\"scheme\"", prot_tracks_pos) == std::string::npos,
+                 "expected no scheme duplicated inside the tracks array");
+
+    // A dangling reference throws, mirroring the initRef rule.
+    MsfCatalog dangling = prot;
+    dangling.tracks[0].content_protection_ref_ids = {"missing"};
+    ok &= throws_runtime_error(dangling, "expected a dangling contentProtectionRefID to throw");
+
+    // Duplicate refIDs throw.
+    MsfCatalog dup_ref = prot;
+    dup_ref.content_protections.push_back(cp);
+    ok &= throws_runtime_error(dup_ref, "expected duplicate refIDs to throw");
+
+    // CMSF 4.1.1.3 allows only cenc and cbcs.
+    MsfCatalog bad_scheme = prot;
+    bad_scheme.content_protections[0].scheme = "rot13";
+    ok &= throws_runtime_error(bad_scheme, "expected an unsupported scheme to throw");
+
+    // 4.1.1.2 requires at least one well-formed default KID.
+    MsfCatalog no_kid = prot;
+    no_kid.content_protections[0].default_kids.clear();
+    ok &= throws_runtime_error(no_kid, "expected an empty defaultKID list to throw");
+
+    MsfCatalog bad_kid = prot;
+    bad_kid.content_protections[0].default_kids = {"not-a-uuid"};
+    ok &= throws_runtime_error(bad_kid, "expected a malformed KID to throw");
+
+    MsfCatalog bad_system = prot;
+    bad_system.content_protections[0].system_id = "nope";
+    ok &= throws_runtime_error(bad_system, "expected a malformed system ID to throw");
+
+    // An unprotected catalog emits no contentProtections key at all.
+    MsfCatalog unprot;
+    unprot.tracks.push_back(sapped_video);
+    ok &= expect_not_contains(serialize_catalog(unprot), "\"contentProtections\"",
+                              "expected no contentProtections when nothing is protected");
+
     return ok ? 0 : 1;
 }
