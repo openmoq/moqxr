@@ -158,7 +158,11 @@ std::vector<CencSystem> parse_pssh_boxes(std::span<const std::uint8_t> bytes,
             continue;
         }
         // header(8) + version/flags(4) + SystemID(16) = 28 bytes minimum.
-        if (box.span.size < 28 || box.span.offset + box.span.size > bytes.size()) {
+        // box.span is caller-supplied and not trusted: guard the sum against
+        // size_t wrap before comparing, the same idiom find_child_box_span
+        // uses for container_offset + container_size above.
+        const std::size_t box_end = box.span.offset + box.span.size;
+        if (box.span.size < 28 || box_end < box.span.offset || box_end > bytes.size()) {
             continue;
         }
         CencSystem system;

@@ -224,6 +224,42 @@ int main() {
     ok &= expect(!systems[0].pssh_base64.empty(), "expected base64 pssh bytes");
     ok &= expect(systems[0].pssh_base64 != systems[1].pssh_base64,
                  "expected distinct pssh payloads per system");
+    // Independently computed (Python's base64.b64encode, not this code) from
+    // p1's exact 36 bytes, so a swapped 6-bit-group or alphabet bug in
+    // base64_encode can't hide behind only a non-empty/distinct check.
+    ok &= expect(systems[0].pssh_base64 ==
+                     "AAAAJHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAAATerb7v",
+                 "expected the exact base64 encoding of the Widevine pssh box");
+
+    // A pssh box with a declared length under 28 bytes is skipped, but a
+    // valid box in the same list is still returned -- paired so the test
+    // can't pass against a function that simply returned nothing at all.
+    std::vector<Mp4Box> short_and_valid{
+        Mp4Box{.type = "pssh", .span = {.offset = 0, .size = 16},
+               .payload = {.offset = 8, .size = 8}, .children = {}},
+        Mp4Box{.type = "pssh", .span = {.offset = 0, .size = p1.size()},
+               .payload = {.offset = 8, .size = p1.size() - 8}, .children = {}},
+    };
+    const auto short_skip = parse_pssh_boxes(p1, short_and_valid);
+    ok &= expect(short_skip.size() == 1, "expected the under-length pssh box to be skipped");
+    ok &= expect(!short_skip.empty() && short_skip[0].system_id ==
+                     "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+                 "expected the valid pssh box alongside it to still be returned");
+
+    // A pssh box whose declared span runs past the buffer is skipped, again
+    // paired with a valid box.
+    std::vector<Mp4Box> truncated_and_valid{
+        Mp4Box{.type = "pssh", .span = {.offset = 0, .size = 1000},
+               .payload = {.offset = 8, .size = 992}, .children = {}},
+        Mp4Box{.type = "pssh", .span = {.offset = 0, .size = p1.size()},
+               .payload = {.offset = 8, .size = p1.size() - 8}, .children = {}},
+    };
+    const auto truncated_skip = parse_pssh_boxes(p1, truncated_and_valid);
+    ok &= expect(truncated_skip.size() == 1,
+                 "expected the past-the-buffer pssh box to be skipped");
+    ok &= expect(!truncated_skip.empty() && truncated_skip[0].system_id ==
+                     "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+                 "expected the valid pssh box alongside it to still be returned");
 
     return ok ? 0 : 1;
 }
