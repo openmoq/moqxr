@@ -511,19 +511,31 @@ std::string mpeg4_audio_codec_string(const Mp4Box& sample_entry, std::span<const
         return "mp4a.40.2";
     }
 
+    // sample_entry.span.size comes from an unchecked 32-bit box-size field in
+    // the stsd entry (extract_tracks), so it cannot be trusted to bound the
+    // ESDS descriptor scan below: a fabricated huge value must not drive
+    // reads past the end of `bytes`. Clamp to the real buffer once, and
+    // guard against size_t overflow in the offset+size sum itself, the same
+    // way find_child_box_offset does.
+    std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
+    if (entry_end < sample_entry.span.offset) {
+        entry_end = bytes.size();
+    }
+    const std::size_t limit = std::min(entry_end, bytes.size());
+
     std::uint8_t audio_object_type = 2;
-    for (std::size_t cursor = esds_offset + 12; cursor + 2 <= sample_entry.span.offset + sample_entry.span.size; ++cursor) {
+    for (std::size_t cursor = esds_offset + 12; cursor + 2 <= limit; ++cursor) {
         if (bytes[cursor] != 0x05) {
             continue;
         }
         std::size_t length = 0;
         std::size_t length_bytes = 0;
-        if (!decode_descriptor_length(bytes, cursor + 1, sample_entry.span.offset + sample_entry.span.size, length, length_bytes) ||
+        if (!decode_descriptor_length(bytes, cursor + 1, limit, length, length_bytes) ||
             length == 0) {
             continue;
         }
         const std::size_t config_offset = cursor + 1 + length_bytes;
-        if (config_offset + length > sample_entry.span.offset + sample_entry.span.size) {
+        if (config_offset + length > limit) {
             continue;
         }
         const std::uint8_t config = bytes[config_offset];

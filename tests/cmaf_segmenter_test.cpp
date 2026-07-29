@@ -174,6 +174,56 @@ std::vector<std::uint8_t> make_oversized_sample_entry_test_mp4() {
     return file;
 }
 
+// Regression for a heap over-read in mpeg4_audio_codec_string (mp4_box.cpp):
+// its ESDS descriptor scan was bounded only by the stsd sample-entry's own
+// declared box size (sample_entry.span.offset + sample_entry.span.size),
+// which extract_tracks reads from the file with no validation, and unlike
+// find_child_box_offset it used that raw, unclamped sum directly as the
+// scan bound, as the decode_descriptor_length end argument, and in the
+// config-offset bounds check. The esds box below carries no DecSpecificInfo
+// (tag 0x05) byte anywhere in its payload, so the byte-by-byte scan never
+// finds a match and runs all the way to its bound; with the mp4a sample
+// entry's box-size field patched to a size far larger than the file, that
+// bound reaches past the end of the buffer. Reverting the clamp in
+// mpeg4_audio_codec_string makes this fixture heap-buffer-overflow under
+// ASAN; with the clamp, extract_tracks returns cleanly and falls back to
+// the default "mp4a.40.2" codec string.
+std::vector<std::uint8_t> make_oversized_audio_sample_entry_test_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 's', 'o', 'u', 'n', 0, 0, 0, 0});
+    // Fixed-size AudioSampleEntry fields (reserved/data_reference_index,
+    // reserved, channelcount, samplesize, pre_defined, reserved, samplerate):
+    // 28 bytes, matching the "8 + 28" child_offset mpeg4_audio_codec_string
+    // passes to find_child_box_offset when locating the esds box.
+    const auto audio_header = std::vector<std::uint8_t>(28, 0);
+    // A FullBox esds payload with no byte equal to 0x05 (DecSpecificInfoTag)
+    // anywhere, so the scan for it never terminates early.
+    const auto esds = make_full_box("esds", std::vector<std::uint8_t>(20, 0));
+    const auto sample_entry = make_box("mp4a", concat({audio_header, esds}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+
+    std::vector<std::uint8_t> file = concat({ftyp, moov});
+
+    // The mp4a sample entry's own box-size field is the first 4 bytes of its
+    // box, reached the same way as the avc1 case above: ftyp, then the moov
+    // header, the trak header, tkhd, the mdia header, mdhd, hdlr, the minf
+    // header, the stbl header, and finally the stsd header plus its 4-byte
+    // version/flags and 4-byte entry-count fields.
+    const std::size_t sample_entry_size_offset =
+        ftyp.size() + 8 + 8 + tkhd.size() + 8 + mdhd.size() + hdlr.size() + 8 + 8 + 16;
+    patch_be32(file, sample_entry_size_offset, 0x40000000);
+    return file;
+}
+
 // Fragmented single-track MP4 whose mdhd carries the given timescale,
 // duration, and packed language (mdhd version 0 or 1, selectable so both
 // 32-bit and 64-bit duration layouts are exercised), and whose video sample
@@ -1229,6 +1279,19 @@ int main() {
                     "expected avcC (found early) to still decode correctly despite the fabricated bound");
         ok &= expect(oversized_tracks.front().max_bitrate == 0,
                     "expected no bitrate parsed when btrt is unreachable inside the fabricated bound");
+    }
+
+    // Heap over-read regression: mpeg4_audio_codec_string must not trust a
+    // fabricated sample-entry size and scan past the end of the buffer when
+    // no DecSpecificInfo (tag 0x05) byte is present. See
+    // make_oversized_audio_sample_entry_test_mp4 for the full explanation.
+    {
+        const auto oversized_audio_bytes = make_oversized_audio_sample_entry_test_mp4();
+        const auto oversized_audio_tracks = extract_tracks(parse_mp4_boxes(oversized_audio_bytes), oversized_audio_bytes);
+        ok &= expect(oversized_audio_tracks.size() == 1,
+                    "expected extract_tracks to survive a fabricated oversized mp4a sample-entry size");
+        ok &= expect(oversized_audio_tracks.front().codec == "mp4a.40.2",
+                    "expected the default AAC-LC codec string when no ESDS config is reachable within the fabricated bound");
     }
 
     // CMSF section 3.5.2: maxGrpSapStartingType is a maximum over only the
