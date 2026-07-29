@@ -127,6 +127,60 @@ std::vector<std::uint8_t> make_fragmented_test_mp4() {
     return concat({ftyp, moov, moof, mdat});
 }
 
+// CMSF section 4: an encv sample entry must still yield the pre-encryption
+// codec string. frma("avc1"), schm("cenc"), and schi/tenc build the sinf
+// Task 2's parse_track_protection expects; avcC sits alongside sinf (not
+// inside it) so the codec string still needs the avcC profile bytes read
+// through the effective sample entry, not just a bare "avc1".
+std::vector<std::uint8_t> make_frma(const std::string& original_format) {
+    return make_box("frma", std::vector<std::uint8_t>(original_format.begin(), original_format.end()));
+}
+
+std::vector<std::uint8_t> make_schm(const std::string& scheme_type) {
+    std::vector<std::uint8_t> payload(scheme_type.begin(), scheme_type.end());
+    append_be32(payload, 0x00010000);
+    return make_full_box("schm", payload);
+}
+
+std::vector<std::uint8_t> make_tenc_box(std::uint8_t is_protected, std::uint8_t iv_size) {
+    std::vector<std::uint8_t> payload{0, 0, is_protected, iv_size};
+    const std::vector<std::uint8_t> kid{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                                        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
+    payload.insert(payload.end(), kid.begin(), kid.end());
+    return make_full_box("tenc", payload);
+}
+
+std::vector<std::uint8_t> make_sinf(const std::string& original_format, const std::string& scheme_type) {
+    const auto schi = make_box("schi", make_tenc_box(1, 8));
+    return make_box("sinf", concat({make_frma(original_format), make_schm(scheme_type), schi}));
+}
+
+std::vector<std::uint8_t> make_encrypted_fragmented_test_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
+    const auto sinf = make_sinf("avc1", "cenc");
+    const auto sample_entry = make_box("encv", concat({visual_header, avcc, sinf}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+    const auto moof = make_box("moof", {'m', 'f', 'h', 'd'});
+    const auto mdat = make_box("mdat", {1, 2, 3, 4, 5, 6});
+    return concat({ftyp, moov, moof, mdat});
+}
+
 // Regression for a heap over-read in find_child_box_offset (mp4_box.cpp):
 // its scan was bounded only by the stsd sample-entry's own declared box
 // size, which extract_tracks reads from the file with no validation
@@ -1311,6 +1365,27 @@ int main() {
                     "expected extract_tracks to survive a fabricated oversized mp4a sample-entry size");
         ok &= expect(oversized_audio_tracks.front().codec == "mp4a.40.2",
                     "expected the default AAC-LC codec string when no ESDS config is reachable within the fabricated bound");
+    }
+
+    // CMSF section 4: an encv sample entry must report the pre-encryption
+    // codec string (resolved through frma), not the encv wrapper itself,
+    // while sample_entry_type keeps the raw encv/enca type so a consumer can
+    // still tell the track is protected.
+    {
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4();
+        const auto enc_tracks = extract_tracks(parse_mp4_boxes(encrypted_bytes), encrypted_bytes);
+        ok &= expect(enc_tracks.size() == 1, "expected one track in the encrypted fixture");
+        ok &= expect(enc_tracks.front().sample_entry_type == "encv",
+                     "expected the raw sample entry type preserved");
+        ok &= expect(enc_tracks.front().codec == "avc1.64000C",
+                     "expected the codec string resolved through frma, with avcC profile bytes read "
+                     "through the effective sample entry, not left as encv");
+        ok &= expect(enc_tracks.front().protection.has_value(),
+                     "expected protection parameters on an encrypted track");
+        ok &= expect(enc_tracks.front().protection->scheme == "cenc",
+                     "expected the cenc scheme recorded");
+        ok &= expect(enc_tracks.front().protection->original_format == "avc1",
+                     "expected the frma original_format recorded");
     }
 
     // CMSF section 3.5.2: maxGrpSapStartingType is a maximum over only the

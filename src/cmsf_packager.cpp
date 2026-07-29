@@ -384,6 +384,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
             .event_type = {},
             .mime_type = "application/json",
             .depends = std::move(media_track_names),
+            .protection = std::nullopt,
         });
     }
     if (include_sap) {
@@ -398,6 +399,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                 .event_type = "org.ietf.moq.cmsf.sap",
                 .mime_type = "application/json",
                 .depends = {media_track.track_name},
+                .protection = std::nullopt,
             });
         }
     }
@@ -411,6 +413,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                     .event_type = {},
                                     .mime_type = {},
                                     .depends = {},
+                                    .protection = std::nullopt,
                                 });
 
     PublishPlan plan{

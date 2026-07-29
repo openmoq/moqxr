@@ -1,5 +1,7 @@
 #include "openmoq/publisher/mp4_box.h"
 
+#include "openmoq/publisher/cenc.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -819,8 +821,15 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         if (source_sample_entry_type == "hev1" && hevc_track_is_hvc1_compatible(top_level_boxes, bytes, track_id, track_index)) {
             sample_entry_type = "hvc1";
         }
+        std::optional<CencTrackProtection> protection = parse_track_protection(bytes, sample_entry);
+        std::string effective_type = sample_entry_type;
+        if (protection.has_value() && !protection->original_format.empty()) {
+            // CMSF 4: the catalog must advertise the pre-encryption codec, not
+            // the encv/enca wrapper.
+            effective_type = protection->original_format;
+        }
         const Mp4Box effective_sample_entry{
-            .type = sample_entry_type,
+            .type = effective_type,
             .span = sample_entry.span,
             .payload = sample_entry.payload,
             .children = {},
@@ -873,6 +882,7 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             .avg_bitrate = bitrate.avg_bitrate,
             .duration_ms = duration_ms,
             .language = language,
+            .protection = std::move(protection),
         });
         ++track_index;
     }
