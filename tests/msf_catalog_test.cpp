@@ -571,5 +571,36 @@ int main() {
     ok &= expect_not_contains(partial_json, "\"isLive\":true",
                               "expected no live tracks in partial VOD conversion");
 
+    // MSF section 5: object 0 of every group holds an independent catalog,
+    // and all catalog objects map to sub-group 0.
+    CatalogPublisher pub;
+    const auto first = pub.publish(live_now);
+    ok &= expect(first.size() == 1, "expected one object for the first catalog");
+    ok &= expect(first[0].group_id == 0, "expected the first catalog in group 0");
+    ok &= expect(first[0].object_id == 0, "expected the first catalog at object 0");
+    ok &= expect(first[0].subgroup_id == 0, "expected all catalog objects in sub-group 0");
+    ok &= expect_contains(first[0].payload, "\"version\":\"1\"", "expected a serialized catalog");
+
+    // Republishing an unchanged catalog emits nothing.
+    const auto unchanged = pub.publish(live_now);
+    ok &= expect(unchanged.empty(), "expected no objects when the catalog is unchanged");
+
+    // Ending the broadcast emits one independent catalog in a NEW group.
+    const auto ended = pub.end_broadcast(EndBroadcastMode::kTerminate, {});
+    ok &= expect(ended.size() == 1, "expected one object for the end-of-broadcast catalog");
+    ok &= expect(ended[0].group_id == 1, "expected the final catalog in a new group");
+    ok &= expect(ended[0].object_id == 0, "expected the final catalog at object 0");
+    ok &= expect_contains(ended[0].payload, "\"isComplete\":true", "expected isComplete on termination");
+    ok &= expect(pub.ended(), "expected the publisher to report the broadcast ended");
+
+    // Section 5.1.3 and 5.2.7 are one-way transitions: nothing may follow.
+    bool threw_after_end = false;
+    try {
+        (void)pub.publish(live_now);
+    } catch (const std::runtime_error&) {
+        threw_after_end = true;
+    }
+    ok &= expect(threw_after_end, "expected publishing after end_broadcast to throw");
+
     return ok ? 0 : 1;
 }

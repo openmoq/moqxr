@@ -135,4 +135,43 @@ MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
                                       EndBroadcastMode mode,
                                       const std::map<std::string, std::uint64_t>& track_durations_ms);
 
+// One catalog object ready for the wire. MSF section 5 requires all catalog
+// objects to map to MOQT sub-group 0.
+struct CatalogObject {
+    std::uint64_t group_id = 0;
+    std::uint64_t object_id = 0;
+    std::uint64_t subgroup_id = 0;
+    std::string payload;
+};
+
+// Owns the catalog track's group and object counters and the last published
+// catalog, and decides what to emit (MSF section 5).
+//
+// Object 0 of every group holds a full independent catalog. Producing an
+// independent catalog always starts a new group.
+class CatalogPublisher {
+public:
+    // Emit whatever is needed to move subscribers to `desired`. Returns an
+    // empty vector when nothing changed. Throws std::runtime_error if the
+    // broadcast has already ended.
+    std::vector<CatalogObject> publish(const MsfCatalog& desired);
+
+    // Emit the final catalog for a broadcast that is ending (MSF 11.3).
+    // After this, publish() throws: section 5.1.3 forbids removing
+    // isComplete, and 5.2.7 forbids a true isLive following a false one.
+    std::vector<CatalogObject> end_broadcast(
+        EndBroadcastMode mode,
+        const std::map<std::string, std::uint64_t>& track_durations_ms);
+
+    bool ended() const { return ended_; }
+
+private:
+    CatalogObject emit_independent(const MsfCatalog& catalog);
+
+    std::optional<MsfCatalog> last_;
+    std::uint64_t next_group_id_ = 0;
+    std::uint64_t next_object_id_ = 0;
+    bool ended_ = false;
+};
+
 }  // namespace openmoq::publisher

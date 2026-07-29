@@ -547,4 +547,98 @@ MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
     return out;
 }
 
+namespace {
+
+bool tracks_equal(const MsfTrack& a, const MsfTrack& b) {
+    // Compare every field that serialize_catalog can emit. A field added to
+    // MsfTrack without being added here would make a real change look like a
+    // no-op, so keep this in step with write_track.
+    return a.name == b.name && a.name_space == b.name_space && a.packaging == b.packaging &&
+           a.role == b.role && a.is_live == b.is_live && a.target_latency_ms == b.target_latency_ms &&
+           a.label == b.label && a.render_group == b.render_group && a.alt_group == b.alt_group &&
+           a.init_ref == b.init_ref && a.depends == b.depends && a.codec == b.codec &&
+           a.mime_type == b.mime_type && a.framerate == b.framerate && a.timescale == b.timescale &&
+           a.bitrate == b.bitrate && a.avg_bitrate == b.avg_bitrate &&
+           a.max_gop_duration_ms == b.max_gop_duration_ms &&
+           a.max_group_duration_ms == b.max_group_duration_ms && a.width == b.width &&
+           a.height == b.height && a.samplerate == b.samplerate &&
+           a.channel_config == b.channel_config && a.lang == b.lang &&
+           a.track_duration_ms == b.track_duration_ms && a.event_type == b.event_type &&
+           a.max_grp_sap_starting_type == b.max_grp_sap_starting_type &&
+           a.max_obj_sap_starting_type == b.max_obj_sap_starting_type &&
+           a.custom_fields == b.custom_fields &&
+           ((!a.buffers.has_value() && !b.buffers.has_value()) ||
+            (a.buffers.has_value() && b.buffers.has_value() &&
+             a.buffers->target_ms == b.buffers->target_ms && a.buffers->min_ms == b.buffers->min_ms &&
+             a.buffers->max_ms == b.buffers->max_ms));
+}
+
+bool catalogs_equal(const MsfCatalog& a, const MsfCatalog& b) {
+    if (a.version != b.version || a.is_complete != b.is_complete ||
+        a.tracks.size() != b.tracks.size() || a.publish_tracks.size() != b.publish_tracks.size() ||
+        a.init_data_list.size() != b.init_data_list.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.tracks.size(); ++i) {
+        if (!tracks_equal(a.tracks[i], b.tracks[i])) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < a.publish_tracks.size(); ++i) {
+        if (!tracks_equal(a.publish_tracks[i], b.publish_tracks[i])) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < a.init_data_list.size(); ++i) {
+        if (a.init_data_list[i].id != b.init_data_list[i].id ||
+            a.init_data_list[i].type != b.init_data_list[i].type ||
+            a.init_data_list[i].data != b.init_data_list[i].data) {
+            return false;
+        }
+    }
+    // generated_at_ms is deliberately excluded: a fresh timestamp on an
+    // otherwise identical catalog is not a change worth republishing.
+    return true;
+}
+
+}  // namespace
+
+CatalogObject CatalogPublisher::emit_independent(const MsfCatalog& catalog) {
+    CatalogObject object;
+    object.group_id = next_group_id_++;
+    object.object_id = 0;
+    object.subgroup_id = 0;
+    object.payload = serialize_catalog(catalog);
+    next_object_id_ = 1;
+    return object;
+}
+
+std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) {
+    if (ended_) {
+        throw std::runtime_error("MSF catalog publish after end_broadcast");
+    }
+    if (last_.has_value() && catalogs_equal(*last_, desired)) {
+        return {};
+    }
+    std::vector<CatalogObject> out;
+    out.push_back(emit_independent(desired));
+    last_ = desired;
+    return out;
+}
+
+std::vector<CatalogObject> CatalogPublisher::end_broadcast(
+    EndBroadcastMode mode,
+    const std::map<std::string, std::uint64_t>& track_durations_ms) {
+    if (ended_) {
+        throw std::runtime_error("MSF catalog end_broadcast called twice");
+    }
+    const MsfCatalog base = last_.value_or(MsfCatalog{});
+    const MsfCatalog final_catalog = make_end_broadcast_catalog(base, mode, track_durations_ms);
+    std::vector<CatalogObject> out;
+    out.push_back(emit_independent(final_catalog));
+    last_ = final_catalog;
+    ended_ = true;
+    return out;
+}
+
 }  // namespace openmoq::publisher
