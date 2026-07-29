@@ -31,4 +31,16 @@ std::optional<ByteSpan> find_child_box_span(std::span<const std::uint8_t> bytes,
                                             std::size_t first_child_offset,
                                             std::string_view type);
 
+// Parse protection parameters from an encv or enca sample entry. Returns
+// nullopt for an unencrypted entry, or when the boxes are absent or
+// malformed -- a track whose protection cannot be confirmed must not be
+// advertised as protected.
+std::optional<CencTrackProtection> parse_track_protection(std::span<const std::uint8_t> bytes,
+                                                          const Mp4Box& sample_entry);
+
+// Collect DRM systems from pssh boxes. Boxes with a malformed length or a
+// truncated system ID are skipped, not thrown on.
+std::vector<CencSystem> parse_pssh_boxes(std::span<const std::uint8_t> bytes,
+                                         const std::vector<Mp4Box>& pssh_boxes);
+
 }  // namespace openmoq::publisher

@@ -23,6 +23,21 @@ struct Mp4Box {
     std::vector<Mp4Box> children;
 };
 
+// Common Encryption parameters for one track, from sinf/schm/schi/tenc.
+struct CencTrackProtection {
+    std::string original_format;   // frma, e.g. "avc1" -- the pre-encryption codec
+    std::string scheme;            // schm, "cenc" or "cbcs" (CMSF 4.1.1.3)
+    std::string default_kid;       // tenc default_KID as a UUID string
+    std::uint8_t per_sample_iv_size = 0;
+    bool is_protected = false;
+};
+
+// One DRM system's initialisation data, from a pssh box.
+struct CencSystem {
+    std::string system_id;         // UUID string
+    std::string pssh_base64;       // the whole pssh box, Base64
+};
+
 struct TrackDescription {
     std::uint32_t track_id = 0;
     std::string handler_type;

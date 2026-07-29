@@ -30,6 +30,69 @@ std::vector<std::uint8_t> make_box(const std::string& type, const std::vector<st
     return out;
 }
 
+std::vector<std::uint8_t> make_full_box(const std::string& type,
+                                        std::uint8_t version,
+                                        std::uint32_t flags,
+                                        const std::vector<std::uint8_t>& payload) {
+    std::vector<std::uint8_t> out;
+    out.push_back(version);
+    out.push_back(static_cast<std::uint8_t>((flags >> 16U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((flags >> 8U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>(flags & 0xFFU));
+    out.insert(out.end(), payload.begin(), payload.end());
+    return make_box(type, out);
+}
+
+// 16 distinct bytes so a transposed read is visible.
+std::vector<std::uint8_t> sample_kid() {
+    return {0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
+}
+
+// tenc: version 0, flags 0, reserved(1), reserved(1),
+// default_isProtected(1), default_Per_Sample_IV_Size(1), default_KID(16).
+std::vector<std::uint8_t> make_tenc(std::uint8_t is_protected, std::uint8_t iv_size) {
+    std::vector<std::uint8_t> payload{0, 0, is_protected, iv_size};
+    const auto kid = sample_kid();
+    payload.insert(payload.end(), kid.begin(), kid.end());
+    return make_full_box("tenc", 0, 0, payload);
+}
+
+// An encv sample entry: 8-byte header + 70-byte VisualSampleEntry body,
+// then children. sinf holds frma, schm, and schi/tenc.
+std::vector<std::uint8_t> make_encv_sample_entry(const std::string& original_format,
+                                                 const std::string& scheme) {
+    std::vector<std::uint8_t> schm_payload;
+    schm_payload.insert(schm_payload.end(), scheme.begin(), scheme.end());
+    append_be32(schm_payload, 0x00010000);
+
+    std::vector<std::uint8_t> frma_payload(original_format.begin(), original_format.end());
+
+    std::vector<std::uint8_t> schi_payload;
+    const auto tenc = make_tenc(1, 8);
+    schi_payload.insert(schi_payload.end(), tenc.begin(), tenc.end());
+
+    std::vector<std::uint8_t> sinf_payload;
+    const auto frma = make_box("frma", frma_payload);
+    const auto schm = make_full_box("schm", 0, 0, schm_payload);
+    const auto schi = make_box("schi", schi_payload);
+    sinf_payload.insert(sinf_payload.end(), frma.begin(), frma.end());
+    sinf_payload.insert(sinf_payload.end(), schm.begin(), schm.end());
+    sinf_payload.insert(sinf_payload.end(), schi.begin(), schi.end());
+
+    std::vector<std::uint8_t> body(70, 0);
+    const auto sinf = make_box("sinf", sinf_payload);
+    body.insert(body.end(), sinf.begin(), sinf.end());
+    return make_box("encv", body);
+}
+
+std::vector<std::uint8_t> make_pssh(const std::vector<std::uint8_t>& system_id) {
+    std::vector<std::uint8_t> payload(system_id.begin(), system_id.end());
+    append_be32(payload, 4);
+    payload.insert(payload.end(), {0xde, 0xad, 0xbe, 0xef});
+    return make_full_box("pssh", 0, 0, payload);
+}
+
 }  // namespace
 
 int main() {
@@ -95,6 +158,72 @@ int main() {
     zero_len.insert(zero_len.end(), {'a', 'a', 'a', 'a'});
     const auto zero = find_child_box_span(zero_len, 0, zero_len.size(), 0, "aaaa");
     ok &= expect(!zero.has_value(), "expected a zero length to terminate the walk");
+
+    // sinf/frma/schm/schi/tenc parsing from an encv sample entry.
+    const auto encv = make_encv_sample_entry("avc1", "cenc");
+    const Mp4Box encv_box{
+        .type = "encv",
+        .span = {.offset = 0, .size = encv.size()},
+        .payload = {.offset = 8, .size = encv.size() - 8},
+        .children = {},
+    };
+    const auto protection = parse_track_protection(encv, encv_box);
+    ok &= expect(protection.has_value(), "expected an encv sample entry to parse as protected");
+    ok &= expect(protection->original_format == "avc1", "expected frma to yield avc1");
+    ok &= expect(protection->scheme == "cenc", "expected schm to yield cenc");
+    ok &= expect(protection->is_protected, "expected tenc default_isProtected");
+    ok &= expect(protection->per_sample_iv_size == 8, "expected tenc IV size 8");
+    ok &= expect(protection->default_kid == "01234567-89ab-cdef-0123-456789abcdef",
+                 "expected the KID rendered as a UUID string");
+
+    // cbcs is the other allowed scheme (CMSF 4.1.1.3).
+    const auto encv_cbcs = make_encv_sample_entry("avc1", "cbcs");
+    const Mp4Box cbcs_box{
+        .type = "encv",
+        .span = {.offset = 0, .size = encv_cbcs.size()},
+        .payload = {.offset = 8, .size = encv_cbcs.size() - 8},
+        .children = {},
+    };
+    const auto cbcs = parse_track_protection(encv_cbcs, cbcs_box);
+    ok &= expect(cbcs.has_value() && cbcs->scheme == "cbcs", "expected cbcs scheme parsed");
+
+    // An unencrypted sample entry has no sinf and must parse as unprotected.
+    std::vector<std::uint8_t> plain_body(70, 0);
+    const auto plain = make_box("avc1", plain_body);
+    const Mp4Box plain_box{
+        .type = "avc1",
+        .span = {.offset = 0, .size = plain.size()},
+        .payload = {.offset = 8, .size = plain.size() - 8},
+        .children = {},
+    };
+    ok &= expect(!parse_track_protection(plain, plain_box).has_value(),
+                 "expected an unencrypted sample entry to yield no protection");
+
+    // Two pssh boxes yield two systems, each with its own base64 payload.
+    const std::vector<std::uint8_t> widevine{0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
+                                             0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed};
+    const std::vector<std::uint8_t> playready{0x9a, 0x04, 0xf0, 0x79, 0x98, 0x40, 0x42, 0x86,
+                                              0xab, 0x92, 0xe6, 0x5b, 0xe0, 0x88, 0x5f, 0x95};
+    std::vector<std::uint8_t> two_pssh;
+    const auto p1 = make_pssh(widevine);
+    const auto p2 = make_pssh(playready);
+    two_pssh.insert(two_pssh.end(), p1.begin(), p1.end());
+    two_pssh.insert(two_pssh.end(), p2.begin(), p2.end());
+    std::vector<Mp4Box> pssh_boxes{
+        Mp4Box{.type = "pssh", .span = {.offset = 0, .size = p1.size()},
+               .payload = {.offset = 8, .size = p1.size() - 8}, .children = {}},
+        Mp4Box{.type = "pssh", .span = {.offset = p1.size(), .size = p2.size()},
+               .payload = {.offset = p1.size() + 8, .size = p2.size() - 8}, .children = {}},
+    };
+    const auto systems = parse_pssh_boxes(two_pssh, pssh_boxes);
+    ok &= expect(systems.size() == 2, "expected two DRM systems");
+    ok &= expect(systems[0].system_id == "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+                 "expected the Widevine system ID");
+    ok &= expect(systems[1].system_id == "9a04f079-9840-4286-ab92-e65be0885f95",
+                 "expected the PlayReady system ID");
+    ok &= expect(!systems[0].pssh_base64.empty(), "expected base64 pssh bytes");
+    ok &= expect(systems[0].pssh_base64 != systems[1].pssh_base64,
+                 "expected distinct pssh payloads per system");
 
     return ok ? 0 : 1;
 }
