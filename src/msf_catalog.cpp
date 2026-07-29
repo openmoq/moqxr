@@ -777,6 +777,18 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     return {object};
 }
 
+std::vector<CatalogObject> CatalogPublisher::force_independent() {
+    if (ended_) {
+        throw std::runtime_error("MSF catalog force_independent after end_broadcast");
+    }
+    if (!last_.has_value()) {
+        return {};
+    }
+    std::vector<CatalogObject> out;
+    out.push_back(emit_independent(*last_));
+    return out;
+}
+
 std::vector<CatalogObject> CatalogPublisher::end_broadcast(
     EndBroadcastMode mode,
     const std::map<std::string, std::uint64_t>& track_durations_ms) {

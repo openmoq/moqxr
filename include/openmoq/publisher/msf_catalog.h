@@ -176,6 +176,11 @@ public:
         EndBroadcastMode mode,
         const std::map<std::string, std::uint64_t>& track_durations_ms);
 
+    // Re-emit the last published catalog as a fresh independent copy in a new
+    // group, for section 5's cache-expiry republication. Returns an empty
+    // vector if nothing has been published yet.
+    std::vector<CatalogObject> force_independent();
+
     bool ended() const { return ended_; }
 
     // Section 5.3: producers publishing frequent deltas SHOULD periodically

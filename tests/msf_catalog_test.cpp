@@ -611,6 +611,40 @@ int main() {
     }
     ok &= expect(threw_second_end, "expected a second end_broadcast call to throw");
 
+    // Section 5: cache-expiry republication re-emits the SAME catalog as a
+    // fresh independent copy in a new group, at object 0.
+    CatalogPublisher rpub;
+    const auto r1 = rpub.publish(live_now);
+    ok &= expect(r1.size() == 1, "expected the initial catalog");
+    ok &= expect(r1[0].group_id == 0 && r1[0].object_id == 0,
+                 "expected the initial catalog at group 0 object 0");
+
+    const auto r2 = rpub.force_independent();
+    ok &= expect(r2.size() == 1, "expected a republished catalog");
+    ok &= expect(r2[0].group_id == 1, "expected the republished catalog in the next group");
+    ok &= expect(r2[0].object_id == 0, "expected the republished catalog at object 0");
+    ok &= expect(r2[0].subgroup_id == 0, "expected all catalog objects in sub-group 0");
+    ok &= expect(r2[0].payload == r1[0].payload,
+                 "expected republication to re-send identical content");
+
+    // A republish before anything has been published emits nothing rather
+    // than serializing an empty catalog.
+    CatalogPublisher empty_pub;
+    ok &= expect(empty_pub.force_independent().empty(),
+                 "expected no republication before the first publish");
+
+    // force_independent is refused after the broadcast ends, like publish().
+    CatalogPublisher done_pub;
+    (void)done_pub.publish(live_now);
+    (void)done_pub.end_broadcast(EndBroadcastMode::kTerminate, {});
+    bool threw_force = false;
+    try {
+        (void)done_pub.force_independent();
+    } catch (const std::runtime_error&) {
+        threw_force = true;
+    }
+    ok &= expect(threw_force, "expected force_independent to throw after end_broadcast");
+
     // Fix round 2: prove tracks_equal is sensitive to fields that a hand-rolled
     // comparison could easily omit. Each case publishes a catalog, then
     // publishes a copy differing in exactly one field, and expects a new
