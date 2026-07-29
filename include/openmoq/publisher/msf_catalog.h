@@ -113,4 +113,26 @@ MsfTrack make_msf_track(const TrackDescription& track,
 // initRef/initDataList wiring that every MP4 emitter otherwise repeats.
 void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name, std::string base64_data);
 
+// How a live broadcast ends (MSF section 11.3).
+enum class EndBroadcastMode {
+    // The stream becomes a VOD asset: isLive false, trackDuration added.
+    kConvertToVod,
+    // The stream ends permanently: isComplete true, empty tracks array.
+    kTerminate,
+};
+
+// Build the final independent catalog for a broadcast that is ending.
+//
+// kConvertToVod clears is_live and applies track_durations_ms in one rebuild.
+// Both must change together: validate_track rejects a track that is live and
+// also carries a duration, so flipping one field at a time would throw.
+// generatedAt is dropped because MSF 5.1.2 says it SHOULD NOT appear when
+// isLive is false.
+//
+// kTerminate returns a catalog with isComplete true and no tracks at all;
+// track_durations_ms is ignored.
+MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
+                                      EndBroadcastMode mode,
+                                      const std::map<std::string, std::uint64_t>& track_durations_ms);
+
 }  // namespace openmoq::publisher

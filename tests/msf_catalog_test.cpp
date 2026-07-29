@@ -2,6 +2,7 @@
 #include "openmoq/publisher/mp4_box.h"
 
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -481,6 +482,58 @@ int main() {
                           "expected samplerate:0 to serialize rather than throw when the rate is unknown");
     ok &= expect_contains(no_rate_json, "\"channelConfig\":\"2\"",
                           "expected channelConfig to still serialize alongside an unknown samplerate");
+
+    // MSF 11.3: ending a live broadcast.
+    MsfCatalog live_now;
+    live_now.generated_at_ms = 1751000000000ULL;
+    MsfTrack live_v;
+    live_v.name = "video";
+    live_v.packaging = "cmaf";
+    live_v.role = "video";
+    live_v.is_live = true;
+    live_v.codec = "avc1.640028";
+    live_v.bitrate = 5000000;
+    live_now.tracks.push_back(live_v);
+    MsfTrack live_a;
+    live_a.name = "audio";
+    live_a.packaging = "cmaf";
+    live_a.role = "audio";
+    live_a.is_live = true;
+    live_a.codec = "mp4a.40.2";
+    live_a.bitrate = 128000;
+    live_a.samplerate = 48000;
+    live_a.channel_config = "2";
+    live_now.tracks.push_back(live_a);
+
+    // Converting to VOD: isLive flips to false AND trackDuration is added in
+    // the same rebuild. Doing it in two steps would throw, because
+    // validate_track rejects is_live together with track_duration_ms.
+    const std::map<std::string, std::uint64_t> durations{{"video", 60000}, {"audio", 60000}};
+    const MsfCatalog vod_cat =
+        make_end_broadcast_catalog(live_now, EndBroadcastMode::kConvertToVod, durations);
+    const std::string vod_json = serialize_catalog(vod_cat);
+    ok &= expect_contains(vod_json, "\"isLive\":false", "expected VOD conversion to clear isLive");
+    ok &= expect_contains(vod_json, "\"trackDuration\":60000", "expected trackDuration on VOD conversion");
+    ok &= expect_not_contains(vod_json, "\"isLive\":true", "expected no track left live after conversion");
+    ok &= expect_not_contains(vod_json, "\"generatedAt\":",
+                              "expected generatedAt dropped on VOD conversion (MSF 5.1.2)");
+    ok &= expect_not_contains(vod_json, "\"isComplete\"",
+                              "expected no isComplete on a VOD conversion");
+
+    // Terminating permanently: isComplete true and an EMPTY tracks array.
+    const MsfCatalog term_cat =
+        make_end_broadcast_catalog(live_now, EndBroadcastMode::kTerminate, {});
+    const std::string term_json = serialize_catalog(term_cat);
+    ok &= expect_contains(term_json, "\"isComplete\":true", "expected isComplete on termination");
+    ok &= expect_contains(term_json, "\"tracks\":[]", "expected an empty tracks array on termination");
+    ok &= expect_not_contains(term_json, "\"video\"", "expected no track entries after termination");
+
+    // A track with no duration supplied still converts, just without the field.
+    const MsfCatalog partial_cat = make_end_broadcast_catalog(
+        live_now, EndBroadcastMode::kConvertToVod, {{"video", 60000}});
+    const std::string partial_json = serialize_catalog(partial_cat);
+    ok &= expect_contains(partial_json, "\"trackDuration\":60000", "expected the known duration");
+    ok &= expect_contains(partial_json, "\"isLive\":false", "expected both tracks marked not live");
 
     return ok ? 0 : 1;
 }

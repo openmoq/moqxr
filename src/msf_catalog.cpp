@@ -512,4 +512,36 @@ void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view tra
     });
 }
 
+MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
+                                      EndBroadcastMode mode,
+                                      const std::map<std::string, std::uint64_t>& track_durations_ms) {
+    MsfCatalog out;
+    out.version = current.version;
+
+    if (mode == EndBroadcastMode::kTerminate) {
+        // Section 11.3: signal isComplete TRUE with an empty Tracks field.
+        // Section 5.1.3: isComplete MUST NOT be removed once added.
+        out.is_complete = true;
+        return out;
+    }
+
+    // kConvertToVod. Section 5.1.2: generatedAt SHOULD NOT be included when
+    // isLive is false, so it is deliberately not copied.
+    out.init_data_list = current.init_data_list;
+    out.tracks.reserve(current.tracks.size());
+    for (MsfTrack track : current.tracks) {
+        track.is_live = false;
+        const auto duration_it = track_durations_ms.find(track.name);
+        if (duration_it != track_durations_ms.end()) {
+            track.track_duration_ms = duration_it->second;
+        }
+        out.tracks.push_back(std::move(track));
+    }
+    for (MsfTrack track : current.publish_tracks) {
+        track.is_live = false;
+        out.publish_tracks.push_back(std::move(track));
+    }
+    return out;
+}
+
 }  // namespace openmoq::publisher
