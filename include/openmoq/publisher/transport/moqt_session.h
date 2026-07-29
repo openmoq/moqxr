@@ -3,6 +3,7 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
+#include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
 #include <atomic>
@@ -77,6 +78,32 @@ public:
     TransportStatus publish_live_objects(const openmoq::publisher::LiveObjectSource& source,
                                          openmoq::publisher::DraftVersion draft_version);
     TransportStatus close(std::uint64_t application_error_code = 0);
+
+    // MSF section 11.3. Sends PUBLISH_DONE (status 0x2 Track Ended, already
+    // hardcoded by encode_publish_done_message) for every request ID this
+    // session still has bookkeeping for (publish_stream_id_by_request_id_) --
+    // the only per-request state that survives outside the blocking
+    // publish_*() loop. `draft_version` is threaded in explicitly because
+    // MoqtSession does not persist the draft used by the in-progress publish
+    // call; it is only ever a parameter to publish()/publish_live(), never a
+    // member, so there is nothing to read it back from here.
+    //
+    // `mode` is accepted for the stable public signature but currently has
+    // no effect: NOT YET IMPLEMENTED is publishing the final independent
+    // catalog object (kConvertToVod vs. kTerminate only change that
+    // catalog's contents). Doing so needs a persistent CatalogPublisher plus
+    // catalog track/stream bookkeeping that MoqtSession does not have --
+    // today the catalog track is a one-shot delivery local to each publish
+    // call (see the "Catalog is a one-shot track" comment further down this
+    // file). That plumbing, and making this method actually use `mode`, is
+    // planned for Task 6.
+    //
+    // Per-track stream_count (the real count belongs to the per-track
+    // SubgroupSenderState that lives inside the blocking publish loop, not
+    // on MoqtSession) is not available here either, so every PUBLISH_DONE
+    // reports stream_count 0 rather than a fabricated number.
+    TransportStatus end_broadcast(openmoq::publisher::EndBroadcastMode mode,
+                                  openmoq::publisher::DraftVersion draft_version);
     PublishStats publish_stats() const;
 
 private:

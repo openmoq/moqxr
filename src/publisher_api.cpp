@@ -555,6 +555,26 @@ transport::TransportStatus Publisher::disconnect(std::uint64_t application_error
     return status;
 }
 
+transport::TransportStatus Publisher::end_broadcast(EndBroadcastMode mode) const {
+    std::shared_ptr<ActiveSession> active;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        active = active_session_;
+    }
+    if (!active || !active->session) {
+        return transport::TransportStatus::failure("end_broadcast requires an active session");
+    }
+    // Held without the lock: end_broadcast blocks on the wire, and holding
+    // state_mutex_ across a write would deadlock a concurrent stats() call,
+    // which is why disconnect() releases it before calling close().
+    //
+    // config_.draft_version is threaded through explicitly because
+    // MoqtSession does not persist the draft used by its in-progress publish
+    // call (it is only ever a parameter to publish()/publish_live()); there
+    // is nothing for end_broadcast to read it back from otherwise.
+    return active->session->end_broadcast(mode, config_.draft_version);
+}
+
 PublisherStats Publisher::stats() const {
     StatsSnapshot snapshot;
     bool split_cmaf_chunks = true;

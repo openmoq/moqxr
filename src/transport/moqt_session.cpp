@@ -4918,6 +4918,40 @@ TransportStatus MoqtSession::close(std::uint64_t application_error_code) {
     return transport_.close(application_error_code);
 }
 
+TransportStatus MoqtSession::end_broadcast(openmoq::publisher::EndBroadcastMode mode,
+                                           openmoq::publisher::DraftVersion draft_version) {
+    // `mode` will select between kConvertToVod and kTerminate once the final
+    // catalog object is wired up (Task 6); it has no effect yet.
+    static_cast<void>(mode);
+
+    // publish_stream_id_by_request_id_ is the only per-request state that
+    // survives outside the blocking publish_*() loop, so it is also the only
+    // set of requests we can honestly report as "ended" here. Snapshot the
+    // request IDs before writing so mutating the map mid-loop (if a future
+    // change adds that) can't invalidate the iteration.
+    std::vector<std::uint64_t> request_ids;
+    request_ids.reserve(publish_stream_id_by_request_id_.size());
+    for (const auto& entry : publish_stream_id_by_request_id_) {
+        request_ids.push_back(entry.first);
+    }
+
+    TransportStatus status = TransportStatus::success();
+    for (const std::uint64_t request_id : request_ids) {
+        // stream_count is real per-track state owned by SubgroupSenderState
+        // inside the blocking publish loop, not persisted on MoqtSession.
+        // Report 0 (not tracked) rather than fabricate a number.
+        const TransportStatus done_status = write_publish_done_for_request(
+            transport_, draft_version, control_stream_id_, publish_stream_id_by_request_id_, request_id,
+            /*stream_count=*/0);
+        if (!done_status.ok) {
+            status = done_status;
+            continue;
+        }
+        publish_stream_id_by_request_id_.erase(request_id);
+    }
+    return status;
+}
+
 TransportStatus MoqtSession::ensure_control_stream(openmoq::publisher::DraftVersion draft) {
     if (control_stream_open_) {
         return TransportStatus::success();

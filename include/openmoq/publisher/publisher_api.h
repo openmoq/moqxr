@@ -17,6 +17,7 @@
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/moq_draft.h"
+#include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
 namespace openmoq::publisher {
@@ -42,6 +43,10 @@ struct PublisherConfig {
     // This publisher is live, or simulating live, unless explicitly told
     // otherwise. VOD semantics are never inferred from the input.
     bool vod = false;
+    // Section 5: a catalog SHOULD be republished after enough time has passed
+    // that it might fall out of a relay cache. Zero disables republication,
+    // which is the historical behaviour.
+    std::chrono::seconds catalog_republish_interval{0};
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     cat4moq::AuthorizationConfig authorization;
 };
@@ -129,6 +134,17 @@ public:
                                                     const transport::TlsConfig& tls = {},
                                                     bool endpoint_alpn_overridden = false) const;
     transport::TransportStatus disconnect(std::uint64_t application_error_code = 0) const;
+    // End the broadcast per MSF section 11.3: send PUBLISH_DONE with status
+    // 0x2 Track Ended for all requests this session still tracks. Returns a
+    // failure status when no session is active.
+    // NOTE: this does not yet publish the final independent catalog
+    // (kConvertToVod marking every track not live plus duration, or
+    // kTerminate's isComplete-with-no-tracks). MoqtSession has no persistent
+    // CatalogPublisher or catalog-stream bookkeeping today; that wiring is
+    // planned for Task 6, which also replaces the current one-shot catalog
+    // delivery with a republishable one. `mode` is accepted now for the
+    // stable public signature but has no effect yet.
+    transport::TransportStatus end_broadcast(EndBroadcastMode mode) const;
     PublisherStats stats() const;
     [[deprecated("Use stats(); live polling is not supported by the blocking publish API.")]]
     std::string stats_json() const;
