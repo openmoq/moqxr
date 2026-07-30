@@ -1158,6 +1158,14 @@ int main() {
                                    "expected an unterminated variable reference to be refused");
         ok &= throws_runtime_error(make_labelled("%%"),
                                    "expected an empty variable name to be refused");
+
+        // Test hygiene: a naive "reject any string containing '%'" validator
+        // would also pass every assertion above except the very first. These
+        // two isolate correct %name% parsing from blanket over-rejection.
+        ok &= serializes_cleanly(make_labelled("%a%%b%"),
+                                 "expected two adjacent valid variable references to be accepted");
+        ok &= serializes_cleanly(make_labelled("prefix-%viewer_id%-suffix"),
+                                 "expected literal text surrounding a valid variable reference to be accepted");
     }
 
     // Deliberate deviation: URL-typed fields are exempt from the 5.4 percent
@@ -1188,6 +1196,120 @@ int main() {
 
         ok &= serializes_cleanly(catalog,
                                  "expected a percent-encoded license URL to be accepted");
+    }
+
+    // Coordinator review finding: the field list above never mentioned
+    // MsfContentProtection, MsfInitData, or MsfUrlEntry::type, so nine
+    // catalog-level string fields reached the serialized catalog with no
+    // percent check at all. Coverage for each below.
+    {
+        const auto make_base_track = []() {
+            MsfTrack track;
+            track.name = "video";
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.codec = "avc1.640028";
+            track.bitrate = 5000000;
+            track.width = 1920;
+            track.height = 1080;
+            track.framerate = 30.0;
+            return track;
+        };
+        const auto make_base_protection = []() {
+            MsfContentProtection protection;
+            protection.ref_id = "cp0";
+            protection.scheme = "cenc";
+            protection.default_kids = {"9eb4050d-e44b-4802-932e-27d75083e266"};
+            protection.system_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
+            return protection;
+        };
+
+        // MsfUrlEntry::type is not a URL -- it holds values like "widevine"
+        // -- so it must not inherit the url field's percent exemption merely
+        // by living in the same struct. Covered for both laURL and certURL.
+        {
+            MsfCatalog catalog;
+            MsfTrack track = make_base_track();
+            track.content_protection_ref_ids = {"cp0"};
+            catalog.tracks.push_back(track);
+            MsfContentProtection protection = make_base_protection();
+            protection.la_url = MsfUrlEntry{"https://drm.example/lic", "wide%vine"};
+            catalog.content_protections.push_back(protection);
+            ok &= throws_runtime_error(catalog, "expected a malformed laURL.type to be refused");
+        }
+        {
+            MsfCatalog catalog;
+            MsfTrack track = make_base_track();
+            track.content_protection_ref_ids = {"cp0"};
+            catalog.tracks.push_back(track);
+            MsfContentProtection protection = make_base_protection();
+            protection.cert_url = MsfUrlEntry{"https://drm.example/cert", "wide%vine"};
+            catalog.content_protections.push_back(protection);
+            ok &= throws_runtime_error(catalog, "expected a malformed certURL.type to be refused");
+        }
+
+        // MsfContentProtection::ref_id
+        {
+            MsfCatalog catalog;
+            MsfTrack track = make_base_track();
+            track.content_protection_ref_ids = {"cp%1"};
+            catalog.tracks.push_back(track);
+            MsfContentProtection protection = make_base_protection();
+            protection.ref_id = "cp%1";
+            catalog.content_protections.push_back(protection);
+            ok &= throws_runtime_error(catalog, "expected a malformed contentProtections refID to be refused");
+        }
+
+        // MsfTrack::content_protection_ref_ids -- exercised on the delta
+        // path, where validate_catalog does not run the dangling-reference
+        // check at all (section 5.3 forbids contentProtections on a delta
+        // catalog), so validate_track's per-element check is the only thing
+        // that can catch a malformed reference here.
+        {
+            MsfCatalog catalog;
+            MsfTrack track = make_base_track();
+            track.content_protection_ref_ids = {"cp%bad"};
+            catalog.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {track}});
+            ok &= throws_runtime_error(catalog,
+                                       "expected a malformed contentProtectionRefIDs element to be refused");
+        }
+
+        // MsfContentProtection::robustness
+        {
+            MsfCatalog catalog;
+            MsfTrack track = make_base_track();
+            track.content_protection_ref_ids = {"cp0"};
+            catalog.tracks.push_back(track);
+            MsfContentProtection protection = make_base_protection();
+            protection.robustness = "SW_SECURE_%bad";
+            catalog.content_protections.push_back(protection);
+            ok &= throws_runtime_error(catalog, "expected a malformed robustness value to be refused");
+        }
+
+        // MsfInitData::id and MsfInitData::type
+        {
+            MsfCatalog catalog;
+            catalog.tracks.push_back(make_base_track());
+            catalog.init_data_list.push_back(
+                MsfInitData{.id = "init%bad", .type = "inline", .data = "AAAA"});
+            ok &= throws_runtime_error(catalog, "expected a malformed initDataList id to be refused");
+        }
+        {
+            MsfCatalog catalog;
+            catalog.tracks.push_back(make_base_track());
+            catalog.init_data_list.push_back(
+                MsfInitData{.id = "init0", .type = "inline%bad", .data = "AAAA"});
+            ok &= throws_runtime_error(catalog, "expected a malformed initDataList type to be refused");
+        }
+
+        // MsfCatalog::version
+        {
+            MsfCatalog catalog;
+            catalog.version = "1%bad";
+            catalog.tracks.push_back(make_base_track());
+            ok &= throws_runtime_error(catalog, "expected a malformed version value to be refused");
+        }
     }
 
     return ok ? 0 : 1;

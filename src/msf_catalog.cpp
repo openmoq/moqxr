@@ -129,8 +129,9 @@ bool is_uuid_string(std::string_view value) {
 
 // MSF 5.4.1: a '%' in a catalog field value is permitted only as part of a
 // well-formed %name% variable reference, where the name consists of
-// alphanumerics, hyphens, and underscores. URL-typed fields are exempt; see
-// docs/protocol-mapping.md.
+// alphanumerics, hyphens, and underscores. MsfUrlEntry::url is exempt (see
+// docs/protocol-mapping.md); MsfUrlEntry::type is a plain string value (e.g.
+// "widevine") and is NOT exempt merely by living in the same struct as url.
 void validate_no_stray_percent(const std::string& value, std::string_view field,
                                const std::string& where) {
     for (std::size_t index = 0; index < value.size(); ++index) {
@@ -245,6 +246,9 @@ void validate_track(const MsfTrack& track) {
     for (const auto& dependency : track.depends) {
         validate_no_stray_percent(dependency, "depends", where);
     }
+    for (const auto& ref : track.content_protection_ref_ids) {
+        validate_no_stray_percent(ref, "contentProtectionRefIDs", where);
+    }
 }
 
 // Catalog-wide invariants that cannot be checked from a single track.
@@ -267,11 +271,24 @@ void validate_catalog(const MsfCatalog& catalog) {
         return;
     }
 
+    // Section 5.4.1: the percent rule also reaches catalog-root fields, which
+    // validate_track never sees. These use a suffix that names the entry
+    // (refID / initDataList id) rather than a track name, which does not
+    // apply at catalog scope.
+    validate_no_stray_percent(catalog.version, "version", "");
+
     std::set<std::string> init_ids;
     for (const auto& entry : catalog.init_data_list) {
         if (!init_ids.insert(entry.id).second) {
             throw std::runtime_error("MSF catalog has a duplicate initDataList id \"" + entry.id + "\"");
         }
+        const std::string init_where = " (initDataList entry \"" + entry.id + "\")";
+        validate_no_stray_percent(entry.id, "id", init_where);
+        validate_no_stray_percent(entry.type, "type", init_where);
+        // entry.data is Base64-encoded initialization data (see the doc
+        // comment on MsfInitData::data and attach_init_data's parameter
+        // name); Base64's alphabet excludes '%', so a percent check here
+        // would be unreachable code.
     }
 
     std::set<std::string> protection_ids;
@@ -280,6 +297,8 @@ void validate_catalog(const MsfCatalog& catalog) {
             throw std::runtime_error("CMSF catalog has a duplicate contentProtections refID \"" +
                                      cp.ref_id + "\"");
         }
+        const std::string cp_where = " (contentProtections entry \"" + cp.ref_id + "\")";
+        validate_no_stray_percent(cp.ref_id, "refID", cp_where);
         // Section 4.1.1.3 defines exactly two schemes.
         if (cp.scheme != "cenc" && cp.scheme != "cbcs") {
             throw std::runtime_error("CMSF contentProtections scheme must be cenc or cbcs, got \"" +
@@ -298,6 +317,20 @@ void validate_catalog(const MsfCatalog& catalog) {
         if (!is_uuid_string(cp.system_id)) {
             throw std::runtime_error("CMSF systemID \"" + cp.system_id + "\" is not a UUID string");
         }
+        validate_optional_no_stray_percent(cp.robustness, "robustness", cp_where);
+        // MsfUrlEntry::url is exempt from the percent rule (see
+        // validate_no_stray_percent's comment); ::type is not a URL -- it
+        // holds values like "widevine" -- so it does not inherit that
+        // exemption merely by sharing the struct.
+        if (cp.la_url.has_value()) {
+            validate_optional_no_stray_percent(cp.la_url->type, "laURL.type", cp_where);
+        }
+        if (cp.cert_url.has_value()) {
+            validate_optional_no_stray_percent(cp.cert_url->type, "certURL.type", cp_where);
+        }
+        // cp.pssh_base64 is Base64 (see MsfContentProtection::pssh_base64's
+        // doc comment); Base64's alphabet excludes '%', so a percent check
+        // here would be unreachable code.
     }
 
     // Section 5.2.3: track names MUST be unique per namespace.
