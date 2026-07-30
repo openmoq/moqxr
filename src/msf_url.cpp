@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -103,6 +104,180 @@ std::uint16_t parse_port(std::string_view text) {
     return static_cast<std::uint16_t>(value);
 }
 
+std::uint64_t parse_u64(std::string_view text, std::string_view what) {
+    if (text.empty()) {
+        throw std::runtime_error("MSF URL " + std::string(what) + " is empty");
+    }
+    std::uint64_t value = 0;
+    for (const char character : text) {
+        if (character < '0' || character > '9') {
+            throw std::runtime_error("MSF URL " + std::string(what) +
+                                     " is not numeric: " + std::string(text));
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(character - '0');
+        if (value > (UINT64_MAX - digit) / 10) {
+            throw std::runtime_error("MSF URL " + std::string(what) +
+                                     " overflows: " + std::string(text));
+        }
+        value = value * 10 + digit;
+    }
+    return value;
+}
+
+// Splits "start[-end]" on its single dash. Throws on more than one dash.
+std::pair<std::string_view, std::optional<std::string_view>> split_range(std::string_view text,
+                                                                        std::string_view what) {
+    const std::size_t dash = text.find('-');
+    if (dash == std::string_view::npos) {
+        return {text, std::nullopt};
+    }
+    const std::string_view tail = text.substr(dash + 1);
+    if (tail.find('-') != std::string_view::npos) {
+        throw std::runtime_error("MSF URL " + std::string(what) + " range has more than one '-'");
+    }
+    return {text.substr(0, dash), tail};
+}
+
+MsfTimeRange parse_time_range(std::string_view text, std::string_view what) {
+    const auto [start_text, end_text] = split_range(text, what);
+    MsfTimeRange range;
+    range.start_ms = parse_u64(start_text, what);
+    if (end_text.has_value()) {
+        range.end_ms = parse_u64(*end_text, what);
+        if (*range.end_ms < range.start_ms) {
+            throw std::runtime_error("MSF URL " + std::string(what) +
+                                     " range ends before it starts");
+        }
+    }
+    return range;
+}
+
+MsfLocation parse_location(std::string_view text) {
+    const std::size_t dot = text.find('.');
+    MsfLocation location;
+    if (dot == std::string_view::npos) {
+        location.group_id = parse_u64(text, "location group");
+        return location;
+    }
+    location.group_id = parse_u64(text.substr(0, dot), "location group");
+    location.object_id = parse_u64(text.substr(dot + 1), "location object");
+    return location;
+}
+
+// Comparison keys. An omitted object means the start of the group when opening
+// a range and the end of the group when closing one.
+std::pair<std::uint64_t, std::uint64_t> location_start_key(const MsfLocation& location) {
+    return {location.group_id, location.object_id.value_or(0)};
+}
+
+std::pair<std::uint64_t, std::uint64_t> location_end_key(const std::optional<MsfLocation>& location) {
+    if (!location.has_value()) {
+        return {UINT64_MAX, UINT64_MAX};
+    }
+    return {location->group_id, location->object_id.value_or(UINT64_MAX)};
+}
+
+MsfLocationRange parse_location_range(std::string_view text) {
+    const auto [start_text, end_text] = split_range(text, "location-range");
+    MsfLocationRange range;
+    range.start = parse_location(start_text);
+    if (end_text.has_value()) {
+        range.end = parse_location(*end_text);
+        if (location_end_key(range.end) < location_start_key(range.start)) {
+            throw std::runtime_error("MSF URL location-range range ends before it starts");
+        }
+    }
+    return range;
+}
+
+std::vector<MsfTimeRange> union_time_ranges(std::vector<MsfTimeRange> ranges) {
+    if (ranges.size() <= 1) {
+        return ranges;
+    }
+    std::sort(ranges.begin(), ranges.end(), [](const MsfTimeRange& left, const MsfTimeRange& right) {
+        if (left.start_ms != right.start_ms) {
+            return left.start_ms < right.start_ms;
+        }
+        return left.end_ms.value_or(UINT64_MAX) < right.end_ms.value_or(UINT64_MAX);
+    });
+    std::vector<MsfTimeRange> merged;
+    merged.push_back(ranges.front());
+    for (std::size_t index = 1; index < ranges.size(); ++index) {
+        MsfTimeRange& last = merged.back();
+        const std::uint64_t last_end = last.end_ms.value_or(UINT64_MAX);
+        if (ranges[index].start_ms > last_end) {
+            merged.push_back(ranges[index]);
+            continue;
+        }
+        const std::uint64_t combined = std::max(last_end, ranges[index].end_ms.value_or(UINT64_MAX));
+        last.end_ms = combined == UINT64_MAX ? std::optional<std::uint64_t>{}
+                                             : std::optional<std::uint64_t>{combined};
+    }
+    return merged;
+}
+
+std::vector<MsfLocationRange> union_location_ranges(std::vector<MsfLocationRange> ranges) {
+    if (ranges.size() <= 1) {
+        return ranges;
+    }
+    std::sort(ranges.begin(), ranges.end(),
+              [](const MsfLocationRange& left, const MsfLocationRange& right) {
+                  const auto left_start = location_start_key(left.start);
+                  const auto right_start = location_start_key(right.start);
+                  if (left_start != right_start) {
+                      return left_start < right_start;
+                  }
+                  return location_end_key(left.end) < location_end_key(right.end);
+              });
+    std::vector<MsfLocationRange> merged;
+    merged.push_back(ranges.front());
+    for (std::size_t index = 1; index < ranges.size(); ++index) {
+        MsfLocationRange& last = merged.back();
+        const auto last_end = location_end_key(last.end);
+        if (location_start_key(ranges[index].start) > last_end) {
+            merged.push_back(ranges[index]);
+            continue;
+        }
+        const auto candidate_end = location_end_key(ranges[index].end);
+        if (candidate_end <= last_end) {
+            continue;
+        }
+        if (candidate_end.first == UINT64_MAX && candidate_end.second == UINT64_MAX) {
+            last.end.reset();
+        } else {
+            last.end = ranges[index].end;
+        }
+    }
+    return merged;
+}
+
+std::string format_location(const MsfLocation& location) {
+    std::string out = std::to_string(location.group_id);
+    if (location.object_id.has_value()) {
+        out.push_back('.');
+        out += std::to_string(*location.object_id);
+    }
+    return out;
+}
+
+std::string format_time_range(const MsfTimeRange& range) {
+    std::string out = std::to_string(range.start_ms);
+    if (range.end_ms.has_value()) {
+        out.push_back('-');
+        out += std::to_string(*range.end_ms);
+    }
+    return out;
+}
+
+std::string format_location_range(const MsfLocationRange& range) {
+    std::string out = format_location(range.start);
+    if (range.end.has_value()) {
+        out.push_back('-');
+        out += format_location(*range.end);
+    }
+    return out;
+}
+
 // Splits the fragment parameter list on '&' and each parameter on its first
 // '='. Reserved names are claimed by later tasks; everything else lands in
 // extra_params.
@@ -144,6 +319,12 @@ void parse_fragment_parameters(std::string_view text, MsfUrl& url) {
                 throw std::runtime_error("MSF URL repeats the reserved 'c4m' parameter");
             }
             url.c4m_token = value;
+        } else if (name == "wallclock-range") {
+            url.wallclock_ranges.push_back(parse_time_range(value, "wallclock-range"));
+        } else if (name == "mediatime-range") {
+            url.mediatime_ranges.push_back(parse_time_range(value, "mediatime-range"));
+        } else if (name == "location-range") {
+            url.location_ranges.push_back(parse_location_range(value));
         } else {
             url.extra_params.emplace_back(name, value);
         }
@@ -284,6 +465,9 @@ MsfUrl parse_msf_url(std::string_view text) {
     if (ampersand != std::string_view::npos) {
         parse_fragment_parameters(value.substr(ampersand + 1), url);
     }
+    url.wallclock_ranges = union_time_ranges(std::move(url.wallclock_ranges));
+    url.mediatime_ranges = union_time_ranges(std::move(url.mediatime_ranges));
+    url.location_ranges = union_location_ranges(std::move(url.location_ranges));
     return url;
 }
 
@@ -310,6 +494,18 @@ std::string build_msf_url(const MsfUrl& url) {
         out += "&connection=q";
     } else if (url.connection == ConnectionRequirement::kWebTransport) {
         out += "&connection=wt";
+    }
+    for (const auto& range : url.wallclock_ranges) {
+        out += "&wallclock-range=";
+        out += format_time_range(range);
+    }
+    for (const auto& range : url.mediatime_ranges) {
+        out += "&mediatime-range=";
+        out += format_time_range(range);
+    }
+    for (const auto& range : url.location_ranges) {
+        out += "&location-range=";
+        out += format_location_range(range);
     }
     for (const auto& [name, value] : url.extra_params) {
         out.push_back('&');

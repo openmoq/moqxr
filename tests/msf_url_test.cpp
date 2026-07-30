@@ -252,5 +252,114 @@ int main() {
     ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&c4m=a&c4m=b"); }, "c4m",
                         "expected a repeated c4m parameter to be refused");
 
+    // MSF 11.1.1 time range examples.
+    {
+        const auto closed = parse_msf_url("moqt://h#msf:ns--t&wallclock-range=1761759637565-1761759836189");
+        ok &= expect(closed.wallclock_ranges.size() == 1 &&
+                     closed.wallclock_ranges[0].start_ms == 1761759637565ULL &&
+                     closed.wallclock_ranges[0].end_ms.has_value() &&
+                     *closed.wallclock_ranges[0].end_ms == 1761759836189ULL,
+                     "expected the draft's closed wallclock range");
+
+        const auto open = parse_msf_url("moqt://h#msf:ns--t&wallclock-range=1761751753894");
+        ok &= expect(open.wallclock_ranges.size() == 1 &&
+                     open.wallclock_ranges[0].start_ms == 1761751753894ULL &&
+                     !open.wallclock_ranges[0].end_ms.has_value(),
+                     "expected the draft's open wallclock range");
+
+        const auto media = parse_msf_url("moqt://h#msf:ns--t&mediatime-range=0-13421");
+        ok &= expect(media.mediatime_ranges.size() == 1 && media.mediatime_ranges[0].start_ms == 0 &&
+                     media.mediatime_ranges[0].end_ms.value_or(0) == 13421ULL,
+                     "expected the draft's closed mediatime range");
+    }
+
+    // MSF 11.1.1 location range examples. 16.24 and 16-24 mean different things
+    // and must not decode alike.
+    {
+        const auto dotted = parse_msf_url("moqt://h#msf:ns--t&location-range=16.24");
+        ok &= expect(dotted.location_ranges.size() == 1 &&
+                     dotted.location_ranges[0].start.group_id == 16 &&
+                     dotted.location_ranges[0].start.object_id.value_or(0) == 24 &&
+                     !dotted.location_ranges[0].end.has_value(),
+                     "expected 16.24 to be an open range from group 16 object 24");
+
+        const auto dashed = parse_msf_url("moqt://h#msf:ns--t&location-range=16-24");
+        ok &= expect(dashed.location_ranges.size() == 1 &&
+                     dashed.location_ranges[0].start.group_id == 16 &&
+                     !dashed.location_ranges[0].start.object_id.has_value() &&
+                     dashed.location_ranges[0].end.has_value() &&
+                     dashed.location_ranges[0].end->group_id == 24 &&
+                     !dashed.location_ranges[0].end->object_id.has_value(),
+                     "expected 16-24 to run from group 16 through all of group 24");
+
+        const auto both = parse_msf_url("moqt://h#msf:ns--t&location-range=34.0-2145.16");
+        ok &= expect(both.location_ranges.size() == 1 &&
+                     both.location_ranges[0].start.group_id == 34 &&
+                     both.location_ranges[0].start.object_id.value_or(99) == 0 &&
+                     both.location_ranges[0].end->group_id == 2145 &&
+                     both.location_ranges[0].end->object_id.value_or(0) == 16,
+                     "expected the draft's fully specified location range");
+    }
+
+    // Union: overlapping ranges merge, disjoint ranges do not.
+    {
+        const auto merged = parse_msf_url(
+            "moqt://h#msf:ns--t&mediatime-range=0-100&mediatime-range=50-200");
+        ok &= expect(merged.mediatime_ranges.size() == 1 && merged.mediatime_ranges[0].start_ms == 0 &&
+                     merged.mediatime_ranges[0].end_ms.value_or(0) == 200,
+                     "expected overlapping ranges to merge into their union");
+
+        const auto disjoint = parse_msf_url(
+            "moqt://h#msf:ns--t&mediatime-range=0-100&mediatime-range=500-600");
+        ok &= expect(disjoint.mediatime_ranges.size() == 2 &&
+                     disjoint.mediatime_ranges[0].start_ms == 0 &&
+                     disjoint.mediatime_ranges[1].start_ms == 500,
+                     "expected disjoint ranges to stay separate, sorted by start");
+
+        const auto with_open = parse_msf_url(
+            "moqt://h#msf:ns--t&mediatime-range=500&mediatime-range=0-600");
+        ok &= expect(with_open.mediatime_ranges.size() == 1 &&
+                     with_open.mediatime_ranges[0].start_ms == 0 &&
+                     !with_open.mediatime_ranges[0].end_ms.has_value(),
+                     "expected an open range to absorb an overlapping closed one");
+    }
+
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&mediatime-range=200-100"); }, "before",
+                        "expected a range whose end precedes its start to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&mediatime-range=a-b"); }, "numeric",
+                        "expected a non-numeric range to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&mediatime-range=1-2-3"); }, "range",
+                        "expected a range with two dashes to be refused");
+
+    // MSF 11.1.3 conformance sweep. These are the draft's own URLs.
+    {
+        const auto quic_catalog = parse_msf_url(
+            "moqt://example.com/relay-app/relayID#msf:customerID-broadcastID--catalog&connection=q");
+        ok &= expect(quic_catalog.track.namespace_tuple ==
+                         std::vector<std::string>{"customerID", "broadcastID"} &&
+                     quic_catalog.track.track_name == "catalog" &&
+                     quic_catalog.connection == ConnectionRequirement::kRawQuic,
+                     "expected the draft's raw-QUIC catalog URL");
+
+        const auto wt_video = parse_msf_url(
+            "moqt://example.com/relay-app/relayID#msf:customerID-broadcastID--video&connection=wt");
+        ok &= expect(wt_video.track.track_name == "video" &&
+                     wt_video.connection == ConnectionRequirement::kWebTransport,
+                     "expected the draft's WebTransport video URL");
+
+        const auto subclip = parse_msf_url(
+            "moqt://example.com/relay-app/relayID#msf:customerID-broadcastID--catalog&location-range=34-64");
+        ok &= expect(subclip.location_ranges.size() == 1 &&
+                     subclip.location_ranges[0].start.group_id == 34 &&
+                     subclip.location_ranges[0].end->group_id == 64,
+                     "expected the draft's subclip URL");
+
+        const auto with_query = parse_msf_url(
+            "moqt://example.com/relay-app/relayID?token=HTRCII74GHFT#msf:customerID-broadcastID--catalog&c4m=gqhkYWxn");
+        ok &= expect(with_query.query == "token=HTRCII74GHFT" &&
+                     with_query.c4m_token.value_or("") == "gqhkYWxn",
+                     "expected a server query and a client c4m token to stay separate");
+    }
+
     return ok ? 0 : 1;
 }

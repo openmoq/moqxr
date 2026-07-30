@@ -33,6 +33,25 @@ std::string encode_namespace_name(const MsfTrackIdentifier& id);
 // unescaped character outside [A-Za-z0-9_.-].
 MsfTrackIdentifier decode_namespace_name(std::string_view text);
 
+// An inclusive millisecond range. An absent end means an open range.
+struct MsfTimeRange {
+    std::uint64_t start_ms = 0;
+    std::optional<std::uint64_t> end_ms;
+};
+
+// A MOQT Location. An absent object_id means the start of the group when the
+// location opens a range, and the end of the group when it closes one.
+struct MsfLocation {
+    std::uint64_t group_id = 0;
+    std::optional<std::uint64_t> object_id;
+};
+
+// An inclusive Location range. An absent end means an open range.
+struct MsfLocationRange {
+    MsfLocation start;
+    std::optional<MsfLocation> end;
+};
+
 // A parsed MSF URL. `query` is captured verbatim and never interpreted: MSF
 // 11.1 reserves it for the server and 5.4.2 forbids its use for variable
 // substitution.
@@ -47,6 +66,15 @@ struct MsfUrl {
 
     ConnectionRequirement connection = ConnectionRequirement::kAny;
     std::optional<std::string> c4m_token;
+
+    // Repeated range parameters are resolved to their union, per MSF 11.1.1.
+    // Ranges merge if and only if they overlap; adjacent-but-disjoint ranges
+    // stay separate. The represented point set is identical either way, and
+    // adjacency is undefined across location group boundaries where an omitted
+    // end object means "through the end of that group".
+    std::vector<MsfTimeRange> wallclock_ranges;
+    std::vector<MsfTimeRange> mediatime_ranges;
+    std::vector<MsfLocationRange> location_ranges;
 
     // Fragment parameters that are not reserved by MSF 11.1.1, preserved in
     // encounter order so a URL survives a parse/build round-trip.
