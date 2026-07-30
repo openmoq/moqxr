@@ -353,7 +353,7 @@ In `include/openmoq/publisher/live_dash_ingest.h`, extend `RegisteredTrack`:
     };
 ```
 
-Include `openmoq/publisher/mp4_box.h` in that header if `CencSystem` is not already visible.
+`CencSystem` is defined in `openmoq/publisher/mp4_box.h` at line 50. `live_dash_ingest.h` does not include it directly, but reaches it transitively through `cmaf_segmenter.h` (line 16), which includes it at its own line 6 — that is also how the existing `TrackDescription description` field resolves. Add a direct `#include "openmoq/publisher/mp4_box.h"` anyway, so the header states its own dependency rather than relying on a transitive one.
 
 In `src/live_dash_ingest.cpp`, inside `process_box_locked`, after `path_state.tracks = extract_tracks(...)` at line 386 and before the per-track loop, parse once per path:
 
@@ -374,7 +374,7 @@ Then in the existing `tracks_.push_back(RegisteredTrack{...})` call, add the fie
                                                   .pssh_systems = path_pssh_systems});
 ```
 
-Add `#include "openmoq/publisher/cmsf_packager.h"` and `<algorithm>` if not already present.
+No new includes are needed in `src/live_dash_ingest.cpp`: it already includes `cmsf_packager.h` (line 3, which will declare `collect_pssh_systems` after Task 1), `mp4_box.h` (line 4), `msf_catalog.h` (line 5, for `attach_content_protection`), and `<algorithm>` (line 7, for `std::any_of`).
 
 - [ ] **Step 4: Attach in `build_catalog_locked`**
 
