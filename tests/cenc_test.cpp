@@ -80,7 +80,7 @@ std::vector<std::uint8_t> make_encv_sample_entry(const std::string& original_for
     sinf_payload.insert(sinf_payload.end(), schm.begin(), schm.end());
     sinf_payload.insert(sinf_payload.end(), schi.begin(), schi.end());
 
-    std::vector<std::uint8_t> body(70, 0);
+    std::vector<std::uint8_t> body(78, 0);
     const auto sinf = make_box("sinf", sinf_payload);
     body.insert(body.end(), sinf.begin(), sinf.end());
     return make_box("encv", body);
@@ -188,7 +188,7 @@ int main() {
     ok &= expect(cbcs.has_value() && cbcs->scheme == "cbcs", "expected cbcs scheme parsed");
 
     // An unencrypted sample entry has no sinf and must parse as unprotected.
-    std::vector<std::uint8_t> plain_body(70, 0);
+    std::vector<std::uint8_t> plain_body(78, 0);
     const auto plain = make_box("avc1", plain_body);
     const Mp4Box plain_box{
         .type = "avc1",

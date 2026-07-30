@@ -23,6 +23,20 @@ struct Mp4Box {
     std::vector<Mp4Box> children;
 };
 
+// Offsets from the start of a sample entry box (including its 8-byte header)
+// to its first child box, per ISO/IEC 14496-12.
+//
+// A sample entry payload begins with the 8-byte SampleEntry base
+// (reserved[6] + data_reference_index). VisualSampleEntry adds 70 bytes on top
+// of that base, for a 78-byte payload; AudioSampleEntry adds 20, for 28. The
+// visual figure is why width and height are read at payload offsets 24 and 26.
+//
+// These are named once because the visual value was previously written as
+// `8 + 70` at five separate call sites -- omitting the SampleEntry base -- so
+// every child lookup landed 8 bytes early, inside compressorname's padding.
+inline constexpr std::size_t kVisualSampleEntryChildOffset = 8 + 78;
+inline constexpr std::size_t kAudioSampleEntryChildOffset = 8 + 28;
+
 // Common Encryption parameters for one track, from sinf/schm/schi/tenc.
 struct CencTrackProtection {
     std::string original_format;   // frma, e.g. "avc1" -- the pre-encryption codec

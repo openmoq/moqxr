@@ -118,7 +118,7 @@ std::vector<std::uint8_t> make_init_segment(std::uint32_t track_id,
                                       0x00, 0x04, 0x11, 0x40, 0x15, 0x00, 0x00, 0x00,
                                       0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x10, 0x10})}));
     } else {
-        auto visual_header = std::vector<std::uint8_t>(70, 0);
+        auto visual_header = std::vector<std::uint8_t>(78, 0);
         visual_header[24] = 0x01;
         visual_header[25] = 0x40;
         visual_header[26] = 0x00;

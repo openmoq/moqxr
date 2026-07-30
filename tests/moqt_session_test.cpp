@@ -335,7 +335,7 @@ std::vector<std::uint8_t> make_live_init_mp4() {
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;

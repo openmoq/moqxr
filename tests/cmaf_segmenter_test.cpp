@@ -295,7 +295,7 @@ std::vector<std::uint8_t> make_fragmented_test_mp4() {
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -364,7 +364,7 @@ std::vector<std::uint8_t> make_encrypted_fragmented_test_mp4(bool include_pssh =
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -449,7 +449,7 @@ std::vector<std::uint8_t> make_oversized_sample_entry_test_mp4() {
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -562,7 +562,7 @@ std::vector<std::uint8_t> make_track_metadata_test_mp4(bool include_btrt,
                                        : make_full_box("mdhd", mdhd_payload);
 
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -616,7 +616,7 @@ std::vector<std::uint8_t> make_fragmented_non_sync_ept_test_mp4() {
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 0, 0, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -647,7 +647,7 @@ std::vector<std::uint8_t> make_progressive_test_mp4() {
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 7, 208, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -688,7 +688,7 @@ std::vector<std::uint8_t> make_encrypted_progressive_test_mp4() {
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 7, 208, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -735,7 +735,7 @@ std::vector<std::uint8_t> make_progressive_gops_mp4(std::uint32_t sample_count,
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 7, 208, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
     visual_header[25] = 0x40;
     visual_header[26] = 0x00;
@@ -816,7 +816,7 @@ std::vector<std::uint8_t> make_multitrack_init_mp4() {
     const auto video_tkhd = make_full_box("tkhd",
                                           {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
     const auto video_hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto video_header = std::vector<std::uint8_t>(70, 0);
+    auto video_header = std::vector<std::uint8_t>(78, 0);
     video_header[24] = 0x01;
     video_header[25] = 0x40;
     video_header[26] = 0x00;
@@ -864,7 +864,7 @@ std::vector<std::uint8_t> make_hevc_init_mp4(std::uint8_t general_profile_byte,
     const auto tkhd = make_full_box("tkhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto video_header = std::vector<std::uint8_t>(70, 0);
+    auto video_header = std::vector<std::uint8_t>(78, 0);
     video_header[24] = 0x01;
     video_header[25] = 0x40;
     video_header[26] = 0x00;
@@ -911,7 +911,7 @@ std::vector<std::uint8_t> make_progressive_hevc_mp4(const std::vector<std::uint8
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 3, 232, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto video_header = std::vector<std::uint8_t>(70, 0);
+    auto video_header = std::vector<std::uint8_t>(78, 0);
     video_header[24] = 0x01;
     video_header[25] = 0x40;
     video_header[26] = 0x00;
@@ -952,7 +952,7 @@ std::vector<std::uint8_t> make_fragmented_hevc_mp4(const std::vector<std::uint8_
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 3, 232, 0, 0, 0, 0});
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    auto video_header = std::vector<std::uint8_t>(70, 0);
+    auto video_header = std::vector<std::uint8_t>(78, 0);
     video_header[24] = 0x01;
     video_header[25] = 0x40;
     video_header[26] = 0x00;
@@ -2291,6 +2291,49 @@ int main() {
             ok &= expect(fragment.track_name == "vide_1",
                         "case11: expected a multi-traf moof with no saio anywhere but the first traf "
                         "to still produce a fragment, not be refused");
+        }
+    }
+
+    // ISO/IEC 14496-12: a VisualSampleEntry payload is the 8-byte SampleEntry
+    // base plus 70 bytes of visual fields = 78. Child boxes start there. The
+    // child offset was once written as 8 + 70, omitting the base, which landed
+    // every lookup 8 bytes early inside compressorname's zero padding. Paired
+    // with a sliding byte scan that error was invisible; against a
+    // length-walking finder it makes avcC and btrt unfindable, degrading the
+    // catalog codec to a bare "avc1" that MSE rejects and dropping bitrate to
+    // a codec-class default. Both values are asserted exactly, on a fixture
+    // whose layout matches what real muxers emit.
+    {
+        auto visual_header = std::vector<std::uint8_t>(78, 0);
+        visual_header[24] = 0x02;   // width  = 0x0280 = 640
+        visual_header[25] = 0x80;
+        visual_header[26] = 0x01;   // height = 0x01e0 = 480
+        visual_header[27] = 0xe0;
+
+        const auto sample_entry = make_box("avc1", concat({visual_header,
+                                                           make_box("avcC", {1, 100, 0, 31, 0xff}),
+                                                           make_btrt(0, 3000000, 3000000)}));
+        const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+        const auto mdhd = make_full_box("mdhd",
+                                        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+        const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+        const auto tkhd = make_full_box("tkhd", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+        const auto moov = make_box("moov",
+                                   make_box("trak", concat({tkhd,
+                                                            make_box("mdia", concat({mdhd, hdlr,
+                                                                                     make_box("minf", make_box("stbl", stsd))}))})));
+        const auto conformant_bytes = concat({moov});
+        const auto conformant_tracks = extract_tracks(parse_mp4_boxes(conformant_bytes), conformant_bytes);
+
+        ok &= expect(conformant_tracks.size() == 1, "expected one track from the conformant visual fixture");
+        if (conformant_tracks.size() == 1) {
+            const auto& track = conformant_tracks.front();
+            ok &= expect(track.codec == "avc1.64001F",
+                         "expected the full RFC 6381 codec string from avcC in a conformant 78-byte visual entry");
+            ok &= expect(track.max_bitrate == 3000000,
+                         "expected btrt maxBitrate from a conformant 78-byte visual entry");
+            ok &= expect(track.width == 640 && track.height == 480,
+                         "expected width and height from a conformant 78-byte visual entry");
         }
     }
 

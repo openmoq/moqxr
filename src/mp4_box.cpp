@@ -429,7 +429,8 @@ bool decode_descriptor_length(std::span<const std::uint8_t> bytes,
 }
 
 std::string avc_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const auto avcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, 8 + 70, "avcC");
+    const auto avcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                          kVisualSampleEntryChildOffset, "avcC");
     if (!avcc.has_value() || avcc->offset + 12 > bytes.size()) {
         return "avc1";
     }
@@ -442,7 +443,8 @@ std::string avc_codec_string(const Mp4Box& sample_entry, std::span<const std::ui
 }
 
 std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const auto hvcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, 8 + 70, "hvcC");
+    const auto hvcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                          kVisualSampleEntryChildOffset, "hvcC");
     if (!hvcc.has_value() || hvcc->offset + 21 > bytes.size()) {
         return sample_entry.type;
     }
@@ -478,7 +480,8 @@ std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::u
 }
 
 std::string mpeg4_audio_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const auto esds = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, 8 + 28, "esds");
+    const auto esds = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                          kAudioSampleEntryChildOffset, "esds");
     if (!esds.has_value() || esds->offset + 16 > bytes.size()) {
         return "mp4a.40.2";
     }
@@ -837,10 +840,10 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         }
 
         // MSF 5.2.22 requires bitrate; ISO 14496-12 puts it in an optional
-        // btrt box inside the sample entry. Same header offsets
-        // build_track_codec_init_data uses: 8 + 70 past a VisualSampleEntry,
-        // 8 + 28 past an AudioSampleEntry.
-        const std::size_t sample_entry_child_offset = handler_type == "vide" ? 8 + 70 : 8 + 28;
+        // btrt box inside the sample entry, past the same sample entry payload
+        // build_track_codec_init_data skips.
+        const std::size_t sample_entry_child_offset =
+            handler_type == "vide" ? kVisualSampleEntryChildOffset : kAudioSampleEntryChildOffset;
         const BitrateInfo bitrate = bitrate_from_sample_entry(sample_entry, bytes, sample_entry_child_offset);
 
         std::string language;

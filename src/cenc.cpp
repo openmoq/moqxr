@@ -106,9 +106,9 @@ std::optional<CencTrackProtection> parse_track_protection(std::span<const std::u
     if (sample_entry.type != "encv" && sample_entry.type != "enca") {
         return std::nullopt;
     }
-    // Children begin past the sample entry header: 8 + 70 for visual,
-    // 8 + 28 for audio. Same offsets build_track_codec_init_data uses.
-    const std::size_t child_offset = sample_entry.type == "encv" ? 8 + 70 : 8 + 28;
+    // sinf sits among the sample entry's children, past its payload.
+    const std::size_t child_offset =
+        sample_entry.type == "encv" ? kVisualSampleEntryChildOffset : kAudioSampleEntryChildOffset;
 
     const auto sinf = find_child_box_span(bytes, sample_entry.span.offset,
                                           sample_entry.span.size, child_offset, "sinf");

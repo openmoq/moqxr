@@ -348,10 +348,10 @@ std::vector<std::uint8_t> build_track_codec_init_data(std::span<const std::uint8
         };
 
         if (track.handler_type == "vide") {
-            return extract_codec_init_data(sample_entry, init_bytes, 8 + 70);
+            return extract_codec_init_data(sample_entry, init_bytes, kVisualSampleEntryChildOffset);
         }
         if (track.handler_type == "soun") {
-            return extract_codec_init_data(sample_entry, init_bytes, 8 + 28);
+            return extract_codec_init_data(sample_entry, init_bytes, kAudioSampleEntryChildOffset);
         }
 
         throw std::runtime_error("catalog generation does not support codec initData for handler " + track.handler_type);
