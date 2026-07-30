@@ -324,11 +324,50 @@ int main() {
                      "expected an open range to absorb an overlapping closed one");
     }
 
+    // Location range union: overlapping ranges merge, exercising both
+    // location_start_key's object-omitted-means-0 and location_end_key's
+    // object-omitted-means-max defaults.
+    {
+        const auto merged = parse_msf_url(
+            "moqt://h#msf:ns--t&location-range=0-5&location-range=5.3-9");
+        ok &= expect(merged.location_ranges.size() == 1 &&
+                     merged.location_ranges[0].start.group_id == 0 &&
+                     !merged.location_ranges[0].start.object_id.has_value() &&
+                     merged.location_ranges[0].end.has_value() &&
+                     merged.location_ranges[0].end->group_id == 9 &&
+                     !merged.location_ranges[0].end->object_id.has_value(),
+                     "expected overlapping location ranges to merge from group 0 to group 9");
+
+        const auto with_open = parse_msf_url(
+            "moqt://h#msf:ns--t&location-range=1&location-range=0-2");
+        ok &= expect(with_open.location_ranges.size() == 1 &&
+                     with_open.location_ranges[0].start.group_id == 0 &&
+                     !with_open.location_ranges[0].start.object_id.has_value() &&
+                     !with_open.location_ranges[0].end.has_value(),
+                     "expected an open location range to absorb an overlapping closed one");
+    }
+
+    // Pins the location-key asymmetry: an omitted end object means "through
+    // the end of that group" (location_end_key's value_or(UINT64_MAX)), not
+    // "the start of that group" (location_start_key's value_or(0)). Under the
+    // wrong default this range would be falsely rejected as ending before it
+    // starts.
+    {
+        const auto range = parse_msf_url("moqt://h#msf:ns--t&location-range=16.24-16");
+        ok &= expect(range.location_ranges.size() == 1 &&
+                     range.location_ranges[0].start.group_id == 16 &&
+                     range.location_ranges[0].start.object_id.value_or(0) == 24 &&
+                     range.location_ranges[0].end.has_value() &&
+                     range.location_ranges[0].end->group_id == 16 &&
+                     !range.location_ranges[0].end->object_id.has_value(),
+                     "expected 16.24-16 to run from group 16 object 24 through all of group 16");
+    }
+
     ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&mediatime-range=200-100"); }, "before",
                         "expected a range whose end precedes its start to be refused");
     ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&mediatime-range=a-b"); }, "numeric",
                         "expected a non-numeric range to be refused");
-    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&mediatime-range=1-2-3"); }, "range",
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&mediatime-range=1-2-3"); }, "more than one",
                         "expected a range with two dashes to be refused");
 
     // MSF 11.1.3 conformance sweep. These are the draft's own URLs.
@@ -351,13 +390,17 @@ int main() {
             "moqt://example.com/relay-app/relayID#msf:customerID-broadcastID--catalog&location-range=34-64");
         ok &= expect(subclip.location_ranges.size() == 1 &&
                      subclip.location_ranges[0].start.group_id == 34 &&
-                     subclip.location_ranges[0].end->group_id == 64,
+                     !subclip.location_ranges[0].start.object_id.has_value() &&
+                     subclip.location_ranges[0].end->group_id == 64 &&
+                     !subclip.location_ranges[0].end->object_id.has_value(),
                      "expected the draft's subclip URL");
 
         const auto with_query = parse_msf_url(
-            "moqt://example.com/relay-app/relayID?token=HTRCII74GHFT#msf:customerID-broadcastID--catalog&c4m=gqhkYWxn");
-        ok &= expect(with_query.query == "token=HTRCII74GHFT" &&
-                     with_query.c4m_token.value_or("") == "gqhkYWxn",
+            "moqt://example.com/relay-app/relayID?token=HTRCII74GHFT@JHBCVSW56HKKneH2Dbyq6NHBI2#msf:customerID-broadcastID--catalog&c4m="
+            "gqhkYWxnIGVzaGFyqGR0eXBNhdZ9hdWQAY3VybGZlbWlzcwZleWV2aW5uZWlhdGVwQWNyZW5lYnJmcmVqMTIzNDU2NzgwMHZpc3VlZF9hdD0xNzMwNDM");
+        ok &= expect(with_query.query == "token=HTRCII74GHFT@JHBCVSW56HKKneH2Dbyq6NHBI2" &&
+                     with_query.c4m_token.value_or("") ==
+                         "gqhkYWxnIGVzaGFyqGR0eXBNhdZ9hdWQAY3VybGZlbWlzcwZleWV2aW5uZWlhdGVwQWNyZW5lYnJmcmVqMTIzNDU2NzgwMHZpc3VlZF9hdD0xNzMwNDM",
                      "expected a server query and a client c4m token to stay separate");
     }
 

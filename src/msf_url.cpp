@@ -170,6 +170,20 @@ std::pair<std::uint64_t, std::uint64_t> location_start_key(const MsfLocation& lo
     return {location.group_id, location.object_id.value_or(0)};
 }
 
+// UINT64_MAX doubles as both a real object id and the "no end" / open-range
+// sentinel below, so a parsed end object of exactly 18446744073709551615 is
+// indistinguishable from an open range once a merge touches it. That value is
+// ~5.8e8 years of milliseconds and exceeds MOQT's 2^62-1 varint group/object
+// ceiling, so the collision is accepted rather than worked around; do not
+// "fix" it by picking a different sentinel.
+//
+// This takes `const std::optional<MsfLocation>&`, not `MsfLocation`. Passing a
+// bare MsfLocation (e.g. a range's `start`) converts implicitly to
+// std::optional and compiles without warning, but silently applies end
+// semantics (object defaults to UINT64_MAX) where start semantics (object
+// defaults to 0, via location_start_key) were wanted. Always pair
+// location_start_key with a range's `start` and location_end_key with a
+// range's `end`.
 std::pair<std::uint64_t, std::uint64_t> location_end_key(const std::optional<MsfLocation>& location) {
     if (!location.has_value()) {
         return {UINT64_MAX, UINT64_MAX};
