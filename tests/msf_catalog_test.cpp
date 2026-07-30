@@ -1310,6 +1310,30 @@ int main() {
             catalog.tracks.push_back(make_base_track());
             ok &= throws_runtime_error(catalog, "expected a malformed version value to be refused");
         }
+
+        // A delta "remove" op writes only name/namespace (section 5.1.6), via
+        // write_track's own json_escape rather than validate_track, and
+        // validate_catalog returns early for deltas. Nothing enforced the
+        // 5.4.1 percent rule on those two fields until now: an identical
+        // track on an "add" op is refused (see the contentProtectionRefIDs
+        // delta-add case above), so "remove" must be too.
+        {
+            MsfCatalog catalog;
+            MsfTrack track;
+            track.name = "bad%name";
+            catalog.delta_update.push_back(MsfDeltaOp{.op = "remove", .tracks = {track}});
+            ok &= throws_runtime_error(
+                catalog, "expected a delta remove with a malformed '%' in name to be refused");
+        }
+        {
+            MsfCatalog catalog;
+            MsfTrack track;
+            track.name = "video";
+            track.name_space = "bad%ns";
+            catalog.delta_update.push_back(MsfDeltaOp{.op = "remove", .tracks = {track}});
+            ok &= throws_runtime_error(
+                catalog, "expected a delta remove with a malformed '%' in namespace to be refused");
+        }
     }
 
     return ok ? 0 : 1;

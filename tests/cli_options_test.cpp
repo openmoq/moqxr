@@ -1,4 +1,5 @@
 #include "openmoq/publisher/cli_options.h"
+#include "openmoq/publisher/msf_url.h"
 
 #include <chrono>
 #include <filesystem>
@@ -11,6 +12,8 @@
 namespace {
 
 using openmoq::publisher::CliOptions;
+using openmoq::publisher::ConnectionRequirement;
+using openmoq::publisher::build_track_msf_url;
 using openmoq::publisher::parse_cli_options;
 
 bool expect(bool condition, const std::string& message) {
@@ -673,6 +676,62 @@ int main() {
         ok &= expect(!options.transport_explicit,
                      "expected a --url with no connection requirement to leave transport_explicit false");
     }
+
+    // Item 1: --url's query must not be silently discarded. The fragment is
+    // explicitly not sent (draft line ~3320), but the query carries
+    // connection-init parameters, so it is folded into endpoint.path exactly
+    // as --endpoint's own parser already does (parse_endpoint never splits on
+    // '?' at all, so a query there just rides along inside path). Assert both
+    // that the query survives into endpoint.path and that it reappears when
+    // printed the same way main.cpp's --print-msf-urls does.
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--url",
+             "moqt://h.example:4433/moq?token=abc&x=1#msf:a-b--catalog"});
+        ok &= expect(options.endpoint.has_value(), "expected --url to produce an endpoint");
+        ok &= expect(options.endpoint->path == "/moq?token=abc&x=1",
+                     "expected the query folded into endpoint.path, matching --endpoint");
+        ok &= expect(options.endpoint->path_explicit,
+                     "expected a query-bearing path to be marked explicit");
+
+        const std::string printed = build_track_msf_url(
+            options.endpoint->host, options.endpoint->port, options.endpoint->path,
+            options.endpoint->path_explicit, options.track_namespace, "catalog",
+            ConnectionRequirement::kAny);
+        ok &= expect(printed == "moqt://h.example:4433/moq?token=abc&x=1#msf:a-b--catalog",
+                     "expected --print-msf-urls output to reproduce the query");
+    }
+
+    // A query with no path at all must still fold in, with the endpoint
+    // defaulting to path "/" the same way --endpoint would if a path were
+    // given explicitly.
+    {
+        const auto options =
+            parse({"prog", "--input", "sample.mp4", "--url", "moqt://h.example?a=1#msf:ns--catalog"});
+        ok &= expect(options.endpoint.has_value(), "expected --url to produce an endpoint");
+        ok &= expect(options.endpoint->path == "/?a=1",
+                     "expected the query folded onto the default '/' path");
+        ok &= expect(options.endpoint->path_explicit,
+                     "expected a query with no path to still mark the path explicit");
+    }
+
+    // Item 2: passing both --url and --namespace is a self-contradiction (the
+    // printed/derived namespace would silently disagree with one of the two
+    // inputs), so it must be refused in both orders, matching --endpoint's
+    // existing treatment.
+    ok &= parse_throws(
+        {"prog", "--input", "sample.mp4", "--url", "moqt://h/p#msf:ns--t", "--namespace", "zzz"},
+        "--namespace", "expected --url followed by --namespace to be refused");
+    ok &= parse_throws(
+        {"prog", "--input", "sample.mp4", "--namespace", "zzz", "--url", "moqt://h/p#msf:ns--t"},
+        "--namespace", "expected --namespace followed by --url to be refused");
+
+    // Item 3: a repeated --url must report its own message rather than
+    // blaming --endpoint, which the user never passed.
+    ok &= parse_throws(
+        {"prog", "--input", "sample.mp4", "--url", "moqt://h/p#msf:ns--t", "--url",
+         "moqt://h2/p2#msf:ns2--t2"},
+        "already given", "expected a repeated --url to report its own dedicated message");
 
     return ok ? 0 : 1;
 }

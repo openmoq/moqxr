@@ -489,6 +489,21 @@ std::string build_msf_url(const MsfUrl& url) {
     if (url.host.empty()) {
         throw std::runtime_error("cannot build an MSF URL without a host");
     }
+    // parse_msf_url finds the FIRST '#' and treats everything after it as the
+    // fragment, so a host or path containing a literal '#' would produce a
+    // URL that either misparses or truncates the track identifier. Refuse
+    // rather than percent-encode: after query folding (see --url in
+    // cli_options.cpp) the path may legitimately contain '?', and mixing
+    // encoding rules for '#' but not '?' in the same component gets subtle
+    // fast.
+    if (url.host.find('#') != std::string::npos) {
+        throw std::runtime_error("cannot build an MSF URL: host contains '#', which would be "
+                                 "misparsed as the fragment delimiter");
+    }
+    if (url.path_explicit && url.path.find('#') != std::string::npos) {
+        throw std::runtime_error("cannot build an MSF URL: path contains '#', which would be "
+                                 "misparsed as the fragment delimiter");
+    }
     std::string out = "moqt://";
     out += url.host;
     if (url.port != 443) {
@@ -558,6 +573,16 @@ std::string build_track_msf_url(const std::string& host, std::uint16_t port, con
             break;
         }
         start = slash + 1;
+    }
+    if (url.track.namespace_tuple.empty()) {
+        // Mirror split_track_namespace's fallback (src/transport/moqt_control_messages.cpp)
+        // exactly: an all-slash (or empty) flat namespace still publishes as a
+        // one-element tuple containing the original string, rather than the
+        // empty tuple encode_namespace_name would otherwise reject. This
+        // keeps the printed URL consistent with what is actually published.
+        // A literal '/' encodes as '.2f' under 11.1.2, so this is
+        // representable.
+        url.track.namespace_tuple.push_back(track_namespace);
     }
     return build_msf_url(url);
 }

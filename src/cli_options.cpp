@@ -190,6 +190,11 @@ CliOptions parse_cli_options(int argc, char** argv) {
     // "--alpn moq-99 --endpoint h:443" that never mentions --url.
     bool endpoint_set = false;
     bool url_set = false;
+    // Tracks whether --namespace was itself given, mirroring endpoint_set /
+    // url_set above, so --url and --namespace can be refused as mutually
+    // exclusive in either order rather than one silently overwriting the
+    // other's track_namespace.
+    bool namespace_set = false;
     // Recorded, not applied, inside the loop: --transport can come either
     // before or after --url, so the conflict/agreement check must happen
     // once after the loop rather than only when --transport is seen first.
@@ -235,8 +240,14 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.endpoint = parse_endpoint(require_value("--endpoint"));
             endpoint_set = true;
         } else if (argument == "--url") {
+            if (url_set) {
+                throw std::runtime_error("--url was already given; only one --url is supported");
+            }
             if (endpoint_set) {
                 throw std::runtime_error("--url and --endpoint are mutually exclusive");
+            }
+            if (namespace_set) {
+                throw std::runtime_error("--url and --namespace are mutually exclusive");
             }
             const auto url = parse_msf_url(require_value("--url"));
 
@@ -259,20 +270,33 @@ CliOptions parse_cli_options(int argc, char** argv) {
             }
             options.track_namespace = flattened;
 
+            // The fragment is explicitly never sent (draft line ~3320), but the
+            // query carries key-value parameters intended for the server at
+            // connection init, so it must survive into the endpoint just like
+            // --endpoint's own query handling (parse_endpoint keeps a query
+            // inside `path` because it never splits on '?' at all). Fold it in
+            // the same way here rather than dropping it.
+            std::string endpoint_path = url.path;
+            bool endpoint_path_explicit = url.path_explicit;
+            if (!url.query.empty()) {
+                endpoint_path += "?" + url.query;
+                endpoint_path_explicit = true;
+            }
+
             // If --alpn/--sni already constructed an EndpointConfig, update
             // the fields --url owns in place rather than replacing the whole
             // struct, so an earlier --alpn/--sni value survives.
             if (options.endpoint.has_value()) {
                 options.endpoint->host = url.host;
                 options.endpoint->port = url.port;
-                options.endpoint->path = url.path;
-                options.endpoint->path_explicit = url.path_explicit;
+                options.endpoint->path = endpoint_path;
+                options.endpoint->path_explicit = endpoint_path_explicit;
             } else {
                 transport::EndpointConfig endpoint;
                 endpoint.host = url.host;
                 endpoint.port = url.port;
-                endpoint.path = url.path;
-                endpoint.path_explicit = url.path_explicit;
+                endpoint.path = endpoint_path;
+                endpoint.path_explicit = endpoint_path_explicit;
                 options.endpoint = endpoint;
             }
             endpoint_set = true;
@@ -318,7 +342,11 @@ CliOptions parse_cli_options(int argc, char** argv) {
         } else if (argument == "--draft") {
             options.draft_version = parse_draft(require_value("--draft"));
         } else if (argument == "--namespace") {
+            if (url_set) {
+                throw std::runtime_error("--url and --namespace are mutually exclusive");
+            }
             options.track_namespace = std::string(require_value("--namespace"));
+            namespace_set = true;
         } else if (argument == "--forward") {
             options.forward = parse_forward_flag(require_value("--forward"));
         } else if (argument == "--publish-catalog") {

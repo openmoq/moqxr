@@ -472,5 +472,70 @@ int main() {
                      "expected a doubled slash to collapse rather than produce an empty element");
     }
 
+    // A flat namespace of just "/" (e.g. --namespace /) collapses to an empty
+    // tuple under the same rule as above, but encode_namespace_name rejects
+    // an empty tuple outright. split_track_namespace
+    // (src/transport/moqt_control_messages.cpp) falls back to publishing a
+    // one-element tuple containing the original string ("/") in that case, so
+    // build_track_msf_url must mirror that fallback exactly rather than
+    // throwing on input that is actually published successfully. A literal
+    // '/' is representable: it escapes to '.2f' per 11.1.2.
+    {
+        const std::string built =
+            build_track_msf_url("h", 443, "/", false, "/", "catalog", ConnectionRequirement::kAny);
+        ok &= expect(built == "moqt://h#msf:.2f--catalog",
+                     "expected the all-slash fallback to publish a one-element tuple containing '/', "
+                     "escaped as '.2f'");
+        const auto parsed = parse_msf_url(built);
+        ok &= expect(parsed.track.namespace_tuple == std::vector<std::string>{"/"},
+                     "expected the fallback tuple to round-trip back to a single '/' element");
+    }
+
+    // Mutation check for the fix above: a caller-supplied element already
+    // containing a slash (as opposed to the whole-string fallback) must still
+    // be rejected elsewhere (see cli_options_test.cpp's slash test); this
+    // block only pins the specific all-slash-collapses-to-empty case.
+    {
+        ok &= expect(build_track_msf_url("h", 443, "/", false, "///", "catalog",
+                                         ConnectionRequirement::kAny) ==
+                         "moqt://h#msf:.2f.2f.2f--catalog",
+                     "expected a run of slashes to fall back to the whole original string, not a "
+                     "single '/'");
+    }
+
+    // build_msf_url must refuse rather than silently emit a URL it cannot
+    // re-parse: parse_msf_url finds the first '#' and treats everything after
+    // it as the fragment, so a host or explicit path containing a literal '#'
+    // would corrupt or truncate the track identifier. Refusing (rather than
+    // percent-encoding) is deliberate: after query folding a path may
+    // legitimately contain '?', and mixing encoding rules for '#' but not '?'
+    // in the same component gets subtle fast.
+    {
+        MsfUrl bad_host;
+        bad_host.host = "h#x";
+        bad_host.track.namespace_tuple = {"ns"};
+        bad_host.track.track_name = "catalog";
+        ok &= expect_throws([&] { (void)build_msf_url(bad_host); }, "host",
+                            "expected a '#' in the host to be refused, naming the host");
+
+        MsfUrl bad_path;
+        bad_path.host = "h";
+        bad_path.path = "/p#x";
+        bad_path.path_explicit = true;
+        bad_path.track.namespace_tuple = {"ns"};
+        bad_path.track.track_name = "catalog";
+        ok &= expect_throws([&] { (void)build_msf_url(bad_path); }, "path",
+                            "expected a '#' in the path to be refused, naming the path");
+
+        // The reported repro goes through build_track_msf_url, as
+        // --print-msf-urls does.
+        ok &= expect_throws(
+            [&] {
+                (void)build_track_msf_url("h", 4433, "/p#x", true, "ns", "catalog",
+                                          ConnectionRequirement::kAny);
+            },
+            "path", "expected build_track_msf_url to refuse a path containing '#'");
+    }
+
     return ok ? 0 : 1;
 }

@@ -265,6 +265,10 @@ build directions.
   because a license acquisition URL is legitimately percent-encoded under RFC
   3986 and a strict reading of 5.4 would reject DRM configurations that work
   today. The exemption is confined to URL-typed fields.
+- **The URL query is preserved.** `--url`'s query string is folded into the
+  endpoint path (`path + "?" + query`), the same way `--endpoint` already
+  carries a query as part of its path. The fragment is never sent, per the
+  draft, but the query is.
 - **An MSF tuple element containing a literal slash is refused by `--url`.**
   The publisher's `track_namespace` is a flat string that the transport layer
   splits on `/`, so such an element cannot survive the round-trip. Refusing

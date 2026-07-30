@@ -267,6 +267,17 @@ void validate_catalog(const MsfCatalog& catalog) {
             if (op.tracks.empty()) {
                 throw std::runtime_error("MSF delta operation \"" + op.op + "\" has no tracks");
             }
+            if (op.op == "remove") {
+                // write_track (via validate_track) never runs for a "remove"
+                // entry -- section 5.1.6 narrows it to just name/namespace --
+                // so the 5.4.1 percent rule must be applied here explicitly,
+                // the same way it is applied to every other emitted string.
+                for (const auto& track : op.tracks) {
+                    const std::string where = " (track \"" + track.name + "\")";
+                    validate_no_stray_percent(track.name, "name", where);
+                    validate_optional_no_stray_percent(track.name_space, "namespace", where);
+                }
+            }
         }
         return;
     }
