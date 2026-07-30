@@ -362,22 +362,6 @@ std::vector<std::uint8_t> build_track_codec_init_data(std::span<const std::uint8
 
 // pssh boxes live directly under moov (ISO/IEC 23001-7), as siblings of the
 // trak boxes -- not inside any single track's sinf. Collecting them once for
-// the whole init segment mirrors how CMSF 4.1.1 protection lives at the
-// catalog root and is shared by every track that references it.
-std::vector<CencSystem> collect_pssh_systems(std::span<const std::uint8_t> init_bytes) {
-    const std::vector<Mp4Box> top_level_boxes = parse_mp4_boxes(init_bytes);
-    const Mp4Box* moov = find_first_box(top_level_boxes, "moov");
-    if (moov == nullptr) {
-        return {};
-    }
-
-    std::vector<Mp4Box> pssh_boxes;
-    for (const Mp4Box* box : find_boxes(moov->children, "pssh")) {
-        pssh_boxes.push_back(*box);
-    }
-    return parse_pssh_boxes(init_bytes, pssh_boxes);
-}
-
 // Apply deployment-configured DRM fields (licence/cert URLs, robustness) onto
 // the contentProtections entries attach_content_protection just created or
 // reused for `systems`. A configured system whose system_id does not match
@@ -417,6 +401,24 @@ void apply_drm_system_configs(MsfCatalog& catalog,
 }
 
 }  // namespace
+
+// Collects every DRM system described by the pssh boxes directly under moov.
+// pssh boxes are siblings of trak, not children of one, so protection applies
+// to the whole init segment mirrors how CMSF 4.1.1 protection lives at the
+// catalog root and is shared by every track that references it.
+std::vector<CencSystem> collect_pssh_systems(std::span<const std::uint8_t> init_bytes) {
+    const std::vector<Mp4Box> top_level_boxes = parse_mp4_boxes(init_bytes);
+    const Mp4Box* moov = find_first_box(top_level_boxes, "moov");
+    if (moov == nullptr) {
+        return {};
+    }
+
+    std::vector<Mp4Box> pssh_boxes;
+    for (const Mp4Box* box : find_boxes(moov->children, "pssh")) {
+        pssh_boxes.push_back(*box);
+    }
+    return parse_pssh_boxes(init_bytes, pssh_boxes);
+}
 
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
