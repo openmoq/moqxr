@@ -402,9 +402,9 @@ void apply_drm_system_configs(MsfCatalog& catalog,
 
 }  // namespace
 
-// Collects every DRM system described by the pssh boxes directly under moov.
-// pssh boxes are siblings of trak, not children of one, so protection applies
-// to the whole init segment mirrors how CMSF 4.1.1 protection lives at the
+// pssh boxes live directly under moov (ISO/IEC 23001-7), as siblings of the
+// trak boxes -- not inside any single track's sinf. Collecting them once for
+// the whole init segment mirrors how CMSF 4.1.1 protection lives at the
 // catalog root and is shared by every track that references it.
 std::vector<CencSystem> collect_pssh_systems(std::span<const std::uint8_t> init_bytes) {
     const std::vector<Mp4Box> top_level_boxes = parse_mp4_boxes(init_bytes);
