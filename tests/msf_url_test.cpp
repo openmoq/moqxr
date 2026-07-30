@@ -90,11 +90,11 @@ int main() {
     }
 
     // Negative cases, each bound to its specific refusal.
-    ok &= expect_throws([] { encode_namespace_name({{"a", "", "b"}, "t"}); }, "empty",
+    ok &= expect_throws([] { encode_namespace_name({{"a", "", "b"}, "t"}); }, "tuple element",
                         "expected an empty tuple element to be refused on encode");
-    ok &= expect_throws([] { encode_namespace_name({{}, "t"}); }, "empty",
+    ok &= expect_throws([] { encode_namespace_name({{}, "t"}); }, "no elements",
                         "expected an empty namespace to be refused on encode");
-    ok &= expect_throws([] { encode_namespace_name({{"a"}, ""}); }, "empty",
+    ok &= expect_throws([] { encode_namespace_name({{"a"}, ""}); }, "track name",
                         "expected an empty track name to be refused on encode");
     ok &= expect_throws([] { decode_namespace_name("nodelimiter"); }, "--",
                         "expected a missing -- delimiter to be refused");
@@ -110,6 +110,79 @@ int main() {
                         "expected a non-hexadecimal . escape to be refused");
     ok &= expect_throws([] { decode_namespace_name("a-b---t"); }, "unescaped",
                         "expected an unescaped hyphen inside an element to be refused");
+
+    // MSF 11.1.3 first example, decomposed exactly as the draft states.
+    {
+        const auto url = parse_msf_url(
+            "moqt://example.com/server/config?a=1&b=2#msf:customer-livestream-123--catalog");
+        ok &= expect(url.host == "example.com", "expected host from the draft example");
+        ok &= expect(url.port == 443, "expected the default port 443");
+        ok &= expect(url.path == "/server/config", "expected path from the draft example");
+        ok &= expect(url.path_explicit, "expected an explicit path");
+        ok &= expect(url.query == "a=1&b=2", "expected the query captured verbatim");
+        ok &= expect(url.track.namespace_tuple == std::vector<std::string>{"customer", "livestream", "123"},
+                     "expected the namespace tuple from the draft example");
+        ok &= expect(url.track.track_name == "catalog", "expected track name from the draft example");
+    }
+
+    // An explicit port is honoured; no path leaves path_explicit false.
+    {
+        const auto url = parse_msf_url("moqt://example.com:4433#msf:ns--catalog");
+        ok &= expect(url.port == 4433, "expected an explicit port");
+        ok &= expect(url.path == "/" && !url.path_explicit, "expected a default, non-explicit path");
+        ok &= expect(url.query.empty(), "expected no query");
+    }
+
+    // The scheme is case-insensitive per MSF 11.1.
+    {
+        const auto url = parse_msf_url("MOQT://example.com#msf:ns--catalog");
+        ok &= expect(url.host == "example.com", "expected an uppercase scheme to be accepted");
+    }
+
+    // Non-reserved parameters are preserved verbatim and in order.
+    {
+        const auto url = parse_msf_url("moqt://h#msf:ns--t&alpha=1&beta=2");
+        const std::vector<std::pair<std::string, std::string>> expected{{"alpha", "1"}, {"beta", "2"}};
+        ok &= expect(url.extra_params == expected, "expected non-reserved parameters preserved in order");
+    }
+
+    // Semantic round-trip: parse(build(x)) == x.
+    {
+        const std::vector<std::string> urls{
+            "moqt://example.com/server/config?a=1&b=2#msf:customer-livestream-123--catalog",
+            "moqt://example.com:4433#msf:ns--catalog",
+            "moqt://example.com/p#msf:a.2db--track.2ename",
+            "moqt://h#msf:ns--t&alpha=1&beta=2",
+        };
+        for (const auto& text : urls) {
+            const auto first = parse_msf_url(text);
+            const auto second = parse_msf_url(build_msf_url(first));
+            ok &= expect(second.host == first.host && second.port == first.port &&
+                         second.path == first.path && second.path_explicit == first.path_explicit &&
+                         second.query == first.query &&
+                         second.track.namespace_tuple == first.track.namespace_tuple &&
+                         second.track.track_name == first.track.track_name &&
+                         second.extra_params == first.extra_params,
+                         "expected semantic round-trip for " + text);
+        }
+    }
+
+    ok &= expect_throws([] { parse_msf_url("https://example.com#msf:ns--t"); }, "moqt",
+                        "expected a non-moqt scheme to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://example.com"); }, "fragment",
+                        "expected a missing fragment to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://example.com#other:ns--t"); }, "msf:",
+                        "expected a fragment without the msf: prefix to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://#msf:ns--t"); }, "host",
+                        "expected a missing host to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h:0#msf:ns--t"); }, "port",
+                        "expected port 0 to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h:70000#msf:ns--t"); }, "port",
+                        "expected an out-of-range port to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h:8x#msf:ns--t"); }, "port",
+                        "expected a non-numeric port to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&noequals"); }, "=",
+                        "expected a parameter without '=' to be refused");
 
     return ok ? 0 : 1;
 }

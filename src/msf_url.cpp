@@ -1,5 +1,7 @@
 #include "openmoq/publisher/msf_url.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -67,14 +69,78 @@ std::string decode_element(std::string_view element, std::string_view what) {
     return out;
 }
 
+bool equals_ignore_case(std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        const auto left_byte = static_cast<unsigned char>(left[index]);
+        const auto right_byte = static_cast<unsigned char>(right[index]);
+        if (std::tolower(left_byte) != std::tolower(right_byte)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::uint16_t parse_port(std::string_view text) {
+    if (text.empty()) {
+        throw std::runtime_error("MSF URL port is empty");
+    }
+    std::uint64_t value = 0;
+    for (const char character : text) {
+        if (character < '0' || character > '9') {
+            throw std::runtime_error("MSF URL port is not numeric: " + std::string(text));
+        }
+        value = value * 10 + static_cast<std::uint64_t>(character - '0');
+        if (value > 65535) {
+            throw std::runtime_error("MSF URL port is out of range: " + std::string(text));
+        }
+    }
+    if (value == 0) {
+        throw std::runtime_error("MSF URL port must be between 1 and 65535");
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
+// Splits the fragment parameter list on '&' and each parameter on its first
+// '='. Reserved names are claimed by later tasks; everything else lands in
+// extra_params.
+void parse_fragment_parameters(std::string_view text, MsfUrl& url) {
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t ampersand = text.find('&', start);
+        const std::string_view parameter = ampersand == std::string_view::npos
+                                               ? text.substr(start)
+                                               : text.substr(start, ampersand - start);
+        if (!parameter.empty()) {
+            const std::size_t equals = parameter.find('=');
+            if (equals == std::string_view::npos) {
+                throw std::runtime_error("MSF URL fragment parameter has no '=': " +
+                                         std::string(parameter));
+            }
+            const std::string name(parameter.substr(0, equals));
+            const std::string value(parameter.substr(equals + 1));
+            if (name.empty()) {
+                throw std::runtime_error("MSF URL fragment parameter has an empty name");
+            }
+            url.extra_params.emplace_back(name, value);
+        }
+        if (ampersand == std::string_view::npos) {
+            break;
+        }
+        start = ampersand + 1;
+    }
+}
+
 }  // namespace
 
 std::string encode_namespace_name(const MsfTrackIdentifier& id) {
     if (id.namespace_tuple.empty()) {
-        throw std::runtime_error("MSF namespace tuple is empty; a track requires a namespace");
+        throw std::runtime_error("MSF namespace tuple has no elements; a track requires a namespace");
     }
     if (id.track_name.empty()) {
-        throw std::runtime_error("MSF track name is empty");
+        throw std::runtime_error("MSF track name is empty; a track name is required");
     }
 
     std::string out;
@@ -139,6 +205,93 @@ MsfTrackIdentifier decode_namespace_name(std::string_view text) {
     }
     id.track_name = decode_element(track_text, "track name");
     return id;
+}
+
+MsfUrl parse_msf_url(std::string_view text) {
+    constexpr std::string_view kScheme = "moqt://";
+    if (text.size() < kScheme.size() || !equals_ignore_case(text.substr(0, kScheme.size()), kScheme)) {
+        throw std::runtime_error("MSF URL must use the moqt:// scheme");
+    }
+    const std::string_view rest = text.substr(kScheme.size());
+
+    const std::size_t hash = rest.find('#');
+    if (hash == std::string_view::npos) {
+        throw std::runtime_error("MSF URL must contain a '#msf:' fragment");
+    }
+    std::string_view before_fragment = rest.substr(0, hash);
+    const std::string_view fragment = rest.substr(hash + 1);
+
+    MsfUrl url;
+
+    const std::size_t question = before_fragment.find('?');
+    if (question != std::string_view::npos) {
+        url.query = std::string(before_fragment.substr(question + 1));
+        before_fragment = before_fragment.substr(0, question);
+    }
+
+    std::string_view authority = before_fragment;
+    const std::size_t slash = before_fragment.find('/');
+    if (slash != std::string_view::npos) {
+        authority = before_fragment.substr(0, slash);
+        url.path = std::string(before_fragment.substr(slash));
+        url.path_explicit = true;
+    }
+    if (authority.empty()) {
+        throw std::runtime_error("MSF URL must contain a host");
+    }
+
+    const std::size_t colon = authority.find(':');
+    if (colon == std::string_view::npos) {
+        url.host = std::string(authority);
+    } else {
+        url.host = std::string(authority.substr(0, colon));
+        url.port = parse_port(authority.substr(colon + 1));
+    }
+    if (url.host.empty()) {
+        throw std::runtime_error("MSF URL must contain a host");
+    }
+
+    constexpr std::string_view kFragmentPrefix = "msf:";
+    if (fragment.size() < kFragmentPrefix.size() ||
+        fragment.substr(0, kFragmentPrefix.size()) != kFragmentPrefix) {
+        throw std::runtime_error("MSF URL fragment must begin with 'msf:'");
+    }
+    const std::string_view value = fragment.substr(kFragmentPrefix.size());
+    const std::size_t ampersand = value.find('&');
+    url.track = decode_namespace_name(ampersand == std::string_view::npos ? value
+                                                                         : value.substr(0, ampersand));
+    if (ampersand != std::string_view::npos) {
+        parse_fragment_parameters(value.substr(ampersand + 1), url);
+    }
+    return url;
+}
+
+std::string build_msf_url(const MsfUrl& url) {
+    if (url.host.empty()) {
+        throw std::runtime_error("cannot build an MSF URL without a host");
+    }
+    std::string out = "moqt://";
+    out += url.host;
+    if (url.port != 443) {
+        out.push_back(':');
+        out += std::to_string(url.port);
+    }
+    if (url.path_explicit) {
+        out += url.path;
+    }
+    if (!url.query.empty()) {
+        out.push_back('?');
+        out += url.query;
+    }
+    out += "#msf:";
+    out += encode_namespace_name(url.track);
+    for (const auto& [name, value] : url.extra_params) {
+        out.push_back('&');
+        out += name;
+        out.push_back('=');
+        out += value;
+    }
+    return out;
 }
 
 }  // namespace openmoq::publisher
