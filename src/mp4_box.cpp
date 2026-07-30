@@ -818,6 +818,14 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
                 timescale = read_be32(bytes, timescale_offset);
             }
         }
+        // This guard deliberately tests the RAW sample_entry_type, not
+        // effective_type (resolved below): for an encrypted track
+        // source_sample_entry_type is "encv"/"enca", never "hev1", so this
+        // never fires and the raw-NAL parameter-set scan inside
+        // hevc_track_is_hvc1_compatible never runs against CENC ciphertext.
+        // That is correct, but emergent rather than designed -- tightening
+        // this to test effective_type would start pattern-matching
+        // ciphertext bytes as if they were NAL units.
         if (source_sample_entry_type == "hev1" && hevc_track_is_hvc1_compatible(top_level_boxes, bytes, track_id, track_index)) {
             sample_entry_type = "hvc1";
         }
@@ -835,14 +843,22 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             .children = {},
         };
         const std::string codec = codec_string_from_sample_entry(effective_sample_entry, bytes);
-        if ((sample_entry_type == "avc1" || sample_entry_type == "avc3" || sample_entry_type == "hvc1" ||
-             sample_entry_type == "hev1") &&
+        // Gate on effective_type, not the raw sample_entry_type: encv/enca
+        // (CMSF's encrypted wrapper types) are byte-for-byte a
+        // VisualSampleEntry/AudioSampleEntry respectively, identical in
+        // layout to their unencrypted avc1/mp4a/etc. counterparts. Gating on
+        // the raw type here would silently omit width/height for every
+        // encrypted video track and, worse, publish samplerate/channelConfig
+        // as the wrong value (0) for every encrypted audio track, since
+        // validate_track makes those fields MUST-present.
+        if ((effective_type == "avc1" || effective_type == "avc3" || effective_type == "hvc1" ||
+             effective_type == "hev1") &&
             sample_entry.payload.offset + 28 <= bytes.size()) {
             width = read_be16(bytes, sample_entry.payload.offset + 24);
             height = read_be16(bytes, sample_entry.payload.offset + 26);
             frame_rate = frame_rate_from_stts(find_child(*stbl, "stts"), timescale, bytes);
         }
-        if ((sample_entry_type == "mp4a" || sample_entry_type == "Opus" || sample_entry_type == "opus") &&
+        if ((effective_type == "mp4a" || effective_type == "Opus" || effective_type == "opus") &&
             sample_entry.payload.offset + 28 <= bytes.size()) {
             channel_count = read_be16(bytes, sample_entry.payload.offset + 16);
             sample_rate = read_be16(bytes, sample_entry.payload.offset + 24);

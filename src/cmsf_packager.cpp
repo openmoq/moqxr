@@ -515,6 +515,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
     const std::vector<CencSystem> pssh_systems =
         any_track_protected ? collect_pssh_systems(segmented_mp4.initialization_segment.owned_bytes)
                             : std::vector<CencSystem>{};
+    std::vector<std::string> protected_schemes;
 
     for (const auto& track : plan.tracks) {
         if (track.track_name == "catalog") {
@@ -551,11 +552,43 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
         }
 
         if (track.protection.has_value()) {
+            // CMSF 4.1.2: "When this field is absent, the track content is
+            // not protected by Common Encryption." pssh is only
+            // SHOULD-present (CMSF 4.1.1.4.5) -- ffmpeg's
+            // -encryption_scheme cenc-aes-ctr, for one, writes
+            // sinf/tenc/senc/saiz/saio with no pssh at all -- so a protected
+            // track with no pssh anywhere in the init segment must not fall
+            // through attach_content_protection's systems loop silently: that
+            // would publish a catalog with no contentProtections entry and no
+            // contentProtectionRefIDs for genuinely encrypted content,
+            // indistinguishable from unprotected media. Refuse instead,
+            // matching the standard cli_options.cpp already sets for the
+            // live-path guard.
+            if (pssh_systems.empty()) {
+                throw std::runtime_error(
+                    "track '" + track.track_name +
+                    "' is protected (CENC) but no pssh system was found in the "
+                    "initialization segment; refusing to publish a catalog with no "
+                    "contentProtections entry for encrypted content");
+            }
             attach_content_protection(msf_catalog, msf_track, *track.protection, pssh_systems);
-            apply_drm_system_configs(msf_catalog, track.protection->scheme, pssh_systems, drm_systems);
+            if (std::find(protected_schemes.begin(), protected_schemes.end(), track.protection->scheme) ==
+                protected_schemes.end()) {
+                protected_schemes.push_back(track.protection->scheme);
+            }
         }
 
         msf_catalog.tracks.push_back(std::move(msf_track));
+    }
+
+    // Hoisted out of the per-track loop above: apply_drm_system_configs
+    // operates on the catalog-root contentProtections entries and the
+    // whole-init-segment pssh_systems list, neither of which is per-track, so
+    // calling it once per distinct protected scheme is equivalent to (and
+    // cheaper than) the previous once-per-protected-track calls, which were
+    // merely idempotent re-applications of the same result.
+    for (const auto& scheme : protected_schemes) {
+        apply_drm_system_configs(msf_catalog, scheme, pssh_systems, drm_systems);
     }
 
     const std::string catalog_text = serialize_catalog(msf_catalog);

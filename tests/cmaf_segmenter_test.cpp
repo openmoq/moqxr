@@ -343,7 +343,7 @@ std::vector<std::uint8_t> widevine_system_id() {
             0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed};
 }
 
-std::vector<std::uint8_t> make_encrypted_fragmented_test_mp4() {
+std::vector<std::uint8_t> make_encrypted_fragmented_test_mp4(bool include_pssh = true) {
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
     const auto tkhd = make_full_box("tkhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
@@ -365,7 +365,49 @@ std::vector<std::uint8_t> make_encrypted_fragmented_test_mp4() {
     const auto trak = make_box("trak", concat({tkhd, mdia}));
     // pssh boxes live directly under moov, as siblings of trak (ISO/IEC
     // 23001-7) -- this is the DRM system build_publish_plan's
-    // collect_pssh_systems must find to emit a CMSF contentProtections entry.
+    // collect_pssh_systems must find to emit a CMSF contentProtections
+    // entry. include_pssh=false models ffmpeg's `-encryption_scheme
+    // cenc-aes-ctr`, which writes sinf/tenc/senc/saiz/saio with no pssh
+    // anywhere (pssh is only SHOULD-present per CMSF 4.1.1.4.5) -- the C2
+    // regression fixture.
+    const auto moov = include_pssh ? make_box("moov", concat({trak, make_pssh(widevine_system_id())}))
+                                   : make_box("moov", trak);
+    const auto moof = make_box("moof", {'m', 'f', 'h', 'd'});
+    const auto mdat = make_box("mdat", {1, 2, 3, 4, 5, 6});
+    return concat({ftyp, moov, moof, mdat});
+}
+
+// CMSF section 4, audio side of C1: an enca sample entry is byte-for-byte an
+// AudioSampleEntry, so channel_count/sample_rate must be read through it the
+// same way an unencrypted mp4a entry would be -- gating that extraction on
+// the raw "enca" type (instead of the frma-resolved effective type) would
+// silently publish samplerate/channelConfig as 0, which validate_track makes
+// MUST-present, so that is a wrong value on the wire, not merely a missing
+// one. channelcount=2 and samplerate=44100 (0xAC44) are encoded at the
+// AudioSampleEntry's fixed offsets 16 and 24, matching the layout
+// make_track_metadata_test_mp4's audio_header uses elsewhere in this file.
+std::vector<std::uint8_t> make_encrypted_audio_fragmented_test_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 's', 'o', 'u', 'n', 0, 0, 0, 0});
+    auto audio_header = std::vector<std::uint8_t>(28, 0);
+    audio_header[16] = 0x00;
+    audio_header[17] = 0x02;    // channelcount = 2
+    audio_header[24] = 0xac;
+    audio_header[25] = 0x44;    // samplerate = 44100 << 16, top bytes 0xAC44
+    const auto esds = make_full_box(
+        "esds", {0x00, 0x00, 0x00, 0x00, 0x03, 0x19, 0x00, 0x02, 0x00, 0x04, 0x11, 0x40, 0x15,
+                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x10, 0x10});
+    const auto sinf = make_sinf("mp4a", "cenc");
+    const auto sample_entry = make_box("enca", concat({audio_header, esds, sinf}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
     const auto pssh = make_pssh(widevine_system_id());
     const auto moov = make_box("moov", concat({trak, pssh}));
     const auto moof = make_box("moof", {'m', 'f', 'h', 'd'});
@@ -1647,12 +1689,78 @@ int main() {
         ok &= expect(enc_tracks.front().codec == "avc1.64000C",
                      "expected the codec string resolved through frma, with avcC profile bytes read "
                      "through the effective sample entry, not left as encv");
+        // C1 regression: extract_tracks previously gated the width/height
+        // extraction on the raw sample_entry_type ("encv"/"enca" for every
+        // encrypted track), so an encrypted track's geometry silently came
+        // out as 0x0 despite encv being byte-for-byte a VisualSampleEntry.
+        // The fixture's visual_header (see make_encrypted_fragmented_test_mp4)
+        // encodes 320x240 at offsets 24/26.
+        ok &= expect(enc_tracks.front().width == 320,
+                     "expected width read from an encv (encrypted) VisualSampleEntry, not left as 0");
+        ok &= expect(enc_tracks.front().height == 240,
+                     "expected height read from an encv (encrypted) VisualSampleEntry, not left as 0");
         ok &= expect(enc_tracks.front().protection.has_value(),
                      "expected protection parameters on an encrypted track");
         ok &= expect(enc_tracks.front().protection->scheme == "cenc",
                      "expected the cenc scheme recorded");
         ok &= expect(enc_tracks.front().protection->original_format == "avc1",
                      "expected the frma original_format recorded");
+    }
+
+    // C1 regression, audio side: an enca sample entry must report its real
+    // channel_count/sample_rate, not 0. See make_encrypted_audio_fragmented_test_mp4
+    // for why 0 is a wrong value on the wire (validate_track makes both
+    // fields MUST-present for a sound track), not merely a missing one.
+    {
+        const auto encrypted_audio_bytes = make_encrypted_audio_fragmented_test_mp4();
+        const auto enc_audio_tracks = extract_tracks(parse_mp4_boxes(encrypted_audio_bytes), encrypted_audio_bytes);
+        ok &= expect(enc_audio_tracks.size() == 1, "expected one track in the encrypted audio fixture");
+        ok &= expect(enc_audio_tracks.front().sample_entry_type == "enca",
+                     "expected the raw enca sample entry type preserved");
+        ok &= expect(enc_audio_tracks.front().channel_count == 2,
+                     "expected channel_count read from an enca (encrypted) AudioSampleEntry, not left as 0");
+        ok &= expect(enc_audio_tracks.front().sample_rate == 44100,
+                     "expected sample_rate read from an enca (encrypted) AudioSampleEntry, not left as 0");
+        ok &= expect(enc_audio_tracks.front().protection.has_value(),
+                     "expected protection parameters on the encrypted audio track");
+    }
+
+    // C2 regression: a protected track (sinf/schm/schi/tenc present) whose
+    // init segment carries no pssh anywhere must not silently publish as
+    // unprotected. CMSF 4.1.2 -- "When this field is absent, the track
+    // content is not protected by Common Encryption" -- so publishing
+    // contentProtectionRefIDs-less output for genuinely encrypted content
+    // would affirmatively assert the opposite of the truth. pssh is only
+    // SHOULD-present (CMSF 4.1.1.4.5); ffmpeg's -encryption_scheme
+    // cenc-aes-ctr is a real encoder that omits it entirely.
+    {
+        const auto no_pssh_bytes = make_encrypted_fragmented_test_mp4(/*include_pssh=*/false);
+        ParsedMp4 no_pssh_parsed{
+            .bytes = no_pssh_bytes,
+            .top_level_boxes = parse_mp4_boxes(no_pssh_bytes),
+            .tracks = {},
+        };
+        no_pssh_parsed.tracks = extract_tracks(no_pssh_parsed.top_level_boxes, no_pssh_parsed.bytes);
+        ok &= expect(no_pssh_parsed.tracks.size() == 1, "expected one track in the no-pssh encrypted fixture");
+        ok &= expect(no_pssh_parsed.tracks.front().protection.has_value(),
+                     "expected the no-pssh fixture's track to still be detected as protected");
+        const auto no_pssh_segmented = segment_for_cmaf(no_pssh_parsed);
+
+        bool threw = false;
+        std::string what;
+        try {
+            (void)build_publish_plan(no_pssh_segmented, DraftVersion::kDraft14,
+                                     /*include_sap=*/false, /*include_msf_timeline=*/false,
+                                     /*vod=*/false);
+        } catch (const std::exception& e) {
+            threw = true;
+            what = e.what();
+        }
+        ok &= expect(threw,
+                    "expected build_publish_plan to refuse a protected track with no pssh systems "
+                    "found, rather than publish an unprotected-looking catalog");
+        ok &= expect_contains(what, "vide_1",
+                              "expected the thrown message to name the offending track");
     }
 
     // Task 6: build_publish_plan wires the pssh-derived DRM systems and each
