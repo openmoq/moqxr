@@ -3,6 +3,7 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/live_srt_config.h"
 #include "openmoq/publisher/live_dash_ingest.h"
+#include "openmoq/publisher/msf_url.h"
 #include "openmoq/publisher/publisher_api.h"
 #include "openmoq/publisher/transport/moqt_session.h"
 
@@ -17,6 +18,22 @@ int main(int argc, char** argv) {
 
     try {
         const CliOptions options = parse_cli_options(argc, argv);
+
+        if (options.print_msf_urls) {
+            if (!options.endpoint.has_value()) {
+                throw std::runtime_error("--print-msf-urls requires --endpoint or --url");
+            }
+            const auto connection = !options.transport_explicit
+                                        ? ConnectionRequirement::kAny
+                                    : options.transport == transport::TransportKind::kWebTransport
+                                        ? ConnectionRequirement::kWebTransport
+                                        : ConnectionRequirement::kRawQuic;
+            std::cout << build_track_msf_url(options.endpoint->host, options.endpoint->port,
+                                             options.endpoint->path, options.endpoint->path_explicit,
+                                             options.track_namespace, "catalog", connection)
+                      << '\n';
+            std::cout.flush();
+        }
 
         const bool stdin_source_available = options.input_source.kind == InputSourceKind::kStdin;
         const bool live_srt = options.live_source == LiveSourceKind::kSrt &&

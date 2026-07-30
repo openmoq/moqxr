@@ -44,7 +44,16 @@ struct CliOptions {
     transport::TlsConfig tls;
     DraftVersion draft_version = DraftVersion::kDraft16;
     std::string track_namespace = "media";
+    // MSF 11.1.1 c4m token from a --url fragment. Parsed and reported; nothing
+    // on the publish path consumes a CAT token today.
+    std::optional<std::string> msf_c4m_token;
     bool endpoint_alpn_overridden = false;
+    // True when the operator chose a transport explicitly, either via
+    // --transport or via a --url connection requirement (e.g. &connection=wt).
+    // False means `transport` merely holds its kRawQuic default. Consulted by
+    // --print-msf-urls: a URL should only assert a connection requirement the
+    // operator actually chose, never an unstated default.
+    bool transport_explicit = false;
     bool forward = false;
     bool publish_catalog = false;
     bool include_sap = false;
@@ -54,6 +63,7 @@ struct CliOptions {
     bool paced = false;
     bool loop = false;
     bool dump_plan = false;
+    bool print_msf_urls = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     // This publisher is live, or simulating live, unless explicitly told
     // otherwise (PublisherConfig::vod's own rule). --vod is the only way to

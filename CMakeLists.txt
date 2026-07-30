@@ -263,6 +263,7 @@ add_library(openmoq_publisher_lib STATIC
     src/live_dash_ingest.cpp
     src/moq_draft.cpp
     src/msf_catalog.cpp
+    src/msf_url.cpp
     src/mp4_box.cpp
     src/publisher_api.cpp
     src/transport/libmoq_publisher.cpp
@@ -375,6 +376,12 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-cenc-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-cenc-tests COMMAND openmoq-publisher-cenc-tests)
+
+    add_executable(openmoq-publisher-msf-url-tests
+        tests/msf_url_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-msf-url-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-msf-url-tests COMMAND openmoq-publisher-msf-url-tests)
 
     add_executable(openmoq-publisher-cli-tests
         tests/cli_options_test.cpp

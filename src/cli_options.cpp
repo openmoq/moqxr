@@ -1,8 +1,11 @@
 #include "openmoq/publisher/cli_options.h"
 
 #include <cstdint>
+#include <iostream>
 #include <stdexcept>
 #include <string_view>
+
+#include "openmoq/publisher/msf_url.h"
 
 namespace openmoq::publisher {
 
@@ -179,6 +182,23 @@ CliOptions parse_cli_options(int argc, char** argv) {
     CliOptions options;
     bool dash_path_set = false;
     bool dash_queue_depth_set = false;
+    bool transport_set = false;
+    // Tracks whether --endpoint / --url were themselves given on the command
+    // line, as opposed to options.endpoint simply having a value (--alpn and
+    // --sni also construct an EndpointConfig when none exists yet). Guarding
+    // mutual exclusion on has_value() would misfire on a plain
+    // "--alpn moq-99 --endpoint h:443" that never mentions --url.
+    bool endpoint_set = false;
+    bool url_set = false;
+    // Tracks whether --namespace was itself given, mirroring endpoint_set /
+    // url_set above, so --url and --namespace can be refused as mutually
+    // exclusive in either order rather than one silently overwriting the
+    // other's track_namespace.
+    bool namespace_set = false;
+    // Recorded, not applied, inside the loop: --transport can come either
+    // before or after --url, so the conflict/agreement check must happen
+    // once after the loop rather than only when --transport is seen first.
+    std::optional<transport::TransportKind> url_required_transport;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
@@ -211,8 +231,95 @@ CliOptions parse_cli_options(int argc, char** argv) {
             dash_queue_depth_set = true;
         } else if (argument == "--transport") {
             options.transport = parse_transport_kind(require_value("--transport"));
+            transport_set = true;
+            options.transport_explicit = true;
         } else if (argument == "--endpoint") {
+            if (url_set) {
+                throw std::runtime_error("--url and --endpoint are mutually exclusive");
+            }
             options.endpoint = parse_endpoint(require_value("--endpoint"));
+            endpoint_set = true;
+        } else if (argument == "--url") {
+            if (url_set) {
+                throw std::runtime_error("--url was already given; only one --url is supported");
+            }
+            if (endpoint_set) {
+                throw std::runtime_error("--url and --endpoint are mutually exclusive");
+            }
+            if (namespace_set) {
+                throw std::runtime_error("--url and --namespace are mutually exclusive");
+            }
+            const auto url = parse_msf_url(require_value("--url"));
+
+            // track_namespace is a flat string the transport layer splits on
+            // '/', so a namespace tuple element containing a literal slash
+            // cannot survive the round-trip.
+            std::string flattened;
+            for (std::size_t element_index = 0; element_index < url.track.namespace_tuple.size();
+                 ++element_index) {
+                const std::string& element = url.track.namespace_tuple[element_index];
+                if (element.find('/') != std::string::npos) {
+                    throw std::runtime_error(
+                        "--url namespace tuple element \"" + element +
+                        "\" contains a slash, which this publisher's flat namespace cannot represent");
+                }
+                if (element_index != 0) {
+                    flattened.push_back('/');
+                }
+                flattened += element;
+            }
+            options.track_namespace = flattened;
+
+            // The fragment is explicitly never sent (draft line ~3320), but the
+            // query carries key-value parameters intended for the server at
+            // connection init, so it must survive into the endpoint just like
+            // --endpoint's own query handling (parse_endpoint keeps a query
+            // inside `path` because it never splits on '?' at all). Fold it in
+            // the same way here rather than dropping it.
+            std::string endpoint_path = url.path;
+            bool endpoint_path_explicit = url.path_explicit;
+            if (!url.query.empty()) {
+                endpoint_path += "?" + url.query;
+                endpoint_path_explicit = true;
+            }
+
+            // If --alpn/--sni already constructed an EndpointConfig, update
+            // the fields --url owns in place rather than replacing the whole
+            // struct, so an earlier --alpn/--sni value survives.
+            if (options.endpoint.has_value()) {
+                options.endpoint->host = url.host;
+                options.endpoint->port = url.port;
+                options.endpoint->path = endpoint_path;
+                options.endpoint->path_explicit = endpoint_path_explicit;
+            } else {
+                transport::EndpointConfig endpoint;
+                endpoint.host = url.host;
+                endpoint.port = url.port;
+                endpoint.path = endpoint_path;
+                endpoint.path_explicit = endpoint_path_explicit;
+                options.endpoint = endpoint;
+            }
+            endpoint_set = true;
+            url_set = true;
+
+            if (url.connection != ConnectionRequirement::kAny) {
+                // Recorded here and resolved once after the loop (see
+                // url_required_transport below), so the outcome does not
+                // depend on whether --transport appears before or after --url.
+                url_required_transport = url.connection == ConnectionRequirement::kRawQuic
+                                             ? transport::TransportKind::kRawQuic
+                                             : transport::TransportKind::kWebTransport;
+            }
+
+            if (url.c4m_token.has_value()) {
+                options.msf_c4m_token = *url.c4m_token;
+                std::cerr << "msf_c4m_token present; this publisher does not consume CAT tokens"
+                          << std::endl;
+            }
+            if (url.track.track_name != "catalog") {
+                std::cerr << "--url track name \"" << url.track.track_name
+                          << "\" ignored; publisher track names come from the media" << std::endl;
+            }
         } else if (argument == "--alpn") {
             if (!options.endpoint.has_value()) {
                 options.endpoint = transport::EndpointConfig{};
@@ -235,7 +342,11 @@ CliOptions parse_cli_options(int argc, char** argv) {
         } else if (argument == "--draft") {
             options.draft_version = parse_draft(require_value("--draft"));
         } else if (argument == "--namespace") {
+            if (url_set) {
+                throw std::runtime_error("--url and --namespace are mutually exclusive");
+            }
             options.track_namespace = std::string(require_value("--namespace"));
+            namespace_set = true;
         } else if (argument == "--forward") {
             options.forward = parse_forward_flag(require_value("--forward"));
         } else if (argument == "--publish-catalog") {
@@ -268,6 +379,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.emit_dir = std::filesystem::path(require_value("--emit-dir"));
         } else if (argument == "--dump-plan") {
             options.dump_plan = true;
+        } else if (argument == "--print-msf-urls") {
+            options.print_msf_urls = true;
         } else if (argument == "--help" || argument == "-h") {
             throw std::runtime_error("");
         } else {
@@ -319,6 +432,18 @@ CliOptions parse_cli_options(int argc, char** argv) {
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
         throw std::runtime_error("--alpn and --sni require --endpoint to be provided first");
     }
+
+    // Resolve any --url connection requirement against --transport exactly
+    // once, regardless of which flag appeared first on the command line.
+    if (url_required_transport.has_value()) {
+        if (transport_set && options.transport != *url_required_transport) {
+            throw std::runtime_error(
+                "--url specifies a connection type that conflicts with --transport");
+        }
+        options.transport = *url_required_transport;
+        options.transport_explicit = true;
+    }
+
     if (options.endpoint.has_value()) {
         options.endpoint->transport = options.transport;
     }
@@ -376,9 +501,9 @@ std::string build_usage(const char* argv0) {
            " --input <mp4|-> [--live-source auto|stdin|srt|dash] [--srt-config <path>]"
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
            " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
-           " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
+           " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
-           " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--alpn value] [--sni value]"
+           " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";
 }
 
