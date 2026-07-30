@@ -97,7 +97,14 @@ Covers `src/transport/libmoq_publisher.cpp:946` and `:1181`, and `src/transport/
 
 - [ ] **Step 1: Write the failing tests**
 
-`tests/cmaf_segmenter_test.cpp` already exercises `build_live_catalog` at line 1501 with `(tracks, init_bytes, true)`. It has `make_box`, `make_full_box`, `concat`, and `expect`. The encrypted-fixture builders `make_frma`, and the `sinf`/`schm`/`schi`/`tenc` helpers, already exist in this file from Phase 3 — reuse them rather than writing new ones. Read them before writing the fixtures below and match their signatures.
+**Do not build new encrypted fixtures.** `tests/cmaf_segmenter_test.cpp` already has everything this task needs, added in Phase 3:
+
+- `make_encrypted_fragmented_test_mp4(bool include_pssh = true)` at line 360 — a complete `ftyp`+`moov`+`moof`+`mdat` file with an `encv` sample entry wrapping `avc1` via `frma`, a `cenc` `schm`, a `schi`/`tenc`, and — when `include_pssh` is true — a `pssh` sibling of `trak` under `moov` carrying the Widevine system ID. `include_pssh = false` is the exact no-`pssh` case this task's refusal test needs, and its comment already records that it models ffmpeg's `-encryption_scheme cenc-aes-ctr`.
+- `make_sinf`, `make_schm`, `make_tenc_box`, `make_frma`, `make_pssh`, `widevine_system_id()` — the building blocks, whose byte layouts match what `parse_track_protection` and `parse_pssh_boxes` actually read.
+- `expect`, `expect_contains`, `expect_not_contains`, `append_be32`, `concat`, `make_box`, `make_full_box`.
+- The existing `build_live_catalog` call at line 1501 uses `(tracks, init_bytes, true)`.
+
+Hand-rolling a `tenc` or `pssh` payload risks a layout the parser rejects, which would make a test fail for the wrong reason or pass while proving nothing. Use the helpers.
 
 Append inside `main()` before `return ok ? 0 : 1;`:
 
@@ -107,7 +114,7 @@ Append inside `main()` before `return ok ? 0 : 1;`:
     // contentProtectionRefIDs mean the track is NOT protected, so a silent
     // omission here is an affirmative false claim about encrypted media.
     {
-        const auto encrypted_bytes = make_encrypted_init_mp4_with_pssh();
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4(true);
         const auto tracks = extract_tracks(parse_mp4_boxes(encrypted_bytes), encrypted_bytes);
         ok &= expect(tracks.size() == 1 && tracks.front().protection.has_value(),
                      "expected the encrypted live fixture to report CENC protection");
@@ -127,7 +134,7 @@ Append inside `main()` before `return ok ? 0 : 1;`:
     // A protected track whose init segment carries no pssh cannot be signalled,
     // so it is refused rather than published as clear.
     {
-        const auto no_pssh_bytes = make_encrypted_init_mp4_without_pssh();
+        const auto no_pssh_bytes = make_encrypted_fragmented_test_mp4(false);
         const auto tracks = extract_tracks(parse_mp4_boxes(no_pssh_bytes), no_pssh_bytes);
         ok &= expect(tracks.size() == 1 && tracks.front().protection.has_value(),
                      "expected the no-pssh fixture to still report CENC protection");
@@ -160,7 +167,7 @@ Append inside `main()` before `return ok ? 0 : 1;`:
 
     // --drm-config deployment fields must reach the live catalog.
     {
-        const auto encrypted_bytes = make_encrypted_init_mp4_with_pssh();
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4(true);
         const auto tracks = extract_tracks(parse_mp4_boxes(encrypted_bytes), encrypted_bytes);
         DrmSystemConfig config;
         config.system_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
@@ -174,69 +181,6 @@ Append inside `main()` before `return ok ? 0 : 1;`:
         ok &= expect_contains(text, "SW_SECURE_DECODE",
                               "expected the configured robustness to reach the live catalog");
     }
-```
-
-Add two fixture builders to the file's anonymous namespace. The `pssh` payload below is a version-0 box: 4 bytes version/flags, then the 16-byte system ID, then a 4-byte data size, then the data.
-
-```cpp
-// A single-track encrypted init segment: encv sample entry wrapping avc1 via
-// frma, plus a moov-level pssh sibling to trak.
-std::vector<std::uint8_t> make_encrypted_init_mp4_common(bool include_pssh) {
-    auto visual_header = std::vector<std::uint8_t>(78, 0);
-    visual_header[24] = 0x01;   // width  = 320
-    visual_header[25] = 0x40;
-    visual_header[26] = 0x00;   // height = 240
-    visual_header[27] = 0xf0;
-
-    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
-    const auto frma = make_box("frma", {'a', 'v', 'c', '1'});
-    const auto schm = make_full_box("schm", {'c', 'e', 'n', 'c', 0, 1, 0, 0});
-
-    std::vector<std::uint8_t> tenc_payload{0, 0, 0, 0, 0, 0, 1, 8};
-    for (int index = 0; index < 16; ++index) {
-        tenc_payload.push_back(static_cast<std::uint8_t>(0x10 + index));
-    }
-    const auto tenc = make_full_box("tenc", tenc_payload);
-    const auto schi = make_box("schi", tenc);
-    const auto sinf = make_box("sinf", concat({frma, schm, schi}));
-    const auto sample_entry = make_box("encv", concat({visual_header, avcc, sinf}));
-
-    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
-    const auto mdhd = make_full_box("mdhd",
-                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
-    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    const auto tkhd = make_full_box("tkhd", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
-    const auto trak = make_box("trak",
-                               concat({tkhd,
-                                       make_box("mdia", concat({mdhd, hdlr,
-                                                                make_box("minf", make_box("stbl", stsd))}))}));
-
-    std::vector<std::vector<std::uint8_t>> moov_children{trak};
-    if (include_pssh) {
-        std::vector<std::uint8_t> pssh_payload{0, 0, 0, 0};
-        const std::uint8_t widevine_id[16] = {0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
-                                              0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed};
-        pssh_payload.insert(pssh_payload.end(), std::begin(widevine_id), std::end(widevine_id));
-        append_be32(pssh_payload, 4);
-        pssh_payload.insert(pssh_payload.end(), {0xDE, 0xAD, 0xBE, 0xEF});
-        moov_children.push_back(make_box("pssh", pssh_payload));
-    }
-
-    std::vector<std::uint8_t> moov_payload;
-    for (const auto& child : moov_children) {
-        moov_payload.insert(moov_payload.end(), child.begin(), child.end());
-    }
-    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
-    return concat({ftyp, make_box("moov", moov_payload)});
-}
-
-std::vector<std::uint8_t> make_encrypted_init_mp4_with_pssh() {
-    return make_encrypted_init_mp4_common(true);
-}
-
-std::vector<std::uint8_t> make_encrypted_init_mp4_without_pssh() {
-    return make_encrypted_init_mp4_common(false);
-}
 ```
 
 Add `#include "openmoq/publisher/publisher_api.h"` to the test file if `DrmSystemConfig` is not already visible.
@@ -383,7 +327,11 @@ idiom is at `tests/live_dash_ingest_test.cpp:295-307`; follow it exactly.
     }
 ```
 
-Build `make_encrypted_dash_init_with_pssh` by copying the fixture shape from Task 2's `make_encrypted_init_mp4_common(true)` — the same `encv`/`frma`/`schm`/`schi`/`tenc` sample entry plus a moov-level `pssh`. Do not share the function across test binaries; each test file owns its fixtures in this codebase. This file already has an `make_init_segment(...)` helper; read it and match its box-building style rather than importing a different one.
+Build `make_encrypted_dash_init_with_pssh` by porting the CENC fixture helpers from `tests/cmaf_segmenter_test.cpp` — `make_frma`, `make_schm`, `make_tenc_box`, `make_sinf`, `make_pssh`, and `widevine_system_id()`, defined there around lines 320-356. Their byte layouts match what `parse_track_protection` and `parse_pssh_boxes` actually read; do **not** hand-roll replacements, since a wrong `tenc` or `pssh` layout makes a test fail for the wrong reason or pass while proving nothing.
+
+Each test binary owns its fixtures in this codebase, so copy the helpers you need rather than trying to share them across binaries.
+
+The fixture must be an **init segment** — `ftyp` + `moov`, with the `pssh` a sibling of `trak` under `moov` — not a full fragmented file, because the DASH ingest treats `ftyp`/`moov` as the init and expects media in separate `moof`/`mdat` boxes. This file's existing `make_init_segment(...)` shows the expected shape; read it and add the `encv` sample entry with `sinf`, plus the `pssh`, to that shape.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
