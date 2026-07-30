@@ -111,11 +111,26 @@ bytes. `build_catalog_locked` therefore has no access to the `pssh` boxes.
 `PathState::init_bytes` holds them at registration time
 (`src/live_dash_ingest.cpp:376`).
 
-**Resolution:** retain the full init bytes for use at catalog construction. Store
-them once per path rather than copying them onto every `RegisteredTrack`, since
-all tracks registered from one path share one init segment. Decoding the
-per-track base64 back to bytes is not an acceptable substitute: that segment is
-a synthesised single-track `moov` and does not carry the `pssh` siblings.
+**Resolution:** parse the systems at registration time, while
+`PathState::init_bytes` is still in hand, and store the small parsed result —
+`std::vector<CencSystem>` — on each `RegisteredTrack`. Registration already
+happens once per path, so `collect_pssh_systems` runs once per path rather than
+once per catalog build.
+
+Storing the parsed systems is preferred over retaining the raw init bytes: an
+init segment is kilobytes and would be duplicated across every track registered
+from that path, whereas a parsed system list is a handful of small structs.
+
+Decoding the per-track base64 back to bytes is not an acceptable substitute
+under any storage choice: that segment is a synthesised single-track `moov` and
+does not carry the `pssh` siblings at all, so it would silently yield no systems
+and turn every protected track into a refusal.
+
+This requires promoting `collect_pssh_systems` from `cmsf_packager.cpp`'s
+anonymous namespace (it is declared at line 367) to `cmsf_packager.h`, so the
+DASH ingest can call it. That is the same shared-helper extraction Phase 3
+applied to the JSON reader, and it keeps one implementation of "find the `pssh`
+boxes under `moov` and parse them" rather than two.
 
 ## Deployment configuration
 
