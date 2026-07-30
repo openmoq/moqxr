@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
             .paced = options.paced,
             .loop = options.loop,
             .vod = options.vod,
+            .drm_systems = options.drm_systems,
             .catalog_republish_interval = options.catalog_republish_interval,
             .subscriber_timeout = options.subscriber_timeout,
         };

@@ -1,5 +1,6 @@
 #include "openmoq/publisher/msf_catalog.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <ios>
@@ -104,6 +105,28 @@ bool is_media_role(const MsfTrack& track) {
     return track.role.has_value() && (*track.role == "video" || *track.role == "audio");
 }
 
+// xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, the form CMSF 4.1.1.2 requires.
+bool is_uuid_string(std::string_view value) {
+    if (value.size() != 36) {
+        return false;
+    }
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const bool is_dash_position = (i == 8 || i == 13 || i == 18 || i == 23);
+        if (is_dash_position) {
+            if (value[i] != '-') {
+                return false;
+            }
+            continue;
+        }
+        const char c = value[i];
+        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // MSF and CMSF invariants that a malformed caller could otherwise publish.
 void validate_track(const MsfTrack& track) {
     const std::string where = " (track \"" + track.name + "\")";
@@ -191,6 +214,32 @@ void validate_catalog(const MsfCatalog& catalog) {
         }
     }
 
+    std::set<std::string> protection_ids;
+    for (const auto& cp : catalog.content_protections) {
+        if (!protection_ids.insert(cp.ref_id).second) {
+            throw std::runtime_error("CMSF catalog has a duplicate contentProtections refID \"" +
+                                     cp.ref_id + "\"");
+        }
+        // Section 4.1.1.3 defines exactly two schemes.
+        if (cp.scheme != "cenc" && cp.scheme != "cbcs") {
+            throw std::runtime_error("CMSF contentProtections scheme must be cenc or cbcs, got \"" +
+                                     cp.scheme + "\"");
+        }
+        // Section 4.1.1.2 makes defaultKID required.
+        if (cp.default_kids.empty()) {
+            throw std::runtime_error("CMSF contentProtections entry \"" + cp.ref_id +
+                                     "\" has no defaultKID");
+        }
+        for (const auto& kid : cp.default_kids) {
+            if (!is_uuid_string(kid)) {
+                throw std::runtime_error("CMSF defaultKID \"" + kid + "\" is not a UUID string");
+            }
+        }
+        if (!is_uuid_string(cp.system_id)) {
+            throw std::runtime_error("CMSF systemID \"" + cp.system_id + "\" is not a UUID string");
+        }
+    }
+
     // Section 5.2.3: track names MUST be unique per namespace.
     // Both tracks and publishTracks must be checked together for uniqueness.
     std::set<std::pair<std::string, std::string>> seen;
@@ -206,6 +255,13 @@ void validate_catalog(const MsfCatalog& catalog) {
             throw std::runtime_error("MSF catalog initRef \"" + *track.init_ref +
                                      "\" has no matching initDataList entry (track \"" + track.name + "\")");
         }
+        for (const auto& ref : track.content_protection_ref_ids) {
+            if (protection_ids.count(ref) == 0) {
+                throw std::runtime_error("CMSF contentProtectionRefID \"" + ref +
+                                         "\" has no matching contentProtections entry (track \"" +
+                                         track.name + "\")");
+            }
+        }
     }
 
     // Section 5.1.5: publishTracks follow the same structure as tracks.
@@ -219,6 +275,13 @@ void validate_catalog(const MsfCatalog& catalog) {
         if (track.init_ref.has_value() && init_ids.count(*track.init_ref) == 0) {
             throw std::runtime_error("MSF catalog initRef \"" + *track.init_ref +
                                      "\" has no matching initDataList entry (track \"" + track.name + "\")");
+        }
+        for (const auto& ref : track.content_protection_ref_ids) {
+            if (protection_ids.count(ref) == 0) {
+                throw std::runtime_error("CMSF contentProtectionRefID \"" + ref +
+                                         "\" has no matching contentProtections entry (track \"" +
+                                         track.name + "\")");
+            }
         }
     }
 }
@@ -327,6 +390,10 @@ void write_track(std::ostringstream& out, const MsfTrack& track) {
         write_raw(out, seq, key, value);
     }
 
+    if (!track.content_protection_ref_ids.empty()) {
+        write_string_array(out, seq, "contentProtectionRefIDs", track.content_protection_ref_ids);
+    }
+
     out << '}';
 }
 
@@ -365,6 +432,49 @@ std::string serialize_catalog(const MsfCatalog& catalog) {
     }
     if (catalog.is_complete.has_value() && *catalog.is_complete) {
         write_bool(out, seq, "isComplete", true);
+    }
+
+    // CMSF 4.1: contentProtections lives at the catalog root, between
+    // isComplete and tracks, matching the CMSF examples in sections 5.2/5.3.
+    // Skipped for a delta catalog, alongside tracks (MSF section 5.3).
+    if (!is_delta && !catalog.content_protections.empty()) {
+        seq.separate();
+        out << "\"contentProtections\":[";
+        JsonSeq cps(out);
+        for (const auto& cp : catalog.content_protections) {
+            cps.separate();
+            out << '{';
+            JsonSeq cp_seq(out);
+            write_string(out, cp_seq, "refID", cp.ref_id);
+            write_string_array(out, cp_seq, "defaultKID", cp.default_kids);
+            write_string(out, cp_seq, "scheme", cp.scheme);
+            cp_seq.separate();
+            out << "\"drmSystem\":{";
+            JsonSeq ds(out);
+            write_string(out, ds, "systemID", cp.system_id);
+            const auto write_url = [&](std::string_view key, const std::optional<MsfUrlEntry>& entry) {
+                if (!entry.has_value()) {
+                    return;
+                }
+                ds.separate();
+                out << '"' << json_escape(key) << "\":{\"url\":\"" << json_escape(entry->url) << '"';
+                if (entry->type.has_value()) {
+                    out << ",\"type\":\"" << json_escape(*entry->type) << '"';
+                }
+                out << '}';
+            };
+            write_url("laURL", cp.la_url);
+            write_url("certURL", cp.cert_url);
+            if (cp.pssh_base64.has_value()) {
+                write_string(out, ds, "pssh", *cp.pssh_base64);
+            }
+            if (cp.robustness.has_value()) {
+                write_string(out, ds, "robustness", *cp.robustness);
+            }
+            out << '}';
+            out << '}';
+        }
+        out << ']';
     }
 
     if (is_delta) {
@@ -567,6 +677,43 @@ void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view tra
     });
 }
 
+void attach_content_protection(MsfCatalog& catalog,
+                               MsfTrack& track,
+                               const CencTrackProtection& protection,
+                               const std::vector<CencSystem>& systems) {
+    for (const auto& system : systems) {
+        // Reuse an existing entry for the same system and scheme so two tracks
+        // sharing a KID share entries, per CMSF 4.1.1's no-duplication rule.
+        auto existing = std::find_if(
+            catalog.content_protections.begin(), catalog.content_protections.end(),
+            [&](const MsfContentProtection& cp) {
+                return cp.system_id == system.system_id && cp.scheme == protection.scheme;
+            });
+
+        if (existing == catalog.content_protections.end()) {
+            MsfContentProtection cp;
+            cp.ref_id = std::to_string(catalog.content_protections.size() + 1);
+            cp.default_kids = {protection.default_kid};
+            cp.scheme = protection.scheme;
+            cp.system_id = system.system_id;
+            if (!system.pssh_base64.empty()) {
+                cp.pssh_base64 = system.pssh_base64;
+            }
+            catalog.content_protections.push_back(std::move(cp));
+            existing = std::prev(catalog.content_protections.end());
+        } else if (std::find(existing->default_kids.begin(), existing->default_kids.end(),
+                             protection.default_kid) == existing->default_kids.end()) {
+            existing->default_kids.push_back(protection.default_kid);
+        }
+
+        if (std::find(track.content_protection_ref_ids.begin(),
+                      track.content_protection_ref_ids.end(),
+                      existing->ref_id) == track.content_protection_ref_ids.end()) {
+            track.content_protection_ref_ids.push_back(existing->ref_id);
+        }
+    }
+}
+
 MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
                                       EndBroadcastMode mode,
                                       const std::map<std::string, std::uint64_t>& track_durations_ms) {
@@ -622,16 +769,37 @@ bool tracks_equal(const MsfTrack& a, const MsfTrack& b) {
            a.max_grp_sap_starting_type == b.max_grp_sap_starting_type &&
            a.max_obj_sap_starting_type == b.max_obj_sap_starting_type &&
            a.custom_fields == b.custom_fields &&
+           a.content_protection_ref_ids == b.content_protection_ref_ids &&
            ((!a.buffers.has_value() && !b.buffers.has_value()) ||
             (a.buffers.has_value() && b.buffers.has_value() &&
              a.buffers->target_ms == b.buffers->target_ms && a.buffers->min_ms == b.buffers->min_ms &&
              a.buffers->max_ms == b.buffers->max_ms));
 }
 
+// Compares every field serialize_catalog can emit for one contentProtections
+// entry, mirroring tracks_equal's invariant so a change here cannot be
+// silently mistaken for a no-op by CatalogPublisher::publish.
+bool content_protections_equal(const MsfContentProtection& a, const MsfContentProtection& b) {
+    const auto url_equal = [](const std::optional<MsfUrlEntry>& x, const std::optional<MsfUrlEntry>& y) {
+        if (x.has_value() != y.has_value()) {
+            return false;
+        }
+        if (!x.has_value()) {
+            return true;
+        }
+        return x->url == y->url && x->type == y->type;
+    };
+    return a.ref_id == b.ref_id && a.default_kids == b.default_kids && a.scheme == b.scheme &&
+           a.system_id == b.system_id && a.pssh_base64 == b.pssh_base64 &&
+           a.robustness == b.robustness && url_equal(a.la_url, b.la_url) &&
+           url_equal(a.cert_url, b.cert_url);
+}
+
 bool catalogs_equal(const MsfCatalog& a, const MsfCatalog& b) {
     if (a.version != b.version || a.is_complete != b.is_complete ||
         a.tracks.size() != b.tracks.size() || a.publish_tracks.size() != b.publish_tracks.size() ||
-        a.init_data_list.size() != b.init_data_list.size()) {
+        a.init_data_list.size() != b.init_data_list.size() ||
+        a.content_protections.size() != b.content_protections.size()) {
         return false;
     }
     for (std::size_t i = 0; i < a.tracks.size(); ++i) {
@@ -648,6 +816,11 @@ bool catalogs_equal(const MsfCatalog& a, const MsfCatalog& b) {
         if (a.init_data_list[i].id != b.init_data_list[i].id ||
             a.init_data_list[i].type != b.init_data_list[i].type ||
             a.init_data_list[i].data != b.init_data_list[i].data) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < a.content_protections.size(); ++i) {
+        if (!content_protections_equal(a.content_protections[i], b.content_protections[i])) {
             return false;
         }
     }
@@ -770,8 +943,19 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     for (std::size_t i = 0; !publish_tracks_changed && i < last_->publish_tracks.size(); ++i) {
         publish_tracks_changed = !tracks_equal(last_->publish_tracks[i], desired.publish_tracks[i]);
     }
+    // Same reasoning as init_data_changed/publish_tracks_changed above: a
+    // same-size contentProtections whose content differs (e.g. a KID added to
+    // an existing entry) is exactly as inexpressible as a delta, since
+    // contentProtections is root-level and every delta operation carries only
+    // tracks (MSF 5.1.6).
+    bool content_protections_changed =
+        last_->content_protections.size() != desired.content_protections.size();
+    for (std::size_t i = 0; !content_protections_changed && i < last_->content_protections.size(); ++i) {
+        content_protections_changed =
+            !content_protections_equal(last_->content_protections[i], desired.content_protections[i]);
+    }
     if ((added.empty() && removed.empty()) || init_data_changed || publish_tracks_changed ||
-        deltas_in_group_ >= max_deltas_per_group_) {
+        content_protections_changed || deltas_in_group_ >= max_deltas_per_group_) {
         std::vector<CatalogObject> out;
         out.push_back(emit_independent(desired));
         last_ = desired;

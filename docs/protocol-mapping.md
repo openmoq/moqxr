@@ -116,11 +116,134 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     the transport draft governs what may legally appear on the wire, so its
     ordering wins.
 - Not implemented: `clone` delta operations, MSF sections 9/10 log and
-  metrics tracks, MSF section 11.1 URL parsing, MSF section 12 compression
-  signalling, and CMSF section 4 content protection.
+  metrics tracks, MSF section 11.1 URL parsing, and MSF section 12
+  compression signalling. CMSF section 4 content protection (see the
+  dedicated section below) is implemented for the batch/VOD publish path
+  only.
 - The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
   which is not an MSF v1 packaging value; it is defined by
   `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.
+
+## CMSF content protection
+
+`draft-ietf-moq-cmsf-01` section 4. Implemented for the batch/VOD publish
+path only; the publisher never decrypts and never encrypts anywhere in this
+project -- it detects and signals protection already present in its input.
+
+- Protection data lives at the catalog root as `contentProtections` (CMSF
+  4.1.1), never duplicated onto a track. Each protected track instead carries
+  `contentProtectionRefIDs` (CMSF 4.1.2) pointing at the root entries by
+  `refID`. `attach_content_protection` (`src/msf_catalog.cpp`) reuses an
+  existing root entry when its system ID and scheme already match, rather
+  than emitting a duplicate, so multiple tracks sharing a KID share one
+  entry. A protected track (`TrackDescription::protection` populated) whose
+  init segment carries no `pssh` system at all is refused by
+  `build_publish_plan` (`src/cmsf_packager.cpp`) rather than silently
+  emitted with no `contentProtections` entry: CMSF 4.1.2 defines an absent
+  `contentProtectionRefIDs` as meaning the track is unprotected, so
+  publishing one for genuinely encrypted content would assert the opposite
+  of the truth. `pssh` is only SHOULD-present (CMSF 4.1.1.4.5); ffmpeg's
+  `-encryption_scheme cenc-aes-ctr` is a real encoder that omits it
+  entirely, so this is the ordinary case, not an exotic one. This also
+  closes a second hole: without this refusal, an unrecognised `schm` scheme
+  on a pssh-less track would never reach `validate_catalog` at all, since no
+  `contentProtections` entry existed for it to reject.
+- A protected track's `codec` string is always the `frma` original format
+  (e.g. `avc1.64000C`), not the `encv`/`enca` sample-entry type that wraps
+  it. `sample_entry_type` separately keeps the raw `encv`/`enca` type, so a
+  consumer can distinguish "this track is protected" from "this track's
+  codec". Resolving the codec through `frma` requires reading the profile
+  bytes (e.g. `avcC`) via the *effective* sample entry, not a bare
+  hard-coded string. The same effective, frma-resolved type also gates
+  geometry extraction (width/height for video, samplerate/channelConfig for
+  audio): `encv`/`enca` are byte-for-byte a VisualSampleEntry/
+  AudioSampleEntry, so gating on the raw wrapper type would silently zero
+  out a video track's dimensions and, worse, publish a wrong (zero)
+  samplerate/channelConfig for an audio track, since `validate_track` makes
+  both MUST-present.
+- CENC parameters (`scheme`, `default_KID`, `per_sample_iv_size`,
+  `is_protected`) come from `sinf`/`schm`/`schi`/`tenc` inside the encrypted
+  sample entry (`cenc.h`'s `parse_track_protection`). A track whose
+  protection boxes are absent or malformed is never advertised as protected
+  -- protection detection fails closed.
+- DRM system init data (`pssh` boxes, siblings of `trak` under `moov`) is
+  extracted per system and becomes `contentProtections[].pssh` (the JSON
+  key; `psshBase64` is only the C++ member name that holds it,
+  `MsfContentProtection::pssh_base64`).
+  `--drm-config` supplies each system's deployment fields (`laURL`,
+  `certURL`, `robustness`) from a JSON file parsed eagerly at CLI startup, so
+  a malformed file fails before publishing begins rather than publishing
+  with partial configuration.
+- **`saio` correction on the CTE ingest path** (`correct_saio_offsets`,
+  `src/cmaf_segmenter.cpp`): when the CTE path rebuilds a moof (e.g. to
+  materialize `trun` defaults), the rebuild changes only `trun`'s own size --
+  every other byte in the traf, moof, and mdat keeps its original position.
+  Each `saio` offset is therefore classified against two separate
+  boundaries, not one:
+  - **Refusal boundary** -- `original_moof_size + mdat_size`. An offset at or
+    beyond this cannot be a moof-relative reference within a republished
+    MOQT object at all; adjusting it would silently point somewhere
+    meaningless and decrypt to garbage. It is refused (the fragment is
+    rejected) rather than guessed at.
+  - **Shift boundary** -- the *original* `trun` box's end offset, relative to
+    the moof. Only an offset at or beyond this point actually moved, since
+    the rebuild changed only `trun`'s size: this is normally `mdat` or a
+    `senc` placed after `trun` in the traf. An offset below this point
+    (inside `tfhd`, or inside a `senc` placed *before* `trun` -- both legal
+    ISO/IEC 14496-12 orderings, and ffmpeg produces the latter) is left
+    unchanged, not shifted.
+
+  A prior version of this function shifted every offset within the refusal
+  boundary regardless of where it fell relative to `trun`, which is only
+  correct when every aux-info target happens to sit after `trun` in the
+  traf; ffmpeg does not guarantee that ordering. The classification is a
+  magnitude heuristic, not a semantic read of which box a saio entry
+  targets: ISO/IEC 14496-12's tfhd flags `0x000001`
+  (base-data-offset-present) and `0x020000` (default-base-is-moof) would
+  give the exact answer instead, and were sanctioned as unnecessary for the
+  CTE ingest path's actual inputs.
+
+  Only the first `traf` in a moof is rebuilt (and only its `saio` corrected
+  for the delta); a multi-`traf` moof copies every other `traf` verbatim,
+  including any `saio` it carries, whose offsets would then be stale
+  against the rebuilt moof's new size. `materialize_live_trun_defaults`
+  therefore refuses a multi-`traf` moof if any `traf` other than the first
+  carries a `saio`, naming the limitation; a single-`traf` moof, and a
+  multi-`traf` moof with no `saio` outside the first, are both handled as
+  before. Correcting `saio` across multiple `traf`s is not implemented.
+- **Refused, not signalled:** the progressive-remux path (`segment_for_cmaf`'s
+  non-fragmented branch) synthesises `moof` boxes from scratch and cannot
+  carry `senc`, `saiz`, or `saio`. Encrypted input there (any track with a
+  populated `CencTrackProtection`) is refused with an error naming the
+  progressive-remux path and the offending track, rather than producing
+  output that looks like valid CMAF but cannot be decrypted.
+- **Not signalled at all today:** the live publish paths --
+  `MoqtSession::publish_live()` (SRT and stdin ingest) and
+  `publish_live_objects()` (DASH ingest) -- build their catalog through
+  `build_live_catalog` (`src/cmsf_packager.cpp`), which never calls
+  `attach_content_protection`. `parse_cli_options` therefore refuses
+  `--drm-config` combined with `--live-source srt`, `--live-source dash`
+  (when it will actually publish, i.e. not a `--dump-plan` dry run with no
+  `--endpoint`), or the default live-stdin path, rather than let a publisher
+  emit a catalog with no `contentProtections`/`contentProtectionRefIDs` at
+  all for encrypted content -- which would be indistinguishable from
+  genuinely unprotected content. **This refusal is narrower than it may
+  look:** the guard only fires when `--drm-config` is actually supplied --
+  detecting protection at CLI-parse time, before any media is read, is not
+  possible. Encrypted live input published with no `--drm-config` at all is
+  not refused and still publishes fully unsignalled, since `--drm-config`
+  supplies only optional deployment fields (`laURL`, `certURL`,
+  `robustness`), not protection detection itself. The same gap exists at the
+  library level: `PublisherConfig::drm_systems`
+  (`include/openmoq/publisher/publisher_api.h`) has no equivalent guard, so
+  an SDK consumer combining it with a live publish path gets the same silent
+  behaviour the CLI guard exists to prevent. Wiring content protection into
+  the live paths is future work, not part of this phase.
+- **Not modelled:** MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41)
+  are a separate, LOC-packaged end-to-end encryption mechanism; CMSF uses
+  CENC instead. The CMSF 4.1.1.4.4 Authorization URL field is also
+  deliberately unmodelled -- the draft describes it but never names its JSON
+  key.
 
 ## Implementation consequence
 

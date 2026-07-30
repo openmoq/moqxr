@@ -28,6 +28,31 @@ struct MsfBuffers {
     std::optional<std::uint64_t> max_ms;
 };
 
+// A URL with an optional type, used by the DRM system fields in CMSF 4.1.1.4.
+// Declared before MsfContentProtection, which holds these by value.
+//
+// Note: CMSF 4.1.1.4.4 describes an Authorization URL but never names its JSON
+// key, and the draft's examples show only laURL and certURL. It is therefore
+// NOT modelled here -- emitting an invented key would be guessing at the spec,
+// and nothing in DrmSystemConfig could populate it anyway.
+struct MsfUrlEntry {
+    std::string url;
+    std::optional<std::string> type;
+};
+
+// One DRM system configuration at the catalog root (CMSF 4.1.1). Tracks
+// reference these by ref_id; the data is never duplicated on a track.
+struct MsfContentProtection {
+    std::string ref_id;                       // 4.1.1.1, required
+    std::vector<std::string> default_kids;    // 4.1.1.2, required
+    std::string scheme;                       // 4.1.1.3, "cenc" or "cbcs"
+    std::string system_id;                    // 4.1.1.4.1, required
+    std::optional<MsfUrlEntry> la_url;        // 4.1.1.4.2
+    std::optional<MsfUrlEntry> cert_url;      // 4.1.1.4.3
+    std::optional<std::string> pssh_base64;   // 4.1.1.4.5
+    std::optional<std::string> robustness;    // 4.1.1.4.6
+};
+
 // A track object (MSF section 5.2). Field names mirror the spec exactly.
 // std::optional models absence so the serializer never emits a field the
 // drafts say MUST NOT appear.
@@ -68,6 +93,8 @@ struct MsfTrack {
     // do not collide with spec field names; the serializer enforces that.
     // Values are raw JSON, so a string value must arrive already quoted.
     std::map<std::string, std::string> custom_fields;
+
+    std::vector<std::string> content_protection_ref_ids;     // 4.1.2
 };
 
 // One operation in a delta update (MSF section 5.1.6). This version emits
@@ -84,6 +111,7 @@ struct MsfCatalog {
     std::string version = "1";                    // 5.1.1, a String
     std::optional<std::uint64_t> generated_at_ms; // 5.1.2
     std::optional<bool> is_complete;              // 5.1.3
+    std::vector<MsfContentProtection> content_protections;   // 4.1.1
     std::vector<MsfTrack> tracks;                 // 5.1.4
     std::vector<MsfTrack> publish_tracks;         // 5.1.5
     std::vector<MsfInitData> init_data_list;      // 5.1.7, emitted after tracks
@@ -126,6 +154,15 @@ MsfTrack make_msf_track(const TrackDescription& track,
 // using "<track_name>-init" as the shared id convention. Centralizes the
 // initRef/initDataList wiring that every MP4 emitter otherwise repeats.
 void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name, std::string base64_data);
+
+// Add or reuse a root contentProtections entry for each DRM system carrying
+// this track's protection, and point the track at them by refID. Systems
+// already present (matched by system_id and scheme) are reused rather than
+// duplicated, so two tracks sharing a KID share entries.
+void attach_content_protection(MsfCatalog& catalog,
+                               MsfTrack& track,
+                               const CencTrackProtection& protection,
+                               const std::vector<CencSystem>& systems);
 
 // How a live broadcast ends (MSF section 11.3).
 enum class EndBroadcastMode {

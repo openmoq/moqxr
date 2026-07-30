@@ -253,9 +253,11 @@ endif()
 
 add_library(openmoq_publisher_lib STATIC
     src/cat4moq.cpp
+    src/cenc.cpp
     src/cli_options.cpp
     src/cmaf_segmenter.cpp
     src/cmsf_packager.cpp
+    src/drm_config.cpp
     src/live_srt_ingest.cpp
     src/live_srt_config.cpp
     src/live_dash_ingest.cpp
@@ -367,6 +369,12 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-msf-catalog-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-msf-catalog-tests COMMAND openmoq-publisher-msf-catalog-tests)
+
+    add_executable(openmoq-publisher-cenc-tests
+        tests/cenc_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-cenc-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-cenc-tests COMMAND openmoq-publisher-cenc-tests)
 
     add_executable(openmoq-publisher-cli-tests
         tests/cli_options_test.cpp

@@ -1,4 +1,6 @@
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/cenc.h"
+#include "openmoq/publisher/drm_config.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/msf_catalog.h"
 
@@ -282,17 +284,20 @@ std::vector<std::uint8_t> build_track_specific_init_segment(std::span<const std:
 std::vector<std::uint8_t> extract_codec_init_data(const Mp4Box& sample_entry,
                                                   std::span<const std::uint8_t> bytes,
                                                   std::size_t child_offset) {
-    for (std::size_t scan_offset = child_offset; scan_offset + 8 <= sample_entry.span.size; ++scan_offset) {
-        const std::size_t cursor = sample_entry.span.offset + scan_offset;
-        const std::uint32_t box_size = read_be32(bytes, cursor);
-        if (box_size < 8 || cursor + box_size > sample_entry.span.offset + sample_entry.span.size) {
-            continue;
-        }
-
-        const std::string type(reinterpret_cast<const char*>(bytes.data() + cursor + 4), 4);
-        if (type == "avcC" || type == "hvcC" || type == "esds" || type == "dOps") {
-            return std::vector<std::uint8_t>(bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
-                                             bytes.begin() + static_cast<std::ptrdiff_t>(cursor + box_size));
+    // Previously a sliding byte scan bounded by the RAW, unvalidated
+    // sample_entry.span.size -- a memory-safety bug and a false-positive
+    // hazard. find_child_box_span walks by declared length and clamps to the
+    // real buffer.
+    for (const std::string_view type : {"avcC", "hvcC", "esds", "dOps"}) {
+        const auto span = find_child_box_span(bytes,
+                                              sample_entry.span.offset,
+                                              sample_entry.span.size,
+                                              child_offset,
+                                              type);
+        if (span.has_value()) {
+            return std::vector<std::uint8_t>(
+                bytes.begin() + static_cast<std::ptrdiff_t>(span->offset),
+                bytes.begin() + static_cast<std::ptrdiff_t>(span->offset + span->size));
         }
     }
 
@@ -343,10 +348,10 @@ std::vector<std::uint8_t> build_track_codec_init_data(std::span<const std::uint8
         };
 
         if (track.handler_type == "vide") {
-            return extract_codec_init_data(sample_entry, init_bytes, 8 + 70);
+            return extract_codec_init_data(sample_entry, init_bytes, kVisualSampleEntryChildOffset);
         }
         if (track.handler_type == "soun") {
-            return extract_codec_init_data(sample_entry, init_bytes, 8 + 28);
+            return extract_codec_init_data(sample_entry, init_bytes, kAudioSampleEntryChildOffset);
         }
 
         throw std::runtime_error("catalog generation does not support codec initData for handler " + track.handler_type);
@@ -355,13 +360,70 @@ std::vector<std::uint8_t> build_track_codec_init_data(std::span<const std::uint8
     throw std::runtime_error("catalog generation could not locate matching trak for codec initData");
 }
 
+// pssh boxes live directly under moov (ISO/IEC 23001-7), as siblings of the
+// trak boxes -- not inside any single track's sinf. Collecting them once for
+// the whole init segment mirrors how CMSF 4.1.1 protection lives at the
+// catalog root and is shared by every track that references it.
+std::vector<CencSystem> collect_pssh_systems(std::span<const std::uint8_t> init_bytes) {
+    const std::vector<Mp4Box> top_level_boxes = parse_mp4_boxes(init_bytes);
+    const Mp4Box* moov = find_first_box(top_level_boxes, "moov");
+    if (moov == nullptr) {
+        return {};
+    }
+
+    std::vector<Mp4Box> pssh_boxes;
+    for (const Mp4Box* box : find_boxes(moov->children, "pssh")) {
+        pssh_boxes.push_back(*box);
+    }
+    return parse_pssh_boxes(init_bytes, pssh_boxes);
+}
+
+// Apply deployment-configured DRM fields (licence/cert URLs, robustness) onto
+// the contentProtections entries attach_content_protection just created or
+// reused for `systems`. A configured system whose system_id does not match
+// any system found in the media is silently skipped -- it describes
+// protection that does not exist in this asset.
+void apply_drm_system_configs(MsfCatalog& catalog,
+                              const std::string& scheme,
+                              const std::vector<CencSystem>& systems,
+                              const std::vector<DrmSystemConfig>& drm_systems) {
+    for (const auto& system : systems) {
+        const auto config_it = std::find_if(
+            drm_systems.begin(), drm_systems.end(),
+            [&](const DrmSystemConfig& config) { return config.system_id == system.system_id; });
+        if (config_it == drm_systems.end()) {
+            continue;
+        }
+
+        const auto entry_it = std::find_if(
+            catalog.content_protections.begin(), catalog.content_protections.end(),
+            [&](const MsfContentProtection& cp) {
+                return cp.system_id == system.system_id && cp.scheme == scheme;
+            });
+        if (entry_it == catalog.content_protections.end()) {
+            continue;
+        }
+
+        if (config_it->la_url.has_value()) {
+            entry_it->la_url = MsfUrlEntry{.url = *config_it->la_url, .type = config_it->la_url_type};
+        }
+        if (config_it->cert_url.has_value()) {
+            entry_it->cert_url = MsfUrlEntry{.url = *config_it->cert_url, .type = config_it->cert_url_type};
+        }
+        if (config_it->robustness.has_value()) {
+            entry_it->robustness = config_it->robustness;
+        }
+    }
+}
+
 }  // namespace
 
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap,
                                bool include_msf_timeline,
-                               bool vod) {
+                               bool vod,
+                               const std::vector<DrmSystemConfig>& drm_systems) {
     std::vector<TrackDescription> tracks = segmented_mp4.tracks;
     std::uint32_t synthetic_track_id = next_synthetic_track_id(tracks);
     if (include_msf_timeline) {
@@ -380,6 +442,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
             .event_type = {},
             .mime_type = "application/json",
             .depends = std::move(media_track_names),
+            .protection = std::nullopt,
         });
     }
     if (include_sap) {
@@ -394,6 +457,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                 .event_type = "org.ietf.moq.cmsf.sap",
                 .mime_type = "application/json",
                 .depends = {media_track.track_name},
+                .protection = std::nullopt,
             });
         }
     }
@@ -407,6 +471,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                     .event_type = {},
                                     .mime_type = {},
                                     .depends = {},
+                                    .protection = std::nullopt,
                                 });
 
     PublishPlan plan{
@@ -439,6 +504,19 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                 std::chrono::system_clock::now().time_since_epoch())
                 .count());
     }
+
+    // pssh boxes are collected once for the whole init segment (not
+    // per-track -- see collect_pssh_systems) and only when some track is
+    // actually protected, since parsing the init segment again is otherwise
+    // wasted work for the common unencrypted case.
+    const bool any_track_protected = std::any_of(
+        plan.tracks.begin(), plan.tracks.end(),
+        [](const TrackDescription& track) { return track.protection.has_value(); });
+    const std::vector<CencSystem> pssh_systems =
+        any_track_protected ? collect_pssh_systems(segmented_mp4.initialization_segment.owned_bytes)
+                            : std::vector<CencSystem>{};
+    std::vector<std::string> protected_schemes;
+
     for (const auto& track : plan.tracks) {
         if (track.track_name == "catalog") {
             continue;
@@ -473,7 +551,44 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
             attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
+        if (track.protection.has_value()) {
+            // CMSF 4.1.2: "When this field is absent, the track content is
+            // not protected by Common Encryption." pssh is only
+            // SHOULD-present (CMSF 4.1.1.4.5) -- ffmpeg's
+            // -encryption_scheme cenc-aes-ctr, for one, writes
+            // sinf/tenc/senc/saiz/saio with no pssh at all -- so a protected
+            // track with no pssh anywhere in the init segment must not fall
+            // through attach_content_protection's systems loop silently: that
+            // would publish a catalog with no contentProtections entry and no
+            // contentProtectionRefIDs for genuinely encrypted content,
+            // indistinguishable from unprotected media. Refuse instead,
+            // matching the standard cli_options.cpp already sets for the
+            // live-path guard.
+            if (pssh_systems.empty()) {
+                throw std::runtime_error(
+                    "track '" + track.track_name +
+                    "' is protected (CENC) but no pssh system was found in the "
+                    "initialization segment; refusing to publish a catalog with no "
+                    "contentProtections entry for encrypted content");
+            }
+            attach_content_protection(msf_catalog, msf_track, *track.protection, pssh_systems);
+            if (std::find(protected_schemes.begin(), protected_schemes.end(), track.protection->scheme) ==
+                protected_schemes.end()) {
+                protected_schemes.push_back(track.protection->scheme);
+            }
+        }
+
         msf_catalog.tracks.push_back(std::move(msf_track));
+    }
+
+    // Hoisted out of the per-track loop above: apply_drm_system_configs
+    // operates on the catalog-root contentProtections entries and the
+    // whole-init-segment pssh_systems list, neither of which is per-track, so
+    // calling it once per distinct protected scheme is equivalent to (and
+    // cheaper than) the previous once-per-protected-track calls, which were
+    // merely idempotent re-applications of the same result.
+    for (const auto& scheme : protected_schemes) {
+        apply_drm_system_configs(msf_catalog, scheme, pssh_systems, drm_systems);
     }
 
     const std::string catalog_text = serialize_catalog(msf_catalog);

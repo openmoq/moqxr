@@ -103,7 +103,8 @@ PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const
                                    config_.draft_version,
                                    config_.include_sap,
                                    config_.include_msf_timeline,
-                                   config_.vod),
+                                   config_.vod,
+                                   config_.drm_systems),
     };
 }
 
@@ -117,7 +118,8 @@ PreparedPublish Publisher::prepare_stream(std::istream& input, std::string_view 
                                    config_.draft_version,
                                    config_.include_sap,
                                    config_.include_msf_timeline,
-                                   config_.vod),
+                                   config_.vod,
+                                   config_.drm_systems),
     };
 }
 

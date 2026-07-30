@@ -23,6 +23,35 @@ struct Mp4Box {
     std::vector<Mp4Box> children;
 };
 
+// Offsets from the start of a sample entry box (including its 8-byte header)
+// to its first child box, per ISO/IEC 14496-12.
+//
+// A sample entry payload begins with the 8-byte SampleEntry base
+// (reserved[6] + data_reference_index). VisualSampleEntry adds 70 bytes on top
+// of that base, for a 78-byte payload; AudioSampleEntry adds 20, for 28. The
+// visual figure is why width and height are read at payload offsets 24 and 26.
+//
+// These are named once because the visual value was previously written as
+// `8 + 70` at five separate call sites -- omitting the SampleEntry base -- so
+// every child lookup landed 8 bytes early, inside compressorname's padding.
+inline constexpr std::size_t kVisualSampleEntryChildOffset = 8 + 78;
+inline constexpr std::size_t kAudioSampleEntryChildOffset = 8 + 28;
+
+// Common Encryption parameters for one track, from sinf/schm/schi/tenc.
+struct CencTrackProtection {
+    std::string original_format;   // frma, e.g. "avc1" -- the pre-encryption codec
+    std::string scheme;            // schm, "cenc" or "cbcs" (CMSF 4.1.1.3)
+    std::string default_kid;       // tenc default_KID as a UUID string
+    std::uint8_t per_sample_iv_size = 0;
+    bool is_protected = false;
+};
+
+// One DRM system's initialisation data, from a pssh box.
+struct CencSystem {
+    std::string system_id;         // UUID string
+    std::string pssh_base64;       // the whole pssh box, Base64
+};
+
 struct TrackDescription {
     std::uint32_t track_id = 0;
     std::string handler_type;
@@ -43,6 +72,8 @@ struct TrackDescription {
     std::uint64_t avg_bitrate = 0;   // bits per second, 0 when unknown
     std::uint64_t duration_ms = 0;   // track duration, 0 when unknown
     std::string language{};          // ISO-639-2/T, empty when unknown or "und"
+    // Present when the sample entry is encv or enca and its sinf parsed.
+    std::optional<CencTrackProtection> protection;
     std::vector<std::uint8_t> codec_private;  // avcC, hvcC, or esds box bytes (including box header)
 };
 

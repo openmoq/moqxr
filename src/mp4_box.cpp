@@ -1,5 +1,7 @@
 #include "openmoq/publisher/mp4_box.h"
 
+#include "openmoq/publisher/cenc.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -408,38 +410,6 @@ bool hevc_track_is_hvc1_compatible(const std::vector<Mp4Box>& top_level_boxes,
     return fragmented_hevc_samples_are_hvc1_compatible(track_id, top_level_boxes, bytes);
 }
 
-std::size_t find_child_box_offset(const Mp4Box& sample_entry,
-                                  std::span<const std::uint8_t> bytes,
-                                  std::size_t child_offset,
-                                  std::string_view type) {
-    // sample_entry.span.size comes from an unchecked 32-bit box-size field in
-    // the stsd entry (extract_tracks), so it cannot be trusted to bound the
-    // scan: a fabricated huge value must not drive reads past the end of
-    // `bytes`. Clamp to the real buffer, and clamp defensively against
-    // size_t overflow in the offset+size sum itself (and in offset+child_offset).
-    std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
-    if (entry_end < sample_entry.span.offset) {
-        entry_end = bytes.size();
-    }
-    const std::size_t limit = std::min(entry_end, bytes.size());
-
-    const std::size_t start = sample_entry.span.offset + child_offset;
-    if (start < sample_entry.span.offset) {
-        return 0;
-    }
-
-    for (std::size_t cursor = start; cursor + 8 <= limit; ++cursor) {
-        const std::uint32_t box_size = read_be32(bytes, cursor);
-        if (box_size < 8 || cursor + box_size > limit) {
-            continue;
-        }
-        if (std::string_view(reinterpret_cast<const char*>(bytes.data() + cursor + 4), 4) == type) {
-            return cursor;
-        }
-    }
-    return 0;
-}
-
 bool decode_descriptor_length(std::span<const std::uint8_t> bytes,
                               std::size_t offset,
                               std::size_t limit,
@@ -459,10 +429,12 @@ bool decode_descriptor_length(std::span<const std::uint8_t> bytes,
 }
 
 std::string avc_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const std::size_t avcc_offset = find_child_box_offset(sample_entry, bytes, 8 + 70, "avcC");
-    if (avcc_offset == 0 || avcc_offset + 12 > bytes.size()) {
+    const auto avcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                          kVisualSampleEntryChildOffset, "avcC");
+    if (!avcc.has_value() || avcc->offset + 12 > bytes.size()) {
         return "avc1";
     }
+    const std::size_t avcc_offset = avcc->offset;
 
     const std::uint8_t profile = bytes[avcc_offset + 9];
     const std::uint8_t compatibility = bytes[avcc_offset + 10];
@@ -471,10 +443,12 @@ std::string avc_codec_string(const Mp4Box& sample_entry, std::span<const std::ui
 }
 
 std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const std::size_t hvcc_offset = find_child_box_offset(sample_entry, bytes, 8 + 70, "hvcC");
-    if (hvcc_offset == 0 || hvcc_offset + 21 > bytes.size()) {
+    const auto hvcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                          kVisualSampleEntryChildOffset, "hvcC");
+    if (!hvcc.has_value() || hvcc->offset + 21 > bytes.size()) {
         return sample_entry.type;
     }
+    const std::size_t hvcc_offset = hvcc->offset;
 
     const std::uint8_t profile_byte = bytes[hvcc_offset + 9];
     const char profile_space = (profile_byte >> 6U) == 1 ? 'A' : (profile_byte >> 6U) == 2 ? 'B' : (profile_byte >> 6U) == 3 ? 'C' : '\0';
@@ -506,17 +480,19 @@ std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::u
 }
 
 std::string mpeg4_audio_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const std::size_t esds_offset = find_child_box_offset(sample_entry, bytes, 8 + 28, "esds");
-    if (esds_offset == 0 || esds_offset + 16 > bytes.size()) {
+    const auto esds = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                          kAudioSampleEntryChildOffset, "esds");
+    if (!esds.has_value() || esds->offset + 16 > bytes.size()) {
         return "mp4a.40.2";
     }
+    const std::size_t esds_offset = esds->offset;
 
     // sample_entry.span.size comes from an unchecked 32-bit box-size field in
     // the stsd entry (extract_tracks), so it cannot be trusted to bound the
     // ESDS descriptor scan below: a fabricated huge value must not drive
     // reads past the end of `bytes`. Clamp to the real buffer once, and
     // guard against size_t overflow in the offset+size sum itself, the same
-    // way find_child_box_offset does.
+    // way find_child_box_span does.
     std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
     if (entry_end < sample_entry.span.offset) {
         entry_end = bytes.size();
@@ -602,10 +578,11 @@ struct BitrateInfo {
 BitrateInfo bitrate_from_sample_entry(const Mp4Box& sample_entry,
                                       std::span<const std::uint8_t> bytes,
                                       std::size_t child_offset) {
-    const std::size_t btrt_offset = find_child_box_offset(sample_entry, bytes, child_offset, "btrt");
-    if (btrt_offset == 0 || btrt_offset + 20 > bytes.size()) {
+    const auto btrt = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, child_offset, "btrt");
+    if (!btrt.has_value() || btrt->offset + 20 > bytes.size()) {
         return {};
     }
+    const std::size_t btrt_offset = btrt->offset;
     return BitrateInfo{
         .max_bitrate = read_be32(bytes, btrt_offset + 12),
         .avg_bitrate = read_be32(bytes, btrt_offset + 16),
@@ -816,34 +793,57 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
                 timescale = read_be32(bytes, timescale_offset);
             }
         }
+        // This guard deliberately tests the RAW sample_entry_type, not
+        // effective_type (resolved below): for an encrypted track
+        // source_sample_entry_type is "encv"/"enca", never "hev1", so this
+        // never fires and the raw-NAL parameter-set scan inside
+        // hevc_track_is_hvc1_compatible never runs against CENC ciphertext.
+        // That is correct, but emergent rather than designed -- tightening
+        // this to test effective_type would start pattern-matching
+        // ciphertext bytes as if they were NAL units.
         if (source_sample_entry_type == "hev1" && hevc_track_is_hvc1_compatible(top_level_boxes, bytes, track_id, track_index)) {
             sample_entry_type = "hvc1";
         }
+        std::optional<CencTrackProtection> protection = parse_track_protection(bytes, sample_entry);
+        std::string effective_type = sample_entry_type;
+        if (protection.has_value() && !protection->original_format.empty()) {
+            // CMSF 4: the catalog must advertise the pre-encryption codec, not
+            // the encv/enca wrapper.
+            effective_type = protection->original_format;
+        }
         const Mp4Box effective_sample_entry{
-            .type = sample_entry_type,
+            .type = effective_type,
             .span = sample_entry.span,
             .payload = sample_entry.payload,
             .children = {},
         };
         const std::string codec = codec_string_from_sample_entry(effective_sample_entry, bytes);
-        if ((sample_entry_type == "avc1" || sample_entry_type == "avc3" || sample_entry_type == "hvc1" ||
-             sample_entry_type == "hev1") &&
+        // Gate on effective_type, not the raw sample_entry_type: encv/enca
+        // (CMSF's encrypted wrapper types) are byte-for-byte a
+        // VisualSampleEntry/AudioSampleEntry respectively, identical in
+        // layout to their unencrypted avc1/mp4a/etc. counterparts. Gating on
+        // the raw type here would silently omit width/height for every
+        // encrypted video track and, worse, publish samplerate/channelConfig
+        // as the wrong value (0) for every encrypted audio track, since
+        // validate_track makes those fields MUST-present.
+        if ((effective_type == "avc1" || effective_type == "avc3" || effective_type == "hvc1" ||
+             effective_type == "hev1") &&
             sample_entry.payload.offset + 28 <= bytes.size()) {
             width = read_be16(bytes, sample_entry.payload.offset + 24);
             height = read_be16(bytes, sample_entry.payload.offset + 26);
             frame_rate = frame_rate_from_stts(find_child(*stbl, "stts"), timescale, bytes);
         }
-        if ((sample_entry_type == "mp4a" || sample_entry_type == "Opus" || sample_entry_type == "opus") &&
+        if ((effective_type == "mp4a" || effective_type == "Opus" || effective_type == "opus") &&
             sample_entry.payload.offset + 28 <= bytes.size()) {
             channel_count = read_be16(bytes, sample_entry.payload.offset + 16);
             sample_rate = read_be16(bytes, sample_entry.payload.offset + 24);
         }
 
         // MSF 5.2.22 requires bitrate; ISO 14496-12 puts it in an optional
-        // btrt box inside the sample entry. Same header offsets
-        // build_track_codec_init_data uses: 8 + 70 past a VisualSampleEntry,
-        // 8 + 28 past an AudioSampleEntry.
-        const std::size_t sample_entry_child_offset = handler_type == "vide" ? 8 + 70 : 8 + 28;
+        // btrt box inside the sample entry, past the same sample entry payload
+        // build_track_codec_init_data skips.
+        const std::size_t sample_entry_child_offset =
+            handler_type == "vide" ? kVisualSampleEntryChildOffset : kAudioSampleEntryChildOffset;
         const BitrateInfo bitrate = bitrate_from_sample_entry(sample_entry, bytes, sample_entry_child_offset);
 
         std::string language;
@@ -873,6 +873,7 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             .avg_bitrate = bitrate.avg_bitrate,
             .duration_ms = duration_ms,
             .language = language,
+            .protection = std::move(protection),
         });
         ++track_index;
     }

@@ -29,6 +29,18 @@ namespace transport {
 struct LibmoqLiveHandle;
 }  // namespace transport
 
+// Deployment configuration for one DRM system, matched to a system found in
+// the media by system_id. These fields are not present in the MP4 -- a
+// licence URL is deployment data, not media data.
+struct DrmSystemConfig {
+    std::string system_id;                      // UUID string, the match key
+    std::optional<std::string> la_url;
+    std::optional<std::string> la_url_type;
+    std::optional<std::string> cert_url;
+    std::optional<std::string> cert_url_type;
+    std::optional<std::string> robustness;
+};
+
 struct PublisherConfig {
     DraftVersion draft_version = DraftVersion::kDraft16;
     std::string track_namespace = "media";
@@ -43,6 +55,23 @@ struct PublisherConfig {
     // This publisher is live, or simulating live, unless explicitly told
     // otherwise. VOD semantics are never inferred from the input.
     bool vod = false;
+    // Matched to systems found in the media by system_id. A configured system
+    // the media carries no pssh for is IGNORED, not emitted -- a
+    // contentProtections entry for an absent system would describe protection
+    // that does not exist.
+    //
+    // No live-path guard exists at this API level: `parse_cli_options`
+    // (src/cli_options.cpp) refuses `--drm-config` combined with a live
+    // publish path, but that refusal is a CLI-only property, not a property
+    // of this struct or of MoqtSession. An SDK consumer that combines
+    // drm_systems with a live publish path (publish_live() /
+    // publish_live_objects()) gets the same silent, unsignalled behaviour the
+    // CLI guard exists to prevent: the live catalog builder never calls
+    // attach_content_protection, so encrypted content publishes with no
+    // contentProtections/contentProtectionRefIDs at all, indistinguishable
+    // from genuinely unprotected media. Adding an API-level guard is future
+    // work (see docs/status.md), not implemented here.
+    std::vector<DrmSystemConfig> drm_systems;
     // Section 5: a catalog SHOULD be republished after enough time has passed
     // that it might fall out of a relay cache. Zero disables republication,
     // which is the historical behaviour.
