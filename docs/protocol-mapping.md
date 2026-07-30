@@ -116,10 +116,10 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     the transport draft governs what may legally appear on the wire, so its
     ordering wins.
 - Not implemented: `clone` delta operations, MSF sections 9/10 log and
-  metrics tracks, MSF section 11.1 URL parsing, and MSF section 12
-  compression signalling. CMSF section 4 content protection (see the
-  dedicated section below) is implemented for the batch/VOD publish path
-  only.
+  metrics tracks, and MSF section 12 compression signalling. CMSF section 4
+  content protection (see the dedicated section below) is implemented for
+  the batch/VOD publish path only. MSF section 11.1 URL parsing has shipped;
+  see `## MSF URLs and fragments` below.
 - The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
   which is not an MSF v1 packaging value; it is defined by
   `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.
@@ -244,6 +244,54 @@ project -- it detects and signals protection already present in its input.
   CENC instead. The CMSF 4.1.1.4.4 Authorization URL field is also
   deliberately unmodelled -- the draft describes it but never names its JSON
   key.
+
+## MSF URLs and fragments
+
+`draft-ietf-moq-msf-01` sections 11.1 (URL structure), 11.1.1 (reserved
+fragment parameters), and 11.1.2 (namespace-name tuple encoding). Implemented
+in `src/msf_url.cpp` and `include/openmoq/publisher/msf_url.h`, both parse and
+build directions.
+
+- `--url` configures the session endpoint, track namespace, and transport
+  from one MSF URL (mutually exclusive with `--endpoint`/`--namespace`).
+  `--print-msf-urls` emits the broadcast's catalog URL only -- the catalog is
+  the discovery entry point, and a client learns every media track from it,
+  so there is no separate per-media-track URL to print.
+- All five reserved fragment parameters (`connection`, `c4m`,
+  `wallclock-range`, `mediatime-range`, `location-range`) parse into typed
+  values.
+- **URL-typed catalog fields are exempt from the 5.4 percent rule.**
+  `MsfUrlEntry::url`, `la_url`, and `cert_url` may contain percent-encoding,
+  because a license acquisition URL is legitimately percent-encoded under RFC
+  3986 and a strict reading of 5.4 would reject DRM configurations that work
+  today. The exemption is confined to URL-typed fields.
+- **An MSF tuple element containing a literal slash is refused by `--url`.**
+  The publisher's `track_namespace` is a flat string that the transport layer
+  splits on `/`, so such an element cannot survive the round-trip. Refusing
+  is preferred over silently producing a namespace with the wrong arity.
+- **`c4m` is parsed but not consumed.** Nothing on the publish path uses a
+  CAT token.
+- **The `--url` track name configures nothing.** The publisher's catalog
+  track name is the literal `"catalog"`, hardcoded in `src/cmsf_packager.cpp`.
+- **Range parameters are parsed but not acted on.** A publisher does not
+  serve subclips.
+- **Union merges overlapping ranges only.** Adjacent-but-disjoint ranges stay
+  separate; the represented point set is identical either way. Merging is
+  restricted to overlap because adjacency is undefined across location group
+  boundaries, where an omitted end object means "through the end of that
+  group."
+- **Section 5.4 is implemented only as emit-side validation.** A `%` in a
+  catalog field value is refused unless it forms a well-formed `%name%`
+  reference. There is no variable resolver, because resolution is
+  client-side per 5.4.2 and this repository has no subscriber.
+- **IPv6 authority literals are not supported.**
+  `moqt://[::1]:4433/p#msf:ns--t` is refused, but the message says "port is
+  not numeric" because the port split takes the first colon inside the
+  brackets. The draft does not discuss IPv6; this is a known limitation with
+  a misleading message, not a working case.
+- **An odd run of hyphens**, such as `a---b`, is refused via "unescaped
+  character" rather than the more on-point "more than one '--' delimiter".
+  Every malformed input is still refused; only the message is less precise.
 
 ## Implementation consequence
 

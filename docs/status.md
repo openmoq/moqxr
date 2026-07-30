@@ -55,7 +55,20 @@ Draft status:
    `docs/superpowers/specs/2026-07-28-msf-cmsf-v1-design.md` for the original
    design. `clone` delta operations are not implemented -- no producer in
    this project generates a track matching another on every field except
-   name -- and Phase 4, MSF URL parsing, remains. (Phase 3, CMSF content
+   name. Phase 4, MSF URL support, has shipped: MSF sections 11.1 (URL
+   structure), 11.1.1 (reserved fragment parameters), and 11.1.2
+   (namespace-name tuple encoding) are implemented in `src/msf_url.cpp` and
+   `include/openmoq/publisher/msf_url.h`, both parse and build directions.
+   `--url` configures the session endpoint, track namespace, and transport
+   from one MSF URL; `--print-msf-urls` emits the broadcast's catalog URL
+   only, since the catalog is the discovery entry point and a client learns
+   every media track from it. MSF section 5.4 is implemented only as
+   emit-side validation -- a `%` in a catalog field value is refused unless
+   it forms a well-formed `%name%` reference -- because resolution is
+   client-side per 5.4.2 and this repository has no subscriber. See
+   `docs/protocol-mapping.md` for the full deviation list, including the
+   fields exempt from the 5.4 rule and the parameters that are parsed but
+   not acted on. (Phase 3, CMSF content
    protection, has shipped for the batch/VOD publish path -- see item 6
    below for what that covers and what it does not.) MSF section 12
    compression signaling is blocked on transport
@@ -83,12 +96,12 @@ Draft status:
    possible. Encrypted live input published with no `--drm-config` at all is
    not refused and still publishes fully unsignalled -- `--drm-config`
    supplies only optional deployment fields, not protection detection.
-   Wiring content protection into the live paths remains future work (Phase
-   4 or later). Also not implemented: MoQ Secure Objects
+   Wiring content protection into the live paths remains future work (a
+   later phase). Also not implemented: MoQ Secure Objects
    encryption fields (MSF 5.2.38-5.2.41, a different LOC-packaged end-to-end
    mechanism than CMSF's CENC), MSF section 12 compression signalling
-   (blocked on transport draft-19 Track and Object Properties), MSF URL and
-   fragment parsing (Phase 4), `clone` delta operations (Phase 2), and the
+   (blocked on transport draft-19 Track and Object Properties), `clone`
+   delta operations (Phase 2), and the
    CMSF 4.1.1.4.4 Authorization URL field (the draft never names its JSON
    key, so it is deliberately unmodelled).
 7. Create an M2TS packaging example based on `draft-gregoire-moq-msfts-00`, using the draft's `m2ts` packaging value to carry MPEG-2 Transport Stream or M2TS source packets directly over MOQT.
