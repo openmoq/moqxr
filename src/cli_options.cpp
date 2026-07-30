@@ -1,8 +1,11 @@
 #include "openmoq/publisher/cli_options.h"
 
 #include <cstdint>
+#include <iostream>
 #include <stdexcept>
 #include <string_view>
+
+#include "openmoq/publisher/msf_url.h"
 
 namespace openmoq::publisher {
 
@@ -179,6 +182,14 @@ CliOptions parse_cli_options(int argc, char** argv) {
     CliOptions options;
     bool dash_path_set = false;
     bool dash_queue_depth_set = false;
+    bool transport_set = false;
+    // Tracks whether --endpoint / --url were themselves given on the command
+    // line, as opposed to options.endpoint simply having a value (--alpn and
+    // --sni also construct an EndpointConfig when none exists yet). Guarding
+    // mutual exclusion on has_value() would misfire on a plain
+    // "--alpn moq-99 --endpoint h:443" that never mentions --url.
+    bool endpoint_set = false;
+    bool url_set = false;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
@@ -211,8 +222,68 @@ CliOptions parse_cli_options(int argc, char** argv) {
             dash_queue_depth_set = true;
         } else if (argument == "--transport") {
             options.transport = parse_transport_kind(require_value("--transport"));
+            transport_set = true;
         } else if (argument == "--endpoint") {
+            if (url_set) {
+                throw std::runtime_error("--url and --endpoint are mutually exclusive");
+            }
             options.endpoint = parse_endpoint(require_value("--endpoint"));
+            endpoint_set = true;
+        } else if (argument == "--url") {
+            if (endpoint_set) {
+                throw std::runtime_error("--url and --endpoint are mutually exclusive");
+            }
+            const auto url = parse_msf_url(require_value("--url"));
+
+            // track_namespace is a flat string the transport layer splits on
+            // '/', so a namespace tuple element containing a literal slash
+            // cannot survive the round-trip.
+            std::string flattened;
+            for (std::size_t element_index = 0; element_index < url.track.namespace_tuple.size();
+                 ++element_index) {
+                const std::string& element = url.track.namespace_tuple[element_index];
+                if (element.find('/') != std::string::npos) {
+                    throw std::runtime_error(
+                        "--url namespace tuple element \"" + element +
+                        "\" contains a slash, which this publisher's flat namespace cannot represent");
+                }
+                if (element_index != 0) {
+                    flattened.push_back('/');
+                }
+                flattened += element;
+            }
+            options.track_namespace = flattened;
+
+            transport::EndpointConfig endpoint;
+            endpoint.host = url.host;
+            endpoint.port = url.port;
+            endpoint.path = url.path;
+            endpoint.path_explicit = url.path_explicit;
+            options.endpoint = endpoint;
+            endpoint_set = true;
+            url_set = true;
+
+            if (url.connection != ConnectionRequirement::kAny) {
+                const auto required = url.connection == ConnectionRequirement::kRawQuic
+                                          ? transport::TransportKind::kRawQuic
+                                          : transport::TransportKind::kWebTransport;
+                if (transport_set && options.transport != required) {
+                    throw std::runtime_error(
+                        "--url specifies a connection type that conflicts with --transport");
+                }
+                options.transport = required;
+                transport_set = true;
+            }
+
+            if (url.c4m_token.has_value()) {
+                options.msf_c4m_token = *url.c4m_token;
+                std::cerr << "msf_c4m_token present; this publisher does not consume CAT tokens"
+                          << std::endl;
+            }
+            if (url.track.track_name != "catalog") {
+                std::cerr << "--url track name \"" << url.track.track_name
+                          << "\" ignored; publisher track names come from the media" << std::endl;
+            }
         } else if (argument == "--alpn") {
             if (!options.endpoint.has_value()) {
                 options.endpoint = transport::EndpointConfig{};
@@ -378,7 +449,7 @@ std::string build_usage(const char* argv0) {
            " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--dump-plan] [--emit-dir <dir>]"
            " [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
-           " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--alpn value] [--sni value]"
+           " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";
 }
 

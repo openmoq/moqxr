@@ -30,6 +30,23 @@ CliOptions parse(std::vector<std::string> args) {
     return parse_cli_options(static_cast<int>(argv.size()), argv.data());
 }
 
+bool parse_throws(std::vector<std::string> args, const std::string& fragment,
+                  const std::string& message) {
+    try {
+        parse(std::move(args));
+    } catch (const std::runtime_error& error) {
+        const std::string what = error.what();
+        if (what.find(fragment) != std::string::npos) {
+            return true;
+        }
+        std::cerr << "FAIL: " << message << " (threw, but message was \"" << what
+                  << "\" and did not contain \"" << fragment << "\")\n";
+        return false;
+    }
+    std::cerr << "FAIL: " << message << " (did not throw)\n";
+    return false;
+}
+
 // A minimal, valid single-system --drm-config file, written to a fresh path
 // each call so parallel test blocks never race on the same file.
 std::filesystem::path write_drm_config_file(std::string_view name) {
@@ -491,6 +508,78 @@ int main() {
 
         std::error_code ec;
         std::filesystem::remove(config_path, ec);
+    }
+
+    // --url configures the endpoint and namespace from one argument.
+    // (--input is required whenever --live-source defaults to "auto",
+    // regardless of --url; unrelated to what this block tests.)
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--url",
+             "moqt://relay.example:4433/moq#msf:customerID-broadcastID--catalog"});
+        ok &= expect(options.endpoint.has_value(), "expected --url to produce an endpoint");
+        ok &= expect(options.endpoint->host == "relay.example", "expected host from --url");
+        ok &= expect(options.endpoint->port == 4433, "expected port from --url");
+        ok &= expect(options.endpoint->path == "/moq", "expected path from --url");
+        ok &= expect(options.endpoint->path_explicit, "expected an explicit path from --url");
+        ok &= expect(options.track_namespace == "customerID/broadcastID",
+                     "expected the tuple joined with '/' into the flat namespace");
+    }
+
+    // connection=wt selects the transport.
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--url",
+             "moqt://relay.example/moq#msf:ns--catalog&connection=wt"});
+        ok &= expect(options.transport == openmoq::publisher::transport::TransportKind::kWebTransport,
+                     "expected connection=wt to select WebTransport");
+    }
+
+    // A c4m token is captured.
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--url",
+             "moqt://relay.example/moq#msf:ns--catalog&c4m=abc123"});
+        ok &= expect(options.msf_c4m_token.value_or("") == "abc123", "expected the c4m token captured");
+    }
+
+    // An agreeing --transport is accepted.
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--transport", "webtransport", "--url",
+             "moqt://relay.example/moq#msf:ns--catalog&connection=wt"});
+        ok &= expect(options.transport == openmoq::publisher::transport::TransportKind::kWebTransport,
+                     "expected an agreeing --transport to be accepted");
+    }
+
+    ok &= parse_throws({"prog", "--url", "moqt://h/p#msf:ns--t", "--endpoint", "h:443"},
+                            "--endpoint",
+                            "expected --url with --endpoint to be refused");
+    ok &= parse_throws({"prog", "--transport", "raw", "--url",
+                             "moqt://h/p#msf:ns--t&connection=wt"},
+                            "connection",
+                            "expected a disagreeing --transport and connection to be refused");
+    ok &= parse_throws({"prog", "--url", "moqt://h/p#msf:a.2fb--t"},
+                            "slash",
+                            "expected a tuple element containing a slash to be refused");
+
+    // The reverse order (--endpoint before --url) must also be refused.
+    ok &= parse_throws({"prog", "--endpoint", "h:443", "--url", "moqt://h/p#msf:ns--t"},
+                            "--endpoint",
+                            "expected --endpoint followed by --url to be refused");
+
+    // --alpn (or --sni) constructs an EndpointConfig eagerly, before any
+    // --endpoint or --url flag is seen. A guard written as
+    // options.endpoint.has_value() would misfire here and reject this
+    // perfectly legal command line, which never mentions --url at all.
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--alpn", "moq-99",
+                   "--endpoint", "relay.example.com:443"});
+        ok &= expect(options.endpoint.has_value(),
+                     "expected --alpn then --endpoint (no --url) to still produce an endpoint");
+        ok &= expect(options.endpoint->host == "relay.example.com",
+                     "expected --endpoint to still set the host after a prior --alpn");
     }
 
     return ok ? 0 : 1;

@@ -44,6 +44,9 @@ struct CliOptions {
     transport::TlsConfig tls;
     DraftVersion draft_version = DraftVersion::kDraft16;
     std::string track_namespace = "media";
+    // MSF 11.1.1 c4m token from a --url fragment. Parsed and reported; nothing
+    // on the publish path consumes a CAT token today.
+    std::optional<std::string> msf_c4m_token;
     bool endpoint_alpn_overridden = false;
     bool forward = false;
     bool publish_catalog = false;
