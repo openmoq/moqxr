@@ -329,6 +329,9 @@ std::vector<std::uint8_t> correct_saio_offsets(std::span<const std::uint8_t> moo
         if (version == 1) {
             write_be64_at(corrected, local_cursor, adjusted);
         } else {
+            // Silently truncates if `adjusted` exceeds UINT32_MAX, which would
+            // require a moof+mdat larger than 4 GiB; unreachable at realistic
+            // fragment sizes and how a version-0 saio entry is defined to fit.
             write_be32_at(corrected, local_cursor, static_cast<std::uint32_t>(adjusted));
         }
 

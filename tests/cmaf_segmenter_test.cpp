@@ -157,6 +157,31 @@ std::vector<std::uint8_t> make_saio_box(std::uint8_t version,
     return make_full_box_with_flags("saio", version, flags, payload);
 }
 
+// Builds a `saio` box whose entry_count field is a caller-chosen, possibly
+// fabricated value, independent of how many offsets actually follow it. Used
+// to simulate an attacker-controlled entry_count that claims far more
+// entries than the box has room for.
+std::vector<std::uint8_t> make_saio_box_with_declared_entry_count(std::uint8_t version,
+                                                                   bool has_aux_info_type,
+                                                                   std::uint32_t declared_entry_count,
+                                                                   const std::vector<std::uint64_t>& actual_offsets) {
+    std::vector<std::uint8_t> payload;
+    if (has_aux_info_type) {
+        append_be32(payload, 0x63656E63U);  // aux_info_type = 'cenc'
+        append_be32(payload, 0);            // aux_info_type_parameter
+    }
+    append_be32(payload, declared_entry_count);
+    for (const std::uint64_t offset : actual_offsets) {
+        if (version == 1) {
+            append_be64(payload, offset);
+        } else {
+            append_be32(payload, static_cast<std::uint32_t>(offset));
+        }
+    }
+    const std::uint32_t flags = has_aux_info_type ? 0x000001U : 0U;
+    return make_full_box_with_flags("saio", version, flags, payload);
+}
+
 // A minimal live (CTE/DASH) moof+mdat fragment: one track, one traf, a
 // 1-sample minimal trun (the shape FFmpeg's DASH muxer emits, which
 // materialize_live_trun_defaults normalizes), optionally senc/saiz, and an
@@ -1893,6 +1918,56 @@ int main() {
             ok &= expect(fragment.payload.owned_bytes == expected_payload,
                         "case6: expected an unencrypted live fragment to pass through byte-for-byte "
                         "unchanged aside from the pre-existing trun normalization");
+        }
+
+        // Case 7: a fabricated entry_count far larger than the box can hold
+        // must be refused before any entry is read, not drive a
+        // bounds-violating read. This is the sole barrier between an
+        // untrusted 32-bit file field and an out-of-bounds read.
+        {
+            constexpr std::uint8_t version = 0;
+            constexpr bool has_aux = false;
+            // No actual offset entries follow -- entry_count alone claims far
+            // more than the box (or the whole moof) could ever hold.
+            const auto saio_box =
+                make_saio_box_with_declared_entry_count(version, has_aux, 0x0FFFFFFFU, {});
+            const auto fx = make_saio_test_fragment(saio_box, 32);
+
+            bool threw = false;
+            std::string what;
+            try {
+                (void)build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            } catch (const std::exception& e) {
+                threw = true;
+                what = e.what();
+            }
+            ok &= expect(threw, "case7: expected a fabricated entry_count to be refused before any "
+                                "entry is read");
+            ok &= expect_contains(what, "entry_count",
+                                  "case7: expected the thrown message to name the entry_count problem");
+        }
+
+        // Case 8: a saio present with neither senc nor saiz in the same traf
+        // is malformed -- there is nothing to validate the offset
+        // classification against -- and must be refused.
+        {
+            constexpr std::uint8_t version = 0;
+            constexpr bool has_aux = false;
+            const auto saio_box = make_saio_box(version, has_aux, {50});
+            const auto fx = make_saio_test_fragment(saio_box, 32, /*include_senc=*/false,
+                                                     /*include_saiz=*/false);
+
+            bool threw = false;
+            std::string what;
+            try {
+                (void)build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            } catch (const std::exception& e) {
+                threw = true;
+                what = e.what();
+            }
+            ok &= expect(threw, "case8: expected a saio without senc or saiz in traf to be refused");
+            ok &= expect_contains(what, "senc or saiz",
+                                  "case8: expected the thrown message to name the missing senc/saiz");
         }
     }
 
