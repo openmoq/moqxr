@@ -57,6 +57,7 @@ struct CliOptions {
     bool paced = false;
     bool loop = false;
     bool dump_plan = false;
+    bool print_msf_urls = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     // This publisher is live, or simulating live, unless explicitly told
     // otherwise (PublisherConfig::vod's own rule). --vod is the only way to

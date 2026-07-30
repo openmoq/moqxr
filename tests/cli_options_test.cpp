@@ -644,5 +644,12 @@ int main() {
                      "expected --alpn set after --url to take effect");
     }
 
+    {
+        const auto options = parse({"prog", "--input", "sample.mp4", "--endpoint", "h:443", "--print-msf-urls"});
+        ok &= expect(options.print_msf_urls, "expected --print-msf-urls to set the flag");
+        const auto defaulted = parse({"prog", "--input", "sample.mp4", "--endpoint", "h:443"});
+        ok &= expect(!defaulted.print_msf_urls, "expected --print-msf-urls to default off");
+    }
+
     return ok ? 0 : 1;
 }

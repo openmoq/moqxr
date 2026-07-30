@@ -91,4 +91,13 @@ MsfUrl parse_msf_url(std::string_view text);
 // and omitting the path when path_explicit is false.
 std::string build_msf_url(const MsfUrl& url);
 
+// Builds the MSF URL for one track of a running publisher. `track_namespace` is
+// the publisher's flat namespace, split on '/' to recover the tuple.
+// `connection` is emitted only when it is not kAny, so the printed URL
+// reproduces an explicitly selected transport rather than leaving it to the
+// client.
+std::string build_track_msf_url(const std::string& host, std::uint16_t port, const std::string& path,
+                                bool path_explicit, const std::string& track_namespace,
+                                const std::string& track_name, ConnectionRequirement connection);
+
 }  // namespace openmoq::publisher

@@ -534,4 +534,32 @@ std::string build_msf_url(const MsfUrl& url) {
     return out;
 }
 
+std::string build_track_msf_url(const std::string& host, std::uint16_t port, const std::string& path,
+                                bool path_explicit, const std::string& track_namespace,
+                                const std::string& track_name, ConnectionRequirement connection) {
+    MsfUrl url;
+    url.host = host;
+    url.port = port;
+    url.path = path;
+    url.path_explicit = path_explicit;
+    url.connection = connection;
+    url.track.track_name = track_name;
+
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t slash = track_namespace.find('/', start);
+        const std::string element = slash == std::string::npos
+                                        ? track_namespace.substr(start)
+                                        : track_namespace.substr(start, slash - start);
+        if (!element.empty()) {
+            url.track.namespace_tuple.push_back(element);
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return build_msf_url(url);
+}
+
 }  // namespace openmoq::publisher

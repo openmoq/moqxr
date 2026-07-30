@@ -404,5 +404,51 @@ int main() {
                      "expected a server query and a client c4m token to stay separate");
     }
 
+    // Emitted URLs are asserted as exact strings.
+    {
+        ok &= expect(build_track_msf_url("relay.example", 4433, "/moq", true, "customerID/broadcastID",
+                                         "catalog", ConnectionRequirement::kAny) ==
+                         "moqt://relay.example:4433/moq#msf:customerID-broadcastID--catalog",
+                     "expected an exact emitted catalog URL");
+        ok &= expect(build_track_msf_url("relay.example", 443, "/moq", true, "ns", "video",
+                                         ConnectionRequirement::kWebTransport) ==
+                         "moqt://relay.example/moq#msf:ns--video&connection=wt",
+                     "expected port 443 omitted and connection emitted");
+        ok &= expect(build_track_msf_url("h", 443, "/", false, "a/b", "audio",
+                                         ConnectionRequirement::kAny) ==
+                         "moqt://h#msf:a-b--audio",
+                     "expected a non-explicit path to be omitted");
+    }
+
+    // Mutation check: pins element order and the '-' vs '--' delimiter choice
+    // precisely. A builder that swapped namespace-join order, used '--' to
+    // join namespace elements, or emitted an extra/missing separator would
+    // still "contain the right pieces" but fail this exact comparison.
+    {
+        ok &= expect(build_track_msf_url("h", 443, "/", false, "a/b/c", "track",
+                                         ConnectionRequirement::kAny) ==
+                         "moqt://h#msf:a-b-c--track",
+                     "expected namespace elements joined with '-' in order, not reversed or "
+                     "delimited with '--'");
+    }
+
+    // A trailing or doubled '/' in the flat namespace must not produce an
+    // empty tuple element: encode_namespace_name throws on an empty element,
+    // which would turn this printing helper into a hard failure for input
+    // that a caller may reasonably pass through unexamined. Decision: treat
+    // consecutive/trailing slashes as no-ops, the same way redundant path
+    // separators are normally ignored, rather than preserving an empty
+    // element or throwing.
+    {
+        ok &= expect(build_track_msf_url("h", 443, "/", false, "a/b/", "catalog",
+                                         ConnectionRequirement::kAny) ==
+                         "moqt://h#msf:a-b--catalog",
+                     "expected a trailing slash to be dropped rather than produce an empty element");
+        ok &= expect(build_track_msf_url("h", 443, "/", false, "a//b", "catalog",
+                                         ConnectionRequirement::kAny) ==
+                         "moqt://h#msf:a-b--catalog",
+                     "expected a doubled slash to collapse rather than produce an empty element");
+    }
+
     return ok ? 0 : 1;
 }
