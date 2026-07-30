@@ -84,7 +84,8 @@ struct LiveCatalog {
 };
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
-                               bool is_live = true);
+                               bool is_live = true,
+                               const std::vector<DrmSystemConfig>& drm_systems = {});
 
 // Base64-encoded, track-specific CMAF init segment (ftyp + single-track moov)
 // for the track at track_index within init_segment. This is exactly the value

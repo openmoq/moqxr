@@ -728,7 +728,8 @@ void emit_plan_objects(const PublishPlan& plan,
 
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
-                               bool is_live) {
+                               bool is_live,
+                               const std::vector<DrmSystemConfig>& drm_systems) {
     LiveCatalog result;
 
     // Build per-track init segments (single-track moov), matching the static file publish path.
@@ -754,6 +755,17 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                 .count());
     }
 
+    // pssh boxes are collected once for the whole init segment (not
+    // per-track -- see collect_pssh_systems) and only when some track is
+    // actually protected, since parsing the init segment again is otherwise
+    // wasted work for the common unencrypted case.
+    const bool any_track_protected = std::any_of(
+        tracks.begin(), tracks.end(),
+        [](const TrackDescription& track) { return track.protection.has_value(); });
+    const std::vector<CencSystem> pssh_systems =
+        any_track_protected ? collect_pssh_systems(init_segment) : std::vector<CencSystem>{};
+    std::vector<std::string> protected_schemes;
+
     for (const auto& track : tracks) {
         MsfTrack msf_track = make_msf_track(track, is_live);
 
@@ -762,7 +774,37 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
             attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
+        if (track.protection.has_value()) {
+            // CMSF 4.1.1.4.5 makes pssh only SHOULD-present, so a protected
+            // track with no pssh anywhere in the init segment must not fall
+            // through silently: CMSF 4.1.2 defines an absent
+            // contentProtectionRefIDs as meaning the track is NOT protected,
+            // so publishing would affirmatively misdescribe encrypted media.
+            if (pssh_systems.empty()) {
+                throw std::runtime_error(
+                    "track '" + track.track_name +
+                    "' is protected (CENC) but no pssh system was found in the "
+                    "initialization segment; refusing to publish a catalog with no "
+                    "contentProtections entry for encrypted content");
+            }
+            attach_content_protection(msf_catalog, msf_track, *track.protection, pssh_systems);
+            if (std::find(protected_schemes.begin(), protected_schemes.end(), track.protection->scheme) ==
+                protected_schemes.end()) {
+                protected_schemes.push_back(track.protection->scheme);
+            }
+        }
+
         msf_catalog.tracks.push_back(std::move(msf_track));
+    }
+
+    // Hoisted out of the per-track loop above: apply_drm_system_configs
+    // operates on the catalog-root contentProtections entries and the
+    // whole-init-segment pssh_systems list, neither of which is per-track, so
+    // calling it once per distinct protected scheme is equivalent to (and
+    // cheaper than) the previous once-per-protected-track calls, which were
+    // merely idempotent re-applications of the same result.
+    for (const auto& scheme : protected_schemes) {
+        apply_drm_system_configs(msf_catalog, scheme, pssh_systems, drm_systems);
     }
 
     const std::string catalog_text = serialize_catalog(msf_catalog);

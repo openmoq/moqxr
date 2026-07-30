@@ -3,6 +3,7 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_srt_ingest.h"
 #include "openmoq/publisher/mp4_box.h"
+#include "openmoq/publisher/publisher_api.h"
 
 #include <algorithm>
 #include <array>
