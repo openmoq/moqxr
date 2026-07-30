@@ -104,6 +104,151 @@ std::vector<std::uint8_t> concat(std::initializer_list<std::vector<std::uint8_t>
     return out;
 }
 
+std::uint32_t read_be32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    return (static_cast<std::uint32_t>(bytes[offset]) << 24U) |
+           (static_cast<std::uint32_t>(bytes[offset + 1]) << 16U) |
+           (static_cast<std::uint32_t>(bytes[offset + 2]) << 8U) |
+           static_cast<std::uint32_t>(bytes[offset + 3]);
+}
+
+std::uint64_t read_be64(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    std::uint64_t value = 0;
+    for (int index = 0; index < 8; ++index) {
+        value = (value << 8U) | bytes[offset + index];
+    }
+    return value;
+}
+
+// Shared byte-layout constants for the live-fragment saio-correction
+// fixtures below. Each is derived by hand from the box shapes
+// make_saio_test_fragment builds, independent of materialize_live_trun_defaults
+// (the code under test), so tests can assert exact numbers rather than
+// merely "changed".
+constexpr std::size_t kSaioFixtureTfhdSize = 28;         // header8 + ver/flags4 + track_id4+dur4+size4+flags4
+constexpr std::size_t kSaioFixtureOriginalTrunSize = 16;  // header8 + ver/flags4 + sample_count4 (flags=0)
+constexpr std::size_t kSaioFixtureNormalizedTrunSize = 32;  // header8 + ver/flags4 + count4 + data_offset4 + 12/sample
+constexpr std::int64_t kSaioFixtureTrunGrowthDelta =
+    static_cast<std::int64_t>(kSaioFixtureNormalizedTrunSize) -
+    static_cast<std::int64_t>(kSaioFixtureOriginalTrunSize);
+constexpr std::size_t kSaioFixtureSencSize = 16;   // header8 + 8 arbitrary payload bytes
+constexpr std::size_t kSaioFixtureSaizSize = 17;   // header8 + ver/flags4 + default_size1 + sample_count4
+
+// Builds a `saio` (Sample Auxiliary Information Offsets) box, ISO/IEC
+// 14496-12 section 8.7.13, with the given version and offset entries.
+// `has_aux_info_type` controls whether flags & 1 is set and the
+// aux_info_type/aux_info_type_parameter prefix is written.
+std::vector<std::uint8_t> make_saio_box(std::uint8_t version,
+                                        bool has_aux_info_type,
+                                        const std::vector<std::uint64_t>& offsets) {
+    std::vector<std::uint8_t> payload;
+    if (has_aux_info_type) {
+        append_be32(payload, 0x63656E63U);  // aux_info_type = 'cenc'
+        append_be32(payload, 0);            // aux_info_type_parameter
+    }
+    append_be32(payload, static_cast<std::uint32_t>(offsets.size()));
+    for (const std::uint64_t offset : offsets) {
+        if (version == 1) {
+            append_be64(payload, offset);
+        } else {
+            append_be32(payload, static_cast<std::uint32_t>(offset));
+        }
+    }
+    const std::uint32_t flags = has_aux_info_type ? 0x000001U : 0U;
+    return make_full_box_with_flags("saio", version, flags, payload);
+}
+
+// A minimal live (CTE/DASH) moof+mdat fragment: one track, one traf, a
+// 1-sample minimal trun (the shape FFmpeg's DASH muxer emits, which
+// materialize_live_trun_defaults normalizes), optionally senc/saiz, and an
+// optional saio built by the caller. Sizes below are fixed and documented so
+// tests can compute the exact trun-growth delta independently of the code
+// under test.
+struct SaioTestFragment {
+    std::vector<std::uint8_t> moof;
+    std::vector<std::uint8_t> mdat;
+    std::vector<std::uint8_t> tfhd;  // the exact tfhd bytes placed in moof, for byte-exact comparisons
+    std::size_t original_moof_size = 0;
+    std::int64_t expected_delta = 0;
+};
+
+SaioTestFragment make_saio_test_fragment(const std::vector<std::uint8_t>& saio_box,
+                                         std::size_t mdat_payload_size,
+                                         bool include_senc = true,
+                                         bool include_saiz = true) {
+    // tfhd: FullBox header(4) + track_id(4) + default_duration(4) +
+    // default_size(4) + default_flags(4) = 16 bytes payload -> 28 byte box.
+    std::vector<std::uint8_t> tfhd_payload;
+    append_be32(tfhd_payload, 1);             // track_id
+    append_be32(tfhd_payload, 1000);          // default_sample_duration
+    append_be32(tfhd_payload, 200);           // default_sample_size
+    append_be32(tfhd_payload, 0x02000000U);   // default_sample_flags
+    const auto tfhd = make_full_box_with_flags(
+        "tfhd", 0, 0x000038U /* default-duration|default-size|default-flags */, tfhd_payload);
+
+    // Minimal live trun: flags = 0, so only sample_count is present.
+    // Box size: header(8) + version/flags(4) + sample_count(4) = 16 bytes.
+    const auto trun = make_full_box_with_flags("trun", 0, 0, be32_bytes(1));
+
+    std::vector<std::uint8_t> senc;
+    if (include_senc) {
+        senc = make_box("senc", {0, 0, 0, 0, 0, 0, 0, 0});
+    }
+    std::vector<std::uint8_t> saiz;
+    if (include_saiz) {
+        saiz = make_full_box("saiz", {8, 0, 0, 0, 1});
+    }
+
+    const auto traf = make_box("traf", concat({tfhd, trun, senc, saiz, saio_box}));
+    const auto moof = make_box("moof", traf);
+    const auto mdat = make_box("mdat", std::vector<std::uint8_t>(mdat_payload_size, 0xAB));
+
+    // Nothing in traf besides trun changes size during normalization, so the
+    // trun growth (see kSaioFixtureTrunGrowthDelta above) is the entire
+    // moof-size delta.
+    return SaioTestFragment{
+        .moof = moof,
+        .mdat = mdat,
+        .tfhd = tfhd,
+        .original_moof_size = moof.size(),
+        .expected_delta = kSaioFixtureTrunGrowthDelta,
+    };
+}
+
+// Computes a saio box's exact size from its shape alone (version, whether
+// the aux_info_type prefix is present, and entry count) without building it,
+// so tests can pick offsets relative to a moof size known in advance.
+std::size_t saio_box_size(std::uint8_t version, bool has_aux_info_type, std::size_t entry_count) {
+    const std::size_t entry_width = version == 1 ? 8 : 4;
+    return 8 /* header */ + 4 /* version/flags */ + (has_aux_info_type ? 8 : 0) + 4 /* entry_count */ +
+          entry_count * entry_width;
+}
+
+// Reads back the corrected offsets from a saio box in already-parsed output
+// bytes, independent of materialize_live_trun_defaults.
+std::vector<std::uint64_t> extract_saio_offsets(const std::vector<std::uint8_t>& bytes,
+                                                const openmoq::publisher::Mp4Box& saio,
+                                                bool has_aux_info_type) {
+    const std::uint8_t version = bytes[saio.payload.offset];
+    std::size_t cursor = saio.payload.offset + 4;
+    if (has_aux_info_type) {
+        cursor += 8;
+    }
+    const std::uint32_t count = read_be32(bytes, cursor);
+    cursor += 4;
+    std::vector<std::uint64_t> offsets;
+    offsets.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        if (version == 1) {
+            offsets.push_back(read_be64(bytes, cursor));
+            cursor += 8;
+        } else {
+            offsets.push_back(read_be32(bytes, cursor));
+            cursor += 4;
+        }
+    }
+    return offsets;
+}
+
 std::vector<std::uint8_t> make_fragmented_test_mp4() {
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
     const auto tkhd = make_full_box("tkhd",
@@ -1540,6 +1685,215 @@ int main() {
                                   "expected no maxGrpSapStartingType on a track with no SAP information");
         ok &= expect_not_contains(soun_track_text, "\"maxObjSapStartingType\":",
                                   "expected no maxObjSapStartingType on a track with no SAP information");
+    }
+
+    // --- Task 7: saio offset correction on the CTE (live) ingest path ---
+    //
+    // build_live_fragment (via materialize_live_trun_defaults) rebuilds each
+    // live moof's trun into a fully-explicit form, which changes the moof's
+    // size. saio holds moof-relative byte offsets into senc/mdat that a
+    // decryptor needs, so it must shift by exactly that size delta or the
+    // decryptor silently reads the wrong bytes. Every expected offset below
+    // is computed from the fixture's own known byte layout, never by asking
+    // the code under test what its answer was.
+    {
+        const std::vector<TrackDescription> saio_tracks = {
+            TrackDescription{.track_id = 1, .handler_type = "vide", .track_name = "vide_1", .timescale = 1000},
+        };
+
+        // Case 1: version 0, no aux_info_type, a moof-relative offset.
+        {
+            constexpr std::uint8_t version = 0;
+            constexpr bool has_aux = false;
+            const std::size_t saio_size = saio_box_size(version, has_aux, 1);
+            const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
+                                                   kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
+            const std::uint64_t original_offset = 50;
+            ok &= expect(original_offset < original_moof_size,
+                        "case1 fixture sanity: offset must be moof-relative");
+
+            const auto saio_box = make_saio_box(version, has_aux, {original_offset});
+            const auto fx = make_saio_test_fragment(saio_box, 32);
+            ok &= expect(fx.original_moof_size == original_moof_size,
+                        "case1: hand-computed moof size must match the fixture's actual size");
+
+            const auto fragment = build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            const auto out_boxes = parse_mp4_boxes(fragment.payload.owned_bytes);
+            const Mp4Box* out_traf = out_boxes.empty() ? nullptr : find_child_box(out_boxes.front(), "traf");
+            const Mp4Box* out_saio = out_traf == nullptr ? nullptr : find_child_box(*out_traf, "saio");
+            ok &= expect(out_saio != nullptr, "case1: expected saio to survive in the corrected output");
+            if (out_saio != nullptr) {
+                const auto corrected = extract_saio_offsets(fragment.payload.owned_bytes, *out_saio, has_aux);
+                const std::uint64_t expected = original_offset + static_cast<std::uint64_t>(fx.expected_delta);
+                ok &= expect(corrected.size() == 1 && corrected.front() == expected,
+                            "case1: expected saio offset " + std::to_string(original_offset) + " corrected to " +
+                                std::to_string(expected) + " (delta " + std::to_string(fx.expected_delta) + ")");
+            }
+        }
+
+        // Case 2: version 1, 64-bit offsets.
+        {
+            constexpr std::uint8_t version = 1;
+            constexpr bool has_aux = false;
+            const std::size_t saio_size = saio_box_size(version, has_aux, 1);
+            const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
+                                                   kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
+            const std::uint64_t original_offset = 64;
+            ok &= expect(original_offset < original_moof_size,
+                        "case2 fixture sanity: offset must be moof-relative");
+
+            const auto saio_box = make_saio_box(version, has_aux, {original_offset});
+            const auto fx = make_saio_test_fragment(saio_box, 32);
+            ok &= expect(fx.original_moof_size == original_moof_size,
+                        "case2: hand-computed moof size must match the fixture's actual size");
+
+            const auto fragment = build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            const auto out_boxes = parse_mp4_boxes(fragment.payload.owned_bytes);
+            const Mp4Box* out_traf = out_boxes.empty() ? nullptr : find_child_box(out_boxes.front(), "traf");
+            const Mp4Box* out_saio = out_traf == nullptr ? nullptr : find_child_box(*out_traf, "saio");
+            ok &= expect(out_saio != nullptr, "case2: expected saio to survive in the corrected output");
+            if (out_saio != nullptr) {
+                ok &= expect(fragment.payload.owned_bytes[out_saio->payload.offset] == 1,
+                            "case2: expected the saio box to keep version 1");
+                const auto corrected = extract_saio_offsets(fragment.payload.owned_bytes, *out_saio, has_aux);
+                const std::uint64_t expected = original_offset + static_cast<std::uint64_t>(fx.expected_delta);
+                ok &= expect(corrected.size() == 1 && corrected.front() == expected,
+                            "case2: expected 64-bit saio offset " + std::to_string(original_offset) +
+                                " corrected to " + std::to_string(expected) + " (delta " +
+                                std::to_string(fx.expected_delta) + ")");
+            }
+        }
+
+        // Case 3: flags & 1 set, so the aux_info_type/aux_info_type_parameter
+        // prefix is present and shifts where entry_count and the offsets
+        // begin. An implementation that ignores the flag reads entry_count
+        // from the wrong place and would produce a differently-wrong number
+        // here, not merely fail to change it.
+        {
+            constexpr std::uint8_t version = 0;
+            constexpr bool has_aux = true;
+            const std::size_t saio_size = saio_box_size(version, has_aux, 1);
+            const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
+                                                   kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
+            const std::uint64_t original_offset = 70;
+            ok &= expect(original_offset < original_moof_size,
+                        "case3 fixture sanity: offset must be moof-relative");
+
+            const auto saio_box = make_saio_box(version, has_aux, {original_offset});
+            const auto fx = make_saio_test_fragment(saio_box, 32);
+            ok &= expect(fx.original_moof_size == original_moof_size,
+                        "case3: hand-computed moof size must match the fixture's actual size");
+
+            const auto fragment = build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            const auto out_boxes = parse_mp4_boxes(fragment.payload.owned_bytes);
+            const Mp4Box* out_traf = out_boxes.empty() ? nullptr : find_child_box(out_boxes.front(), "traf");
+            const Mp4Box* out_saio = out_traf == nullptr ? nullptr : find_child_box(*out_traf, "saio");
+            ok &= expect(out_saio != nullptr, "case3: expected saio to survive in the corrected output");
+            if (out_saio != nullptr) {
+                const auto corrected = extract_saio_offsets(fragment.payload.owned_bytes, *out_saio, has_aux);
+                const std::uint64_t expected = original_offset + static_cast<std::uint64_t>(fx.expected_delta);
+                ok &= expect(corrected.size() == 1 && corrected.front() == expected,
+                            "case3: expected saio offset " + std::to_string(original_offset) +
+                                " (with aux_info_type prefix) corrected to " + std::to_string(expected) +
+                                " (delta " + std::to_string(fx.expected_delta) + ")");
+            }
+        }
+
+        // Case 4: an mdat-relative offset (at or beyond the original moof
+        // size, but within moof + mdat) is corrected, not refused.
+        {
+            constexpr std::uint8_t version = 0;
+            constexpr bool has_aux = false;
+            const std::size_t saio_size = saio_box_size(version, has_aux, 1);
+            const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
+                                                   kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
+            const std::size_t mdat_payload_size = 64;
+            const std::uint64_t original_offset = static_cast<std::uint64_t>(original_moof_size) + 4;
+            ok &= expect(original_offset >= original_moof_size &&
+                            original_offset < original_moof_size + 8 + mdat_payload_size,
+                        "case4 fixture sanity: offset must land inside mdat");
+
+            const auto saio_box = make_saio_box(version, has_aux, {original_offset});
+            const auto fx = make_saio_test_fragment(saio_box, mdat_payload_size);
+            ok &= expect(fx.original_moof_size == original_moof_size,
+                        "case4: hand-computed moof size must match the fixture's actual size");
+
+            const auto fragment = build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            const auto out_boxes = parse_mp4_boxes(fragment.payload.owned_bytes);
+            const Mp4Box* out_traf = out_boxes.empty() ? nullptr : find_child_box(out_boxes.front(), "traf");
+            const Mp4Box* out_saio = out_traf == nullptr ? nullptr : find_child_box(*out_traf, "saio");
+            ok &= expect(out_saio != nullptr, "case4: expected saio to survive in the corrected output");
+            if (out_saio != nullptr) {
+                const auto corrected = extract_saio_offsets(fragment.payload.owned_bytes, *out_saio, has_aux);
+                const std::uint64_t expected = original_offset + static_cast<std::uint64_t>(fx.expected_delta);
+                ok &= expect(corrected.size() == 1 && corrected.front() == expected,
+                            "case4: expected mdat-relative saio offset " + std::to_string(original_offset) +
+                                " corrected to " + std::to_string(expected) + " (delta " +
+                                std::to_string(fx.expected_delta) + ")");
+            }
+        }
+
+        // Case 5: an absolute-looking offset (beyond moof + mdat) is
+        // refused, with a fixture that is otherwise entirely valid so the
+        // refusal is attributable only to the classification.
+        {
+            constexpr std::uint8_t version = 0;
+            constexpr bool has_aux = false;
+            const std::size_t saio_size = saio_box_size(version, has_aux, 1);
+            const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
+                                                   kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
+            const std::size_t mdat_payload_size = 32;
+            const std::size_t mdat_total_size = 8 + mdat_payload_size;
+            const std::uint64_t original_offset =
+                static_cast<std::uint64_t>(original_moof_size + mdat_total_size) + 1000;
+
+            const auto saio_box = make_saio_box(version, has_aux, {original_offset});
+            const auto fx = make_saio_test_fragment(saio_box, mdat_payload_size);
+            ok &= expect(fx.original_moof_size == original_moof_size,
+                        "case5: hand-computed moof size must match the fixture's actual size");
+            ok &= expect(fx.mdat.size() == mdat_total_size, "case5: hand-computed mdat size must match the fixture");
+
+            bool threw = false;
+            std::string what;
+            try {
+                (void)build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            } catch (const std::exception& e) {
+                threw = true;
+                what = e.what();
+            }
+            ok &= expect(threw, "case5: expected an absolute-looking saio offset to be refused, not adjusted");
+            ok &= expect_contains(what, std::to_string(original_offset),
+                                  "case5: expected the thrown message to name the offending offset");
+        }
+
+        // Case 6: an unencrypted fragment (no saio/senc/saiz at all) passes
+        // through unchanged aside from the pre-existing trun normalization --
+        // the regression guard for every existing CTE user.
+        {
+            const auto fx = make_saio_test_fragment(/*saio_box=*/{}, /*mdat_payload_size=*/16,
+                                                    /*include_senc=*/false, /*include_saiz=*/false);
+            const auto fragment = build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+
+            const std::size_t placeholder_moof_size =
+                8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureNormalizedTrunSize;
+            const std::uint32_t expected_data_offset = static_cast<std::uint32_t>(placeholder_moof_size + 8);
+
+            std::vector<std::uint8_t> expected_trun_payload;
+            append_be32(expected_trun_payload, 1);                    // sample_count
+            append_be32(expected_trun_payload, expected_data_offset); // data_offset
+            append_be32(expected_trun_payload, 1000);                 // duration (tfhd default)
+            append_be32(expected_trun_payload, 200);                  // size (tfhd default)
+            append_be32(expected_trun_payload, 0x02000000U);          // flags (tfhd default)
+            const auto expected_trun = make_full_box_with_flags("trun", 0, 0x000701U, expected_trun_payload);
+
+            const auto expected_traf = make_box("traf", concat({fx.tfhd, expected_trun}));
+            const auto expected_moof = make_box("moof", expected_traf);
+            const auto expected_payload = concat({expected_moof, fx.mdat});
+
+            ok &= expect(fragment.payload.owned_bytes == expected_payload,
+                        "case6: expected an unencrypted live fragment to pass through byte-for-byte "
+                        "unchanged aside from the pre-existing trun normalization");
+        }
     }
 
     return ok ? 0 : 1;

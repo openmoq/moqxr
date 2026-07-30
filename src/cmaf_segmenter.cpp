@@ -1,11 +1,14 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 
+#include "openmoq/publisher/cenc.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <map>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -219,8 +222,126 @@ struct LiveTrunSample {
     std::uint32_t composition_offset = 0;
 };
 
+void write_be32_at(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint32_t value) {
+    bytes[offset] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
+    bytes[offset + 1] = static_cast<std::uint8_t>((value >> 16U) & 0xFFU);
+    bytes[offset + 2] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
+    bytes[offset + 3] = static_cast<std::uint8_t>(value & 0xFFU);
+}
+
+void write_be64_at(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint64_t value) {
+    for (int shift = 56, index = 0; shift >= 0; shift -= 8, ++index) {
+        bytes[offset + static_cast<std::size_t>(index)] = static_cast<std::uint8_t>((value >> shift) & 0xFFU);
+    }
+}
+
+// Corrects the byte offsets in a `saio` (Sample Auxiliary Information
+// Offsets) box so they remain valid after rebuild_moof changes the moof's
+// size by `delta` bytes. ISO/IEC 14496-12 section 8.7.13:
+//
+//   version(1) + flags(3)
+//   if (flags & 1): aux_info_type(4) + aux_info_type_parameter(4)
+//   entry_count(4)
+//   entry_count * (4 bytes if version == 0, else 8 bytes)
+//
+// Every entry is classified against the ORIGINAL moof size and the mdat size
+// that follows it (see build_live_fragment): an offset inside the moof
+// (pointing at senc) or inside the mdat is moof-relative and shifts by
+// delta; anything beyond moof + mdat cannot be a moof-relative reference in
+// a republished MOQT object, and adjusting it would silently produce a
+// fragment that decrypts to garbage, so it is refused instead.
+std::vector<std::uint8_t> correct_saio_offsets(std::span<const std::uint8_t> moof_bytes,
+                                               const Mp4Box& saio,
+                                               const Mp4Box& traf,
+                                               std::size_t original_moof_size,
+                                               std::size_t mdat_size,
+                                               std::int64_t delta) {
+    if (saio.payload.size < 4) {
+        throw std::runtime_error("saio correction: box too small for a FullBox header");
+    }
+    const std::uint8_t version = moof_bytes[saio.payload.offset];
+    if (version != 0 && version != 1) {
+        throw std::runtime_error("saio correction: unsupported version " +
+                                 std::to_string(static_cast<unsigned>(version)));
+    }
+    const std::uint32_t flags = read_full_box_flags(saio, moof_bytes);
+    const std::size_t box_end = saio.payload.offset + saio.payload.size;
+    std::size_t cursor = saio.payload.offset + 4;
+
+    if ((flags & 0x000001U) != 0) {
+        if (cursor + 8 > box_end) {
+            throw std::runtime_error("saio correction: truncated aux_info_type fields");
+        }
+        cursor += 8;  // aux_info_type + aux_info_type_parameter, preserved verbatim below
+    }
+
+    if (cursor + 4 > box_end) {
+        throw std::runtime_error("saio correction: truncated entry_count");
+    }
+    const std::uint32_t entry_count = read_be32(moof_bytes, cursor);
+    cursor += 4;
+
+    const std::size_t entry_width = version == 1 ? 8 : 4;
+    // Validate the box is long enough for entry_count entries BEFORE reading
+    // any of them: a fabricated entry_count must not drive reads past the box.
+    if (entry_count > (box_end - cursor) / entry_width) {
+        throw std::runtime_error("saio correction: entry_count exceeds box size");
+    }
+
+    // The auxiliary data a saio offset points at (senc, or saiz describing
+    // it) must be locatable in the same traf, or there is nothing to
+    // validate the classification below against.
+    const bool has_senc =
+        find_child_box_span(moof_bytes, traf.span.offset, traf.span.size, 8, "senc").has_value();
+    const bool has_saiz =
+        find_child_box_span(moof_bytes, traf.span.offset, traf.span.size, 8, "saiz").has_value();
+    if (!has_senc && !has_saiz) {
+        throw std::runtime_error("saio correction: saio present without senc or saiz in traf");
+    }
+
+    const auto raw = slice_bytes(moof_bytes, saio.span);
+    std::vector<std::uint8_t> corrected(raw.begin(), raw.end());
+    std::size_t local_cursor = cursor - saio.span.offset;
+    const std::size_t moof_and_mdat_size = original_moof_size + mdat_size;
+
+    for (std::uint32_t index = 0; index < entry_count; ++index) {
+        const std::uint64_t offset = version == 1 ? read_be64(moof_bytes, cursor) : read_be32(moof_bytes, cursor);
+
+        if (offset >= moof_and_mdat_size) {
+            throw std::runtime_error("saio correction: offset " + std::to_string(offset) +
+                                     " is beyond the original moof + mdat (" +
+                                     std::to_string(moof_and_mdat_size) +
+                                     ") and cannot be a moof-relative reference");
+        }
+
+        if (delta < 0) {
+            // Negating INT64_MIN directly is undefined behaviour; delta + 1
+            // stays representable, so negate that and add the 1 back in
+            // unsigned space instead.
+            const std::uint64_t magnitude = static_cast<std::uint64_t>(-(delta + 1)) + 1U;
+            if (magnitude > offset) {
+                throw std::runtime_error("saio correction: offset " + std::to_string(offset) +
+                                         " would underflow when shifted by " + std::to_string(delta));
+            }
+        }
+
+        const std::uint64_t adjusted = static_cast<std::uint64_t>(static_cast<std::int64_t>(offset) + delta);
+        if (version == 1) {
+            write_be64_at(corrected, local_cursor, adjusted);
+        } else {
+            write_be32_at(corrected, local_cursor, static_cast<std::uint32_t>(adjusted));
+        }
+
+        cursor += entry_width;
+        local_cursor += entry_width;
+    }
+
+    return corrected;
+}
+
 std::vector<std::uint8_t> materialize_live_trun_defaults(
     std::span<const std::uint8_t> moof_bytes,
+    std::size_t mdat_size,
     std::uint32_t default_sample_duration,
     std::uint32_t default_sample_size,
     std::uint32_t default_sample_flags) {
@@ -300,12 +421,20 @@ std::vector<std::uint8_t> materialize_live_trun_defaults(
         return make_full_box("trun", version, normalized_flags, payload);
     };
 
-    const auto rebuild_moof = [&](const std::vector<std::uint8_t>& normalized_trun) {
+    // saio_delta corrects saio (sample auxiliary information offsets) for the
+    // size change this rebuild makes to trun. It is a parameter, not a
+    // captured mutable variable, so the placeholder call below and the real
+    // call remain independent: each rebuilds from the original moof_bytes
+    // and traf->children, and neither can compound onto the other.
+    const auto rebuild_moof = [&](const std::vector<std::uint8_t>& normalized_trun, std::int64_t saio_delta) {
         std::vector<std::vector<std::uint8_t>> traf_children;
         traf_children.reserve(traf->children.size());
         for (const auto& child : traf->children) {
             if (child.span.offset == trun->span.offset) {
                 traf_children.push_back(normalized_trun);
+            } else if (child.type == "saio" && saio_delta != 0) {
+                traf_children.push_back(
+                    correct_saio_offsets(moof_bytes, child, *traf, moof.span.size, mdat_size, saio_delta));
             } else {
                 const auto raw = slice_bytes(moof_bytes, child.span);
                 traf_children.emplace_back(raw.begin(), raw.end());
@@ -326,8 +455,15 @@ std::vector<std::uint8_t> materialize_live_trun_defaults(
         return make_box("moof", concat_boxes(moof_children));
     };
 
-    const auto placeholder_moof = rebuild_moof(build_trun(0));
-    return rebuild_moof(build_trun(static_cast<std::uint32_t>(placeholder_moof.size() + 8)));
+    // First call: a placeholder used only to measure the rebuilt size. Its
+    // saio values are irrelevant, so saio_delta is 0 and saio is copied
+    // verbatim. build_trun always writes data_offset as a fixed-width
+    // 32-bit field, so this placeholder is the same size as the real moof
+    // built below, making the size delta measured from it valid there too.
+    const auto placeholder_moof = rebuild_moof(build_trun(0), 0);
+    const std::int64_t saio_delta =
+        static_cast<std::int64_t>(placeholder_moof.size()) - static_cast<std::int64_t>(moof.span.size);
+    return rebuild_moof(build_trun(static_cast<std::uint32_t>(placeholder_moof.size() + 8)), saio_delta);
 }
 
 const Mp4Box* require_child(const Mp4Box& box, std::string_view type) {
@@ -1393,7 +1529,7 @@ MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
     // entries. Materialize those values for CMAF consumers that read sample
     // metadata directly from trun.
     const std::vector<std::uint8_t> normalized_moof = materialize_live_trun_defaults(
-        moof_bytes, default_sample_duration, default_sample_size, default_sample_flags);
+        moof_bytes, mdat_bytes.size(), default_sample_duration, default_sample_size, default_sample_flags);
 
     // Combine moof+mdat into a single owned payload (CMSF compliance).
     std::vector<std::uint8_t> payload;
