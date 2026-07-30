@@ -555,7 +555,10 @@ int main() {
     ok &= parse_throws({"prog", "--url", "moqt://h/p#msf:ns--t", "--endpoint", "h:443"},
                             "--endpoint",
                             "expected --url with --endpoint to be refused");
-    ok &= parse_throws({"prog", "--transport", "raw", "--url",
+    // The conflict is now resolved after the loop (see url_required_transport
+    // below), which runs after the --input requirement check, so this needs
+    // --input just like the success-path --url blocks above.
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--transport", "raw", "--url",
                              "moqt://h/p#msf:ns--t&connection=wt"},
                             "connection",
                             "expected a disagreeing --transport and connection to be refused");
@@ -580,6 +583,65 @@ int main() {
                      "expected --alpn then --endpoint (no --url) to still produce an endpoint");
         ok &= expect(options.endpoint->host == "relay.example.com",
                      "expected --endpoint to still set the host after a prior --alpn");
+    }
+
+    // The --transport/connection agreement and conflict checks must be
+    // order-independent: resolved once after the loop, not only when
+    // --transport happens to come before --url.
+
+    // Disagreeing pair, --url first (the --transport-first case is covered
+    // above, under "expected a disagreeing --transport and connection to be refused").
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--url",
+                             "moqt://h/p#msf:ns--t&connection=wt", "--transport", "raw"},
+                            "connection",
+                            "expected a connection requirement followed by a disagreeing --transport to be refused");
+
+    // Agreeing pair, --url first (the --transport-first case is covered
+    // above, under "An agreeing --transport is accepted").
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--url",
+             "moqt://relay.example/moq#msf:ns--catalog&connection=wt", "--transport", "webtransport"});
+        ok &= expect(options.transport == openmoq::publisher::transport::TransportKind::kWebTransport,
+                     "expected an agreeing connection requirement followed by --transport to be accepted");
+    }
+
+    // A --url with no connection parameter must not disturb an explicit
+    // --transport, in either order.
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--transport", "webtransport", "--url",
+             "moqt://relay.example/moq#msf:ns--catalog"});
+        ok &= expect(options.transport == openmoq::publisher::transport::TransportKind::kWebTransport,
+                     "expected --transport before a connection-less --url to remain intact");
+    }
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--url", "moqt://relay.example/moq#msf:ns--catalog",
+             "--transport", "webtransport"});
+        ok &= expect(options.transport == openmoq::publisher::transport::TransportKind::kWebTransport,
+                     "expected --transport after a connection-less --url to remain intact");
+    }
+
+    // --url must update host/port/path in place rather than replacing the
+    // whole EndpointConfig, so an alpn/sni set by an earlier flag survives.
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--alpn", "moq-99", "--url",
+             "moqt://relay.example/moq#msf:ns--catalog"});
+        ok &= expect(options.endpoint.has_value(), "expected --alpn then --url to produce an endpoint");
+        ok &= expect(options.endpoint->alpn == "moq-99",
+                     "expected --alpn set before --url to survive the --url endpoint update");
+        ok &= expect(options.endpoint->host == "relay.example",
+                     "expected --url to still set the host after a prior --alpn");
+    }
+    {
+        const auto options = parse(
+            {"prog", "--input", "sample.mp4", "--url", "moqt://relay.example/moq#msf:ns--catalog",
+             "--alpn", "moq-99"});
+        ok &= expect(options.endpoint.has_value(), "expected --url then --alpn to produce an endpoint");
+        ok &= expect(options.endpoint->alpn == "moq-99",
+                     "expected --alpn set after --url to take effect");
     }
 
     return ok ? 0 : 1;

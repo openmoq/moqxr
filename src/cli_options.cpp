@@ -190,6 +190,10 @@ CliOptions parse_cli_options(int argc, char** argv) {
     // "--alpn moq-99 --endpoint h:443" that never mentions --url.
     bool endpoint_set = false;
     bool url_set = false;
+    // Recorded, not applied, inside the loop: --transport can come either
+    // before or after --url, so the conflict/agreement check must happen
+    // once after the loop rather than only when --transport is seen first.
+    std::optional<transport::TransportKind> url_required_transport;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
@@ -254,25 +258,32 @@ CliOptions parse_cli_options(int argc, char** argv) {
             }
             options.track_namespace = flattened;
 
-            transport::EndpointConfig endpoint;
-            endpoint.host = url.host;
-            endpoint.port = url.port;
-            endpoint.path = url.path;
-            endpoint.path_explicit = url.path_explicit;
-            options.endpoint = endpoint;
+            // If --alpn/--sni already constructed an EndpointConfig, update
+            // the fields --url owns in place rather than replacing the whole
+            // struct, so an earlier --alpn/--sni value survives.
+            if (options.endpoint.has_value()) {
+                options.endpoint->host = url.host;
+                options.endpoint->port = url.port;
+                options.endpoint->path = url.path;
+                options.endpoint->path_explicit = url.path_explicit;
+            } else {
+                transport::EndpointConfig endpoint;
+                endpoint.host = url.host;
+                endpoint.port = url.port;
+                endpoint.path = url.path;
+                endpoint.path_explicit = url.path_explicit;
+                options.endpoint = endpoint;
+            }
             endpoint_set = true;
             url_set = true;
 
             if (url.connection != ConnectionRequirement::kAny) {
-                const auto required = url.connection == ConnectionRequirement::kRawQuic
-                                          ? transport::TransportKind::kRawQuic
-                                          : transport::TransportKind::kWebTransport;
-                if (transport_set && options.transport != required) {
-                    throw std::runtime_error(
-                        "--url specifies a connection type that conflicts with --transport");
-                }
-                options.transport = required;
-                transport_set = true;
+                // Recorded here and resolved once after the loop (see
+                // url_required_transport below), so the outcome does not
+                // depend on whether --transport appears before or after --url.
+                url_required_transport = url.connection == ConnectionRequirement::kRawQuic
+                                             ? transport::TransportKind::kRawQuic
+                                             : transport::TransportKind::kWebTransport;
             }
 
             if (url.c4m_token.has_value()) {
@@ -390,6 +401,17 @@ CliOptions parse_cli_options(int argc, char** argv) {
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
         throw std::runtime_error("--alpn and --sni require --endpoint to be provided first");
     }
+
+    // Resolve any --url connection requirement against --transport exactly
+    // once, regardless of which flag appeared first on the command line.
+    if (url_required_transport.has_value()) {
+        if (transport_set && options.transport != *url_required_transport) {
+            throw std::runtime_error(
+                "--url specifies a connection type that conflicts with --transport");
+        }
+        options.transport = *url_required_transport;
+    }
+
     if (options.endpoint.has_value()) {
         options.endpoint->transport = options.transport;
     }
