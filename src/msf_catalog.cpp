@@ -127,6 +127,47 @@ bool is_uuid_string(std::string_view value) {
     return true;
 }
 
+// MSF 5.4.1: a '%' in a catalog field value is permitted only as part of a
+// well-formed %name% variable reference, where the name consists of
+// alphanumerics, hyphens, and underscores. URL-typed fields are exempt; see
+// docs/protocol-mapping.md.
+void validate_no_stray_percent(const std::string& value, std::string_view field,
+                               const std::string& where) {
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] != '%') {
+            continue;
+        }
+        const std::size_t closing = value.find('%', index + 1);
+        if (closing == std::string::npos) {
+            throw std::runtime_error("MSF catalog field " + std::string(field) +
+                                     " has an unterminated '%' variable reference" + where);
+        }
+        const std::string name = value.substr(index + 1, closing - index - 1);
+        if (name.empty()) {
+            throw std::runtime_error("MSF catalog field " + std::string(field) +
+                                     " has an empty '%' variable name" + where);
+        }
+        for (const char character : name) {
+            const auto byte = static_cast<unsigned char>(character);
+            const bool allowed = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                                 (byte >= '0' && byte <= '9') || byte == '-' || byte == '_';
+            if (!allowed) {
+                throw std::runtime_error("MSF catalog field " + std::string(field) +
+                                         " has a '%' variable name containing '" +
+                                         std::string(1, character) + "'" + where);
+            }
+        }
+        index = closing;
+    }
+}
+
+void validate_optional_no_stray_percent(const std::optional<std::string>& value,
+                                        std::string_view field, const std::string& where) {
+    if (value.has_value()) {
+        validate_no_stray_percent(*value, field, where);
+    }
+}
+
 // MSF and CMSF invariants that a malformed caller could otherwise publish.
 void validate_track(const MsfTrack& track) {
     const std::string where = " (track \"" + track.name + "\")";
@@ -184,6 +225,25 @@ void validate_track(const MsfTrack& track) {
             throw std::runtime_error("MSF catalog custom field \"" + key +
                                      "\" has an empty raw JSON value" + where);
         }
+    }
+
+    // Section 5.4.1: '%' MUST NOT appear in a catalog field value except as
+    // part of a well-formed variable reference. Not applied to
+    // MsfUrlEntry::url (la_url/cert_url) or custom_fields; see the function
+    // comment above validate_no_stray_percent.
+    validate_no_stray_percent(track.name, "name", where);
+    validate_no_stray_percent(track.packaging, "packaging", where);
+    validate_optional_no_stray_percent(track.name_space, "namespace", where);
+    validate_optional_no_stray_percent(track.role, "role", where);
+    validate_optional_no_stray_percent(track.label, "label", where);
+    validate_optional_no_stray_percent(track.init_ref, "initRef", where);
+    validate_optional_no_stray_percent(track.codec, "codec", where);
+    validate_optional_no_stray_percent(track.mime_type, "mimeType", where);
+    validate_optional_no_stray_percent(track.channel_config, "channelConfig", where);
+    validate_optional_no_stray_percent(track.lang, "lang", where);
+    validate_optional_no_stray_percent(track.event_type, "eventType", where);
+    for (const auto& dependency : track.depends) {
+        validate_no_stray_percent(dependency, "depends", where);
     }
 }
 

@@ -38,6 +38,16 @@ bool throws_runtime_error(const openmoq::publisher::MsfCatalog& catalog, const s
     }
 }
 
+bool serializes_cleanly(const openmoq::publisher::MsfCatalog& catalog, const std::string& message) {
+    try {
+        openmoq::publisher::serialize_catalog(catalog);
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: " << message << " (threw: " << error.what() << ")\n";
+        return false;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1115,6 +1125,70 @@ int main() {
     dangling_publish_track_ref.publish_tracks.push_back(dangling_publish_track);
     ok &= throws_runtime_error(dangling_publish_track_ref,
                                "expected a dangling contentProtectionRefID on publishTracks to throw");
+
+    // MSF 5.4.1: '%' is permitted in a catalog field value only as part of a
+    // well-formed %name% variable reference.
+    {
+        const auto make_labelled = [](const std::string& label) {
+            MsfCatalog catalog;
+            MsfTrack track;
+            track.name = "video";
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.codec = "avc1.640028";
+            track.bitrate = 5000000;
+            track.width = 1920;
+            track.height = 1080;
+            track.framerate = 30.0;
+            track.label = label;
+            catalog.tracks.push_back(track);
+            return catalog;
+        };
+
+        ok &= serializes_cleanly(make_labelled("watermark-%viewer_id%"),
+                                 "expected a well-formed variable reference to be accepted");
+        ok &= serializes_cleanly(make_labelled("plain label"),
+                                 "expected a label with no percent to be accepted");
+        ok &= throws_runtime_error(make_labelled("100% quality"),
+                                   "expected a bare percent to be refused");
+        ok &= throws_runtime_error(make_labelled("%bad name%"),
+                                   "expected a variable name containing a space to be refused");
+        ok &= throws_runtime_error(make_labelled("%unterminated"),
+                                   "expected an unterminated variable reference to be refused");
+        ok &= throws_runtime_error(make_labelled("%%"),
+                                   "expected an empty variable name to be refused");
+    }
+
+    // Deliberate deviation: URL-typed fields are exempt from the 5.4 percent
+    // rule, because a license acquisition URL is legitimately percent-encoded
+    // under RFC 3986. Pinned so it cannot regress silently.
+    {
+        MsfCatalog catalog;
+        MsfTrack track;
+        track.name = "video";
+        track.packaging = "cmaf";
+        track.role = "video";
+        track.is_live = true;
+        track.codec = "avc1.640028";
+        track.bitrate = 5000000;
+        track.width = 1920;
+        track.height = 1080;
+        track.framerate = 30.0;
+        catalog.tracks.push_back(track);
+
+        MsfContentProtection protection;
+        protection.ref_id = "cp0";
+        protection.scheme = "cenc";
+        protection.default_kids = {"9eb4050d-e44b-4802-932e-27d75083e266"};
+        protection.system_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
+        protection.la_url = MsfUrlEntry{"https://drm.example/lic?sid=%20a"};
+        catalog.content_protections.push_back(protection);
+        catalog.tracks.front().content_protection_ref_ids = {"cp0"};
+
+        ok &= serializes_cleanly(catalog,
+                                 "expected a percent-encoded license URL to be accepted");
+    }
 
     return ok ? 0 : 1;
 }
