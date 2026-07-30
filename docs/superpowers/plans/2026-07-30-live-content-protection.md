@@ -14,7 +14,7 @@
 - Build with BOTH flags: `-DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF -DOPENMOQ_LIBMOQ_SOURCE_DIR=/media/mondain/terrorbyte/workspace/github-moq/moq5`. Without the libmoq flag the suite silently drops from 15 targets to 14 with no error message.
 - Baseline at branch start: **15/15 tests, 12 unique compiler warnings** (`grep -E "warning:" | sort -u | wc -l`). No `-Werror`.
 - **The publisher never encrypts and never decrypts.** This phase detects and signals protection already present in its input.
-- Every `parse({...})` in `tests/cli_options_test.cpp` expected to **succeed** must include `"--input", "sample.mp4"`. `--input` is unconditionally required (`src/cli_options.cpp` throws "missing required --input argument" when `--live-source` is at its `auto` default), and these tests call the parser directly, so a missing one aborts the binary before any assertion runs.
+- `--input` is required only when `--live-source` is at its `auto` default; `src/cli_options.cpp` exempts `--live-source srt` and `--live-source dash`. The existing tests reflect this: the dash case at `tests/cli_options_test.cpp:257` and the srt case at `:236` both succeed with no `--input`. Match the surrounding tests rather than adding one. Where `--live-source` is left at `auto` and the parse is expected to succeed, `"--input", "sample.mp4"` is required, because these tests call the parser directly and an unexpected throw aborts the binary before any assertion runs.
 - No emoji, no "Generated with Claude Code" tagline, no `Co-Authored-By` line.
 - Prefer `#include` and unqualified names over fully-qualified spellings.
 
@@ -432,8 +432,10 @@ git commit -m "Attach content protection on the DASH CTE ingest path"
     // --drm-config is accepted there.
     {
         const auto config_path = write_drm_config_file("phase5-dash.json");
-        const auto options = parse({"prog", "--input", "sample.mp4", "--endpoint", "h:443",
-                                    "--live-source", "dash", "--dash-listen", "127.0.0.1:8080",
+        const auto options = parse({"openmoq-publisher", "--live-source", "dash",
+                                    "--dash-listen", "127.0.0.1:8080",
+                                    "--dash-path", "/ingest",
+                                    "--endpoint", "https://relay.example.com:443/moq",
                                     "--drm-config", config_path.string()});
         ok &= expect(!options.drm_systems.empty(),
                      "expected --drm-config to be accepted with --live-source dash");
@@ -442,15 +444,16 @@ git commit -m "Attach content protection on the DASH CTE ingest path"
     // SRT still cannot carry CMAF CENC metadata, and the refusal must say why.
     {
         const auto config_path = write_drm_config_file("phase5-srt.json");
-        ok &= parse_throws({"prog", "--input", "sample.mp4", "--endpoint", "h:443",
-                            "--live-source", "srt", "--srt-config", "srt.json",
+        ok &= parse_throws({"openmoq-publisher", "--live-source", "srt",
+                            "--srt-config", "/tmp/foo.json",
+                            "--endpoint", "localhost:4443", "--namespace", "ns",
                             "--drm-config", config_path.string()},
                            "MPEG-TS",
                            "expected the SRT refusal to explain that MPEG-TS carries no CENC metadata");
     }
 ```
 
-Check the exact flags the existing SRT and DASH tests in this file use — `--srt-config` and `--dash-listen` may have different required forms. Match what the file already does rather than guessing, and report any adjustment.
+The flag forms above are copied from the existing tests at `tests/cli_options_test.cpp:236` (srt) and `:257` (dash). `--live-source dash` requires `--dash-listen`, or the parse throws `--live-source dash requires --dash-listen`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
