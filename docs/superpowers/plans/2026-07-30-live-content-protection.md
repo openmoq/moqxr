@@ -502,13 +502,27 @@ git commit -m "Accept --drm-config on the live paths that can detect protection"
 
 Item 6 currently says content protection is "**shipped** for the batch/VOD publish path". Extend it: protection is now also detected and signalled on the live paths that receive a real CMAF initialization segment — the DASH CTE ingest and the live stdin path.
 
-Then find and rewrite the passage stating that "Wiring content protection into the live paths remains future work (a later phase)" together with the surrounding text about `--drm-config` being refused on live paths. That passage runs from roughly `docs/status.md:88` to `:100`; locate it by its text since line numbers will have shifted. It must now say:
+**Six statements across the two documents become false with this phase. Every one must change, or the docs contradict themselves** — the defect the Phase 3 review caught. Locate each by its text, since line numbers will shift as you edit:
+
+In `docs/status.md`:
+1. `:96-98` — "Encrypted live input published with no `--drm-config` at all is not refused and still publishes fully unsignalled -- `--drm-config` supplies only optional deployment fields, not protection detection."
+2. `:99` — "Wiring content protection into the live paths remains future work (a later phase)."
+
+In `docs/protocol-mapping.md`:
+3. `:121` — content protection described as covering "the batch/VOD publish path only".
+4. `:129` — "Implemented for the batch/VOD publish path".
+5. `:220-224` — "**Not signalled at all today:** the live publish paths -- `MoqtSession::publish_live()` (SRT and stdin ingest) and `publish_live_objects()` (DASH ingest) -- build their catalog through `build_live_catalog`, which never calls `attach_content_protection`."
+6. `:237-241` — the library-level note ending "Wiring content protection into the live paths is future work, not part of this phase." Note this passage also claims an SDK consumer combining `PublisherConfig::drm_systems` with a live publish path "gets the same silent behaviour the CLI guard exists to prevent". That is no longer true for real-init paths: they now detect and signal protection regardless of whether `drm_systems` was supplied. Rewrite it to say what remains true — that `drm_systems` supplies only deployment fields, and that SRT still cannot detect protection.
+
+The replacement text must say:
 
 - Detection works on any live path receiving a real init segment.
 - SRT is excluded because MPEG-TS carries no CENC metadata, not because the work is unfinished.
 - A protected track with no `pssh` is refused on the live paths, matching batch.
 
-After editing, grep `docs/status.md` for `live path` and for `drm-config` and read every hit to confirm none still claims live protection is unimplemented. Report the hit counts.
+After editing, grep **both** files for `live path`, `live publish`, `drm-config`, and `future work`, and read every hit to confirm none still claims live protection is unimplemented. Report the hit counts.
+
+Do not overreach: MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41), MSF section 12 compression signalling, `clone` delta operations, and the CMSF 4.1.1.4.4 Authorization URL all remain genuinely unimplemented and must stay in their lists.
 
 - [ ] **Step 2: Add limitations to `docs/protocol-mapping.md`**
 
