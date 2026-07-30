@@ -410,38 +410,6 @@ bool hevc_track_is_hvc1_compatible(const std::vector<Mp4Box>& top_level_boxes,
     return fragmented_hevc_samples_are_hvc1_compatible(track_id, top_level_boxes, bytes);
 }
 
-std::size_t find_child_box_offset(const Mp4Box& sample_entry,
-                                  std::span<const std::uint8_t> bytes,
-                                  std::size_t child_offset,
-                                  std::string_view type) {
-    // sample_entry.span.size comes from an unchecked 32-bit box-size field in
-    // the stsd entry (extract_tracks), so it cannot be trusted to bound the
-    // scan: a fabricated huge value must not drive reads past the end of
-    // `bytes`. Clamp to the real buffer, and clamp defensively against
-    // size_t overflow in the offset+size sum itself (and in offset+child_offset).
-    std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
-    if (entry_end < sample_entry.span.offset) {
-        entry_end = bytes.size();
-    }
-    const std::size_t limit = std::min(entry_end, bytes.size());
-
-    const std::size_t start = sample_entry.span.offset + child_offset;
-    if (start < sample_entry.span.offset) {
-        return 0;
-    }
-
-    for (std::size_t cursor = start; cursor + 8 <= limit; ++cursor) {
-        const std::uint32_t box_size = read_be32(bytes, cursor);
-        if (box_size < 8 || cursor + box_size > limit) {
-            continue;
-        }
-        if (std::string_view(reinterpret_cast<const char*>(bytes.data() + cursor + 4), 4) == type) {
-            return cursor;
-        }
-    }
-    return 0;
-}
-
 bool decode_descriptor_length(std::span<const std::uint8_t> bytes,
                               std::size_t offset,
                               std::size_t limit,
@@ -461,10 +429,11 @@ bool decode_descriptor_length(std::span<const std::uint8_t> bytes,
 }
 
 std::string avc_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const std::size_t avcc_offset = find_child_box_offset(sample_entry, bytes, 8 + 70, "avcC");
-    if (avcc_offset == 0 || avcc_offset + 12 > bytes.size()) {
+    const auto avcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, 8 + 70, "avcC");
+    if (!avcc.has_value() || avcc->offset + 12 > bytes.size()) {
         return "avc1";
     }
+    const std::size_t avcc_offset = avcc->offset;
 
     const std::uint8_t profile = bytes[avcc_offset + 9];
     const std::uint8_t compatibility = bytes[avcc_offset + 10];
@@ -473,10 +442,11 @@ std::string avc_codec_string(const Mp4Box& sample_entry, std::span<const std::ui
 }
 
 std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const std::size_t hvcc_offset = find_child_box_offset(sample_entry, bytes, 8 + 70, "hvcC");
-    if (hvcc_offset == 0 || hvcc_offset + 21 > bytes.size()) {
+    const auto hvcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, 8 + 70, "hvcC");
+    if (!hvcc.has_value() || hvcc->offset + 21 > bytes.size()) {
         return sample_entry.type;
     }
+    const std::size_t hvcc_offset = hvcc->offset;
 
     const std::uint8_t profile_byte = bytes[hvcc_offset + 9];
     const char profile_space = (profile_byte >> 6U) == 1 ? 'A' : (profile_byte >> 6U) == 2 ? 'B' : (profile_byte >> 6U) == 3 ? 'C' : '\0';
@@ -508,17 +478,18 @@ std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::u
 }
 
 std::string mpeg4_audio_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
-    const std::size_t esds_offset = find_child_box_offset(sample_entry, bytes, 8 + 28, "esds");
-    if (esds_offset == 0 || esds_offset + 16 > bytes.size()) {
+    const auto esds = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, 8 + 28, "esds");
+    if (!esds.has_value() || esds->offset + 16 > bytes.size()) {
         return "mp4a.40.2";
     }
+    const std::size_t esds_offset = esds->offset;
 
     // sample_entry.span.size comes from an unchecked 32-bit box-size field in
     // the stsd entry (extract_tracks), so it cannot be trusted to bound the
     // ESDS descriptor scan below: a fabricated huge value must not drive
     // reads past the end of `bytes`. Clamp to the real buffer once, and
     // guard against size_t overflow in the offset+size sum itself, the same
-    // way find_child_box_offset does.
+    // way find_child_box_span does.
     std::size_t entry_end = sample_entry.span.offset + sample_entry.span.size;
     if (entry_end < sample_entry.span.offset) {
         entry_end = bytes.size();
@@ -604,10 +575,11 @@ struct BitrateInfo {
 BitrateInfo bitrate_from_sample_entry(const Mp4Box& sample_entry,
                                       std::span<const std::uint8_t> bytes,
                                       std::size_t child_offset) {
-    const std::size_t btrt_offset = find_child_box_offset(sample_entry, bytes, child_offset, "btrt");
-    if (btrt_offset == 0 || btrt_offset + 20 > bytes.size()) {
+    const auto btrt = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size, child_offset, "btrt");
+    if (!btrt.has_value() || btrt->offset + 20 > bytes.size()) {
         return {};
     }
+    const std::size_t btrt_offset = btrt->offset;
     return BitrateInfo{
         .max_bitrate = read_be32(bytes, btrt_offset + 12),
         .avg_bitrate = read_be32(bytes, btrt_offset + 16),

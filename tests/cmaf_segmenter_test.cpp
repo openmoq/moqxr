@@ -133,6 +133,14 @@ constexpr std::int64_t kSaioFixtureTrunGrowthDelta =
 constexpr std::size_t kSaioFixtureSencSize = 16;   // header8 + 8 arbitrary payload bytes
 constexpr std::size_t kSaioFixtureSaizSize = 17;   // header8 + ver/flags4 + default_size1 + sample_count4
 
+// Where the ORIGINAL (pre-normalization) trun box ends, relative to the
+// moof, in the default {tfhd, trun, senc, saiz, saio} traf child order
+// make_saio_test_fragment builds. correct_saio_offsets only shifts an offset
+// at or beyond this point; an offset before it (inside tfhd or trun itself)
+// must not move, since the rebuild changes only trun's own size.
+constexpr std::size_t kSaioFixtureTrunEnd = 8 /* moof header */ + 8 /* traf header */ +
+                                           kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize;
+
 // Builds a `saio` (Sample Auxiliary Information Offsets) box, ISO/IEC
 // 14496-12 section 8.7.13, with the given version and offset entries.
 // `has_aux_info_type` controls whether flags & 1 is set and the
@@ -199,7 +207,8 @@ struct SaioTestFragment {
 SaioTestFragment make_saio_test_fragment(const std::vector<std::uint8_t>& saio_box,
                                          std::size_t mdat_payload_size,
                                          bool include_senc = true,
-                                         bool include_saiz = true) {
+                                         bool include_saiz = true,
+                                         bool senc_before_trun = false) {
     // tfhd: FullBox header(4) + track_id(4) + default_duration(4) +
     // default_size(4) + default_flags(4) = 16 bytes payload -> 28 byte box.
     std::vector<std::uint8_t> tfhd_payload;
@@ -223,7 +232,12 @@ SaioTestFragment make_saio_test_fragment(const std::vector<std::uint8_t>& saio_b
         saiz = make_full_box("saiz", {8, 0, 0, 0, 1});
     }
 
-    const auto traf = make_box("traf", concat({tfhd, trun, senc, saiz, saio_box}));
+    // senc_before_trun exercises the legal-but-less-common ISO/IEC 14496-12
+    // box ordering ffmpeg produces: senc ahead of trun in the traf. Nothing
+    // besides trun's position changes size, so original_moof_size and
+    // expected_delta below stay valid for either ordering.
+    const auto traf = senc_before_trun ? make_box("traf", concat({tfhd, senc, trun, saiz, saio_box}))
+                                       : make_box("traf", concat({tfhd, trun, senc, saiz, saio_box}));
     const auto moof = make_box("moof", traf);
     const auto mdat = make_box("mdat", std::vector<std::uint8_t>(mdat_payload_size, 0xAB));
 
@@ -415,16 +429,17 @@ std::vector<std::uint8_t> make_encrypted_audio_fragmented_test_mp4() {
     return concat({ftyp, moov, moof, mdat});
 }
 
-// Regression for a heap over-read in find_child_box_offset (mp4_box.cpp):
-// its scan was bounded only by the stsd sample-entry's own declared box
-// size, which extract_tracks reads from the file with no validation
-// (read_be32 at the stsd's first child offset). A fabricated size far
-// larger than the file drove the scan past the end of the buffer once a
-// searched-for child box was absent. avcC is present here and found within
-// the first ~80 bytes (as in a real file), so the avcC lookup terminates
-// early; btrt is absent, as in most real files, so the unconditional
-// per-track bitrate lookup is the one left scanning to the fabricated
-// bound. Reverting the clamp in find_child_box_offset makes this fixture
+// Regression for a heap over-read, originally in the sliding
+// find_child_box_offset scan (mp4_box.cpp), now guarded by
+// find_child_box_span: the lookup was bounded only by the stsd
+// sample-entry's own declared box size, which extract_tracks reads from the
+// file with no validation (read_be32 at the stsd's first child offset). A
+// fabricated size far larger than the file drove the scan past the end of
+// the buffer once a searched-for child box was absent. avcC is present here
+// and found within the first ~80 bytes (as in a real file), so the avcC
+// lookup terminates early; btrt is absent, as in most real files, so the
+// unconditional per-track bitrate lookup is the one left walking to the
+// fabricated bound. Reverting find_child_box_span's clamp makes this fixture
 // heap-buffer-overflow under ASAN; with the clamp, extract_tracks returns
 // cleanly and reports no bitrate.
 std::vector<std::uint8_t> make_oversized_sample_entry_test_mp4() {
@@ -463,12 +478,14 @@ std::vector<std::uint8_t> make_oversized_sample_entry_test_mp4() {
 }
 
 // Regression for a heap over-read in mpeg4_audio_codec_string (mp4_box.cpp):
-// its ESDS descriptor scan was bounded only by the stsd sample-entry's own
-// declared box size (sample_entry.span.offset + sample_entry.span.size),
-// which extract_tracks reads from the file with no validation, and unlike
-// find_child_box_offset it used that raw, unclamped sum directly as the
-// scan bound, as the decode_descriptor_length end argument, and in the
-// config-offset bounds check. The esds box below carries no DecSpecificInfo
+// its ESDS descriptor scan (the byte-by-byte search for tag 0x05, distinct
+// from the find_child_box_span lookup that now locates the esds box itself)
+// was bounded only by the stsd sample-entry's own declared box size
+// (sample_entry.span.offset + sample_entry.span.size), which extract_tracks
+// reads from the file with no validation, and it used that raw, unclamped
+// sum directly as the scan bound, as the decode_descriptor_length end
+// argument, and in the config-offset bounds check. The esds box below
+// carries no DecSpecificInfo
 // (tag 0x05) byte anywhere in its payload, so the byte-by-byte scan never
 // finds a match and runs all the way to its bound; with the mp4a sample
 // entry's box-size field patched to a size far larger than the file, that
@@ -486,7 +503,7 @@ std::vector<std::uint8_t> make_oversized_audio_sample_entry_test_mp4() {
     // Fixed-size AudioSampleEntry fields (reserved/data_reference_index,
     // reserved, channelcount, samplesize, pre_defined, reserved, samplerate):
     // 28 bytes, matching the "8 + 28" child_offset mpeg4_audio_codec_string
-    // passes to find_child_box_offset when locating the esds box.
+    // passes to find_child_box_span when locating the esds box.
     const auto audio_header = std::vector<std::uint8_t>(28, 0);
     // A FullBox esds payload with no byte equal to 0x05 (DecSpecificInfoTag)
     // anywhere, so the scan for it never terminates early.
@@ -1648,9 +1665,10 @@ int main() {
                      "expected pathological v1 duration*1000 overflow to fall back to 0, not wrap");
     }
 
-    // C1 regression: find_child_box_offset must not trust a fabricated
-    // sample-entry size and scan past the end of the buffer when the
-    // searched-for child box (btrt) is absent. See
+    // I3 regression: bitrate_from_sample_entry (via find_child_box_span,
+    // which superseded the sliding find_child_box_offset scan) must not
+    // trust a fabricated sample-entry size and walk past the end of the
+    // buffer when the searched-for child box (btrt) is absent. See
     // make_oversized_sample_entry_test_mp4 for the full explanation.
     {
         const auto oversized_bytes = make_oversized_sample_entry_test_mp4();
@@ -1909,16 +1927,18 @@ int main() {
             TrackDescription{.track_id = 1, .handler_type = "vide", .track_name = "vide_1", .timescale = 1000},
         };
 
-        // Case 1: version 0, no aux_info_type, a moof-relative offset.
+        // Case 1: version 0, no aux_info_type, a moof-relative offset that
+        // lands inside senc (i.e. at or beyond the original trun's end) --
+        // the only offsets a rebuild that changes only trun's size can move.
         {
             constexpr std::uint8_t version = 0;
             constexpr bool has_aux = false;
             const std::size_t saio_size = saio_box_size(version, has_aux, 1);
             const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
                                                    kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
-            const std::uint64_t original_offset = 50;
-            ok &= expect(original_offset < original_moof_size,
-                        "case1 fixture sanity: offset must be moof-relative");
+            const std::uint64_t original_offset = kSaioFixtureTrunEnd + 2;
+            ok &= expect(original_offset >= kSaioFixtureTrunEnd && original_offset < original_moof_size,
+                        "case1 fixture sanity: offset must land at or after the original trun's end (in senc)");
 
             const auto saio_box = make_saio_box(version, has_aux, {original_offset});
             const auto fx = make_saio_test_fragment(saio_box, 32);
@@ -1947,8 +1967,8 @@ int main() {
             const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
                                                    kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
             const std::uint64_t original_offset = 64;
-            ok &= expect(original_offset < original_moof_size,
-                        "case2 fixture sanity: offset must be moof-relative");
+            ok &= expect(original_offset >= kSaioFixtureTrunEnd && original_offset < original_moof_size,
+                        "case2 fixture sanity: offset must land at or after the original trun's end (in senc)");
 
             const auto saio_box = make_saio_box(version, has_aux, {original_offset});
             const auto fx = make_saio_test_fragment(saio_box, 32);
@@ -1984,8 +2004,8 @@ int main() {
             const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureOriginalTrunSize +
                                                    kSaioFixtureSencSize + kSaioFixtureSaizSize + saio_size;
             const std::uint64_t original_offset = 70;
-            ok &= expect(original_offset < original_moof_size,
-                        "case3 fixture sanity: offset must be moof-relative");
+            ok &= expect(original_offset >= kSaioFixtureTrunEnd && original_offset < original_moof_size,
+                        "case3 fixture sanity: offset must land at or after the original trun's end (in senc)");
 
             const auto saio_box = make_saio_box(version, has_aux, {original_offset});
             const auto fx = make_saio_test_fragment(saio_box, 32);
@@ -2151,6 +2171,126 @@ int main() {
             ok &= expect(threw, "case8: expected a saio without senc or saiz in traf to be refused");
             ok &= expect_contains(what, "senc or saiz",
                                   "case8: expected the thrown message to name the missing senc/saiz");
+        }
+
+        // Case 9 (I1): senc placed BEFORE trun in the traf -- a legal
+        // ISO/IEC 14496-12 ordering ffmpeg produces. rebuild_moof only ever
+        // changes trun's own size, so an offset pointing into a senc that
+        // sits entirely before trun (unlike case 1's senc, which sits after
+        // trun) must NOT move. Applying delta unconditionally -- the bug --
+        // would shift this offset to 66; verified by temporarily reverting
+        // the trun_end guard in correct_saio_offsets and confirming this
+        // case fails with corrected == 66 instead of 50.
+        {
+            constexpr std::uint8_t version = 0;
+            constexpr bool has_aux = false;
+            const std::size_t saio_size = saio_box_size(version, has_aux, 1);
+            const std::size_t original_moof_size = 8 + 8 + kSaioFixtureTfhdSize + kSaioFixtureSencSize +
+                                                   kSaioFixtureOriginalTrunSize + kSaioFixtureSaizSize + saio_size;
+            // In this reordering, senc spans [44, 60) and trun spans
+            // [60, 76); 50 lands inside senc, strictly before trun.
+            const std::size_t senc_start = 8 + 8 + kSaioFixtureTfhdSize;
+            const std::size_t reordered_trun_end = senc_start + kSaioFixtureSencSize + kSaioFixtureOriginalTrunSize;
+            const std::uint64_t original_offset = 50;
+            ok &= expect(original_offset >= senc_start && original_offset < senc_start + kSaioFixtureSencSize,
+                        "case9 fixture sanity: offset must land inside senc");
+            ok &= expect(original_offset < reordered_trun_end,
+                        "case9 fixture sanity: offset must land before trun in this reordering");
+
+            const auto saio_box = make_saio_box(version, has_aux, {original_offset});
+            const auto fx = make_saio_test_fragment(saio_box, 32, /*include_senc=*/true, /*include_saiz=*/true,
+                                                    /*senc_before_trun=*/true);
+            ok &= expect(fx.original_moof_size == original_moof_size,
+                        "case9: hand-computed moof size must match the fixture's actual size");
+
+            const auto fragment = build_live_fragment(fx.moof, fx.mdat, saio_tracks, 0);
+            const auto out_boxes = parse_mp4_boxes(fragment.payload.owned_bytes);
+            const Mp4Box* out_traf = out_boxes.empty() ? nullptr : find_child_box(out_boxes.front(), "traf");
+            const Mp4Box* out_saio = out_traf == nullptr ? nullptr : find_child_box(*out_traf, "saio");
+            ok &= expect(out_saio != nullptr, "case9: expected saio to survive in the corrected output");
+            if (out_saio != nullptr) {
+                const auto corrected = extract_saio_offsets(fragment.payload.owned_bytes, *out_saio, has_aux);
+                ok &= expect(corrected.size() == 1 && corrected.front() == original_offset,
+                            "case9: expected a saio offset pointing into a senc BEFORE trun to stay " +
+                                std::to_string(original_offset) + ", not shift by the trun-growth delta");
+            }
+        }
+
+        // Case 10 (I2): a multi-traf moof where a traf OTHER than the first
+        // (the only one materialize_live_trun_defaults rebuilds and
+        // corrects saio inside) carries a saio. That saio's offsets are
+        // computed against the moof's ORIGINAL size; copying that traf
+        // verbatim after the first traf's rebuild changes the moof's size
+        // would leave those offsets silently stale. Refuse instead.
+        {
+            std::vector<std::uint8_t> tfhd_a_payload;
+            append_be32(tfhd_a_payload, 1);
+            append_be32(tfhd_a_payload, 1000);
+            append_be32(tfhd_a_payload, 200);
+            append_be32(tfhd_a_payload, 0x02000000U);
+            const auto tfhd_a = make_full_box_with_flags("tfhd", 0, 0x000038U, tfhd_a_payload);
+            const auto trun_a = make_full_box_with_flags("trun", 0, 0, be32_bytes(1));
+            const auto traf_a = make_box("traf", concat({tfhd_a, trun_a}));
+
+            std::vector<std::uint8_t> tfhd_b_payload;
+            append_be32(tfhd_b_payload, 2);
+            append_be32(tfhd_b_payload, 1000);
+            append_be32(tfhd_b_payload, 200);
+            append_be32(tfhd_b_payload, 0x02000000U);
+            const auto tfhd_b = make_full_box_with_flags("tfhd", 0, 0x000038U, tfhd_b_payload);
+            const auto trun_b = make_full_box_with_flags("trun", 0, 0, be32_bytes(1));
+            const auto senc_b = make_box("senc", {0, 0, 0, 0, 0, 0, 0, 0});
+            const auto saiz_b = make_full_box("saiz", {8, 0, 0, 0, 1});
+            const auto saio_b = make_saio_box(0, false, {50});
+            const auto traf_b = make_box("traf", concat({tfhd_b, trun_b, senc_b, saiz_b, saio_b}));
+
+            const auto moof = make_box("moof", concat({traf_a, traf_b}));
+            const auto mdat = make_box("mdat", std::vector<std::uint8_t>(16, 0xAB));
+
+            bool threw = false;
+            std::string what;
+            try {
+                (void)build_live_fragment(moof, mdat, saio_tracks, 0);
+            } catch (const std::exception& e) {
+                threw = true;
+                what = e.what();
+            }
+            ok &= expect(threw,
+                        "case10: expected a saio in a non-first traf of a multi-traf moof to be refused");
+            ok &= expect_contains(what, "traf",
+                                  "case10: expected the thrown message to name the multi-traf limitation");
+        }
+
+        // Case 11 (I2 companion): a multi-traf moof where NO traf besides
+        // the first carries a saio must keep working unchanged -- the
+        // refusal in case 10 is scoped to saio specifically, not to
+        // multiple trafs in general.
+        {
+            std::vector<std::uint8_t> tfhd_a_payload;
+            append_be32(tfhd_a_payload, 1);
+            append_be32(tfhd_a_payload, 1000);
+            append_be32(tfhd_a_payload, 200);
+            append_be32(tfhd_a_payload, 0x02000000U);
+            const auto tfhd_a = make_full_box_with_flags("tfhd", 0, 0x000038U, tfhd_a_payload);
+            const auto trun_a = make_full_box_with_flags("trun", 0, 0, be32_bytes(1));
+            const auto traf_a = make_box("traf", concat({tfhd_a, trun_a}));
+
+            std::vector<std::uint8_t> tfhd_b_payload;
+            append_be32(tfhd_b_payload, 2);
+            append_be32(tfhd_b_payload, 1000);
+            append_be32(tfhd_b_payload, 200);
+            append_be32(tfhd_b_payload, 0x02000000U);
+            const auto tfhd_b = make_full_box_with_flags("tfhd", 0, 0x000038U, tfhd_b_payload);
+            const auto trun_b = make_full_box_with_flags("trun", 0, 0, be32_bytes(1));
+            const auto traf_b = make_box("traf", concat({tfhd_b, trun_b}));  // no senc/saiz/saio
+
+            const auto moof = make_box("moof", concat({traf_a, traf_b}));
+            const auto mdat = make_box("mdat", std::vector<std::uint8_t>(16, 0xAB));
+
+            const auto fragment = build_live_fragment(moof, mdat, saio_tracks, 0);
+            ok &= expect(fragment.track_name == "vide_1",
+                        "case11: expected a multi-traf moof with no saio anywhere but the first traf "
+                        "to still produce a fragment, not be refused");
         }
     }
 

@@ -244,17 +244,44 @@ void write_be64_at(std::vector<std::uint8_t>& bytes, std::size_t offset, std::ui
 //   entry_count(4)
 //   entry_count * (4 bytes if version == 0, else 8 bytes)
 //
-// Every entry is classified against the ORIGINAL moof size and the mdat size
-// that follows it (see build_live_fragment): an offset inside the moof
-// (pointing at senc) or inside the mdat is moof-relative and shifts by
-// delta; anything beyond moof + mdat cannot be a moof-relative reference in
-// a republished MOQT object, and adjusting it would silently produce a
-// fragment that decrypts to garbage, so it is refused instead.
+// Two separate classifications are made here, against two different
+// boundaries, and it is a mistake to conflate them (an earlier version of
+// this function did):
+//
+//   1. Refusal boundary -- original_moof_size + mdat_size. An offset at or
+//      beyond this cannot be a moof-relative reference at all in a
+//      republished MOQT object; adjusting it would silently produce a
+//      fragment that decrypts to garbage, so it is refused instead.
+//   2. Shift boundary -- `trun_end`, the ORIGINAL trun box's end offset,
+//      relative to the moof. rebuild_moof only ever changes trun's own size
+//      (normalizing it to an explicit form); every other byte in the traf,
+//      moof, and mdat keeps its original position. So only a target at or
+//      after trun's end actually moves by `delta` -- e.g. mdat, or a `senc`
+//      that (as CMAF conventionally, and as ffmpeg does) is placed AFTER
+//      trun in the traf. A target before trun's end -- e.g. a `senc` placed
+//      BEFORE trun, which is equally legal ISO/IEC 14496-12 box ordering --
+//      does not move at all, and must not be shifted.
+//
+// A prior version of this function shifted every offset within boundary 1,
+// which is only correct when every aux-info target happens to sit after
+// trun; ffmpeg is one real-world encoder that does not guarantee that
+// ordering.
+//
+// The classification here is a magnitude heuristic (compare the offset
+// against trun_end and the moof+mdat boundary), not a semantic read of which
+// aux-info box the entry targets. ISO/IEC 14496-12's tfhd flags could give
+// the exact answer instead: 0x000001 (base-data-offset-present) and
+// 0x020000 (default-base-is-moof) together determine how saio's own
+// aux_info_type_parameter / implicit base is resolved. The design here
+// sanctioned the heuristic as sufficient for the CTE ingest path's actual
+// inputs; the point of this note is to keep that choice visible rather than
+// implicit.
 std::vector<std::uint8_t> correct_saio_offsets(std::span<const std::uint8_t> moof_bytes,
                                                const Mp4Box& saio,
                                                const Mp4Box& traf,
                                                std::size_t original_moof_size,
                                                std::size_t mdat_size,
+                                               std::size_t trun_end,
                                                std::int64_t delta) {
     if (saio.payload.size < 4) {
         throw std::runtime_error("saio correction: box too small for a FullBox header");
@@ -314,18 +341,25 @@ std::vector<std::uint8_t> correct_saio_offsets(std::span<const std::uint8_t> moo
                                      ") and cannot be a moof-relative reference");
         }
 
-        if (delta < 0) {
-            // Negating INT64_MIN directly is undefined behaviour; delta + 1
-            // stays representable, so negate that and add the 1 back in
-            // unsigned space instead.
-            const std::uint64_t magnitude = static_cast<std::uint64_t>(-(delta + 1)) + 1U;
-            if (magnitude > offset) {
-                throw std::runtime_error("saio correction: offset " + std::to_string(offset) +
-                                         " would underflow when shifted by " + std::to_string(delta));
+        // Only an offset that lands at or after the ORIGINAL trun's end
+        // actually moves: rebuild_moof changes only trun's own size, so
+        // anything before trun (e.g. a senc placed ahead of trun in the
+        // traf, which ffmpeg does) keeps its original position.
+        std::uint64_t adjusted = offset;
+        if (offset >= trun_end) {
+            if (delta < 0) {
+                // Negating INT64_MIN directly is undefined behaviour; delta + 1
+                // stays representable, so negate that and add the 1 back in
+                // unsigned space instead.
+                const std::uint64_t magnitude = static_cast<std::uint64_t>(-(delta + 1)) + 1U;
+                if (magnitude > offset) {
+                    throw std::runtime_error("saio correction: offset " + std::to_string(offset) +
+                                             " would underflow when shifted by " + std::to_string(delta));
+                }
             }
+            adjusted = static_cast<std::uint64_t>(static_cast<std::int64_t>(offset) + delta);
         }
 
-        const std::uint64_t adjusted = static_cast<std::uint64_t>(static_cast<std::int64_t>(offset) + delta);
         if (version == 1) {
             write_be64_at(corrected, local_cursor, adjusted);
         } else {
@@ -357,6 +391,27 @@ std::vector<std::uint8_t> materialize_live_trun_defaults(
     const Mp4Box* trun = traf == nullptr ? nullptr : find_child_box(*traf, "trun");
     if (traf == nullptr || trun == nullptr || trun->payload.size < 8) {
         throw std::runtime_error("materialize_live_trun_defaults: missing traf/trun");
+    }
+
+    // Only the first traf is rebuilt below (and only its own saio corrected
+    // for the delta the rebuild introduces). A multi-traf moof would copy
+    // every other traf verbatim, including any saio it carries, whose
+    // offsets would then be stale against the rebuilt moof's new size.
+    // Correcting saio across multiple trafs is real scope this function does
+    // not implement; refuse rather than silently produce a fragment with
+    // stale aux-info offsets in a traf this function never looks at.
+    const std::vector<const Mp4Box*> all_trafs = find_boxes(moof.children, "traf");
+    if (all_trafs.size() > 1) {
+        for (const Mp4Box* other_traf : all_trafs) {
+            if (other_traf->span.offset == traf->span.offset) {
+                continue;  // the one traf this function rebuilds
+            }
+            if (find_child_box(*other_traf, "saio") != nullptr) {
+                throw std::runtime_error(
+                    "materialize_live_trun_defaults: multi-traf moof with a saio box in a "
+                    "traf other than the first is not supported");
+            }
+        }
     }
 
     const std::uint8_t version = moof_bytes[trun->payload.offset];
@@ -424,6 +479,13 @@ std::vector<std::uint8_t> materialize_live_trun_defaults(
         return make_full_box("trun", version, normalized_flags, payload);
     };
 
+    // The end of the ORIGINAL trun box, relative to the moof (moof.span.offset
+    // is 0: materialize_live_trun_defaults is always called with moof_bytes
+    // holding exactly one top-level moof box, per the check above). Only a
+    // saio offset at or beyond this point can have moved due to this
+    // rebuild -- see the classification note on correct_saio_offsets.
+    const std::size_t trun_end = trun->span.offset + trun->span.size;
+
     // saio_delta corrects saio (sample auxiliary information offsets) for the
     // size change this rebuild makes to trun. It is a parameter, not a
     // captured mutable variable, so the placeholder call below and the real
@@ -437,7 +499,7 @@ std::vector<std::uint8_t> materialize_live_trun_defaults(
                 traf_children.push_back(normalized_trun);
             } else if (child.type == "saio" && saio_delta != 0) {
                 traf_children.push_back(
-                    correct_saio_offsets(moof_bytes, child, *traf, moof.span.size, mdat_size, saio_delta));
+                    correct_saio_offsets(moof_bytes, child, *traf, moof.span.size, mdat_size, trun_end, saio_delta));
             } else {
                 const auto raw = slice_bytes(moof_bytes, child.span);
                 traf_children.emplace_back(raw.begin(), raw.end());
