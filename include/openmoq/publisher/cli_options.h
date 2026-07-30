@@ -48,6 +48,12 @@ struct CliOptions {
     // on the publish path consumes a CAT token today.
     std::optional<std::string> msf_c4m_token;
     bool endpoint_alpn_overridden = false;
+    // True when the operator chose a transport explicitly, either via
+    // --transport or via a --url connection requirement (e.g. &connection=wt).
+    // False means `transport` merely holds its kRawQuic default. Consulted by
+    // --print-msf-urls: a URL should only assert a connection requirement the
+    // operator actually chose, never an unstated default.
+    bool transport_explicit = false;
     bool forward = false;
     bool publish_catalog = false;
     bool include_sap = false;

@@ -23,7 +23,9 @@ int main(int argc, char** argv) {
             if (!options.endpoint.has_value()) {
                 throw std::runtime_error("--print-msf-urls requires --endpoint or --url");
             }
-            const auto connection = options.transport == transport::TransportKind::kWebTransport
+            const auto connection = !options.transport_explicit
+                                        ? ConnectionRequirement::kAny
+                                    : options.transport == transport::TransportKind::kWebTransport
                                         ? ConnectionRequirement::kWebTransport
                                         : ConnectionRequirement::kRawQuic;
             std::cout << build_track_msf_url(options.endpoint->host, options.endpoint->port,

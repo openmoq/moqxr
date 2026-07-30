@@ -647,8 +647,31 @@ int main() {
     {
         const auto options = parse({"prog", "--input", "sample.mp4", "--endpoint", "h:443", "--print-msf-urls"});
         ok &= expect(options.print_msf_urls, "expected --print-msf-urls to set the flag");
+        ok &= expect(!options.transport_explicit,
+                     "expected transport_explicit to default to false without --transport or --url");
         const auto defaulted = parse({"prog", "--input", "sample.mp4", "--endpoint", "h:443"});
         ok &= expect(!defaulted.print_msf_urls, "expected --print-msf-urls to default off");
+    }
+
+    // transport_explicit distinguishes an operator-chosen transport from the
+    // unstated kRawQuic default, so --print-msf-urls never asserts a
+    // connection requirement the operator never expressed.
+    {
+        const auto options =
+            parse({"prog", "--input", "sample.mp4", "--endpoint", "h:443", "--transport", "raw"});
+        ok &= expect(options.transport_explicit, "expected --transport to mark transport_explicit");
+    }
+    {
+        const auto options = parse({"prog", "--input", "sample.mp4", "--url",
+                                    "moqt://h/p#msf:ns--catalog&connection=wt"});
+        ok &= expect(options.transport_explicit,
+                     "expected a --url connection requirement to mark transport_explicit");
+    }
+    {
+        const auto options =
+            parse({"prog", "--input", "sample.mp4", "--url", "moqt://h/p#msf:ns--catalog"});
+        ok &= expect(!options.transport_explicit,
+                     "expected a --url with no connection requirement to leave transport_explicit false");
     }
 
     return ok ? 0 : 1;

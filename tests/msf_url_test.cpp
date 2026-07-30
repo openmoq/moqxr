@@ -418,6 +418,28 @@ int main() {
                                          ConnectionRequirement::kAny) ==
                          "moqt://h#msf:a-b--audio",
                      "expected a non-explicit path to be omitted");
+        ok &= expect(build_track_msf_url("relay.example", 443, "/moq", true, "ns", "video",
+                                         ConnectionRequirement::kRawQuic) ==
+                         "moqt://relay.example/moq#msf:ns--video&connection=q",
+                     "expected kRawQuic to emit &connection=q");
+    }
+
+    // Round-trip: build_track_msf_url's output must be consumable by
+    // parse_msf_url, recovering the original namespace tuple and track name.
+    // Exercises an element with a literal hyphen, which must escape to '.2d'
+    // since '-' is the tuple separator, so a codec that forgot to escape it
+    // would be caught here rather than only by the direct encode test above.
+    {
+        const std::string built = build_track_msf_url(
+            "relay.example", 4433, "/moq", true, "customer-A/broadcast", "catalog",
+            ConnectionRequirement::kWebTransport);
+        const auto parsed = parse_msf_url(built);
+        ok &= expect(parsed.track.namespace_tuple == std::vector<std::string>{"customer-A", "broadcast"},
+                     "expected the namespace tuple to survive a build/parse round-trip");
+        ok &= expect(parsed.track.track_name == "catalog",
+                     "expected the track name to survive a build/parse round-trip");
+        ok &= expect(parsed.connection == ConnectionRequirement::kWebTransport,
+                     "expected the connection requirement to survive a build/parse round-trip");
     }
 
     // Mutation check: pins element order and the '-' vs '--' delimiter choice

@@ -227,6 +227,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
         } else if (argument == "--transport") {
             options.transport = parse_transport_kind(require_value("--transport"));
             transport_set = true;
+            options.transport_explicit = true;
         } else if (argument == "--endpoint") {
             if (url_set) {
                 throw std::runtime_error("--url and --endpoint are mutually exclusive");
@@ -412,6 +413,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
                 "--url specifies a connection type that conflicts with --transport");
         }
         options.transport = *url_required_transport;
+        options.transport_explicit = true;
     }
 
     if (options.endpoint.has_value()) {
