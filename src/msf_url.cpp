@@ -127,7 +127,26 @@ void parse_fragment_parameters(std::string_view text, MsfUrl& url) {
         if (name.empty()) {
             throw std::runtime_error("MSF URL fragment parameter has an empty name");
         }
-        url.extra_params.emplace_back(name, value);
+        if (name == "connection") {
+            if (url.connection != ConnectionRequirement::kAny) {
+                throw std::runtime_error("MSF URL repeats the reserved 'connection' parameter");
+            }
+            if (value == "q") {
+                url.connection = ConnectionRequirement::kRawQuic;
+            } else if (value == "wt") {
+                url.connection = ConnectionRequirement::kWebTransport;
+            } else {
+                throw std::runtime_error(
+                    "MSF URL 'connection' parameter must be 'q' or 'wt', got: " + value);
+            }
+        } else if (name == "c4m") {
+            if (url.c4m_token.has_value()) {
+                throw std::runtime_error("MSF URL repeats the reserved 'c4m' parameter");
+            }
+            url.c4m_token = value;
+        } else {
+            url.extra_params.emplace_back(name, value);
+        }
         if (ampersand == std::string_view::npos) {
             break;
         }
@@ -287,11 +306,20 @@ std::string build_msf_url(const MsfUrl& url) {
     }
     out += "#msf:";
     out += encode_namespace_name(url.track);
+    if (url.connection == ConnectionRequirement::kRawQuic) {
+        out += "&connection=q";
+    } else if (url.connection == ConnectionRequirement::kWebTransport) {
+        out += "&connection=wt";
+    }
     for (const auto& [name, value] : url.extra_params) {
         out.push_back('&');
         out += name;
         out.push_back('=');
         out += value;
+    }
+    if (url.c4m_token.has_value()) {
+        out += "&c4m=";
+        out += *url.c4m_token;
     }
     return out;
 }

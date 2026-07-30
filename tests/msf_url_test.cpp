@@ -189,5 +189,51 @@ int main() {
     ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&x=1&"); }, "blank parameter segment",
                         "expected a trailing '&' to be refused");
 
+    // MSF 11.1.1 connection parameter.
+    {
+        const auto quic = parse_msf_url("moqt://h#msf:ns--t&connection=q");
+        ok &= expect(quic.connection == ConnectionRequirement::kRawQuic,
+                     "expected connection=q to mean raw QUIC");
+        const auto web = parse_msf_url("moqt://h#msf:ns--t&connection=wt");
+        ok &= expect(web.connection == ConnectionRequirement::kWebTransport,
+                     "expected connection=wt to mean WebTransport");
+        const auto absent = parse_msf_url("moqt://h#msf:ns--t");
+        ok &= expect(absent.connection == ConnectionRequirement::kAny,
+                     "expected an absent connection parameter to leave the requirement unconstrained");
+        ok &= expect(quic.extra_params.empty(),
+                     "expected a reserved parameter not to land in extra_params");
+    }
+
+    // c4m is stored opaquely.
+    {
+        const auto url = parse_msf_url("moqt://h#msf:ns--t&c4m=gqhkYWxnIGVzaGFy");
+        ok &= expect(url.c4m_token.has_value() && *url.c4m_token == "gqhkYWxnIGVzaGFy",
+                     "expected the c4m token stored verbatim");
+    }
+
+    // Reserved scalars round-trip.
+    {
+        const auto first = parse_msf_url("moqt://h#msf:ns--t&connection=wt&c4m=abc");
+        const auto second = parse_msf_url(build_msf_url(first));
+        ok &= expect(second.connection == first.connection && second.c4m_token == first.c4m_token,
+                     "expected reserved scalar parameters to round-trip");
+    }
+
+    // Key names are case-sensitive, so a differently cased key is not reserved.
+    {
+        const auto url = parse_msf_url("moqt://h#msf:ns--t&Connection=q");
+        ok &= expect(url.connection == ConnectionRequirement::kAny,
+                     "expected Connection with a capital C not to be treated as reserved");
+        ok &= expect(url.extra_params.size() == 1,
+                     "expected a differently cased key to be preserved as a non-reserved parameter");
+    }
+
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&connection=tcp"); }, "connection",
+                        "expected an unknown connection value to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&connection=q&connection=wt"); },
+                        "connection", "expected a repeated connection parameter to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&c4m=a&c4m=b"); }, "c4m",
+                        "expected a repeated c4m parameter to be refused");
+
     return ok ? 0 : 1;
 }
