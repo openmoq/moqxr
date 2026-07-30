@@ -244,15 +244,23 @@ Nothing consumes it.
 
 ### Emitting: `--print-msf-urls`
 
-Off by default. When set, prints one URL per line to stdout — the catalog track
-followed by each media track — once the publish plan is known. Status output
-stays on stderr, matching the existing split in `src/main.cpp`.
+Off by default. When set, prints the broadcast's **catalog URL** to stdout,
+once, immediately after options are parsed. Status output stays on stderr,
+matching the existing split in `src/main.cpp`.
 
-Each printed URL carries the session endpoint, the namespace tuple obtained by
-splitting `track_namespace` on `/`, and the track name. A `connection`
-parameter is included when the transport was explicitly selected, so the printed
-URL reproduces the operator's configuration rather than leaving it to the
-client.
+The catalog URL is the only one an operator needs: it is the discovery entry
+point, and a client learns every media track from the catalog it fetches.
+Printing per-track URLs would duplicate what the catalog already publishes.
+
+It is also the only one printable from a single site. `src/main.cpp` has four
+independent ingest branches — dash, srt, stdin, and file — with no shared plan
+variable, and the track list is reached differently in each. Printing before the
+branches keeps the behaviour identical on every path.
+
+The printed URL carries the session endpoint, the namespace tuple obtained by
+splitting `track_namespace` on `/`, and the track name `catalog`. A `connection`
+parameter records the selected transport, so the URL reproduces the operator's
+configuration rather than leaving it to the client.
 
 ## Section 5.4 emit-side validation
 
