@@ -30,6 +30,22 @@ CliOptions parse(std::vector<std::string> args) {
     return parse_cli_options(static_cast<int>(argv.size()), argv.data());
 }
 
+// A minimal, valid single-system --drm-config file, written to a fresh path
+// each call so parallel test blocks never race on the same file.
+std::filesystem::path write_drm_config_file(std::string_view name) {
+    const std::filesystem::path config_path = std::filesystem::temp_directory_path() / name;
+    std::ofstream out(config_path);
+    out << R"({
+  "systems": [
+    {
+      "systemID": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+      "laURL": "https://widevine.example.com/proxy"
+    }
+  ]
+})";
+    return config_path;
+}
+
 }  // namespace
 
 int main() {
@@ -370,6 +386,111 @@ int main() {
         ok &= expect(threw, "expected a missing --drm-config file to fail rather than crash");
         ok &= expect(message.find("/nonexistent/openmoq-drm-config.json") != std::string::npos,
                      "expected the error to name the offending path");
+    }
+
+    // --drm-config combined with a live source must be refused: build_live_catalog
+    // never calls attach_content_protection, so publishing would produce a
+    // catalog with no contentProtections or contentProtectionRefIDs at all --
+    // indistinguishable from unprotected content. See docs/status.md.
+    {
+        const std::filesystem::path config_path =
+            write_drm_config_file("openmoq-drm-config-cli-live-srt-test.json");
+
+        bool threw = false;
+        std::string message;
+        try {
+            parse({"openmoq-publisher", "--live-source", "srt", "--srt-config", "/tmp/foo.json",
+                   "--endpoint", "localhost:4443", "--namespace", "ns",
+                   "--drm-config", config_path.string()});
+        } catch (const std::runtime_error& error) {
+            threw = true;
+            message = error.what();
+        }
+        ok &= expect(threw, "expected --drm-config with --live-source srt to be refused");
+        ok &= expect(message.find("--live-source srt") != std::string::npos,
+                     "expected the refusal to name --live-source srt");
+
+        std::error_code ec;
+        std::filesystem::remove(config_path, ec);
+    }
+
+    {
+        const std::filesystem::path config_path =
+            write_drm_config_file("openmoq-drm-config-cli-live-dash-test.json");
+
+        bool threw = false;
+        std::string message;
+        try {
+            parse({"openmoq-publisher", "--live-source", "dash",
+                   "--dash-listen", "127.0.0.1:8080",
+                   "--endpoint", "https://relay.example.com:443/moq",
+                   "--drm-config", config_path.string()});
+        } catch (const std::runtime_error& error) {
+            threw = true;
+            message = error.what();
+        }
+        ok &= expect(threw, "expected --drm-config with --live-source dash to be refused");
+        ok &= expect(message.find("--live-source dash") != std::string::npos,
+                     "expected the refusal to name --live-source dash");
+
+        std::error_code ec;
+        std::filesystem::remove(config_path, ec);
+    }
+
+    {
+        const std::filesystem::path config_path =
+            write_drm_config_file("openmoq-drm-config-cli-live-stdin-test.json");
+
+        bool threw = false;
+        std::string message;
+        try {
+            parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443",
+                   "--drm-config", config_path.string()});
+        } catch (const std::runtime_error& error) {
+            threw = true;
+            message = error.what();
+        }
+        ok &= expect(threw, "expected --drm-config with the default live stdin path to be refused");
+        ok &= expect(message.find("live stdin") != std::string::npos,
+                     "expected the refusal to name the live stdin path");
+
+        std::error_code ec;
+        std::filesystem::remove(config_path, ec);
+    }
+
+    // --drm-config with a file input (batch/VOD mode) must remain unaffected:
+    // only the live publish paths lack content-protection signalling, and the
+    // batch plan path already attaches it via attach_content_protection.
+    {
+        const std::filesystem::path config_path =
+            write_drm_config_file("openmoq-drm-config-cli-batch-test.json");
+
+        const CliOptions options = parse({"openmoq-publisher", "--input", "sample.mp4",
+                                          "--endpoint", "localhost:4443",
+                                          "--drm-config", config_path.string()});
+        ok &= expect(options.drm_systems.size() == 1,
+                     "expected --drm-config with file input (batch mode) to remain unaffected");
+
+        std::error_code ec;
+        std::filesystem::remove(config_path, ec);
+    }
+
+    // Dash dry run (--dump-plan, no --endpoint) never actually publishes a
+    // live catalog, so --drm-config there is not the misleading case this
+    // guard targets.
+    {
+        const std::filesystem::path config_path =
+            write_drm_config_file("openmoq-drm-config-cli-dash-dry-run-test.json");
+
+        const CliOptions options = parse({"openmoq-publisher", "--live-source", "dash",
+                                          "--dash-listen", "127.0.0.1:8080",
+                                          "--dump-plan",
+                                          "--drm-config", config_path.string()});
+        ok &= expect(options.drm_systems.size() == 1,
+                     "expected --drm-config with a dash dry run (no --endpoint) to remain unaffected");
+
+        std::error_code ec;
+        std::filesystem::remove(config_path, ec);
     }
 
     return ok ? 0 : 1;

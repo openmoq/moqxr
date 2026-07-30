@@ -1301,6 +1301,17 @@ SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object
         return segmented;
     }
 
+    for (const auto& track : parsed_mp4.tracks) {
+        if (track.protection.has_value()) {
+            // Synthesized moofs cannot carry senc, saiz, or saio, so the
+            // output would be undecryptable while appearing valid. Refuse
+            // rather than publish media that cannot be played.
+            throw std::runtime_error(
+                "encrypted input requires fragmented MP4: the progressive remux path cannot "
+                "carry CENC auxiliary boxes (track " + track.track_name + ")");
+        }
+    }
+
     segmented.initialization_segment.owned_bytes =
         build_fragmented_init_segment(*ftyp, *moov, parsed_mp4.tracks, parsed_mp4.bytes);
     segmented.initialization_segment.span = {};

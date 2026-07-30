@@ -334,6 +334,40 @@ CliOptions parse_cli_options(int argc, char** argv) {
         throw std::runtime_error("--namespace must not be empty");
     }
 
+    // build_live_catalog (src/cmsf_packager.cpp) never calls
+    // attach_content_protection, so a live publish path today would produce a
+    // catalog with no contentProtections and no contentProtectionRefIDs at
+    // all -- indistinguishable from unprotected content. Refuse the
+    // combination outright rather than publish a misleading catalog; wiring
+    // content protection into the live paths is out of scope here (see
+    // docs/status.md).
+    if (!options.drm_systems.empty()) {
+        if (live_source_uses_srt) {
+            throw std::runtime_error(
+                "--drm-config is not supported with --live-source srt: the live publish path "
+                "does not yet attach content protection to the catalog, so publishing would "
+                "produce an unprotected-looking catalog for encrypted content");
+        }
+        // A dash dry run (--dump-plan without --endpoint) never builds a live
+        // catalog at all -- main.cpp just prints raw object info locally --
+        // so there is no misleading catalog for this guard to prevent.
+        if (live_source_uses_dash && options.endpoint.has_value()) {
+            throw std::runtime_error(
+                "--drm-config is not supported with --live-source dash: the live publish path "
+                "does not yet attach content protection to the catalog, so publishing would "
+                "produce an unprotected-looking catalog for encrypted content");
+        }
+        const bool live_stdin_default = live_source_uses_stdin &&
+                                        options.input_source.kind == InputSourceKind::kStdin &&
+                                        options.endpoint.has_value();
+        if (live_stdin_default) {
+            throw std::runtime_error(
+                "--drm-config is not supported with the live stdin publish path: the live "
+                "publish path does not yet attach content protection to the catalog, so "
+                "publishing would produce an unprotected-looking catalog for encrypted content");
+        }
+    }
+
     return options;
 }
 

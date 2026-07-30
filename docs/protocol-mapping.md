@@ -116,11 +116,82 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
     the transport draft governs what may legally appear on the wire, so its
     ordering wins.
 - Not implemented: `clone` delta operations, MSF sections 9/10 log and
-  metrics tracks, MSF section 11.1 URL parsing, MSF section 12 compression
-  signalling, and CMSF section 4 content protection.
+  metrics tracks, MSF section 11.1 URL parsing, and MSF section 12
+  compression signalling. CMSF section 4 content protection (see the
+  dedicated section below) is implemented for the batch/VOD publish path
+  only.
 - The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
   which is not an MSF v1 packaging value; it is defined by
   `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.
+
+## CMSF content protection
+
+`draft-ietf-moq-cmsf-01` section 4. Implemented for the batch/VOD publish
+path only; the publisher never decrypts and never encrypts anywhere in this
+project -- it detects and signals protection already present in its input.
+
+- Protection data lives at the catalog root as `contentProtections` (CMSF
+  4.1.1), never duplicated onto a track. Each protected track instead carries
+  `contentProtectionRefIDs` (MSF 4.1.2) pointing at the root entries by
+  `refID`. `attach_content_protection` (`src/msf_catalog.cpp`) reuses an
+  existing root entry when its system ID and scheme already match, rather
+  than emitting a duplicate, so multiple tracks sharing a KID share one
+  entry.
+- A protected track's `codec` string is always the `frma` original format
+  (e.g. `avc1.64000C`), not the `encv`/`enca` sample-entry type that wraps
+  it. `sample_entry_type` separately keeps the raw `encv`/`enca` type, so a
+  consumer can distinguish "this track is protected" from "this track's
+  codec". Resolving the codec through `frma` requires reading the profile
+  bytes (e.g. `avcC`) via the *effective* sample entry, not a bare
+  hard-coded string.
+- CENC parameters (`scheme`, `default_KID`, `per_sample_iv_size`,
+  `is_protected`) come from `sinf`/`schm`/`schi`/`tenc` inside the encrypted
+  sample entry (`cenc.h`'s `parse_track_protection`). A track whose
+  protection boxes are absent or malformed is never advertised as protected
+  -- protection detection fails closed.
+- DRM system init data (`pssh` boxes, siblings of `trak` under `moov`) is
+  extracted per system and becomes `contentProtections[].psshBase64`.
+  `--drm-config` supplies each system's deployment fields (`laURL`,
+  `certURL`, `robustness`) from a JSON file parsed eagerly at CLI startup, so
+  a malformed file fails before publishing begins rather than publishing
+  with partial configuration.
+- **`saio` correction on the CTE ingest path** (`correct_saio_offsets`,
+  `src/cmaf_segmenter.cpp`): when the CTE path rebuilds a moof (e.g. to
+  materialize `trun` defaults), every offset in a `saio` box is classified
+  against the *original* moof size plus the following mdat's size, then
+  corrected or refused:
+  - An offset less than `original_moof_size + mdat_size` -- i.e. one that
+    lands inside the original moof (pointing at `senc`) or inside the mdat
+    -- is moof-relative, and is shifted by the same byte delta the rebuild
+    applied to the moof's size.
+  - An offset at or beyond `original_moof_size + mdat_size` cannot be a
+    moof-relative reference within a republished MOQT object; adjusting it
+    by the delta would silently point somewhere meaningless and decrypt to
+    garbage. It is refused (the fragment is rejected) rather than guessed
+    at.
+- **Refused, not signalled:** the progressive-remux path (`segment_for_cmaf`'s
+  non-fragmented branch) synthesises `moof` boxes from scratch and cannot
+  carry `senc`, `saiz`, or `saio`. Encrypted input there (any track with a
+  populated `CencTrackProtection`) is refused with an error naming the
+  progressive-remux path and the offending track, rather than producing
+  output that looks like valid CMAF but cannot be decrypted.
+- **Not signalled at all today:** the live publish paths --
+  `MoqtSession::publish_live()` (SRT and stdin ingest) and
+  `publish_live_objects()` (DASH ingest) -- build their catalog through
+  `build_live_catalog` (`src/cmsf_packager.cpp`), which never calls
+  `attach_content_protection`. `parse_cli_options` therefore refuses
+  `--drm-config` combined with `--live-source srt`, `--live-source dash`
+  (when it will actually publish, i.e. not a `--dump-plan` dry run with no
+  `--endpoint`), or the default live-stdin path, rather than let a publisher
+  emit a catalog with no `contentProtections`/`contentProtectionRefIDs` at
+  all for encrypted content -- which would be indistinguishable from
+  genuinely unprotected content. Wiring content protection into the live
+  paths is future work, not part of this phase.
+- **Not modelled:** MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41)
+  are a separate, LOC-packaged end-to-end encryption mechanism; CMSF uses
+  CENC instead. The CMSF 4.1.1.4.4 Authorization URL field is also
+  deliberately unmodelled -- the draft describes it but never names its JSON
+  key.
 
 ## Implementation consequence
 

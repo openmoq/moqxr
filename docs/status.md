@@ -61,6 +61,27 @@ Draft status:
    resolves from the `btrt` box when present, else a codec-class default
    (with an operator warning); the stsz-based computed fallback described in
    the design document is not yet implemented.
-6. Add DRM/CENC-aware packaging support: detect and preserve encrypted CMAF boxes such as `sinf`, `tenc`, `pssh`, `saiz`, `saio`, and `senc`, expose the needed catalog signaling, and validate encrypted sample forwarding without attempting decryption.
+6. CMSF content protection (`draft-ietf-moq-cmsf-01` section 4), Phase 3: **shipped** for the batch/VOD publish path. CENC protection is detected from an encrypted sample entry's `sinf`/`schm`/`schi`/`tenc` boxes; the reported codec string is resolved through `frma` so an encrypted track advertises its real pre-encryption codec (e.g. `avc1.64000C`) rather than the bare `encv`/`enca` wrapper type. `pssh` boxes sibling to `trak` under `moov` are extracted per DRM system. The catalog signals this at the root as `contentProtections`, one entry per distinct system (keyed by system ID and scheme, so tracks sharing a KID share one entry), with each protected track pointing at its entries by `contentProtectionRefIDs` -- protection data is never duplicated onto the track itself. `--drm-config` supplies deployment configuration (`laURL`, `certURL`, `robustness`) per DRM system, parsed eagerly at CLI startup so a malformed file fails before publishing begins. On the CTE (fragmented, moof-preserving) ingest path, `saio` (Sample Auxiliary Information Offsets) entries are corrected by the moof-size delta when a moof is rebuilt (see `docs/protocol-mapping.md` for the exact offset classification rule); an offset that cannot be a moof-relative reference is refused rather than guessed at, since a wrong offset would decrypt to garbage. **The publisher never decrypts and never encrypts anywhere in this project** -- it only detects and signals protection already present in its input.
+   **Not implemented, and refused or unsignalled rather than silently wrong:**
+   the progressive-remux path (`segment_for_cmaf`'s non-fragmented branch,
+   `src/cmaf_segmenter.cpp`) synthesises `moof` boxes from scratch and cannot
+   carry `senc`/`saiz`/`saio`, so encrypted input there is refused with an
+   error naming the path and the track rather than producing output that
+   looks valid but cannot be decrypted. The live publish paths
+   (`publish_live()`'s SRT/stdin ingest and `publish_live_objects()`'s DASH
+   ingest, via `build_live_catalog` in `src/cmsf_packager.cpp`) never call
+   `attach_content_protection` at all, so `--drm-config` combined with
+   `--live-source srt`, `--live-source dash`, or the default live-stdin path
+   is refused outright by `parse_cli_options` (`src/cli_options.cpp`) --
+   publishing would otherwise produce a catalog with no
+   `contentProtections`/`contentProtectionRefIDs`, indistinguishable from
+   genuinely unprotected content. Wiring content protection into the live
+   paths remains future work. Also not implemented: MoQ Secure Objects
+   encryption fields (MSF 5.2.38-5.2.41, a different LOC-packaged end-to-end
+   mechanism than CMSF's CENC), MSF section 12 compression signalling
+   (blocked on transport draft-19 Track and Object Properties), MSF URL and
+   fragment parsing (Phase 4), `clone` delta operations (Phase 2), and the
+   CMSF 4.1.1.4.4 Authorization URL field (the draft never names its JSON
+   key, so it is deliberately unmodelled).
 7. Create an M2TS packaging example based on `draft-gregoire-moq-msfts-00`, using the draft's `m2ts` packaging value to carry MPEG-2 Transport Stream or M2TS source packets directly over MOQT.
 8. Keep Linux, macOS, and Windows CI/release builds green, including the psychedelic FFmpeg live-publisher example.

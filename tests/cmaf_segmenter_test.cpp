@@ -616,6 +616,49 @@ std::vector<std::uint8_t> make_progressive_test_mp4() {
     return file;
 }
 
+// CMSF section 4: the progressive-remux path synthesises moof boxes from
+// scratch, so it cannot carry senc/saiz/saio. An encv sample entry (CENC
+// protection present) must be refused rather than silently remuxed into
+// undecryptable-looking output. Mirrors make_progressive_test_mp4's box
+// layout with sinf added to the sample entry, as make_encrypted_fragmented_
+// test_mp4 does for the fragmented fixture above.
+std::vector<std::uint8_t> make_encrypted_progressive_test_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 7, 208, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(70, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
+    const auto sinf = make_sinf("avc1", "cenc");
+    const auto sample_entry = make_box("encv", concat({visual_header, avcc, sinf}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stts = make_full_box("stts", {0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 3, 232});
+    const auto stsc = make_full_box("stsc", {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 1});
+    const auto stsz = make_full_box("stsz", {0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 4});
+    auto stco = make_full_box("stco", {0, 0, 0, 1, 0, 0, 0, 0});
+    const auto stss = make_full_box("stss", {0, 0, 0, 1, 0, 0, 0, 1});
+    const auto stbl = make_box("stbl", concat({stsd, stts, stsc, stsz, stco, stss}));
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+    const auto mdat = make_box("mdat", {1, 2, 3, 4, 5, 6, 7, 8});
+
+    std::vector<std::uint8_t> file = concat({ftyp, moov, mdat});
+    const std::uint32_t mdat_payload_offset = static_cast<std::uint32_t>(ftyp.size() + moov.size() + 8);
+    const std::size_t stco_payload_offset =
+        ftyp.size() + 8 + tkhd.size() + 8 + mdhd.size() + hdlr.size() + 8 + 8 + stsd.size() + stts.size() +
+        stsc.size() + stsz.size() + 16;
+    patch_be32(file, stco_payload_offset, mdat_payload_offset);
+    return file;
+}
+
 // Progressive (non-fragmented) MP4 with `sample_count` video samples (each
 // `sample_size` bytes, all in one chunk) and sync samples at the given 1-based
 // indices. Exercises bounded per-GOP coalescing: multiple keyframes -> multiple
@@ -1189,6 +1232,38 @@ int main() {
                  "expected remuxed codec init payload");
     ok &= expect(!remuxed_plan.track_initializations.front().init_segment.empty(),
                  "expected remuxed standalone init segment");
+
+    // CMSF section 4: the progressive-remux path synthesises moof boxes from
+    // scratch, so it cannot carry senc, saiz, or saio. An encv track must be
+    // refused rather than silently remuxed into undecryptable-looking output.
+    {
+        const auto encrypted_progressive_bytes = make_encrypted_progressive_test_mp4();
+        ParsedMp4 parsed_encrypted_progressive{
+            .bytes = encrypted_progressive_bytes,
+            .top_level_boxes = parse_mp4_boxes(encrypted_progressive_bytes),
+            .tracks = {},
+        };
+        parsed_encrypted_progressive.tracks =
+            extract_tracks(parsed_encrypted_progressive.top_level_boxes, parsed_encrypted_progressive.bytes);
+        ok &= expect(parsed_encrypted_progressive.tracks.size() == 1 &&
+                     parsed_encrypted_progressive.tracks.front().protection.has_value(),
+                     "expected the encrypted progressive fixture to report CENC protection");
+
+        bool refused_encrypted_remux = false;
+        std::string refusal_message;
+        try {
+            (void)segment_for_cmaf(parsed_encrypted_progressive);
+        } catch (const std::runtime_error& error) {
+            refused_encrypted_remux = true;
+            refusal_message = error.what();
+        }
+        ok &= expect(refused_encrypted_remux,
+                     "expected encrypted progressive input to be refused rather than remuxed");
+        ok &= expect(refusal_message.find("progressive remux") != std::string::npos,
+                     "expected the refusal message to name the progressive remux path");
+        ok &= expect(refusal_message.find(parsed_encrypted_progressive.tracks.front().track_name) != std::string::npos,
+                     "expected the refusal message to name the offending track");
+    }
 
     // Bounded per-GOP coalescing: a multi-keyframe progressive MP4 must become
     // multiple media objects (one group per GOP), never a single whole-track
