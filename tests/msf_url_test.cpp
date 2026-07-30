@@ -153,6 +153,7 @@ int main() {
             "moqt://example.com:4433#msf:ns--catalog",
             "moqt://example.com/p#msf:a.2db--track.2ename",
             "moqt://h#msf:ns--t&alpha=1&beta=2",
+            "moqt://h/#msf:ns--t",
         };
         for (const auto& text : urls) {
             const auto first = parse_msf_url(text);
@@ -183,6 +184,10 @@ int main() {
                         "expected a non-numeric port to be refused");
     ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&noequals"); }, "=",
                         "expected a parameter without '=' to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&&x=1"); }, "blank parameter segment",
+                        "expected consecutive '&' to be refused");
+    ok &= expect_throws([] { parse_msf_url("moqt://h#msf:ns--t&x=1&"); }, "blank parameter segment",
+                        "expected a trailing '&' to be refused");
 
     return ok ? 0 : 1;
 }

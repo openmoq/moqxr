@@ -113,19 +113,21 @@ void parse_fragment_parameters(std::string_view text, MsfUrl& url) {
         const std::string_view parameter = ampersand == std::string_view::npos
                                                ? text.substr(start)
                                                : text.substr(start, ampersand - start);
-        if (!parameter.empty()) {
-            const std::size_t equals = parameter.find('=');
-            if (equals == std::string_view::npos) {
-                throw std::runtime_error("MSF URL fragment parameter has no '=': " +
-                                         std::string(parameter));
-            }
-            const std::string name(parameter.substr(0, equals));
-            const std::string value(parameter.substr(equals + 1));
-            if (name.empty()) {
-                throw std::runtime_error("MSF URL fragment parameter has an empty name");
-            }
-            url.extra_params.emplace_back(name, value);
+        if (parameter.empty()) {
+            throw std::runtime_error(
+                "MSF URL fragment has a blank parameter segment between consecutive or trailing '&'");
         }
+        const std::size_t equals = parameter.find('=');
+        if (equals == std::string_view::npos) {
+            throw std::runtime_error("MSF URL fragment parameter has no '=': " +
+                                     std::string(parameter));
+        }
+        const std::string name(parameter.substr(0, equals));
+        const std::string value(parameter.substr(equals + 1));
+        if (name.empty()) {
+            throw std::runtime_error("MSF URL fragment parameter has an empty name");
+        }
+        url.extra_params.emplace_back(name, value);
         if (ampersand == std::string_view::npos) {
             break;
         }
