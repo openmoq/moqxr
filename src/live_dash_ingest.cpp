@@ -336,8 +336,14 @@ bool LiveDashIngestSession::finished() const {
 std::optional<LiveObject> LiveDashIngestSession::try_next_object() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (catalog_dirty_ && !tracks_.empty()) {
+        // Clear the flag only after a successful build: build_catalog_locked
+        // can throw (a protected track with no pssh anywhere in the init
+        // segment), and clearing it beforehand would leave the session never
+        // re-attempting the catalog build once a caller starts catching that
+        // exception.
+        LiveObject catalog = build_catalog_locked();
         catalog_dirty_ = false;
-        return build_catalog_locked();
+        return catalog;
     }
     if (queue_.empty()) {
         return std::nullopt;
@@ -358,8 +364,10 @@ std::optional<LiveObject> LiveDashIngestSession::next_object_blocking() {
     cv_.wait_for(lock, kPollInterval,
                  [&]() { return closed_ || catalog_dirty_ || !queue_.empty(); });
     if (catalog_dirty_ && !tracks_.empty()) {
+        // See try_next_object(): clear only after a successful build.
+        LiveObject catalog = build_catalog_locked();
         catalog_dirty_ = false;
-        return build_catalog_locked();
+        return catalog;
     }
     if (queue_.empty()) {
         return std::nullopt;

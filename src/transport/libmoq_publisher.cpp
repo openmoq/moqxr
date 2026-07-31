@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -1387,7 +1388,20 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
             stats.groups_published = static_cast<std::uint64_t>(groups.size());
             return cancel_teardown(live, sender, ep, stats, out_stats);
         }
-        std::optional<LiveObject> next = source.next_object();
+        std::optional<LiveObject> next;
+        try {
+            next = source.next_object();
+        } catch (const std::runtime_error& error) {
+            // A catalog-build refusal (e.g. a protected track with no pssh
+            // anywhere in the init segment) throws from inside next_object()
+            // rather than returning nullopt. Report and tear down through the
+            // normal path instead of letting it unwind past every
+            // live_teardown() call: uncaught, it would skip out_stats and
+            // leave ep/sender un-torn-down, only to be caught by main.cpp's
+            // top-level handler far from any connection state.
+            return live_teardown(live, sender, ep,
+                                 std::string("live object source failed: ") + error.what());
+        }
         if (!next.has_value()) {
             break;  // source exhausted
         }
