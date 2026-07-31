@@ -446,7 +446,7 @@ int main() {
                                           "--dash-listen", "127.0.0.1:8080",
                                           "--endpoint", "https://relay.example.com:443/moq",
                                           "--drm-config", config_path.string()});
-        ok &= expect(!options.drm_systems.empty(),
+        ok &= expect(options.drm_systems.size() == 1,
                      "expected --drm-config to be accepted with --live-source dash");
 
         std::error_code ec;
@@ -459,7 +459,7 @@ int main() {
 
         const CliOptions options = parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443",
                                           "--drm-config", config_path.string()});
-        ok &= expect(!options.drm_systems.empty(),
+        ok &= expect(options.drm_systems.size() == 1,
                      "expected --drm-config to be accepted with the default live stdin path");
 
         std::error_code ec;
