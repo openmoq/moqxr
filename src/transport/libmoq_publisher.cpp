@@ -944,7 +944,8 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
 
     // Per-track CMAF init segments for catalog/init_data (libmoq owns the
     // catalog itself; we only use the per-track init segments here).
-    const LiveCatalog live_catalog = build_live_catalog(tracks, init_segment, /*is_live=*/true);
+    const LiveCatalog live_catalog =
+        build_live_catalog(tracks, init_segment, /*is_live=*/true, config.drm_systems);
     auto init_for_track = [&](const std::string& name) -> std::vector<std::uint8_t> {
         for (const auto& init : live_catalog.track_initializations) {
             if (init.track_name == name) {

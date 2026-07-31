@@ -64,6 +64,33 @@ int main(int argc, char** argv) {
         };
         Publisher publisher(config);
 
+        // --drm-config's laURL/certURL/robustness are deployment fields, not
+        // protection detection: detection works on the DASH and stdin live
+        // paths regardless of --drm-config, but silently dropping the parsed
+        // deployment fields would be a trap for an operator who assumes they
+        // reached the catalog. Warn on exactly the paths that cannot apply
+        // them; --live-source srt with --drm-config is already refused above
+        // in parse_cli_options, so it never reaches here.
+        if (!options.drm_systems.empty()) {
+            if (live_dash) {
+                std::cerr << "warning: --drm-config was parsed (laURL/certURL/robustness) but the "
+                             "DASH live path never applies deployment fields to its catalog "
+                             "(detection and signalling still work); only the batch/VOD publish "
+                             "path applies them."
+                          << std::endl;
+            } else if (live_stdin) {
+#ifndef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+                std::cerr << "warning: --drm-config was parsed (laURL/certURL/robustness) but the "
+                             "stdin live path on this backend (legacy MoqtSession) never applies "
+                             "deployment fields to its catalog (detection and signalling still "
+                             "work); only the batch/VOD publish path applies them. Build with "
+                             "-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON to have the stdin live path apply "
+                             "them too."
+                          << std::endl;
+#endif
+            }
+        }
+
         if (live_dash) {
             std::cerr << "live_source=dash listen=" << options.dash_listen_host
                       << ":" << options.dash_listen_port

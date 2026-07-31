@@ -3651,9 +3651,21 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     std::cerr << "[moqt-session] live: discovered " << tracks.size() << " track(s): "
               << openmoq::publisher::summarize_tracks(tracks) << '\n';
 
-    // Build catalog and init data
-    openmoq::publisher::LiveCatalog live_catalog =
-        openmoq::publisher::build_live_catalog(tracks, init_segment, true);
+    // Build catalog and init data. A protected track with no pssh anywhere in
+    // the init segment (CMSF 4.1.2: an absent contentProtectionRefIDs means
+    // "not protected") makes build_live_catalog throw std::runtime_error
+    // rather than silently omitting the protection entry. Catch it here and
+    // return a failure status instead of letting it unwind past this
+    // function: the caller (Publisher::publish_live in publisher_api.cpp)
+    // only runs its normal teardown -- close(0) + clear_active_session(),
+    // which populates stats_.last_error and closes the MOQT session cleanly
+    // -- when publish_live() returns rather than throws.
+    openmoq::publisher::LiveCatalog live_catalog;
+    try {
+        live_catalog = openmoq::publisher::build_live_catalog(tracks, init_segment, true);
+    } catch (const std::runtime_error& error) {
+        return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
+    }
 
     // Phase 2: Publish namespace + PUBLISH all tracks
     NamespaceMessage namespace_message{
@@ -5073,7 +5085,22 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             continue;
         }
 
-        std::optional<openmoq::publisher::LiveObject> next = source.next_object();
+        std::optional<openmoq::publisher::LiveObject> next;
+        try {
+            next = source.next_object();
+        } catch (const std::runtime_error& error) {
+            // A catalog-build refusal (e.g. a protected track with no pssh
+            // anywhere in the init segment, per CMSF 4.1.2) throws from
+            // inside next_object() rather than returning nullopt. Return a
+            // failure status instead of letting it unwind past this
+            // function: the caller (Publisher::publish_live_objects in
+            // publisher_api.cpp) only runs its normal teardown -- close(0) +
+            // clear_active_session(), which populates stats_.last_error and
+            // closes the MOQT session cleanly -- when publish_live_objects()
+            // returns rather than throws.
+            return TransportStatus::failure(
+                std::string("live object source failed: ") + error.what());
+        }
         if (!next.has_value()) {
             // A live source with a liveness predicate distinguishes a transient
             // media gap (keep polling, keep servicing control) from real EOF.

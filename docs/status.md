@@ -101,10 +101,12 @@ Draft status:
    there are no CENC boxes to detect and nothing `--drm-config` could
    describe -- this is a property of the container, not unfinished work.
    `--drm-config` itself supplies only optional deployment fields (`laURL`,
-   `certURL`, `robustness`), never protection detection; the DASH ingest
-   path in particular has no access to the publisher's `DrmSystemConfig`
-   list, so protection is detected and signalled there but those deployment
-   fields are not applied, unlike the `build_live_catalog`-based paths.
+   `certURL`, `robustness`), never protection detection. No live path in the
+   default build (`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=OFF`, the `MoqtSession`
+   backend) applies those deployment fields: `MoqtSession` has no access to
+   `PublisherConfig::drm_systems` at all, so protection is detected and
+   signalled on the stdin and DASH live paths but those deployment fields are
+   not applied there. Only the batch/VOD path applies them.
    Also not implemented: MoQ Secure Objects
    encryption fields (MSF 5.2.38-5.2.41, a different LOC-packaged end-to-end
    mechanism than CMSF's CENC), MSF section 12 compression signalling

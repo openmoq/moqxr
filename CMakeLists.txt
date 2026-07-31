@@ -342,6 +342,14 @@ endif()
 
 add_executable(openmoq-publisher src/main.cpp)
 target_link_libraries(openmoq-publisher PRIVATE openmoq_publisher_lib)
+if(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER)
+    # main.cpp needs to know which backend is selected to decide whether a
+    # --drm-config warning for the live paths is accurate (see the
+    # drm_systems live-path observability note in src/main.cpp); the define
+    # is PRIVATE on openmoq_publisher_lib and does not propagate to a
+    # separately-linked executable target, so it is set here too.
+    target_compile_definitions(openmoq-publisher PRIVATE OPENMOQ_ENABLE_LIBMOQ_PUBLISHER=1)
+endif()
 
 add_executable(openmoq-publisher-psychedelic-example
     examples/psychedelic/Psychedelic.cpp

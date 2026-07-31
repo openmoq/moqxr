@@ -246,29 +246,48 @@ project -- it detects and signals protection already present in its input.
 
   `--drm-config` itself supplies only optional deployment fields (`laURL`,
   `certURL`, `robustness`) per DRM system; it has never determined whether a
-  track is protected. **The DASH ingest path does not apply those
-  deployment fields:** detection and signalling work there, but the ingest
-  session has no access to the publisher's `DrmSystemConfig` list, so
-  `laURL`/`certURL`/`robustness` never reach the DASH-built catalog. Only
-  the `build_live_catalog`-based paths (stdin ingest, and batch) apply them.
-  The same distinction holds at the library level:
+  track is protected. **No live path in the default build
+  (`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=OFF`, i.e. the `MoqtSession` backend)
+  applies those deployment fields:** detection and signalling work on the
+  stdin and DASH live paths, but `MoqtSession` has no access to
+  `PublisherConfig::drm_systems` at all, so `laURL`/`certURL`/`robustness`
+  never reach a live-built catalog on that backend. Only the batch/VOD path
+  applies them. (When built with `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`, the
+  libmoq stdin ingest path also applies them, since it passes
+  `config.drm_systems` into `build_live_catalog`; the libmoq SRT path does
+  not, though that is moot since SRT ingest never marks a track protected in
+  the first place.) The same distinction holds at the library level:
   `PublisherConfig::drm_systems`
   (`include/openmoq/publisher/publisher_api.h`) supplies deployment fields
-  to the paths that support them; an SDK consumer combining it with the DASH
-  ingest path gets detection and signalling from the init segment as
-  before, just without those deployment fields applied, and combining it
-  with SRT ingest still yields nothing to detect, for the same container
-  reason as the CLI.
+  to the paths that support them; an SDK consumer combining it with a live
+  publish path on the default backend gets detection and signalling from the
+  init segment as before, just without those deployment fields applied, and
+  combining it with SRT ingest still yields nothing to detect, for the same
+  container reason as the CLI.
 
   **`pssh` is parsed once per ingest path**, from the full initialization
   segment held at registration (`collect_pssh_systems`,
   `src/cmsf_packager.cpp`), rather than re-parsed on every catalog build --
   an efficiency choice, not a limitation. `build_track_specific_init_segment`
-  (`src/cmsf_packager.cpp:230-268`) copies every `moov` child that is not
+  (`src/cmsf_packager.cpp:215-281`) copies every `moov` child that is not
   `trak` or `mvex` verbatim into each per-track init segment, `pssh`
   included, so a subscriber initialising a decoder from a track's `initData`
   still has the `pssh` it needs.
-- **Not modelled:** MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41)
+- **Known limitation, `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`:** under this
+  non-default backend, the stdin live path's `build_live_catalog` result
+  (`src/transport/libmoq_publisher.cpp`) is used only for its
+  `track_initializations` -- the per-track init segments handed to
+  `moq_media_sender_add_track`. Its `msf_catalog`/`catalog_payload` are never
+  read, because libmoq generates the catalog it actually publishes itself,
+  from `moq_media_track_cfg_t`/`moq_media_sender_cfg_t`. The libmoq service
+  library does model content protection (`moq_media_track_cfg_t`'s
+  `content_protection_ref_ids` and `moq_media_sender_cfg_t`'s
+  `content_protections`); the limitation is that this project's translation
+  from `TrackDescription`/`CencTrackProtection` to those libmoq config
+  structs does not populate them. So on this backend the stdin path gains the
+  §4.1.2 refusal (still refuses a protected track with no `pssh`, since that
+  check runs in `build_live_catalog` before the result is discarded) but
+  emits no `contentProtections` in the catalog libmoq actually sends. MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41)
   are a separate, LOC-packaged end-to-end encryption mechanism; CMSF uses
   CENC instead. The CMSF 4.1.1.4.4 Authorization URL field is also
   deliberately unmodelled -- the draft describes it but never names its JSON
