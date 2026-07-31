@@ -2337,5 +2337,78 @@ int main() {
         }
     }
 
+    // Phase 5: an encrypted live init segment must produce contentProtections,
+    // exactly as the batch path does. CMSF 4.1.2 makes an absent
+    // contentProtectionRefIDs mean the track is NOT protected, so a silent
+    // omission here is an affirmative false claim about encrypted media.
+    {
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4(true);
+        const auto tracks = extract_tracks(parse_mp4_boxes(encrypted_bytes), encrypted_bytes);
+        ok &= expect(tracks.size() == 1 && tracks.front().protection.has_value(),
+                     "expected the encrypted live fixture to report CENC protection");
+
+        const auto live_catalog = build_live_catalog(tracks, encrypted_bytes, true);
+        const std::string text(live_catalog.catalog_payload.begin(), live_catalog.catalog_payload.end());
+        ok &= expect_contains(text, "\"contentProtections\"",
+                              "expected a live catalog for encrypted input to carry contentProtections");
+        ok &= expect_contains(text, "\"contentProtectionRefIDs\"",
+                              "expected the protected live track to reference a contentProtections entry");
+        ok &= expect(live_catalog.msf_catalog.content_protections.size() == 1,
+                     "expected exactly one contentProtections entry for a single-system fixture");
+        ok &= expect(live_catalog.msf_catalog.tracks.front().content_protection_ref_ids.size() == 1,
+                     "expected the track to reference exactly one entry");
+    }
+
+    // A protected track whose init segment carries no pssh cannot be signalled,
+    // so it is refused rather than published as clear.
+    {
+        const auto no_pssh_bytes = make_encrypted_fragmented_test_mp4(false);
+        const auto tracks = extract_tracks(parse_mp4_boxes(no_pssh_bytes), no_pssh_bytes);
+        ok &= expect(tracks.size() == 1 && tracks.front().protection.has_value(),
+                     "expected the no-pssh fixture to still report CENC protection");
+
+        bool refused = false;
+        std::string message;
+        try {
+            (void)build_live_catalog(tracks, no_pssh_bytes, true);
+        } catch (const std::runtime_error& error) {
+            refused = true;
+            message = error.what();
+        }
+        ok &= expect(refused, "expected a protected live track with no pssh to be refused");
+        ok &= expect(message.find("pssh") != std::string::npos,
+                     "expected the refusal to name the missing pssh");
+        ok &= expect(message.find(tracks.front().track_name) != std::string::npos,
+                     "expected the refusal to name the offending track");
+    }
+
+    // Regression guard for every existing live user: unencrypted input must
+    // produce no contentProtections at all.
+    {
+        const auto live_catalog = build_live_catalog(multitrack_segmented.tracks, multitrack_init_bytes, true);
+        const std::string text(live_catalog.catalog_payload.begin(), live_catalog.catalog_payload.end());
+        ok &= expect_not_contains(text, "\"contentProtections\"",
+                                  "expected unencrypted live input to carry no contentProtections");
+        ok &= expect(live_catalog.msf_catalog.content_protections.empty(),
+                     "expected no contentProtections entries for unencrypted live input");
+    }
+
+    // --drm-config deployment fields must reach the live catalog.
+    {
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4(true);
+        const auto tracks = extract_tracks(parse_mp4_boxes(encrypted_bytes), encrypted_bytes);
+        DrmSystemConfig config;
+        config.system_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
+        config.la_url = "https://drm.example/lic";
+        config.robustness = "SW_SECURE_DECODE";
+
+        const auto live_catalog = build_live_catalog(tracks, encrypted_bytes, true, {config});
+        const std::string text(live_catalog.catalog_payload.begin(), live_catalog.catalog_payload.end());
+        ok &= expect_contains(text, "https://drm.example/lic",
+                              "expected the configured laURL to reach the live catalog");
+        ok &= expect_contains(text, "SW_SECURE_DECODE",
+                              "expected the configured robustness to reach the live catalog");
+    }
+
     return ok ? 0 : 1;
 }

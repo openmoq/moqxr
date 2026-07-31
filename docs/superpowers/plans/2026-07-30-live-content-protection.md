@@ -14,7 +14,7 @@
 - Build with BOTH flags: `-DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF -DOPENMOQ_LIBMOQ_SOURCE_DIR=/media/mondain/terrorbyte/workspace/github-moq/moq5`. Without the libmoq flag the suite silently drops from 15 targets to 14 with no error message.
 - Baseline at branch start: **15/15 tests, 12 unique compiler warnings** (`grep -E "warning:" | sort -u | wc -l`). No `-Werror`.
 - **The publisher never encrypts and never decrypts.** This phase detects and signals protection already present in its input.
-- Every `parse({...})` in `tests/cli_options_test.cpp` expected to **succeed** must include `"--input", "sample.mp4"`. `--input` is unconditionally required (`src/cli_options.cpp` throws "missing required --input argument" when `--live-source` is at its `auto` default), and these tests call the parser directly, so a missing one aborts the binary before any assertion runs.
+- `--input` is required only when `--live-source` is at its `auto` default; `src/cli_options.cpp` exempts `--live-source srt` and `--live-source dash`. The existing tests reflect this: the dash case at `tests/cli_options_test.cpp:257` and the srt case at `:236` both succeed with no `--input`. Match the surrounding tests rather than adding one. Where `--live-source` is left at `auto` and the parse is expected to succeed, `"--input", "sample.mp4"` is required, because these tests call the parser directly and an unexpected throw aborts the binary before any assertion runs.
 - No emoji, no "Generated with Claude Code" tagline, no `Co-Authored-By` line.
 - Prefer `#include` and unqualified names over fully-qualified spellings.
 
@@ -97,7 +97,14 @@ Covers `src/transport/libmoq_publisher.cpp:946` and `:1181`, and `src/transport/
 
 - [ ] **Step 1: Write the failing tests**
 
-`tests/cmaf_segmenter_test.cpp` already exercises `build_live_catalog` at line 1501 with `(tracks, init_bytes, true)`. It has `make_box`, `make_full_box`, `concat`, and `expect`. The encrypted-fixture builders `make_frma`, and the `sinf`/`schm`/`schi`/`tenc` helpers, already exist in this file from Phase 3 — reuse them rather than writing new ones. Read them before writing the fixtures below and match their signatures.
+**Do not build new encrypted fixtures.** `tests/cmaf_segmenter_test.cpp` already has everything this task needs, added in Phase 3:
+
+- `make_encrypted_fragmented_test_mp4(bool include_pssh = true)` at line 360 — a complete `ftyp`+`moov`+`moof`+`mdat` file with an `encv` sample entry wrapping `avc1` via `frma`, a `cenc` `schm`, a `schi`/`tenc`, and — when `include_pssh` is true — a `pssh` sibling of `trak` under `moov` carrying the Widevine system ID. `include_pssh = false` is the exact no-`pssh` case this task's refusal test needs, and its comment already records that it models ffmpeg's `-encryption_scheme cenc-aes-ctr`.
+- `make_sinf`, `make_schm`, `make_tenc_box`, `make_frma`, `make_pssh`, `widevine_system_id()` — the building blocks, whose byte layouts match what `parse_track_protection` and `parse_pssh_boxes` actually read.
+- `expect`, `expect_contains`, `expect_not_contains`, `append_be32`, `concat`, `make_box`, `make_full_box`.
+- The existing `build_live_catalog` call at line 1501 uses `(tracks, init_bytes, true)`.
+
+Hand-rolling a `tenc` or `pssh` payload risks a layout the parser rejects, which would make a test fail for the wrong reason or pass while proving nothing. Use the helpers.
 
 Append inside `main()` before `return ok ? 0 : 1;`:
 
@@ -107,7 +114,7 @@ Append inside `main()` before `return ok ? 0 : 1;`:
     // contentProtectionRefIDs mean the track is NOT protected, so a silent
     // omission here is an affirmative false claim about encrypted media.
     {
-        const auto encrypted_bytes = make_encrypted_init_mp4_with_pssh();
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4(true);
         const auto tracks = extract_tracks(parse_mp4_boxes(encrypted_bytes), encrypted_bytes);
         ok &= expect(tracks.size() == 1 && tracks.front().protection.has_value(),
                      "expected the encrypted live fixture to report CENC protection");
@@ -127,7 +134,7 @@ Append inside `main()` before `return ok ? 0 : 1;`:
     // A protected track whose init segment carries no pssh cannot be signalled,
     // so it is refused rather than published as clear.
     {
-        const auto no_pssh_bytes = make_encrypted_init_mp4_without_pssh();
+        const auto no_pssh_bytes = make_encrypted_fragmented_test_mp4(false);
         const auto tracks = extract_tracks(parse_mp4_boxes(no_pssh_bytes), no_pssh_bytes);
         ok &= expect(tracks.size() == 1 && tracks.front().protection.has_value(),
                      "expected the no-pssh fixture to still report CENC protection");
@@ -160,7 +167,7 @@ Append inside `main()` before `return ok ? 0 : 1;`:
 
     // --drm-config deployment fields must reach the live catalog.
     {
-        const auto encrypted_bytes = make_encrypted_init_mp4_with_pssh();
+        const auto encrypted_bytes = make_encrypted_fragmented_test_mp4(true);
         const auto tracks = extract_tracks(parse_mp4_boxes(encrypted_bytes), encrypted_bytes);
         DrmSystemConfig config;
         config.system_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
@@ -174,69 +181,6 @@ Append inside `main()` before `return ok ? 0 : 1;`:
         ok &= expect_contains(text, "SW_SECURE_DECODE",
                               "expected the configured robustness to reach the live catalog");
     }
-```
-
-Add two fixture builders to the file's anonymous namespace. The `pssh` payload below is a version-0 box: 4 bytes version/flags, then the 16-byte system ID, then a 4-byte data size, then the data.
-
-```cpp
-// A single-track encrypted init segment: encv sample entry wrapping avc1 via
-// frma, plus a moov-level pssh sibling to trak.
-std::vector<std::uint8_t> make_encrypted_init_mp4_common(bool include_pssh) {
-    auto visual_header = std::vector<std::uint8_t>(78, 0);
-    visual_header[24] = 0x01;   // width  = 320
-    visual_header[25] = 0x40;
-    visual_header[26] = 0x00;   // height = 240
-    visual_header[27] = 0xf0;
-
-    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
-    const auto frma = make_box("frma", {'a', 'v', 'c', '1'});
-    const auto schm = make_full_box("schm", {'c', 'e', 'n', 'c', 0, 1, 0, 0});
-
-    std::vector<std::uint8_t> tenc_payload{0, 0, 0, 0, 0, 0, 1, 8};
-    for (int index = 0; index < 16; ++index) {
-        tenc_payload.push_back(static_cast<std::uint8_t>(0x10 + index));
-    }
-    const auto tenc = make_full_box("tenc", tenc_payload);
-    const auto schi = make_box("schi", tenc);
-    const auto sinf = make_box("sinf", concat({frma, schm, schi}));
-    const auto sample_entry = make_box("encv", concat({visual_header, avcc, sinf}));
-
-    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
-    const auto mdhd = make_full_box("mdhd",
-                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
-    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
-    const auto tkhd = make_full_box("tkhd", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
-    const auto trak = make_box("trak",
-                               concat({tkhd,
-                                       make_box("mdia", concat({mdhd, hdlr,
-                                                                make_box("minf", make_box("stbl", stsd))}))}));
-
-    std::vector<std::vector<std::uint8_t>> moov_children{trak};
-    if (include_pssh) {
-        std::vector<std::uint8_t> pssh_payload{0, 0, 0, 0};
-        const std::uint8_t widevine_id[16] = {0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
-                                              0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed};
-        pssh_payload.insert(pssh_payload.end(), std::begin(widevine_id), std::end(widevine_id));
-        append_be32(pssh_payload, 4);
-        pssh_payload.insert(pssh_payload.end(), {0xDE, 0xAD, 0xBE, 0xEF});
-        moov_children.push_back(make_box("pssh", pssh_payload));
-    }
-
-    std::vector<std::uint8_t> moov_payload;
-    for (const auto& child : moov_children) {
-        moov_payload.insert(moov_payload.end(), child.begin(), child.end());
-    }
-    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
-    return concat({ftyp, make_box("moov", moov_payload)});
-}
-
-std::vector<std::uint8_t> make_encrypted_init_mp4_with_pssh() {
-    return make_encrypted_init_mp4_common(true);
-}
-
-std::vector<std::uint8_t> make_encrypted_init_mp4_without_pssh() {
-    return make_encrypted_init_mp4_common(false);
-}
 ```
 
 Add `#include "openmoq/publisher/publisher_api.h"` to the test file if `DrmSystemConfig` is not already visible.
@@ -383,7 +327,11 @@ idiom is at `tests/live_dash_ingest_test.cpp:295-307`; follow it exactly.
     }
 ```
 
-Build `make_encrypted_dash_init_with_pssh` by copying the fixture shape from Task 2's `make_encrypted_init_mp4_common(true)` — the same `encv`/`frma`/`schm`/`schi`/`tenc` sample entry plus a moov-level `pssh`. Do not share the function across test binaries; each test file owns its fixtures in this codebase. This file already has an `make_init_segment(...)` helper; read it and match its box-building style rather than importing a different one.
+Build `make_encrypted_dash_init_with_pssh` by porting the CENC fixture helpers from `tests/cmaf_segmenter_test.cpp` — `make_frma`, `make_schm`, `make_tenc_box`, `make_sinf`, `make_pssh`, and `widevine_system_id()`, defined there around lines 320-356. Their byte layouts match what `parse_track_protection` and `parse_pssh_boxes` actually read; do **not** hand-roll replacements, since a wrong `tenc` or `pssh` layout makes a test fail for the wrong reason or pass while proving nothing.
+
+Each test binary owns its fixtures in this codebase, so copy the helpers you need rather than trying to share them across binaries.
+
+The fixture must be an **init segment** — `ftyp` + `moov`, with the `pssh` a sibling of `trak` under `moov` — not a full fragmented file, because the DASH ingest treats `ftyp`/`moov` as the init and expects media in separate `moof`/`mdat` boxes. This file's existing `make_init_segment(...)` shows the expected shape; read it and add the `encv` sample entry with `sinf`, plus the `pssh`, to that shape.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -405,7 +353,7 @@ In `include/openmoq/publisher/live_dash_ingest.h`, extend `RegisteredTrack`:
     };
 ```
 
-Include `openmoq/publisher/mp4_box.h` in that header if `CencSystem` is not already visible.
+`CencSystem` is defined in `openmoq/publisher/mp4_box.h` at line 50. `live_dash_ingest.h` does not include it directly, but reaches it transitively through `cmaf_segmenter.h` (line 16), which includes it at its own line 6 — that is also how the existing `TrackDescription description` field resolves. Add a direct `#include "openmoq/publisher/mp4_box.h"` anyway, so the header states its own dependency rather than relying on a transitive one.
 
 In `src/live_dash_ingest.cpp`, inside `process_box_locked`, after `path_state.tracks = extract_tracks(...)` at line 386 and before the per-track loop, parse once per path:
 
@@ -426,7 +374,7 @@ Then in the existing `tracks_.push_back(RegisteredTrack{...})` call, add the fie
                                                   .pssh_systems = path_pssh_systems});
 ```
 
-Add `#include "openmoq/publisher/cmsf_packager.h"` and `<algorithm>` if not already present.
+No new includes are needed in `src/live_dash_ingest.cpp`: it already includes `cmsf_packager.h` (line 3, which will declare `collect_pssh_systems` after Task 1), `mp4_box.h` (line 4), `msf_catalog.h` (line 5, for `attach_content_protection`), and `<algorithm>` (line 7, for `std::any_of`).
 
 - [ ] **Step 4: Attach in `build_catalog_locked`**
 
@@ -453,9 +401,16 @@ This path does not apply `--drm-config` deployment fields; the DASH session has 
 
 Expected: 15/15.
 
-- [ ] **Step 6: Prove the full-init-segment requirement is real**
+- [ ] **Step 6: Prove the attachment and the refusal are load-bearing**
 
-Temporarily change the registration to parse from the per-track init instead — decode `init_data` back to bytes and pass that to `collect_pssh_systems`. Expected: the DASH protection test fails, because the synthesised single-track `moov` has no `pssh`. Restore and confirm the suite passes. Report what you observed. This is the mutation that proves the design point rather than assuming it.
+Two mutations, run one at a time and restored between. Report the exact assertion messages you observed for each.
+
+1. Remove the `attach_content_protection` call in `build_catalog_locked`. Expected: the DASH `contentProtections` assertions fail. Every other DASH test still passes.
+2. Force `registered.pssh_systems` to be empty at the point of use. Expected: the protected track is refused with the message naming it, proving the refusal path fires rather than being unreachable.
+
+**An earlier version of this step asked for a different mutation — parsing from the per-track init segment, expecting it to fail — on the theory that a synthesised single-track `moov` carries no `pssh`. That theory is false** and was disproved empirically: `build_track_specific_init_segment` (`src/cmsf_packager.cpp:230-268`) copies every `moov` child that is not `trak` or `mvex` verbatim, `pssh` included.
+
+Do not "fix" that by stripping `pssh` from per-track init segments. A subscriber initialising a decoder from a track's `initData` needs the `pssh` to set up DRM; removing it would break the consumer the field exists for. Parsing at registration is still the right design — once per path rather than once per catalog build, no base64 round-trip, and no dependence on incidental copy behaviour — but it is a design preference, not a correctness requirement.
 
 - [ ] **Step 7: Commit**
 
@@ -475,7 +430,15 @@ git commit -m "Attach content protection on the DASH CTE ingest path"
 **Interfaces:**
 - Consumes: nothing new.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Replace the two existing refusal tests, then add the new ones**
+
+**Three tests already assert the refusals this task removes.** They will fail once the guards are gone, and they must be rewritten rather than deleted — the behaviour they cover still needs coverage, just inverted:
+
+- `tests/cli_options_test.cpp:437-458` asserts `--drm-config` with `--live-source dash` is refused and that the message names `--live-source dash`. **Invert it**: the parse must now succeed and `options.drm_systems` must be non-empty. Reuse its existing flag set verbatim (`--live-source dash`, `--dash-listen 127.0.0.1:8080`, `--endpoint https://relay.example.com:443/moq`) so the new test exercises the same command line the old one did.
+- `tests/cli_options_test.cpp:460-482` asserts the same for the live stdin path, using `{"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443", "--drm-config", ...}`. **Invert it** the same way.
+- `tests/cli_options_test.cpp:415-435` asserts the SRT refusal. **Keep it**, but update the message assertion: it currently checks for `--live-source srt`, which the new message still contains, so verify whether it passes unchanged and additionally assert the message mentions `MPEG-TS`.
+
+Each of those blocks ends by removing its temp config file with `std::filesystem::remove(config_path, ec)`. Preserve that cleanup in whatever you write.
 
 `tests/cli_options_test.cpp` has `parse(std::vector<std::string>)` at line 24, `parse_throws(args, fragment, message)` from Phase 4, and `write_drm_config_file(name)` which writes a valid single-system config and returns its path.
 
@@ -484,8 +447,10 @@ git commit -m "Attach content protection on the DASH CTE ingest path"
     // --drm-config is accepted there.
     {
         const auto config_path = write_drm_config_file("phase5-dash.json");
-        const auto options = parse({"prog", "--input", "sample.mp4", "--endpoint", "h:443",
-                                    "--live-source", "dash", "--dash-listen", "127.0.0.1:8080",
+        const auto options = parse({"openmoq-publisher", "--live-source", "dash",
+                                    "--dash-listen", "127.0.0.1:8080",
+                                    "--dash-path", "/ingest",
+                                    "--endpoint", "https://relay.example.com:443/moq",
                                     "--drm-config", config_path.string()});
         ok &= expect(!options.drm_systems.empty(),
                      "expected --drm-config to be accepted with --live-source dash");
@@ -494,15 +459,16 @@ git commit -m "Attach content protection on the DASH CTE ingest path"
     // SRT still cannot carry CMAF CENC metadata, and the refusal must say why.
     {
         const auto config_path = write_drm_config_file("phase5-srt.json");
-        ok &= parse_throws({"prog", "--input", "sample.mp4", "--endpoint", "h:443",
-                            "--live-source", "srt", "--srt-config", "srt.json",
+        ok &= parse_throws({"openmoq-publisher", "--live-source", "srt",
+                            "--srt-config", "/tmp/foo.json",
+                            "--endpoint", "localhost:4443", "--namespace", "ns",
                             "--drm-config", config_path.string()},
                            "MPEG-TS",
                            "expected the SRT refusal to explain that MPEG-TS carries no CENC metadata");
     }
 ```
 
-Check the exact flags the existing SRT and DASH tests in this file use — `--srt-config` and `--dash-listen` may have different required forms. Match what the file already does rather than guessing, and report any adjustment.
+The flag forms above are copied from the existing tests at `tests/cli_options_test.cpp:236` (srt) and `:257` (dash). `--live-source dash` requires `--dash-listen`, or the parse throws `--live-source dash requires --dash-listen`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -551,13 +517,28 @@ git commit -m "Accept --drm-config on the live paths that can detect protection"
 
 Item 6 currently says content protection is "**shipped** for the batch/VOD publish path". Extend it: protection is now also detected and signalled on the live paths that receive a real CMAF initialization segment — the DASH CTE ingest and the live stdin path.
 
-Then find and rewrite the passage stating that "Wiring content protection into the live paths remains future work (a later phase)" together with the surrounding text about `--drm-config` being refused on live paths. That passage runs from roughly `docs/status.md:88` to `:100`; locate it by its text since line numbers will have shifted. It must now say:
+**Seven statements across the two documents become false with this phase. Every one must change, or the docs contradict themselves** — the defect the Phase 3 review caught. Locate each by its text, since line numbers will shift as you edit:
+
+In `docs/status.md`:
+1. `:85-95` — the passage stating that the live publish paths "never call `attach_content_protection` at all, so `--drm-config` combined with `--live-source srt`, `--live-source dash`, or the default live-stdin path is refused outright". Two thirds of that is now false: only SRT is still refused, and the other two paths do call `attach_content_protection`. **This is the largest single edit in the task.**
+2. `:96-98` — "Encrypted live input published with no `--drm-config` at all is not refused and still publishes fully unsignalled -- `--drm-config` supplies only optional deployment fields, not protection detection." The first clause is now false for real-init paths: encrypted live input is detected and signalled whether or not `--drm-config` was supplied, because detection comes from the initialization segment rather than from configuration. The clause about `--drm-config` supplying only deployment fields stays true.
+3. `:99` — "Wiring content protection into the live paths remains future work (a later phase)."
+
+In `docs/protocol-mapping.md`:
+4. `:121` — content protection described as covering "the batch/VOD publish path only".
+5. `:129` — "Implemented for the batch/VOD publish path".
+6. `:220-224` — "**Not signalled at all today:** the live publish paths -- `MoqtSession::publish_live()` (SRT and stdin ingest) and `publish_live_objects()` (DASH ingest) -- build their catalog through `build_live_catalog`, which never calls `attach_content_protection`."
+7. `:237-241` — the library-level note ending "Wiring content protection into the live paths is future work, not part of this phase." Note this passage also claims an SDK consumer combining `PublisherConfig::drm_systems` with a live publish path "gets the same silent behaviour the CLI guard exists to prevent". That is no longer true for real-init paths: they now detect and signal protection regardless of whether `drm_systems` was supplied. Rewrite it to say what remains true — that `drm_systems` supplies only deployment fields, and that SRT still cannot detect protection.
+
+The replacement text must say:
 
 - Detection works on any live path receiving a real init segment.
 - SRT is excluded because MPEG-TS carries no CENC metadata, not because the work is unfinished.
 - A protected track with no `pssh` is refused on the live paths, matching batch.
 
-After editing, grep `docs/status.md` for `live path` and for `drm-config` and read every hit to confirm none still claims live protection is unimplemented. Report the hit counts.
+After editing, grep **both** files for `live path`, `live publish`, `drm-config`, and `future work`, and read every hit to confirm none still claims live protection is unimplemented. Report the hit counts.
+
+Do not overreach: MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41), MSF section 12 compression signalling, `clone` delta operations, and the CMSF 4.1.1.4.4 Authorization URL all remain genuinely unimplemented and must stay in their lists.
 
 - [ ] **Step 2: Add limitations to `docs/protocol-mapping.md`**
 
@@ -565,7 +546,7 @@ In the `## CMSF content protection` section, record:
 
 - **The DASH CTE path does not apply `--drm-config` deployment fields.** Protection is detected and signalled there, but `laURL`, `certURL`, and `robustness` are not applied because the ingest session has no access to the publisher's `DrmSystemConfig` list. `build_live_catalog`-based paths do apply them.
 - **SRT cannot carry CENC.** The publisher synthesises its init segment from parsed elementary streams, so no `sinf`, `tenc`, or `pssh` exists to detect. This is a property of MPEG-TS, not a gap in the implementation.
-- **`pssh` is read from the full initialization segment**, never from the per-track init segment embedded in the catalog, because `pssh` boxes are siblings of `trak` under `moov` and do not survive single-track init synthesis.
+- **`pssh` is parsed once per ingest path**, from the full initialization segment held at registration, rather than per catalog build. Note that `build_track_specific_init_segment` does copy moov-level `pssh` into each per-track init segment — every `moov` child that is not `trak` or `mvex` is copied verbatim — so a subscriber's `initData` carries the `pssh` it needs to initialise DRM. Do not describe the per-track segment as `pssh`-free; it is not.
 
 - [ ] **Step 3: Verify the full suite and warning count**
 

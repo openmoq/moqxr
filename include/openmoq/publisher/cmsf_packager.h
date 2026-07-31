@@ -7,6 +7,7 @@
 
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/moq_draft.h"
+#include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/msf_catalog.h"
 
 namespace openmoq::publisher {
@@ -83,7 +84,8 @@ struct LiveCatalog {
 };
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
-                               bool is_live = true);
+                               bool is_live = true,
+                               const std::vector<DrmSystemConfig>& drm_systems = {});
 
 // Base64-encoded, track-specific CMAF init segment (ftyp + single-track moov)
 // for the track at track_index within init_segment. This is exactly the value
@@ -92,5 +94,11 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
 std::string track_init_data_base64(std::span<const std::uint8_t> init_segment,
                                    const TrackDescription& track,
                                    std::size_t track_index);
+
+// Collects every DRM system described by the pssh boxes directly under moov.
+// pssh boxes are siblings of trak, not children of one, so protection applies
+// to the initialization segment as a whole and is shared by every track that
+// references it (CMSF 4.1.1). Returns empty when there is no moov or no pssh.
+std::vector<CencSystem> collect_pssh_systems(std::span<const std::uint8_t> init_bytes);
 
 }  // namespace openmoq::publisher

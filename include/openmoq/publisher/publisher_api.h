@@ -60,17 +60,27 @@ struct PublisherConfig {
     // contentProtections entry for an absent system would describe protection
     // that does not exist.
     //
-    // No live-path guard exists at this API level: `parse_cli_options`
-    // (src/cli_options.cpp) refuses `--drm-config` combined with a live
-    // publish path, but that refusal is a CLI-only property, not a property
-    // of this struct or of MoqtSession. An SDK consumer that combines
-    // drm_systems with a live publish path (publish_live() /
-    // publish_live_objects()) gets the same silent, unsignalled behaviour the
-    // CLI guard exists to prevent: the live catalog builder never calls
-    // attach_content_protection, so encrypted content publishes with no
-    // contentProtections/contentProtectionRefIDs at all, indistinguishable
-    // from genuinely unprotected media. Adding an API-level guard is future
-    // work (see docs/status.md), not implemented here.
+    // Content-protection detection and signalling work on the live publish
+    // paths (publish_live()'s stdin ingest and publish_live_objects()'s DASH
+    // ingest) wherever a real CMAF initialization segment reaches the
+    // publisher: the live catalog builders do call attach_content_protection,
+    // from the init segment's sinf/schm/schi/tenc boxes and the moov-level
+    // pssh siblings, exactly as the batch path does. That detection is
+    // independent of drm_systems -- it happens whether or not this field is
+    // populated. `parse_cli_options` (src/cli_options.cpp) refuses only
+    // `--drm-config` combined with `--live-source srt`: SRT carries MPEG-TS,
+    // and the publisher synthesises a CMAF init segment from parsed
+    // elementary streams, so there is no sinf/schm/schi/tenc or pssh box for
+    // the publisher ever to detect on that path -- a property of the
+    // container, not unfinished work. drm_systems itself supplies only
+    // optional deployment fields (laURL/certURL/robustness), never protection
+    // detection; on the default build (MoqtSession backend, i.e. without
+    // -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON), no live path applies those
+    // deployment fields to the catalog even when detection succeeds and this
+    // field is populated -- only the batch/VOD path does (see
+    // docs/status.md and docs/protocol-mapping.md for the full picture).
+    // This holds on both backends: the libmoq stdin path passes drm_systems
+    // through but discards the built catalog, so nothing reaches the wire.
     std::vector<DrmSystemConfig> drm_systems;
     // Section 5: a catalog SHOULD be republished after enough time has passed
     // that it might fall out of a relay cache. Zero disables republication,

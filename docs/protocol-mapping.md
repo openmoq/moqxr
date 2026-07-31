@@ -118,7 +118,9 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
 - Not implemented: `clone` delta operations, MSF sections 9/10 log and
   metrics tracks, and MSF section 12 compression signalling. CMSF section 4
   content protection (see the dedicated section below) is implemented for
-  the batch/VOD publish path only. MSF section 11.1 URL parsing has shipped;
+  the batch/VOD publish path and, for detection and signalling, the live
+  paths that receive a real CMAF initialization segment (DASH CTE ingest
+  and live stdin ingest); SRT ingest cannot carry CENC metadata. MSF section 11.1 URL parsing has shipped;
   see `## MSF URLs and fragments` below.
 - The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
   which is not an MSF v1 packaging value; it is defined by
@@ -127,7 +129,9 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
 ## CMSF content protection
 
 `draft-ietf-moq-cmsf-01` section 4. Implemented for the batch/VOD publish
-path only; the publisher never decrypts and never encrypts anywhere in this
+path, and for detection and signalling on the live paths that receive a real
+CMAF initialization segment (the DASH CTE ingest and the live stdin path);
+the publisher never decrypts and never encrypts anywhere in this
 project -- it detects and signals protection already present in its input.
 
 - Protection data lives at the catalog root as `contentProtections` (CMSF
@@ -217,28 +221,75 @@ project -- it detects and signals protection already present in its input.
   populated `CencTrackProtection`) is refused with an error naming the
   progressive-remux path and the offending track, rather than producing
   output that looks like valid CMAF but cannot be decrypted.
-- **Not signalled at all today:** the live publish paths --
-  `MoqtSession::publish_live()` (SRT and stdin ingest) and
-  `publish_live_objects()` (DASH ingest) -- build their catalog through
-  `build_live_catalog` (`src/cmsf_packager.cpp`), which never calls
-  `attach_content_protection`. `parse_cli_options` therefore refuses
-  `--drm-config` combined with `--live-source srt`, `--live-source dash`
-  (when it will actually publish, i.e. not a `--dump-plan` dry run with no
-  `--endpoint`), or the default live-stdin path, rather than let a publisher
-  emit a catalog with no `contentProtections`/`contentProtectionRefIDs` at
-  all for encrypted content -- which would be indistinguishable from
-  genuinely unprotected content. **This refusal is narrower than it may
-  look:** the guard only fires when `--drm-config` is actually supplied --
-  detecting protection at CLI-parse time, before any media is read, is not
-  possible. Encrypted live input published with no `--drm-config` at all is
-  not refused and still publishes fully unsignalled, since `--drm-config`
-  supplies only optional deployment fields (`laURL`, `certURL`,
-  `robustness`), not protection detection itself. The same gap exists at the
-  library level: `PublisherConfig::drm_systems`
-  (`include/openmoq/publisher/publisher_api.h`) has no equivalent guard, so
-  an SDK consumer combining it with a live publish path gets the same silent
-  behaviour the CLI guard exists to prevent. Wiring content protection into
-  the live paths is future work, not part of this phase.
+- **Live paths:** content protection is detected and signalled wherever a
+  real CMAF initialization segment reaches the publisher.
+  `MoqtSession::publish_live()`'s stdin ingest and `publish_live_objects()`'s
+  DASH ingest both call `attach_content_protection` when building their
+  catalog -- via `build_live_catalog` (`src/cmsf_packager.cpp`) for stdin
+  ingest, and `build_catalog_locked` (`src/live_dash_ingest.cpp`) for DASH
+  ingest. Detection there is independent of `--drm-config`: it comes from
+  the init segment's `sinf`/`schm`/`schi`/`tenc` boxes and the moov-level
+  `pssh` siblings, exactly as in the batch path, so encrypted live input on
+  these two paths is detected and signalled whether or not `--drm-config`
+  was supplied. A protected track whose init segment carries no `pssh` is
+  refused on these live paths too, matching batch: CMSF 4.1.2 makes an
+  absent `contentProtectionRefIDs` mean the content is not protected, so
+  publishing one for genuinely encrypted content would be an affirmative
+  false claim.
+
+  `parse_cli_options` still refuses `--drm-config` combined with
+  `--live-source srt`. SRT carries MPEG-TS; the publisher synthesises a
+  CMAF init segment from parsed elementary streams, so there is no `sinf`,
+  `tenc`, or `pssh` box for the publisher to detect. This is a property of
+  the container, not unfinished work on the live paths, and the refusal
+  message now explains that rather than describing it as a gap.
+
+  `--drm-config` itself supplies only optional deployment fields (`laURL`,
+  `certURL`, `robustness`) per DRM system; it has never determined whether a
+  track is protected. **No live path in the default build
+  (`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=OFF`, i.e. the `MoqtSession` backend)
+  applies those deployment fields:** detection and signalling work on the
+  stdin and DASH live paths, but `MoqtSession` has no access to
+  `PublisherConfig::drm_systems` at all, so `laURL`/`certURL`/`robustness`
+  never reach a live-built catalog on that backend. Only the batch/VOD path
+  applies them. This holds on **both** backends. Building with
+  `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON` does not change it: that path passes
+  `config.drm_systems` into `build_live_catalog`, but consumes only the
+  returned `track_initializations` and discards `msf_catalog`/
+  `catalog_payload` entirely, so the deployment fields have nothing to reach.
+  The argument is passed for correctness should that path ever consume the
+  built catalog; today it is inert. The same distinction holds at the library level:
+  `PublisherConfig::drm_systems`
+  (`include/openmoq/publisher/publisher_api.h`) supplies deployment fields
+  to the paths that support them; an SDK consumer combining it with a live
+  publish path on the default backend gets detection and signalling from the
+  init segment as before, just without those deployment fields applied, and
+  combining it with SRT ingest still yields nothing to detect, for the same
+  container reason as the CLI.
+
+  **`pssh` is parsed once per ingest path**, from the full initialization
+  segment held at registration (`collect_pssh_systems`,
+  `src/cmsf_packager.cpp`), rather than re-parsed on every catalog build --
+  an efficiency choice, not a limitation. `build_track_specific_init_segment`
+  (`src/cmsf_packager.cpp:215-281`) copies every `moov` child that is not
+  `trak` or `mvex` verbatim into each per-track init segment, `pssh`
+  included, so a subscriber initialising a decoder from a track's `initData`
+  still has the `pssh` it needs.
+- **Known limitation, `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`:** under this
+  non-default backend, the stdin live path's `build_live_catalog` result
+  (`src/transport/libmoq_publisher.cpp`) is used only for its
+  `track_initializations` -- the per-track init segments handed to
+  `moq_media_sender_add_track`. Its `msf_catalog`/`catalog_payload` are never
+  read, because libmoq generates the catalog it actually publishes itself,
+  from `moq_media_track_cfg_t`/`moq_media_sender_cfg_t`. The libmoq service
+  library does model content protection (`moq_media_track_cfg_t`'s
+  `content_protection_ref_ids` and `moq_media_sender_cfg_t`'s
+  `content_protections`); the limitation is that this project's translation
+  from `TrackDescription`/`CencTrackProtection` to those libmoq config
+  structs does not populate them. So on this backend the stdin path gains the
+  §4.1.2 refusal (still refuses a protected track with no `pssh`, since that
+  check runs in `build_live_catalog` before the result is discarded) but
+  emits no `contentProtections` in the catalog libmoq actually sends.
 - **Not modelled:** MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41)
   are a separate, LOC-packaged end-to-end encryption mechanism; CMSF uses
   CENC instead. The CMSF 4.1.1.4.4 Authorization URL field is also

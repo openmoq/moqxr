@@ -121,10 +121,22 @@ Storing the parsed systems is preferred over retaining the raw init bytes: an
 init segment is kilobytes and would be duplicated across every track registered
 from that path, whereas a parsed system list is a handful of small structs.
 
-Decoding the per-track base64 back to bytes is not an acceptable substitute
-under any storage choice: that segment is a synthesised single-track `moov` and
-does not carry the `pssh` siblings at all, so it would silently yield no systems
-and turn every protected track into a refusal.
+**Correction, established empirically during Task 3.** An earlier draft of this
+spec claimed the per-track init segment carries no `pssh` and therefore could
+not serve as the parse source. That is false in this codebase:
+`build_track_specific_init_segment` (`src/cmsf_packager.cpp:230-268`) copies
+every `moov` child that is not `trak` or `mvex` verbatim, `pssh` included, so a
+per-track init segment does retain the moov-level `pssh` boxes.
+
+That behaviour is correct and must not be changed. A subscriber initialising a
+decoder from a track's `initData` needs the `pssh` to set up DRM; stripping it
+would break exactly the consumer the field exists for.
+
+Parsing at registration from `PathState::init_bytes` remains the right design
+for different reasons: it runs once per path rather than once per catalog build,
+it avoids a base64 decode round-trip, and it does not depend on
+`build_track_specific_init_segment`'s copy-everything-else behaviour, which is
+incidental rather than contractual.
 
 This requires promoting `collect_pssh_systems` from `cmsf_packager.cpp`'s
 anonymous namespace (it is declared at line 367) to `cmsf_packager.h`, so the
