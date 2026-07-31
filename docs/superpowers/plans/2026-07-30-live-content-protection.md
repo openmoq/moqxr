@@ -423,7 +423,15 @@ git commit -m "Attach content protection on the DASH CTE ingest path"
 **Interfaces:**
 - Consumes: nothing new.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Replace the two existing refusal tests, then add the new ones**
+
+**Three tests already assert the refusals this task removes.** They will fail once the guards are gone, and they must be rewritten rather than deleted — the behaviour they cover still needs coverage, just inverted:
+
+- `tests/cli_options_test.cpp:437-458` asserts `--drm-config` with `--live-source dash` is refused and that the message names `--live-source dash`. **Invert it**: the parse must now succeed and `options.drm_systems` must be non-empty. Reuse its existing flag set verbatim (`--live-source dash`, `--dash-listen 127.0.0.1:8080`, `--endpoint https://relay.example.com:443/moq`) so the new test exercises the same command line the old one did.
+- `tests/cli_options_test.cpp:460-482` asserts the same for the live stdin path, using `{"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443", "--drm-config", ...}`. **Invert it** the same way.
+- `tests/cli_options_test.cpp:415-435` asserts the SRT refusal. **Keep it**, but update the message assertion: it currently checks for `--live-source srt`, which the new message still contains, so verify whether it passes unchanged and additionally assert the message mentions `MPEG-TS`.
+
+Each of those blocks ends by removing its temp config file with `std::filesystem::remove(config_path, ec)`. Preserve that cleanup in whatever you write.
 
 `tests/cli_options_test.cpp` has `parse(std::vector<std::string>)` at line 24, `parse_throws(args, fragment, message)` from Phase 4, and `write_drm_config_file(name)` which writes a valid single-system config and returns its path.
 
