@@ -145,6 +145,20 @@ Table of Contents
    m2ts-packaged tracks; equivalent behavior for m2ts tracks is defined
    in this document.
 
+   This document tracks the revision of [MSF] listed in Section 15.1.
+   Catalog field names, JSON types, and the structure of the root
+   catalog object are those of that revision.  Where a later MSF
+   revision renames a field, changes its JSON type, or relocates it,
+   implementations follow the later revision; this document defines only
+   the m2ts-specific fields in Section 6 and does not restate MSF field
+   definitions.
+
+   The catalog "version" field is the MSF version, as defined by [MSF],
+   and is not the version of this packaging format.  A catalog carrying
+   m2ts-packaged tracks declares the MSF version it conforms to; the
+   packaging version described in Section 1 is not signaled in the
+   catalog.
+
 3.  Conventions and Definitions
 
    The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
@@ -401,7 +415,7 @@ Table of Contents
      +-------------------------+----------------------+--------------+
      | M2TS SCTE-35 PID        | m2tsScte35Pid        | Section 6.10 |
      +-------------------------+----------------------+--------------+
-     | Initialization data     | initData             | Section 6.11 |
+     | Initialization ref      | initRef              | Section 6.11 |
      +-------------------------+----------------------+--------------+
 
                                   Table 1
@@ -495,18 +509,21 @@ Table of Contents
 
    Required: Optional JSON Type: String Location: Track Object
 
-   An m2ts track MAY use the MSF initData field to carry Base64 [BASE64]
-   encoded initialization data.  If present, the decoded value MUST be a
-   sequence of whole source packets using the packet size declared by
-   m2tsPacketSize.
+   An m2ts track MAY carry Base64 [BASE64] encoded initialization data
+   using the MSF initialization data mechanism: the track sets initRef
+   to the id of an entry in the root Initialization Data List, and that
+   entry carries the data with type "inline".  If present, the decoded
+   value MUST be a sequence of whole source packets using the packet
+   size declared by m2tsPacketSize.
 
-   Publishers SHOULD include current PAT and PMT packets in initData
-   when those tables are not guaranteed to be available at the first
-   Object of each Group.  When PSI changes within a live track,
-   publishers SHOULD update initData to reflect the new PAT and PMT
-   before publishing subsequent Objects.  Receivers MUST NOT assume that
-   initData remains valid after a version change in transport-stream
-   PSI; updated PSI in the media Objects takes precedence.
+   Publishers SHOULD include current PAT and PMT packets in the
+   referenced initialization data when those tables are not guaranteed
+   to be available at the first Object of each Group.  When PSI changes
+   within a live track, publishers SHOULD update the referenced entry to
+   reflect the new PAT and PMT before publishing subsequent Objects.
+   Receivers MUST NOT assume that initialization data remains valid
+   after a version change in transport-stream PSI; updated PSI in the
+   media Objects takes precedence.
 
 7.  Catalog Examples
 
@@ -515,7 +532,7 @@ Table of Contents
 7.1.  Live 188-octet Transport Stream
 
    {
-     "version": 1,
+     "version": "1",
      "generatedAt": 1746104606044,
      "tracks": [
        {
@@ -541,7 +558,7 @@ Table of Contents
 7.2.  Live 192-octet M2TS Source Packets
 
    {
-     "version": 1,
+     "version": "1",
      "generatedAt": 1746104606044,
      "tracks": [
        {
@@ -565,7 +582,7 @@ Table of Contents
 7.3.  VOD Transport Stream
 
    {
-     "version": 1,
+     "version": "1",
      "tracks": [
        {
          "name": "asset-main",
@@ -593,7 +610,7 @@ Table of Contents
    content.
 
    {
-     "version": 1,
+     "version": "1",
      "generatedAt": 1746104606044,
      "tracks": [
        {
@@ -643,7 +660,7 @@ Table of Contents
    new track before routing packets to a decoder.
 
    {
-     "version": 1,
+     "version": "1",
      "generatedAt": 1746104606044,
      "tracks": [
        {
@@ -829,10 +846,10 @@ Table of Contents
               <https://datatracker.ietf.org/doc/html/draft-ietf-moq-
               transport-17>.
 
-   [MSF]      Law, W., "MOQT Streaming Format", Work in Progress,
-              Internet-Draft, draft-ietf-moq-msf-00, 19 January 2026,
-              <https://datatracker.ietf.org/doc/html/draft-ietf-moq-msf-
-              00>.
+   [MSF]      Law, W. and S. Nandakumar, "MOQT Streaming Format", Work
+              in Progress, Internet-Draft, draft-ietf-moq-msf-01,
+              2 June 2026, <https://datatracker.ietf.org/doc/html/draft-
+              ietf-moq-msf-01>.
 
    [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
               Requirement Levels", BCP 14, RFC 2119,
