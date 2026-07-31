@@ -543,16 +543,12 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
             attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);
         }
 
-        if (track.protection.has_value()) {
-            if (registered.pssh_systems.empty()) {
-                throw std::runtime_error(
-                    "track '" + track.track_name +
-                    "' is protected (CENC) but no pssh system was found in the "
-                    "initialization segment; refusing to publish a catalog with no "
-                    "contentProtections entry for encrypted content");
-            }
-            attach_content_protection(msf_catalog, msf_track, *track.protection, registered.pssh_systems);
-        }
+        // Same shared enforcement the batch and live paths use; see
+        // attach_protection_for_track in msf_catalog.cpp. The returned scheme
+        // is deliberately ignored here: this session has no access to the
+        // publisher's DrmSystemConfig list, so there are no deployment fields
+        // to apply. That is a documented limitation, not an oversight.
+        (void)attach_protection_for_track(msf_catalog, msf_track, track, registered.pssh_systems);
 
         msf_catalog.tracks.push_back(std::move(msf_track));
     }

@@ -818,6 +818,24 @@ void attach_content_protection(MsfCatalog& catalog,
     }
 }
 
+std::optional<std::string> attach_protection_for_track(MsfCatalog& catalog,
+                                                       MsfTrack& track,
+                                                       const TrackDescription& description,
+                                                       const std::vector<CencSystem>& pssh_systems) {
+    if (!description.protection.has_value()) {
+        return std::nullopt;
+    }
+    if (pssh_systems.empty()) {
+        throw std::runtime_error(
+            "track '" + description.track_name +
+            "' is protected (CENC) but no pssh system was found in the "
+            "initialization segment; refusing to publish a catalog with no "
+            "contentProtections entry for encrypted content");
+    }
+    attach_content_protection(catalog, track, *description.protection, pssh_systems);
+    return description.protection->scheme;
+}
+
 MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
                                       EndBroadcastMode mode,
                                       const std::map<std::string, std::uint64_t>& track_durations_ms) {

@@ -553,30 +553,13 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
             attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
-        if (track.protection.has_value()) {
-            // CMSF 4.1.2: "When this field is absent, the track content is
-            // not protected by Common Encryption." pssh is only
-            // SHOULD-present (CMSF 4.1.1.4.5) -- ffmpeg's
-            // -encryption_scheme cenc-aes-ctr, for one, writes
-            // sinf/tenc/senc/saiz/saio with no pssh at all -- so a protected
-            // track with no pssh anywhere in the init segment must not fall
-            // through attach_content_protection's systems loop silently: that
-            // would publish a catalog with no contentProtections entry and no
-            // contentProtectionRefIDs for genuinely encrypted content,
-            // indistinguishable from unprotected media. Refuse instead,
-            // matching the standard cli_options.cpp already sets for the
-            // live-path guard.
-            if (pssh_systems.empty()) {
-                throw std::runtime_error(
-                    "track '" + track.track_name +
-                    "' is protected (CENC) but no pssh system was found in the "
-                    "initialization segment; refusing to publish a catalog with no "
-                    "contentProtections entry for encrypted content");
-            }
-            attach_content_protection(msf_catalog, msf_track, *track.protection, pssh_systems);
-            if (std::find(protected_schemes.begin(), protected_schemes.end(), track.protection->scheme) ==
+        // The CMSF 4.1.2 refusal and attachment live in one place
+        // (attach_protection_for_track, msf_catalog.cpp) so the batch, live,
+        // and DASH paths cannot drift apart on a spec obligation.
+        if (const auto scheme = attach_protection_for_track(msf_catalog, msf_track, track, pssh_systems)) {
+            if (std::find(protected_schemes.begin(), protected_schemes.end(), *scheme) ==
                 protected_schemes.end()) {
-                protected_schemes.push_back(track.protection->scheme);
+                protected_schemes.push_back(*scheme);
             }
         }
 
@@ -774,23 +757,13 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
             attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
-        if (track.protection.has_value()) {
-            // CMSF 4.1.1.4.5 makes pssh only SHOULD-present, so a protected
-            // track with no pssh anywhere in the init segment must not fall
-            // through silently: CMSF 4.1.2 defines an absent
-            // contentProtectionRefIDs as meaning the track is NOT protected,
-            // so publishing would affirmatively misdescribe encrypted media.
-            if (pssh_systems.empty()) {
-                throw std::runtime_error(
-                    "track '" + track.track_name +
-                    "' is protected (CENC) but no pssh system was found in the "
-                    "initialization segment; refusing to publish a catalog with no "
-                    "contentProtections entry for encrypted content");
-            }
-            attach_content_protection(msf_catalog, msf_track, *track.protection, pssh_systems);
-            if (std::find(protected_schemes.begin(), protected_schemes.end(), track.protection->scheme) ==
+        // Same shared enforcement the batch path uses; see
+        // attach_protection_for_track in msf_catalog.cpp. `init_segment` is the
+        // full initialization segment, not the per-track one built above.
+        if (const auto scheme = attach_protection_for_track(msf_catalog, msf_track, track, pssh_systems)) {
+            if (std::find(protected_schemes.begin(), protected_schemes.end(), *scheme) ==
                 protected_schemes.end()) {
-                protected_schemes.push_back(track.protection->scheme);
+                protected_schemes.push_back(*scheme);
             }
         }
 

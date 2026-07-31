@@ -164,6 +164,30 @@ void attach_content_protection(MsfCatalog& catalog,
                                const CencTrackProtection& protection,
                                const std::vector<CencSystem>& systems);
 
+// Applies the CMSF 4.1.2 rule for one track, so every publish path enforces it
+// identically. An unprotected track attaches nothing. A protected track whose
+// initialization segment carries no pssh system is refused rather than
+// published: 4.1.2 defines an absent contentProtectionRefIDs as meaning the
+// content is NOT protected, so emitting a catalog without one would
+// affirmatively misdescribe encrypted media rather than merely omit a field.
+// pssh is only SHOULD-present (4.1.1.4.5) -- ffmpeg's
+// -encryption_scheme cenc-aes-ctr writes sinf/tenc/senc/saiz/saio and no pssh
+// at all -- so this case is reachable with ordinary tooling.
+//
+// Returns the protection scheme when an entry was attached, so callers that
+// apply deployment configuration (laURL/certURL/robustness) can accumulate the
+// distinct schemes; returns nullopt for an unprotected track. Callers with no
+// deployment configuration to apply -- the DASH ingest, which has no access to
+// the publisher's DrmSystemConfig list -- ignore the result.
+//
+// `pssh_systems` must come from the FULL initialization segment. A per-track
+// segment happens to retain moov-level pssh boxes today, but that is incidental
+// to build_track_specific_init_segment's copy behaviour, not contractual.
+std::optional<std::string> attach_protection_for_track(MsfCatalog& catalog,
+                                                       MsfTrack& track,
+                                                       const TrackDescription& description,
+                                                       const std::vector<CencSystem>& pssh_systems);
+
 // How a live broadcast ends (MSF section 11.3).
 enum class EndBroadcastMode {
     // The stream becomes a VOD asset: isLive false, trackDuration added.
