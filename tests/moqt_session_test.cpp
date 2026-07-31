@@ -15,6 +15,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -341,6 +342,64 @@ std::vector<std::uint8_t> make_live_init_mp4() {
     visual_header[26] = 0x00;
     visual_header[27] = 0xf0;
     const auto sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto moov = make_box("moov", trak);
+    return concat({ftyp, moov});
+}
+
+// CENC fixture builders, ported from tests/cmaf_segmenter_test.cpp (each test
+// binary owns its own fixtures in this codebase). Byte layouts must match what
+// parse_track_protection and parse_pssh_boxes actually read -- see that file's
+// make_frma/make_schm/make_tenc_box/make_sinf for the authoritative version.
+std::vector<std::uint8_t> make_frma(const std::string& original_format) {
+    return make_box("frma", std::vector<std::uint8_t>(original_format.begin(), original_format.end()));
+}
+
+std::vector<std::uint8_t> make_schm(const std::string& scheme_type) {
+    std::vector<std::uint8_t> payload(scheme_type.begin(), scheme_type.end());
+    append_be32(payload, 0x00010000);
+    return make_full_box("schm", payload);
+}
+
+std::vector<std::uint8_t> make_tenc_box(std::uint8_t is_protected, std::uint8_t iv_size) {
+    std::vector<std::uint8_t> payload{0, 0, is_protected, iv_size};
+    const std::vector<std::uint8_t> kid{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                                        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
+    payload.insert(payload.end(), kid.begin(), kid.end());
+    return make_full_box("tenc", payload);
+}
+
+std::vector<std::uint8_t> make_sinf(const std::string& original_format, const std::string& scheme_type) {
+    const auto schi = make_box("schi", make_tenc_box(1, 8));
+    return make_box("sinf", concat({make_frma(original_format), make_schm(scheme_type), schi}));
+}
+
+// A live init segment (ftyp + moov) describing a single CENC-protected video
+// track (encv + sinf/schm/schi/tenc) with no pssh box anywhere -- the CMSF
+// 4.1.2 refusal fixture for the stdin live path's build_live_catalog guard.
+// Mirrors make_live_init_mp4() above but swaps the avc1 sample entry for an
+// encrypted encv one and omits the pssh box that make_encrypted_fragmented_
+// test_mp4(false) would otherwise place under moov (not needed here since
+// this fixture carries no pssh at all).
+std::vector<std::uint8_t> make_live_init_mp4_cenc_no_pssh() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = make_full_box("tkhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
+    const auto sinf = make_sinf("avc1", "cenc");
+    const auto sample_entry = make_box("encv", concat({visual_header, avcc, sinf}));
     const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
     const auto stbl = make_box("stbl", stsd);
     const auto minf = make_box("minf", stbl);
@@ -2537,6 +2596,60 @@ int main() {
     }
 
     {
+        // Phase 5 regression: CMSF 4.1.2 makes an absent contentProtectionRefIDs
+        // mean "not protected", so a CENC-protected track (encv/sinf/schm/schi/
+        // tenc) whose init segment carries no pssh anywhere makes
+        // build_live_catalog() throw std::runtime_error rather than silently
+        // publishing a catalog that misdescribes encrypted media as clear. The
+        // stdin live path (publish_live) must catch that and return a failure
+        // status instead of letting the exception unwind past this function --
+        // in production, Publisher::publish_live's teardown (session->close(0)
+        // + clear_active_session(), which populates stats_.last_error) only
+        // runs when publish_live() returns rather than throws. This asserts
+        // three things: (1) a failure status comes back rather than the
+        // process aborting on an uncaught exception, (2) the message names the
+        // missing pssh, and (3) the session is left in a state where the
+        // caller's normal teardown (modeled here by close(0), matching
+        // publisher_api.cpp's `active->session->close(0)`) still runs
+        // cleanly and is observable on the transport -- so a future
+        // regression that returns failure without leaving the session in a
+        // closeable state still fails this test.
+        MockTransport cenc_no_pssh_transport;
+        cenc_no_pssh_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        cenc_no_pssh_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+
+        MoqtSession cenc_no_pssh_session(
+            cenc_no_pssh_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        status = cenc_no_pssh_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected CENC-no-pssh live session connect to succeed");
+
+        const auto cenc_no_pssh_bytes = make_live_init_mp4_cenc_no_pssh();
+        std::string cenc_no_pssh_input_bytes(cenc_no_pssh_bytes.begin(), cenc_no_pssh_bytes.end());
+        std::istringstream cenc_no_pssh_input(cenc_no_pssh_input_bytes);
+        status = cenc_no_pssh_session.publish_live(cenc_no_pssh_input, DraftVersion::kDraft14, false);
+        ok &= expect(!status.ok,
+                     "expected a CENC-protected track with no pssh to refuse the stdin live "
+                     "publish rather than letting build_live_catalog's throw escape");
+        ok &= expect(status.message.find("pssh") != std::string::npos,
+                     "expected the failure status to name the missing pssh");
+        ok &= expect(control_message_count(cenc_no_pssh_transport, 0x06) == 0,
+                     "expected the refusal to bail out before announcing the namespace");
+
+        const TransportStatus cenc_no_pssh_close_status = cenc_no_pssh_session.close(0);
+        ok &= expect(cenc_no_pssh_close_status.ok,
+                     "expected the caller's normal teardown (close(0)) to still succeed after "
+                     "the guard returns a failure status");
+        ok &= expect(cenc_no_pssh_transport.state() == ConnectionState::kClosed &&
+                         cenc_no_pssh_transport.last_close_code == 0,
+                     "expected teardown to actually reach the transport -- proving the session "
+                     "was left in a closeable state rather than mid-unwind");
+    }
+
+    {
         // MSF section 11.3: after a live catalog has actually been published
         // through publish_live(), end_broadcast() must write a genuine final
         // catalog object onto the wire (not just send PUBLISH_DONE for media).
@@ -2910,6 +3023,67 @@ int main() {
         ok &= expect(!object_live_transport.writes.empty() &&
                          message_type(object_live_transport.writes.back().bytes) == 0x09,
                      "expected arbitrary live-object publish to finish with PUBLISH_NAMESPACE_DONE");
+    }
+
+    {
+        // Phase 5 regression, DASH live path: a LiveObjectSource's next_object()
+        // can throw the same CMSF 4.1.2 refusal (a CENC-protected track with no
+        // pssh anywhere in the init segment) that build_live_catalog() throws
+        // on the stdin path -- e.g. a DASH ingest session building its catalog
+        // lazily inside next_object(). publish_live_objects() must catch that
+        // std::runtime_error and return a failure status rather than letting it
+        // unwind past this function, for the same teardown reason as the
+        // stdin-path guard above: the caller's normal teardown only runs when
+        // this returns rather than throws. Asserts the same three things: a
+        // failure status (not a process abort on an uncaught exception), a
+        // message naming the missing pssh, and that the caller's teardown
+        // (close(0)) still runs cleanly and is observable on the transport
+        // afterward.
+        MockTransport cenc_no_pssh_objects_transport;
+        cenc_no_pssh_objects_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        cenc_no_pssh_objects_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        cenc_no_pssh_objects_transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "events", 0));
+        cenc_no_pssh_objects_transport.reads[0].push_back({});
+
+        LiveObjectSource cenc_no_pssh_source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = []() -> std::optional<LiveObject> {
+                throw std::runtime_error(
+                    "track 'events' is protected (CENC) but no pssh system was found in the "
+                    "initialization segment; refusing to publish a catalog with no "
+                    "contentProtections entry for encrypted content");
+            },
+        };
+
+        MoqtSession cenc_no_pssh_objects_session(cenc_no_pssh_objects_transport,
+                                                 std::string(kTestTrackNamespace),
+                                                 false,
+                                                 false,
+                                                 false,
+                                                 std::chrono::seconds(1));
+        status = cenc_no_pssh_objects_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected CENC-no-pssh DASH live-object session connect to succeed");
+
+        status = cenc_no_pssh_objects_session.publish_live_objects(cenc_no_pssh_source, DraftVersion::kDraft14);
+        ok &= expect(!status.ok,
+                     "expected a next_object() CMSF 4.1.2 refusal to fail the DASH live-object "
+                     "publish rather than letting the throw escape publish_live_objects");
+        ok &= expect(status.message.find("pssh") != std::string::npos,
+                     "expected the failure status to name the missing pssh");
+
+        const TransportStatus cenc_no_pssh_objects_close_status = cenc_no_pssh_objects_session.close(0);
+        ok &= expect(cenc_no_pssh_objects_close_status.ok,
+                     "expected the caller's normal teardown (close(0)) to still succeed after "
+                     "the guard returns a failure status");
+        ok &= expect(cenc_no_pssh_objects_transport.state() == ConnectionState::kClosed &&
+                         cenc_no_pssh_objects_transport.last_close_code == 0,
+                     "expected teardown to actually reach the transport -- proving the session "
+                     "was left in a closeable state rather than mid-unwind");
     }
 
     {
