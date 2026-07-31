@@ -64,8 +64,13 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap = false,
                                bool include_msf_timeline = false,
-                               bool vod = false,
-                               const std::vector<DrmSystemConfig>& drm_systems = {});
+                               bool vod = false);
+PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
+                               DraftVersion version,
+                               bool include_sap,
+                               bool include_msf_timeline,
+                               bool vod,
+                               const std::vector<DrmSystemConfig>& drm_systems);
 std::string render_publish_plan(const PublishPlan& plan);
 PublishPlan materialize_publish_plan(const PublishPlan& plan, std::span<const std::uint8_t> bytes);
 void emit_plan_objects(const PublishPlan& plan,
@@ -84,8 +89,11 @@ struct LiveCatalog {
 };
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
-                               bool is_live = true,
-                               const std::vector<DrmSystemConfig>& drm_systems = {});
+                               bool is_live = true);
+LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
+                               std::span<const std::uint8_t> init_segment,
+                               bool is_live,
+                               const std::vector<DrmSystemConfig>& drm_systems);
 
 // Base64-encoded, track-specific CMAF init segment (ftyp + single-track moov)
 // for the track at track_index within init_segment. This is exactly the value

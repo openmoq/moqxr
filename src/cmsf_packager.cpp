@@ -424,6 +424,14 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap,
                                bool include_msf_timeline,
+                               bool vod) {
+    return build_publish_plan(segmented_mp4, version, include_sap, include_msf_timeline, vod, {});
+}
+
+PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
+                               DraftVersion version,
+                               bool include_sap,
+                               bool include_msf_timeline,
                                bool vod,
                                const std::vector<DrmSystemConfig>& drm_systems) {
     std::vector<TrackDescription> tracks = segmented_mp4.tracks;
@@ -707,6 +715,12 @@ void emit_plan_objects(const PublishPlan& plan,
         throw std::runtime_error("failed to create publish-plan.txt");
     }
     manifest << render_publish_plan(plan);
+}
+
+LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
+                               std::span<const std::uint8_t> init_segment,
+                               bool is_live) {
+    return build_live_catalog(tracks, init_segment, is_live, {});
 }
 
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
