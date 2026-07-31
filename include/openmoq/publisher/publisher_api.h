@@ -78,8 +78,9 @@ struct PublisherConfig {
     // -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON), no live path applies those
     // deployment fields to the catalog even when detection succeeds and this
     // field is populated -- only the batch/VOD path does (see
-    // docs/status.md and docs/protocol-mapping.md for the full picture,
-    // including the libmoq-backend exception).
+    // docs/status.md and docs/protocol-mapping.md for the full picture).
+    // This holds on both backends: the libmoq stdin path passes drm_systems
+    // through but discards the built catalog, so nothing reaches the wire.
     std::vector<DrmSystemConfig> drm_systems;
     // Section 5: a catalog SHOULD be republished after enough time has passed
     // that it might fall out of a relay cache. Zero disables republication,

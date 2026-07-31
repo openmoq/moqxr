@@ -79,15 +79,18 @@ int main(int argc, char** argv) {
                              "path applies them."
                           << std::endl;
             } else if (live_stdin) {
-#ifndef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+                // Not backend-conditional. The libmoq backend passes
+                // drm_systems into build_live_catalog but consumes only the
+                // returned track_initializations, discarding the built
+                // catalog, so the deployment fields never reach the wire
+                // there either. Suppressing this warning on that build would
+                // leave the one operator whose fields are silently dropped as
+                // the only one not told about it.
                 std::cerr << "warning: --drm-config was parsed (laURL/certURL/robustness) but the "
-                             "stdin live path on this backend (legacy MoqtSession) never applies "
-                             "deployment fields to its catalog (detection and signalling still "
-                             "work); only the batch/VOD publish path applies them. Build with "
-                             "-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON to have the stdin live path apply "
-                             "them too."
+                             "stdin live path never applies deployment fields to its catalog on "
+                             "either backend (detection and signalling still work); only the "
+                             "batch/VOD publish path applies them."
                           << std::endl;
-#endif
             }
         }
 

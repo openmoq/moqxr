@@ -252,11 +252,13 @@ project -- it detects and signals protection already present in its input.
   stdin and DASH live paths, but `MoqtSession` has no access to
   `PublisherConfig::drm_systems` at all, so `laURL`/`certURL`/`robustness`
   never reach a live-built catalog on that backend. Only the batch/VOD path
-  applies them. (When built with `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`, the
-  libmoq stdin ingest path also applies them, since it passes
-  `config.drm_systems` into `build_live_catalog`; the libmoq SRT path does
-  not, though that is moot since SRT ingest never marks a track protected in
-  the first place.) The same distinction holds at the library level:
+  applies them. This holds on **both** backends. Building with
+  `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON` does not change it: that path passes
+  `config.drm_systems` into `build_live_catalog`, but consumes only the
+  returned `track_initializations` and discards `msf_catalog`/
+  `catalog_payload` entirely, so the deployment fields have nothing to reach.
+  The argument is passed for correctness should that path ever consume the
+  built catalog; today it is inert. The same distinction holds at the library level:
   `PublisherConfig::drm_systems`
   (`include/openmoq/publisher/publisher_api.h`) supplies deployment fields
   to the paths that support them; an SDK consumer combining it with a live
@@ -287,7 +289,8 @@ project -- it detects and signals protection already present in its input.
   structs does not populate them. So on this backend the stdin path gains the
   §4.1.2 refusal (still refuses a protected track with no `pssh`, since that
   check runs in `build_live_catalog` before the result is discarded) but
-  emits no `contentProtections` in the catalog libmoq actually sends. MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41)
+  emits no `contentProtections` in the catalog libmoq actually sends.
+- **Not modelled:** MoQ Secure Objects encryption fields (MSF 5.2.38-5.2.41)
   are a separate, LOC-packaged end-to-end encryption mechanism; CMSF uses
   CENC instead. The CMSF 4.1.1.4.4 Authorization URL field is also
   deliberately unmodelled -- the draft describes it but never names its JSON
