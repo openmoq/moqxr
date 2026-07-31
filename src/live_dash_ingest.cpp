@@ -385,6 +385,18 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
             }
             path_state.tracks = extract_tracks(parse_mp4_boxes(path_state.init_bytes), path_state.init_bytes);
             const std::string prefix = path_slug(path);
+            // pssh boxes are siblings of trak under moov, so they live in the
+            // full init segment kept in path_state.init_bytes. Parse them here,
+            // once per path, while that full init is still in hand -- this
+            // runs once per path rather than once per catalog build, and
+            // avoids a base64 decode round-trip through the per-track init
+            // segment build_catalog_locked embeds per track.
+            const bool path_has_protection =
+                std::any_of(path_state.tracks.begin(), path_state.tracks.end(),
+                            [](const TrackDescription& track) { return track.protection.has_value(); });
+            const std::vector<CencSystem> path_pssh_systems =
+                path_has_protection ? collect_pssh_systems(path_state.init_bytes)
+                                    : std::vector<CencSystem>{};
             for (std::size_t index = 0; index < path_state.tracks.size(); ++index) {
                 TrackDescription& track = path_state.tracks[index];
                 track.track_name = prefix + "_" + track.track_name;
@@ -396,7 +408,8 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
                               << "' has no usable init segment: " << error.what() << std::endl;
                 }
                 tracks_.push_back(RegisteredTrack{.description = track,
-                                                  .init_data_base64 = std::move(init_data)});
+                                                  .init_data_base64 = std::move(init_data),
+                                                  .pssh_systems = path_pssh_systems});
             }
             path_state.initialized = true;
             catalog_dirty_ = true;
@@ -520,6 +533,17 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
 
         if (!registered.init_data_base64.empty()) {
             attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);
+        }
+
+        if (track.protection.has_value()) {
+            if (registered.pssh_systems.empty()) {
+                throw std::runtime_error(
+                    "track '" + track.track_name +
+                    "' is protected (CENC) but no pssh system was found in the "
+                    "initialization segment; refusing to publish a catalog with no "
+                    "contentProtections entry for encrypted content");
+            }
+            attach_content_protection(msf_catalog, msf_track, *track.protection, registered.pssh_systems);
         }
 
         msf_catalog.tracks.push_back(std::move(msf_track));

@@ -171,6 +171,78 @@ std::string as_string(const std::vector<std::uint8_t>& bytes) {
     return std::string(bytes.begin(), bytes.end());
 }
 
+// CENC fixture helpers ported from tests/cmaf_segmenter_test.cpp (around
+// lines 320-356). Their byte layouts match what parse_track_protection and
+// parse_pssh_boxes actually read; do not hand-roll replacements here.
+std::vector<std::uint8_t> make_frma(const std::string& original_format) {
+    return make_box("frma", std::vector<std::uint8_t>(original_format.begin(), original_format.end()));
+}
+
+std::vector<std::uint8_t> make_schm(const std::string& scheme_type) {
+    std::vector<std::uint8_t> payload(scheme_type.begin(), scheme_type.end());
+    append_be32(payload, 0x00010000);
+    return full_box("schm", 0, 0, payload);
+}
+
+std::vector<std::uint8_t> make_tenc_box(std::uint8_t is_protected, std::uint8_t iv_size) {
+    std::vector<std::uint8_t> payload{0, 0, is_protected, iv_size};
+    const std::vector<std::uint8_t> kid{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                                        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
+    payload.insert(payload.end(), kid.begin(), kid.end());
+    return full_box("tenc", 0, 0, payload);
+}
+
+std::vector<std::uint8_t> make_sinf(const std::string& original_format, const std::string& scheme_type) {
+    const auto schi = make_box("schi", make_tenc_box(1, 8));
+    return make_box("sinf", concat({make_frma(original_format), make_schm(scheme_type), schi}));
+}
+
+// A pssh box: FullBox header, then a 16-byte SystemID and a trailing 4-byte
+// data-size/data pair, matching the layout parse_pssh_boxes (cenc.cpp) reads
+// (SystemID at header+version/flags = offset 12).
+std::vector<std::uint8_t> make_pssh(const std::vector<std::uint8_t>& system_id) {
+    std::vector<std::uint8_t> payload(system_id.begin(), system_id.end());
+    append_be32(payload, 4);
+    payload.insert(payload.end(), {0xde, 0xad, 0xbe, 0xef});
+    return full_box("pssh", 0, 0, payload);
+}
+
+// The Widevine common system ID, edef8ba9-79d6-4ace-a3c8-27dcd51d21ed, as raw
+// bytes -- the same system ID used in msf_catalog_test.cpp.
+std::vector<std::uint8_t> widevine_system_id() {
+    return {0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
+            0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed};
+}
+
+// An encrypted DASH init segment: ftyp + moov, with the pssh a sibling of
+// trak under moov (not inside sinf) -- mirrors make_init_segment's shape with
+// an encv sample entry carrying sinf, plus a moov-level pssh. This is the
+// full init segment collect_pssh_systems is parsed from at registration.
+std::vector<std::uint8_t> make_encrypted_dash_init_with_pssh() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto tkhd = full_box("tkhd", 0, 0, concat({std::vector<std::uint8_t>(8, 0), be32(1), std::vector<std::uint8_t>(4, 0)}));
+    const auto mdhd = full_box("mdhd", 0, 0, concat({std::vector<std::uint8_t>(8, 0), be32(1000), std::vector<std::uint8_t>(8, 0)}));
+    const auto hdlr = full_box("hdlr", 0, 0, std::vector<std::uint8_t>{0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[26] = 0x00;
+    visual_header[27] = 0xf0;
+    const auto avcc = make_box("avcC", {1, 100, 0, 12, 0xff});
+    const auto sinf = make_sinf("avc1", "cenc");
+    const auto sample_entry = make_box("encv", concat({visual_header, avcc, sinf}));
+    const auto stsd = full_box("stsd", 0, 0, concat({be32(1), sample_entry}));
+    const auto stbl = make_box("stbl", stsd);
+    const auto minf = make_box("minf", stbl);
+    const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
+    const auto trak = make_box("trak", concat({tkhd, mdia}));
+    const auto trex = full_box("trex", 0, 0, concat({be32(1), be32(1), be32(1000), be32(0), be32(0x02000000)}));
+    const auto mvex = make_box("mvex", trex);
+    const auto pssh = make_pssh(widevine_system_id());
+    const auto moov = make_box("moov", concat({trak, mvex, pssh}));
+    return concat({ftyp, moov});
+}
+
 bool expect_chunked_decodes(const std::string& encoded, const std::string& expected) {
     ChunkedBodyDecoder decoder(1024);
     for (const char ch : encoded) {
@@ -480,6 +552,28 @@ int main() {
             ok &= expect(catalog_text.find("\"width\":320") != std::string::npos &&
                              catalog_text.find("\"height\":240") != std::string::npos,
                          "expected DASH catalog video dimensions for renderer selection");
+        }
+    }
+
+    {
+        // Phase 5: an encrypted DASH init segment's catalog must carry
+        // contentProtections/contentProtectionRefIDs for the protected track.
+        LiveDashIngestSession session(8);
+        const auto encrypted_init = make_encrypted_dash_init_with_pssh();
+        session.ingest("/ingest/enc",
+                       std::span<const std::uint8_t>(encrypted_init.data(), encrypted_init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected a track from the encrypted DASH init segment");
+
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected a catalog object from the encrypted DASH init");
+        if (catalog.has_value()) {
+            const std::string catalog_text(catalog->payload.begin(), catalog->payload.end());
+            ok &= expect(catalog_text.find("\"contentProtections\"") != std::string::npos,
+                         "expected the DASH catalog to carry contentProtections for an encrypted init");
+            ok &= expect(catalog_text.find("\"contentProtectionRefIDs\"") != std::string::npos,
+                         "expected the protected DASH track to reference a contentProtections entry");
         }
     }
 

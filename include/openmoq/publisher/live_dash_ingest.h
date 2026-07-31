@@ -15,6 +15,7 @@
 
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_object.h"
+#include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
 namespace openmoq::publisher {
@@ -87,6 +88,14 @@ private:
     struct RegisteredTrack {
         TrackDescription description;
         std::string init_data_base64;
+        // Parsed once per path at registration, while the full init segment is
+        // still in hand -- this runs once per path rather than once per
+        // catalog build, and avoids a base64 decode round-trip through
+        // init_data_base64 above (a per-track init segment; it does carry any
+        // moov-level pssh siblings too, since build_track_specific_init_segment
+        // copies them verbatim, but re-deriving from it on every catalog build
+        // would be redundant work).
+        std::vector<CencSystem> pssh_systems;
     };
 
     std::optional<LiveObject> next_object_blocking();
