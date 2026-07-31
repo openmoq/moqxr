@@ -574,6 +574,29 @@ int main() {
                      "expected --alpn then --endpoint (no --url) to still produce an endpoint");
         ok &= expect(options.endpoint->host == "relay.example.com",
                      "expected --endpoint to still set the host after a prior --alpn");
+        // --endpoint used to replace the whole EndpointConfig, discarding an
+        // earlier --alpn while leaving endpoint_alpn_overridden true. That is
+        // doubly wrong: the operator's value is lost AND the stale flag makes
+        // resolve_endpoint skip its own draft-appropriate selection, so the
+        // connection goes out with a struct default nobody chose. Only this
+        // ordering was affected; --endpoint then --alpn always worked, which
+        // is why the earlier version of this test did not catch it.
+        ok &= expect(options.endpoint->alpn == "moq-99",
+                     "expected --alpn before --endpoint to survive the endpoint assignment");
+        ok &= expect(options.endpoint_alpn_overridden,
+                     "expected the override flag to stay set alongside the value it describes");
+    }
+
+    // The same ordering hazard for --sni, which shares the construct-if-absent
+    // path with --alpn.
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--sni", "sni.example.com",
+                   "--endpoint", "relay.example.com:443"});
+        ok &= expect(options.endpoint->sni == "sni.example.com",
+                     "expected --sni before --endpoint to survive the endpoint assignment");
+        ok &= expect(options.endpoint->host == "relay.example.com",
+                     "expected --endpoint to still set the host after a prior --sni");
     }
 
     // The --transport/connection agreement and conflict checks must be

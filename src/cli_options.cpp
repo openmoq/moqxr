@@ -237,7 +237,21 @@ CliOptions parse_cli_options(int argc, char** argv) {
             if (url_set) {
                 throw std::runtime_error("--url and --endpoint are mutually exclusive");
             }
-            options.endpoint = parse_endpoint(require_value("--endpoint"));
+            // If --alpn/--sni already constructed an EndpointConfig, update the
+            // four fields parse_endpoint owns in place rather than replacing
+            // the whole struct. Replacing it discarded an earlier --alpn while
+            // leaving endpoint_alpn_overridden true, so resolve_endpoint also
+            // skipped its own draft-appropriate selection: the connection went
+            // out with a struct default nobody chose. Mirrors what --url does.
+            const transport::EndpointConfig parsed = parse_endpoint(require_value("--endpoint"));
+            if (options.endpoint.has_value()) {
+                options.endpoint->host = parsed.host;
+                options.endpoint->port = parsed.port;
+                options.endpoint->path = parsed.path;
+                options.endpoint->path_explicit = parsed.path_explicit;
+            } else {
+                options.endpoint = parsed;
+            }
             endpoint_set = true;
         } else if (argument == "--url") {
             if (url_set) {
