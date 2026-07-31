@@ -408,10 +408,10 @@ int main() {
                      "expected the error to name the offending path");
     }
 
-    // --drm-config combined with a live source must be refused: build_live_catalog
-    // never calls attach_content_protection, so publishing would produce a
-    // catalog with no contentProtections or contentProtectionRefIDs at all --
-    // indistinguishable from unprotected content. See docs/status.md.
+    // --drm-config combined with --live-source srt must be refused: SRT
+    // carries MPEG-TS, from which the publisher synthesises a CMAF init
+    // segment with no sinf/tenc/pssh boxes, so there is nothing for
+    // --drm-config to describe. See docs/status.md.
     {
         const std::filesystem::path config_path =
             write_drm_config_file("openmoq-drm-config-cli-live-srt-test.json");
@@ -429,29 +429,25 @@ int main() {
         ok &= expect(threw, "expected --drm-config with --live-source srt to be refused");
         ok &= expect(message.find("--live-source srt") != std::string::npos,
                      "expected the refusal to name --live-source srt");
+        ok &= expect(message.find("MPEG-TS") != std::string::npos,
+                     "expected the refusal to explain that MPEG-TS carries no CENC metadata");
 
         std::error_code ec;
         std::filesystem::remove(config_path, ec);
     }
 
+    // Phase 5: detection now works on the dash and stdin live paths, so
+    // --drm-config is accepted there.
     {
         const std::filesystem::path config_path =
             write_drm_config_file("openmoq-drm-config-cli-live-dash-test.json");
 
-        bool threw = false;
-        std::string message;
-        try {
-            parse({"openmoq-publisher", "--live-source", "dash",
-                   "--dash-listen", "127.0.0.1:8080",
-                   "--endpoint", "https://relay.example.com:443/moq",
-                   "--drm-config", config_path.string()});
-        } catch (const std::runtime_error& error) {
-            threw = true;
-            message = error.what();
-        }
-        ok &= expect(threw, "expected --drm-config with --live-source dash to be refused");
-        ok &= expect(message.find("--live-source dash") != std::string::npos,
-                     "expected the refusal to name --live-source dash");
+        const CliOptions options = parse({"openmoq-publisher", "--live-source", "dash",
+                                          "--dash-listen", "127.0.0.1:8080",
+                                          "--endpoint", "https://relay.example.com:443/moq",
+                                          "--drm-config", config_path.string()});
+        ok &= expect(!options.drm_systems.empty(),
+                     "expected --drm-config to be accepted with --live-source dash");
 
         std::error_code ec;
         std::filesystem::remove(config_path, ec);
@@ -461,18 +457,10 @@ int main() {
         const std::filesystem::path config_path =
             write_drm_config_file("openmoq-drm-config-cli-live-stdin-test.json");
 
-        bool threw = false;
-        std::string message;
-        try {
-            parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443",
-                   "--drm-config", config_path.string()});
-        } catch (const std::runtime_error& error) {
-            threw = true;
-            message = error.what();
-        }
-        ok &= expect(threw, "expected --drm-config with the default live stdin path to be refused");
-        ok &= expect(message.find("live stdin") != std::string::npos,
-                     "expected the refusal to name the live stdin path");
+        const CliOptions options = parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443",
+                                          "--drm-config", config_path.string()});
+        ok &= expect(!options.drm_systems.empty(),
+                     "expected --drm-config to be accepted with the default live stdin path");
 
         std::error_code ec;
         std::filesystem::remove(config_path, ec);
@@ -496,8 +484,8 @@ int main() {
     }
 
     // Dash dry run (--dump-plan, no --endpoint) never actually publishes a
-    // live catalog, so --drm-config there is not the misleading case this
-    // guard targets.
+    // live catalog. --drm-config is accepted here too, same as the live dash
+    // path above -- there is no dash-specific refusal left to guard against.
     {
         const std::filesystem::path config_path =
             write_drm_config_file("openmoq-drm-config-cli-dash-dry-run-test.json");
