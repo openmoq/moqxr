@@ -401,9 +401,16 @@ This path does not apply `--drm-config` deployment fields; the DASH session has 
 
 Expected: 15/15.
 
-- [ ] **Step 6: Prove the full-init-segment requirement is real**
+- [ ] **Step 6: Prove the attachment and the refusal are load-bearing**
 
-Temporarily change the registration to parse from the per-track init instead — decode `init_data` back to bytes and pass that to `collect_pssh_systems`. Expected: the DASH protection test fails, because the synthesised single-track `moov` has no `pssh`. Restore and confirm the suite passes. Report what you observed. This is the mutation that proves the design point rather than assuming it.
+Two mutations, run one at a time and restored between. Report the exact assertion messages you observed for each.
+
+1. Remove the `attach_content_protection` call in `build_catalog_locked`. Expected: the DASH `contentProtections` assertions fail. Every other DASH test still passes.
+2. Force `registered.pssh_systems` to be empty at the point of use. Expected: the protected track is refused with the message naming it, proving the refusal path fires rather than being unreachable.
+
+**An earlier version of this step asked for a different mutation — parsing from the per-track init segment, expecting it to fail — on the theory that a synthesised single-track `moov` carries no `pssh`. That theory is false** and was disproved empirically: `build_track_specific_init_segment` (`src/cmsf_packager.cpp:230-268`) copies every `moov` child that is not `trak` or `mvex` verbatim, `pssh` included.
+
+Do not "fix" that by stripping `pssh` from per-track init segments. A subscriber initialising a decoder from a track's `initData` needs the `pssh` to set up DRM; removing it would break the consumer the field exists for. Parsing at registration is still the right design — once per path rather than once per catalog build, no base64 round-trip, and no dependence on incidental copy behaviour — but it is a design preference, not a correctness requirement.
 
 - [ ] **Step 7: Commit**
 
@@ -538,7 +545,7 @@ In the `## CMSF content protection` section, record:
 
 - **The DASH CTE path does not apply `--drm-config` deployment fields.** Protection is detected and signalled there, but `laURL`, `certURL`, and `robustness` are not applied because the ingest session has no access to the publisher's `DrmSystemConfig` list. `build_live_catalog`-based paths do apply them.
 - **SRT cannot carry CENC.** The publisher synthesises its init segment from parsed elementary streams, so no `sinf`, `tenc`, or `pssh` exists to detect. This is a property of MPEG-TS, not a gap in the implementation.
-- **`pssh` is read from the full initialization segment**, never from the per-track init segment embedded in the catalog, because `pssh` boxes are siblings of `trak` under `moov` and do not survive single-track init synthesis.
+- **`pssh` is parsed once per ingest path**, from the full initialization segment held at registration, rather than per catalog build. Note that `build_track_specific_init_segment` does copy moov-level `pssh` into each per-track init segment — every `moov` child that is not `trak` or `mvex` is copied verbatim — so a subscriber's `initData` carries the `pssh` it needs to initialise DRM. Do not describe the per-track segment as `pssh`-free; it is not.
 
 - [ ] **Step 3: Verify the full suite and warning count**
 
