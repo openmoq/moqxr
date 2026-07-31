@@ -517,17 +517,18 @@ git commit -m "Accept --drm-config on the live paths that can detect protection"
 
 Item 6 currently says content protection is "**shipped** for the batch/VOD publish path". Extend it: protection is now also detected and signalled on the live paths that receive a real CMAF initialization segment — the DASH CTE ingest and the live stdin path.
 
-**Six statements across the two documents become false with this phase. Every one must change, or the docs contradict themselves** — the defect the Phase 3 review caught. Locate each by its text, since line numbers will shift as you edit:
+**Seven statements across the two documents become false with this phase. Every one must change, or the docs contradict themselves** — the defect the Phase 3 review caught. Locate each by its text, since line numbers will shift as you edit:
 
 In `docs/status.md`:
-1. `:96-98` — "Encrypted live input published with no `--drm-config` at all is not refused and still publishes fully unsignalled -- `--drm-config` supplies only optional deployment fields, not protection detection."
-2. `:99` — "Wiring content protection into the live paths remains future work (a later phase)."
+1. `:85-95` — the passage stating that the live publish paths "never call `attach_content_protection` at all, so `--drm-config` combined with `--live-source srt`, `--live-source dash`, or the default live-stdin path is refused outright". Two thirds of that is now false: only SRT is still refused, and the other two paths do call `attach_content_protection`. **This is the largest single edit in the task.**
+2. `:96-98` — "Encrypted live input published with no `--drm-config` at all is not refused and still publishes fully unsignalled -- `--drm-config` supplies only optional deployment fields, not protection detection." The first clause is now false for real-init paths: encrypted live input is detected and signalled whether or not `--drm-config` was supplied, because detection comes from the initialization segment rather than from configuration. The clause about `--drm-config` supplying only deployment fields stays true.
+3. `:99` — "Wiring content protection into the live paths remains future work (a later phase)."
 
 In `docs/protocol-mapping.md`:
-3. `:121` — content protection described as covering "the batch/VOD publish path only".
-4. `:129` — "Implemented for the batch/VOD publish path".
-5. `:220-224` — "**Not signalled at all today:** the live publish paths -- `MoqtSession::publish_live()` (SRT and stdin ingest) and `publish_live_objects()` (DASH ingest) -- build their catalog through `build_live_catalog`, which never calls `attach_content_protection`."
-6. `:237-241` — the library-level note ending "Wiring content protection into the live paths is future work, not part of this phase." Note this passage also claims an SDK consumer combining `PublisherConfig::drm_systems` with a live publish path "gets the same silent behaviour the CLI guard exists to prevent". That is no longer true for real-init paths: they now detect and signal protection regardless of whether `drm_systems` was supplied. Rewrite it to say what remains true — that `drm_systems` supplies only deployment fields, and that SRT still cannot detect protection.
+4. `:121` — content protection described as covering "the batch/VOD publish path only".
+5. `:129` — "Implemented for the batch/VOD publish path".
+6. `:220-224` — "**Not signalled at all today:** the live publish paths -- `MoqtSession::publish_live()` (SRT and stdin ingest) and `publish_live_objects()` (DASH ingest) -- build their catalog through `build_live_catalog`, which never calls `attach_content_protection`."
+7. `:237-241` — the library-level note ending "Wiring content protection into the live paths is future work, not part of this phase." Note this passage also claims an SDK consumer combining `PublisherConfig::drm_systems` with a live publish path "gets the same silent behaviour the CLI guard exists to prevent". That is no longer true for real-init paths: they now detect and signal protection regardless of whether `drm_systems` was supplied. Rewrite it to say what remains true — that `drm_systems` supplies only deployment fields, and that SRT still cannot detect protection.
 
 The replacement text must say:
 
