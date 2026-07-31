@@ -123,8 +123,21 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
   and live stdin ingest); SRT ingest cannot carry CENC metadata. MSF section 11.1 URL parsing has shipped;
   see `## MSF URLs and fragments` below.
 - The MSFTS example (`examples/msfts-publisher`) publishes `packaging: "m2ts"`,
-  which is not an MSF v1 packaging value; it is defined by
-  `draft-gregoire-moq-msfts-00` and is correct only for that draft's tracks.
+  which is not one of the values in MSF v1's Table 3; it is defined by
+  `draft-gregoire-moq-msfts` (`examples/msfts-publisher/docs/`) and is correct
+  only for that draft's tracks. MSF v1 establishes no IANA registry for
+  packaging values, so extensions add them by normative statement in their own
+  document -- CMSF does exactly the same for `cmaf`. A validator that treats
+  MSF Table 3 as a closed list would reject both.
+- That draft now tracks `draft-ietf-moq-msf-01`. It previously referenced
+  `msf-00`, which differed in two ways that reach the wire: the catalog
+  `version` field was a JSON Number rather than a String (MSF 5.1.1), and
+  initialization data was a track-level `initData` field rather than the root
+  `initDataList` plus a track `initRef` (MSF 5.1.7 and 5.2.13). The example
+  always emitted the MSF v1 shapes, because it builds through the shared
+  `serialize_catalog`; it was the draft text that lagged. The `m2ts*` track
+  fields are producer extensions permitted by MSF section 5 and collide with
+  nothing.
 
 ## CMSF content protection
 

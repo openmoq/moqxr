@@ -397,10 +397,12 @@ std::vector<std::uint8_t> MsftsSource::make_catalog() const {
     MsfTrack track;
     track.name = config_.track_name;
     track.name_space = config_.track_namespace;
-    // "m2ts" is not an MSF v1 (draft-ietf-moq-msf-01) packaging value; it is
-    // defined by draft-gregoire-moq-msfts-00 section 6 ("Catalog"), which
-    // this example implements. See docs/protocol-mapping.md "MSF v1 catalog"
-    // for the caveat.
+    // "m2ts" is not one of MSF v1's Table 3 packaging values; it is defined by
+    // draft-gregoire-moq-msfts section 6 ("Catalog"), which this example
+    // implements. That draft tracks draft-ietf-moq-msf-01, so the catalog this
+    // builds -- string "version", root initDataList plus track initRef -- is
+    // the shape both documents now agree on. See docs/protocol-mapping.md
+    // "MSF v1 catalog" for the caveat.
     track.packaging = "m2ts";
     track.role = "video";
     track.is_live = true;

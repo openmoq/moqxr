@@ -114,5 +114,5 @@ Draft status:
    delta operations (Phase 2), and the
    CMSF 4.1.1.4.4 Authorization URL field (the draft never names its JSON
    key, so it is deliberately unmodelled).
-7. Create an M2TS packaging example based on `draft-gregoire-moq-msfts-00`, using the draft's `m2ts` packaging value to carry MPEG-2 Transport Stream or M2TS source packets directly over MOQT.
+7. The M2TS packaging example (`examples/msfts-publisher`) has **shipped**: it publishes `packaging: "m2ts"` per `draft-gregoire-moq-msfts`, carrying MPEG-2 Transport Stream or M2TS source packets directly over MOQT, and is covered by `openmoq-publisher-msfts-tests`. The catalog it emits carries eight of the draft's nine `m2ts*` track fields -- `m2tsPacketSize`, `m2tsPacketsPerObject`, `m2tsProgramNumber`, `m2tsPmtPid`, `m2tsPcrPid`, `m2tsPsiInterval`, `m2tsRandomAccess`, and `m2tsTimestampMode`. Not implemented: `m2tsScte35Pid` (draft section 6.10), since the example does not parse SCTE-35 splice signalling out of the source stream.
 8. Keep Linux, macOS, and Windows CI/release builds green, including the psychedelic FFmpeg live-publisher example.
