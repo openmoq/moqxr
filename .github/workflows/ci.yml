@@ -29,29 +29,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Checkout picoquic
-        uses: actions/checkout@v5
-        with:
-          repository: private-octopus/picoquic
-          ref: master
-          path: third_party/picoquic
-
-      - name: Checkout picotls
-        uses: actions/checkout@v5
-        with:
-          repository: private-octopus/picotls
-          ref: master
-          path: third_party/picotls
-          submodules: recursive
-
-      - name: Checkout moq5
-        if: matrix.backend == 'libmoq'
-        uses: actions/checkout@v5
-        with:
-          repository: openmoq/moq5
-          ref: main
-          path: third_party/moq5
-
       - name: Show toolchain
         shell: bash
         run: |
@@ -98,8 +75,6 @@ jobs:
           args=(
             cmake -S . -B build
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-            "-DOPENMOQ_PICOQUIC_SOURCE_DIR=${{ github.workspace }}/third_party/picoquic"
-            "-DOPENMOQ_PICOTLS_SOURCE_DIR=${{ github.workspace }}/third_party/picotls"
           )
           if [ "${{ matrix.backend }}" = "libmoq" ]; then
             args+=(

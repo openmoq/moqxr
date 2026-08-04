@@ -39,19 +39,37 @@ cmake --build build --target openmoq-publisher-msfts-example
 Its CMake target links only `openmoq_publisher_lib`; it does not consume moq5
 or picoquic APIs directly.
 
+## Managed Pico Dependencies
+
+By default, CMake owns dependency checkouts under `<build>/_deps` and follows:
+
+- `private-octopus/picoquic` `master`
+- canonical `h2o/picotls` `master`, including its recorded submodules
+- `openmoq/moq5` `main` when `OPENMOQ_USE_LIBMOQ_PUBLISHER=ON`
+
+The first configure downloads the current branch heads. Later configures use a
+successful-check timestamp in that build directory and contact upstream again
+after 24 hours. If a required initial download or scheduled refresh cannot
+reach upstream, configure fails instead of silently accepting a stale branch.
+Configure output records each resolved source directory, tracking branch, and
+commit. Run the configure command before an incremental build when you want the
+daily dependency check; CI and release builds always configure first.
+
+Set `OPENMOQ_DEPENDENCY_REFRESH_INTERVAL_HOURS` to change the interval. Setting
+it to `0` checks on every configure.
+
 ## Build with Local Picoquic and Picotls
 
-By default, CMake looks for:
+Explicit source overrides remain available for offline development or testing a
+local dependency change. CMake never fetches, checks out, or otherwise modifies
+an override directory.
 
-- sibling `../picoquic` and `../picotls` checkouts
-- fallback: `third_party/picoquic` and `third_party/picotls`
-- fallback: `thirdparty/picoquic` and `thirdparty/picotls`
-
-If you prefer custom paths, clone picoquic and picotls to any convenient location and initialize the picotls submodules:
+Clone picoquic and canonical picotls to any convenient location and initialize
+the picotls submodules:
 
 ```bash
 git clone https://github.com/private-octopus/picoquic.git /path/to/picoquic
-git clone --recurse-submodules https://github.com/private-octopus/picotls.git /path/to/picotls
+git clone --recurse-submodules https://github.com/h2o/picotls.git /path/to/picotls
 ```
 
 Then point CMake at them:
@@ -74,8 +92,6 @@ picotls requires both `pkg-config` and OpenSSL headers and libraries. On Windows
 choco install pkgconfiglite openssl
 
 cmake -S . -B build `
-  -DOPENMOQ_PICOQUIC_SOURCE_DIR=C:\path\to\picoquic `
-  -DOPENMOQ_PICOTLS_SOURCE_DIR=C:\path\to\picotls `
   -DOPENSSL_ROOT_DIR="C:\Program Files\OpenSSL-Win64" `
   -DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF
 cmake --build build --config Release
@@ -87,9 +103,10 @@ GitHub Actions workflows set `OPENSSL_ROOT_DIR` automatically from the runner's 
 ## Useful CMake Options
 
 - `-DOPENMOQ_ENABLE_PICOQUIC=ON|OFF`
-- `-DOPENMOQ_PICOQUIC_SOURCE_DIR=/path/to/picoquic`
-- `-DOPENMOQ_PICOTLS_SOURCE_DIR=/path/to/picotls`
-- `-DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5`
+- `-DOPENMOQ_DEPENDENCY_REFRESH_INTERVAL_HOURS=24`
+- `-DOPENMOQ_PICOQUIC_SOURCE_DIR=/path/to/picoquic` (explicit local override)
+- `-DOPENMOQ_PICOTLS_SOURCE_DIR=/path/to/picotls` (explicit local override)
+- `-DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5` (explicit local override)
 - `-DOPENMOQ_OPENSSL_ROOT_DIR=/path/to/openssl`
 - `-DOPENSSL_ROOT_DIR=/path/to/openssl`
 - `-DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON|OFF`
@@ -98,16 +115,14 @@ GitHub Actions workflows set `OPENSSL_ROOT_DIR` automatically from the runner's 
 ### Publish backend (temporary migration gate)
 
 moqxr is migrating its publish path from the legacy MoqtSession/moxygen-style
-transport onto the sibling **libmoq** service tier. While the migration is being
+transport onto the **libmoq** service tier. While the migration is being
 reviewed, the backend is selectable:
 
-- **libmoq available** — the libmoq integration code (translation, drivers,
-  tests) builds and is validated whenever CMake finds a sibling `../moq5`
-  checkout. It also accepts `../libmoq`, `third_party/moq5`,
-  `thirdparty/moq5`, or an explicit `OPENMOQ_LIBMOQ_SOURCE_DIR`; availability
-  is independent of which backend is *selected*.
 - **`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`** — the production `Publisher` routes
-  batch, live stdin, live SRT, and `LiveObjectSource` publishing through libmoq.
+  batch, live stdin, live SRT, and `LiveObjectSource` publishing through a
+  managed checkout of `openmoq/moq5` `main`.
+- **local libmoq override** — setting `OPENMOQ_LIBMOQ_SOURCE_DIR` builds and
+  validates that source tree even when the legacy backend remains selected.
 - **Caller-supplied catalog exception** — a `LiveObjectSource` using
   `LiveCatalogMode::kSourceObject` is routed through `MoqtSession` in either
   configuration. This preserves catalog formats such as MSFTS `"m2ts"` that
@@ -125,7 +140,7 @@ This gate is **temporary** — it will be removed once the libmoq publish path i
 accepted as the default. An injected `TransportFactory` always forces the legacy
 path regardless of this option.
 
-For a checkout outside the auto-detected locations:
+For a local checkout override:
 
 ```bash
 cmake -S . -B build-libmoq \
@@ -142,7 +157,8 @@ GitHub Actions publishes release archives for Linux, macOS, and Windows:
 - pushing a `v*` tag builds release artifacts and attaches them to the matching GitHub Release
 - running the `Release Builds` workflow manually uploads the same archives as workflow artifacts
 - manual runs can also publish a GitHub Release when you provide a `release_tag` such as `v0.1.0`
-- both CI and release workflows check out `private-octopus/picoquic` plus `private-octopus/picotls`, so published binaries include the picoquic transport path
+- CI and release use the managed dependency flow, so each clean job resolves
+  picoquic `master` and canonical picotls `master` during configure
 - Linux and macOS archives are `.tar.gz` and contain `openmoq-publisher`, `libopenmoq_publisher.a`, `include/`, `docs/`, `README.md`, and `LICENSE`
 - Windows archives are `.zip` and contain `openmoq-publisher.exe`, `openmoq_publisher.lib`, `include/`, `docs/`, `README.md`, and `LICENSE`
 
@@ -156,4 +172,5 @@ GitHub Actions builds and tests the project on:
   `openmoq-publisher-libmoq-translation-tests` target
 
 Every lane runs CMake configure, the full default build, a static-library
-existence check, and CTest.
+existence check, and CTest. The libmoq lane also resolves `openmoq/moq5` `main`
+during configure.

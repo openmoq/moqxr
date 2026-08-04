@@ -186,11 +186,11 @@ ffmpeg -re \
 
 可选的 [moq5](https://github.com/openmoq/moq5) backend 通过 moq5 service tier 处理批量、直播 stdin、直播 SRT 和直播 object 发布。service tier 负责 catalog 发布、CMSF/CMAF 验证、基于 subscriber demand 的 gating、有限 backpressure 和有序 transport drain。
 
-CMake 会自动检测 sibling checkout `../moq5`。如果 checkout 位于其他位置，请设置 `OPENMOQ_LIBMOQ_SOURCE_DIR`：
+启用此 backend 后，CMake 会获取当前的 `openmoq/moq5` `main`。仅在使用本地或
+offline source override 时设置 `OPENMOQ_LIBMOQ_SOURCE_DIR`：
 
 ```bash
 cmake -S . -B build-libmoq \
-  -DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5 \
   -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON
 cmake --build build-libmoq
 ctest --test-dir build-libmoq --output-on-failure

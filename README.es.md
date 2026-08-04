@@ -186,11 +186,12 @@ Consulte el [inicio rápido de la CLI](docs/quickstart.md), las [recetas de FFmp
 
 El backend opcional [moq5](https://github.com/openmoq/moq5) enruta la publicación por lotes, stdin en vivo, SRT en vivo y objetos en vivo mediante la capa de servicio de moq5. La capa de servicio gestiona la publicación del catálogo, la validación CMSF/CMAF, el gating por demanda de suscriptores, el backpressure acotado y el drenaje ordenado del transporte.
 
-CMake detecta automáticamente un checkout hermano `../moq5`. Defina `OPENMOQ_LIBMOQ_SOURCE_DIR` cuando el checkout se encuentre en otra ubicación:
+CMake obtiene la versión actual de `openmoq/moq5` `main` cuando se habilita este
+backend. Defina `OPENMOQ_LIBMOQ_SOURCE_DIR` solo para usar una fuente local u
+offline:
 
 ```bash
 cmake -S . -B build-libmoq \
-  -DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5 \
   -DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON
 cmake --build build-libmoq
 ctest --test-dir build-libmoq --output-on-failure
