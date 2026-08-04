@@ -52,7 +52,6 @@ constexpr std::uint64_t kDraft16Version = 0xff000010ULL;
 constexpr std::uint64_t kDraft17Version = 0xff000011ULL;
 constexpr std::uint64_t kDraft18Version = 0xff000012ULL;
 constexpr std::uint64_t kMaxQuicVarintValue = 4611686018427387903ULL;
-constexpr std::uint64_t kPublishStatusTrackEnded = 0x2;
 constexpr std::uint64_t kSubscribeErrorTrackDoesNotExist = 0x2;
 constexpr std::uint8_t kGroupOrderAscending = 0x1;
 constexpr std::uint8_t kForwardPreference = 0x1;
@@ -1432,14 +1431,16 @@ std::vector<std::uint8_t> encode_track_message(const TrackMessage& message) {
 
 std::vector<std::uint8_t> encode_publish_done_message(DraftVersion draft,
                                                       std::uint64_t request_id,
-                                                      std::uint64_t stream_count) {
+                                                      std::uint64_t stream_count,
+                                                      std::uint64_t status_code,
+                                                      std::string_view reason) {
     std::vector<std::uint8_t> payload;
     if (!uses_moq_vi64(draft)) {
         append_moqint(payload, draft, request_id);
     }
-    append_moqint(payload, draft, kPublishStatusTrackEnded);
+    append_moqint(payload, draft, status_code);
     append_moqint(payload, draft, stream_count);
-    append_moqint(payload, draft, 0);
+    append_string(payload, draft, reason);
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kPublishDoneType);
@@ -1533,7 +1534,11 @@ bool decode_publish_namespace_error(std::span<const std::uint8_t> bytes, Publish
 bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishOk& message) {
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
-    if (!parse_publish_family_message(bytes, draft, kPublishOkType, payload_offset, payload_length)) {
+    const bool request_ok_alias = draft == DraftVersion::kDraft18;
+    const bool parsed = request_ok_alias
+                            ? parse_uint16_length_message(bytes, draft, kRequestOkType, payload_offset, payload_length)
+                            : parse_publish_family_message(bytes, draft, kPublishOkType, payload_offset, payload_length);
+    if (!parsed) {
         return false;
     }
     if (payload_offset + payload_length > bytes.size()) {
@@ -1541,7 +1546,8 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
     }
     std::size_t offset = payload_offset;
     const std::size_t payload_end = payload_offset + payload_length;
-    if (!decode_moqint_impl(bytes, offset, draft, message.request_id)) {
+    message.request_id = 0;
+    if (!request_ok_alias && !decode_moqint_impl(bytes, offset, draft, message.request_id)) {
         return false;
     }
 

@@ -405,7 +405,9 @@ std::vector<std::uint8_t> build_subscribe_update_message() {
 
 std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     std::vector<std::uint8_t> payload;
-    append_moqint(payload, draft, 55);
+    if (draft != DraftVersion::kDraft18) {
+        append_moqint(payload, draft, 55);
+    }
     if (draft == DraftVersion::kDraft14) {
         payload.push_back(1);    // forward
         payload.push_back(128);  // subscriber priority
@@ -435,7 +437,7 @@ std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     if (draft == DraftVersion::kDraft14) {
         append_varint_length_message(bytes, 0x1e, payload);
     } else {
-        append_moqint(bytes, draft, 0x1e);
+        append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
         bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
         bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
         bytes.insert(bytes.end(), payload.begin(), payload.end());
@@ -745,7 +747,8 @@ bool test_peer_control_message_decoders_for_all_drafts() {
 
         PublishOk publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message(draft), draft, publish_ok), label + " publish ok decode");
-        ok &= expect(publish_ok.request_id == 55 && publish_ok.forward == 1 && publish_ok.filter_type == 3,
+        ok &= expect(publish_ok.request_id == (draft == DraftVersion::kDraft18 ? 0 : 55) &&
+                         publish_ok.forward == 1 && publish_ok.filter_type == 3,
                      label + " publish ok fields");
 
         PublishError publish_error;

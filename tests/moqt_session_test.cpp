@@ -575,6 +575,21 @@ std::vector<std::uint8_t> encode_unsubscribe_message(DraftVersion draft, std::ui
     return message;
 }
 
+std::vector<std::uint8_t> encode_request_update_message(DraftVersion draft,
+                                                        std::uint64_t request_id,
+                                                        std::uint8_t value,
+                                                        std::uint64_t parameter_type = 0x10) {
+    std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
+    append_bytes(payload, encode_moqint(draft, 1));
+    append_bytes(payload, encode_moqint(draft, parameter_type));
+    append_bytes(payload, encode_moqint(draft, value));
+
+    std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
+    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    message.insert(message.end(), payload.begin(), payload.end());
+    return message;
+}
+
 std::vector<std::uint8_t> encode_legacy_subscribe_update_message(std::uint64_t track_alias) {
     std::vector<std::uint8_t> payload = encode_varint(track_alias);
     const std::vector<std::uint8_t> start_group = encode_varint(0);
@@ -595,7 +610,10 @@ std::vector<std::uint8_t> encode_legacy_subscribe_update_message(std::uint64_t t
 std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
                                                     std::uint64_t request_id,
                                                     std::uint8_t forward = 1) {
-    std::vector<std::uint8_t> payload = encode_varint(request_id);
+    std::vector<std::uint8_t> payload;
+    if (draft != DraftVersion::kDraft18) {
+        payload = encode_varint(request_id);
+    }
     if (draft == DraftVersion::kDraft14) {
         payload.push_back(forward);
         payload.push_back(0x80);
@@ -615,7 +633,7 @@ std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
         }
     }
 
-    std::vector<std::uint8_t> message = encode_varint(0x1e);
+    std::vector<std::uint8_t> message = encode_moqint(draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
     if (draft == DraftVersion::kDraft14) {
         const std::vector<std::uint8_t> length = encode_varint(payload.size());
         message.insert(message.end(), length.begin(), length.end());
@@ -2379,10 +2397,12 @@ int main() {
     {
         MockTransport draft18_wrong_type_transport;
         draft18_wrong_type_transport.reads[3].push_back(encode_draft18_setup_response());
-        // Namespace request stream receives PUBLISH_OK, which is a valid MOQT
-        // message type but invalid response type for a namespace request.
-        draft18_wrong_type_transport.reads[0].push_back(
-            encode_publish_ok_message(DraftVersion::kDraft18, 9, 1));
+        // Namespace request stream receives the removed standalone PUBLISH_OK
+        // type instead of draft-18 REQUEST_OK.
+        std::vector<std::uint8_t> removed_publish_ok_type =
+            encode_publish_ok_message(DraftVersion::kDraft18, 9, 1);
+        removed_publish_ok_type[0] = 0x1e;
+        draft18_wrong_type_transport.reads[0].push_back(removed_publish_ok_type);
 
         MoqtSession draft18_wrong_type_session(draft18_wrong_type_transport, std::string(kTestTrackNamespace), true);
         status = draft18_wrong_type_session.connect(endpoint, tls);
@@ -3023,6 +3043,342 @@ int main() {
         ok &= expect(!object_live_transport.writes.empty() &&
                          message_type(object_live_transport.writes.back().bytes) == 0x09,
                      "expected arbitrary live-object publish to finish with PUBLISH_NAMESPACE_DONE");
+    }
+
+    {
+        // Regression: draft-18 assigns a track alias in PUBLISH, so an
+        // auto-forward live-object publisher must establish every track on a
+        // request stream before it emits subgroup objects using those aliases.
+        MockTransport draft18_object_live_transport;
+        draft18_object_live_transport.reads[3].push_back(encode_draft18_setup_response());
+        draft18_object_live_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        draft18_object_live_transport.reads[4].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 2, 1));
+        draft18_object_live_transport.reads[8].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 4, 1));
+
+        std::vector<LiveObject> objects = {
+            LiveObject{
+                .track_name = "catalog",
+                .group_id = 0,
+                .subgroup_id = 0,
+                .object_id = 0,
+                .payload = {'{', '}'},
+            },
+            LiveObject{
+                .track_name = "video0_vide_1",
+                .group_id = 1,
+                .subgroup_id = 0,
+                .object_id = 0,
+                .payload = {'M'},
+            },
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video0_vide_1"},
+            },
+            .next_object = [&objects, &object_index]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        MoqtSession draft18_object_live_session(
+            draft18_object_live_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            true,
+            false,
+            std::chrono::seconds(1));
+        status = draft18_object_live_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 auto-forward live-object session connect to succeed");
+        status = draft18_object_live_session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(status.ok, "expected draft-18 auto-forward live-object publish to succeed");
+        ok &= expect(!draft18_object_live_transport.reads.contains(4) &&
+                         !draft18_object_live_transport.reads.contains(8),
+                     "expected draft-18 live-object publish to wait for both PUBLISH_OK responses");
+        ok &= expect(draft18_object_live_session.publish_stats().objects_published == 2,
+                     "expected draft-18 auto-forward to publish catalog and media objects");
+
+        std::size_t catalog_publish_index = draft18_object_live_transport.writes.size();
+        std::size_t media_publish_index = draft18_object_live_transport.writes.size();
+        std::size_t first_object_index = draft18_object_live_transport.writes.size();
+        std::size_t publish_done_count = 0;
+        bool publish_done_with_fin = true;
+        for (std::size_t index = 0; index < draft18_object_live_transport.writes.size(); ++index) {
+            const auto& write = draft18_object_live_transport.writes[index];
+            if (write.stream_id == 4 && message_type(write.bytes) == 0x1d) {
+                catalog_publish_index = index;
+            } else if (write.stream_id == 8 && message_type(write.bytes) == 0x1d) {
+                media_publish_index = index;
+            } else if (write.stream_id >= 6 && (write.stream_id & 0x3ULL) == 0x2ULL) {
+                first_object_index = std::min(first_object_index, index);
+            }
+            if ((write.stream_id == 4 || write.stream_id == 8) && message_type(write.bytes) == 0x0b) {
+                ++publish_done_count;
+                publish_done_with_fin = publish_done_with_fin && write.fin;
+            }
+        }
+        ok &= expect(first_object_index < draft18_object_live_transport.writes.size(),
+                     "expected draft-18 auto-forward to emit an object stream");
+        ok &= expect(catalog_publish_index < first_object_index,
+                     "expected draft-18 catalog PUBLISH before the first live object");
+        ok &= expect(media_publish_index < first_object_index,
+                     "expected draft-18 media PUBLISH before the first live object");
+        ok &= expect(publish_done_count == 2 && publish_done_with_fin,
+                     "expected one final PUBLISH_DONE per draft-18 PUBLISH stream");
+    }
+
+    {
+        // A successful PUBLISH with Forward=0 establishes the aliases but
+        // does not authorize auto-forward object delivery.
+        MockTransport draft18_no_forward_transport;
+        draft18_no_forward_transport.reads[3].push_back(encode_draft18_setup_response());
+        draft18_no_forward_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        draft18_no_forward_transport.reads[4].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 2, 0));
+        draft18_no_forward_transport.reads[8].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 4, 0));
+
+        std::vector<LiveObject> objects = {
+            LiveObject{
+                .track_name = "catalog",
+                .group_id = 0,
+                .subgroup_id = 0,
+                .object_id = 0,
+                .payload = {'{', '}'},
+            },
+            LiveObject{
+                .track_name = "video0_vide_1",
+                .group_id = 1,
+                .subgroup_id = 0,
+                .object_id = 0,
+                .payload = {'M'},
+            },
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video0_vide_1"},
+            },
+            .next_object = [&objects, &object_index]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+
+        MoqtSession draft18_no_forward_session(
+            draft18_no_forward_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            true,
+            false,
+            std::chrono::seconds(1));
+        status = draft18_no_forward_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 Forward=0 live-object session connect to succeed");
+        status = draft18_no_forward_session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(status.ok, "expected draft-18 Forward=0 live-object publish to succeed");
+
+        const bool sent_object = std::any_of(
+            draft18_no_forward_transport.writes.begin(),
+            draft18_no_forward_transport.writes.end(),
+            [](const MockTransport::WriteEvent& write) {
+                return write.stream_id >= 6 && (write.stream_id & 0x3ULL) == 0x2ULL;
+            });
+        ok &= expect(!sent_object, "expected draft-18 Forward=0 to suppress auto-forward objects");
+        ok &= expect(draft18_no_forward_session.publish_stats().objects_published == 0,
+                     "expected draft-18 Forward=0 not to count suppressed objects");
+        ok &= expect(object_index == 0,
+                     "expected draft-18 Forward=0 to leave source objects queued for a later subscriber");
+    }
+
+    {
+        MockTransport draft18_invalid_publish_ok_transport;
+        draft18_invalid_publish_ok_transport.reads[3].push_back(encode_draft18_setup_response());
+        draft18_invalid_publish_ok_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        draft18_invalid_publish_ok_transport.reads[4].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 2, 2));
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = []() -> std::optional<LiveObject> { return std::nullopt; },
+        };
+
+        MoqtSession draft18_invalid_publish_ok_session(
+            draft18_invalid_publish_ok_transport, std::string(kTestTrackNamespace), true);
+        status = draft18_invalid_publish_ok_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected invalid draft-18 PUBLISH_OK session connect to succeed");
+        status = draft18_invalid_publish_ok_session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(!status.ok && status.message == "invalid draft-18 PUBLISH_OK",
+                     "expected invalid draft-18 PUBLISH_OK to be rejected without generic fallback");
+        ok &= expect(draft18_invalid_publish_ok_transport.last_close_code == 0x3,
+                     "expected invalid draft-18 PUBLISH_OK to close with PROTOCOL_VIOLATION");
+    }
+
+    {
+        MockTransport draft18_forward_update_transport;
+        draft18_forward_update_transport.reads[3].push_back(encode_draft18_setup_response());
+        draft18_forward_update_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        draft18_forward_update_transport.reads[4].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 2, 0));
+
+        std::size_t publish_stream_read_count = 0;
+        draft18_forward_update_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id != 4 || ++publish_stream_read_count != 2) {
+                return;
+            }
+            transport.reads[4].push_back(
+                encode_request_update_message(DraftVersion::kDraft18, 2, 1));
+        };
+
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&object_index]() -> std::optional<LiveObject> {
+                if (object_index++ != 0) {
+                    return std::nullopt;
+                }
+                return LiveObject{
+                    .track_name = "events",
+                    .group_id = 1,
+                    .subgroup_id = 0,
+                    .object_id = 0,
+                    .payload = {'M'},
+                };
+            },
+        };
+
+        MoqtSession draft18_forward_update_session(
+            draft18_forward_update_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = draft18_forward_update_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 forward-update session connect to succeed");
+        status = draft18_forward_update_session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(status.ok, "expected draft-18 Forward=1 REQUEST_UPDATE publish to succeed");
+        ok &= expect(draft18_forward_update_session.publish_stats().objects_published == 1,
+                     "expected Forward=1 REQUEST_UPDATE to release the queued object");
+
+        const bool sent_update_ok = std::any_of(
+            draft18_forward_update_transport.writes.begin(),
+            draft18_forward_update_transport.writes.end(),
+            [](const MockTransport::WriteEvent& write) {
+                return write.stream_id == 4 && message_type(write.bytes) == 0x07;
+            });
+        ok &= expect(sent_update_ok, "expected REQUEST_UPDATE_OK on the retained PUBLISH stream");
+    }
+
+    {
+        MockTransport draft18_unsupported_update_transport;
+        draft18_unsupported_update_transport.reads[3].push_back(encode_draft18_setup_response());
+        draft18_unsupported_update_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        draft18_unsupported_update_transport.reads[4].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 2, 1));
+
+        std::size_t publish_stream_read_count = 0;
+        draft18_unsupported_update_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id != 4 || ++publish_stream_read_count != 2) {
+                return;
+            }
+            transport.reads[4].push_back(
+                encode_request_update_message(DraftVersion::kDraft18, 2, 100, 0x20));
+        };
+
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&object_index]() -> std::optional<LiveObject> {
+                if (object_index++ != 0) {
+                    return std::nullopt;
+                }
+                return LiveObject{
+                    .track_name = "events",
+                    .group_id = 1,
+                    .subgroup_id = 0,
+                    .object_id = 0,
+                    .payload = {'M'},
+                };
+            },
+        };
+
+        MoqtSession draft18_unsupported_update_session(
+            draft18_unsupported_update_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = draft18_unsupported_update_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 unsupported-update session connect to succeed");
+        status = draft18_unsupported_update_session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(status.ok, "expected unsupported draft-18 update to terminate only its subscription");
+        ok &= expect(object_index == 0 &&
+                         draft18_unsupported_update_session.publish_stats().objects_published == 0,
+                     "expected unsupported draft-18 update not to be silently applied");
+
+        bool sent_request_error = false;
+        bool sent_update_failed = false;
+        bool sent_request_ok = false;
+        for (const auto& write : draft18_unsupported_update_transport.writes) {
+            if (write.stream_id != 4) {
+                continue;
+            }
+            sent_request_error = sent_request_error || message_type(write.bytes) == 0x05;
+            sent_request_ok = sent_request_ok || message_type(write.bytes) == 0x07;
+            sent_update_failed = sent_update_failed ||
+                                 (message_type(write.bytes) == 0x0b && write.fin &&
+                                  write.bytes.size() > 3 && write.bytes[3] == 0x08);
+        }
+        ok &= expect(sent_request_error && sent_update_failed && !sent_request_ok,
+                     "expected unsupported update REQUEST_ERROR followed by final PUBLISH_DONE");
+    }
+
+    {
+        MockTransport draft18_invalid_scope_update_transport;
+        draft18_invalid_scope_update_transport.reads[3].push_back(encode_draft18_setup_response());
+        draft18_invalid_scope_update_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        draft18_invalid_scope_update_transport.reads[4].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 2, 1));
+
+        std::size_t publish_stream_read_count = 0;
+        draft18_invalid_scope_update_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id != 4 || ++publish_stream_read_count != 2) {
+                return;
+            }
+            transport.reads[4].push_back(
+                encode_request_update_message(DraftVersion::kDraft18, 2, 1, 0x22));
+        };
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = []() -> std::optional<LiveObject> { return std::nullopt; },
+        };
+
+        MoqtSession draft18_invalid_scope_update_session(
+            draft18_invalid_scope_update_transport, std::string(kTestTrackNamespace), true);
+        status = draft18_invalid_scope_update_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected invalid-scope draft-18 update session connect to succeed");
+        status = draft18_invalid_scope_update_session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(!status.ok && status.message == "invalid REQUEST_UPDATE on PUBLISH stream",
+                     "expected invalid-scope draft-18 update parameter to be a protocol violation");
+        ok &= expect(draft18_invalid_scope_update_transport.last_close_code == 0x3,
+                     "expected invalid-scope draft-18 update to close with PROTOCOL_VIOLATION");
     }
 
     {
