@@ -71,7 +71,116 @@ The CLI exposes one live source at a time:
 | SRT | `--live-source srt --srt-config FILE` | MPEG-TS over SRT | Requires libsrt; CENC metadata is unavailable in this path |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | Chunked CMAF `POST` or `PUT` requests | Listener currently requires a Unix-like platform |
 
-See the [CLI quick start](docs/quickstart.md), [FFmpeg recipes](docs/ffmpeg.md), and [SRT technical note](docs/srt-ingest-technical-note.md) for complete configurations and commands.
+### SRT ingest
+
+The publisher is an SRT caller. Create `/tmp/srt_callers.json` with the SRT listener address and MPEG-TS/CMAF settings:
+
+```json
+{
+  "srt_callers": [
+    {
+      "id": "cam1",
+      "srt": {
+        "mode": "caller",
+        "host": "127.0.0.1",
+        "port": 9000,
+        "latency_ms": 120
+      },
+      "mpegts": {
+        "auto_detect_program": true,
+        "program_number": null,
+        "video_pid": null,
+        "audio_pid": null
+      },
+      "cmaf": {
+        "fragment_on_keyframe": true,
+        "empty_moov": true,
+        "default_base_moof": true,
+        "separate_moof_per_track": true,
+        "target_fragment_duration_ms": 1000
+      }
+    }
+  ]
+}
+```
+
+In the first terminal, start an FFmpeg SRT listener that sends MPEG-TS after the publisher connects:
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+  -i input.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
+```
+
+In the second terminal, start the SRT caller and MoQ publisher:
+
+```bash
+./build/openmoq-publisher \
+  --live-source srt \
+  --srt-config /tmp/srt_callers.json \
+  --endpoint 127.0.0.1:4443 \
+  --transport raw \
+  --namespace live \
+  --draft 16 \
+  --timeout 120 \
+  --forward 0
+```
+
+The only supported SRT mode is `caller`; the configured host and port must identify an existing SRT listener. Use `--forward 1` for an immediate relay smoke test, or keep `--forward 0` to wait for subscriber interest.
+
+### CTE LL-DASH ingest
+
+Start the publisher with an HTTP/1.1 chunked CMAF listener and a MoQ relay target:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Send an existing CMAF/fMP4 stream with HTTP/1.1 chunked transfer encoding:
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
+```
+
+FFmpeg can instead create two video representations plus audio and push them directly to the ingest prefix:
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+Each path below `/ingest` maintains independent parser state and produces path-prefixed MoQ track names. Use `--forward 1` to send objects immediately, or `--forward 0` to wait for subscriber interest. The DASH listener currently requires a Unix-like platform.
+
+See the [CLI quick start](docs/quickstart.md), [FFmpeg recipes](docs/ffmpeg.md), and [SRT technical note](docs/srt-ingest-technical-note.md) for additional details.
 
 ## Publishing via moq5
 

@@ -71,7 +71,116 @@ CLI では一度に 1 つの live source を使用します。
 | SRT | `--live-source srt --srt-config FILE` | SRT 経由 MPEG-TS | libsrt が必要。この経路では CENC metadata を利用不可 |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | chunked CMAF `POST` または `PUT` request | listener は現在 Unix 系 platform が必要 |
 
-完全な構成とコマンドについては、[CLI quick start](docs/quickstart.md)、[FFmpeg recipe](docs/ffmpeg.md)、[SRT technical note](docs/srt-ingest-technical-note.md) を参照してください。
+### SRT ingest
+
+publisher は SRT caller として動作します。SRT listener のアドレスと MPEG-TS/CMAF 設定を含む `/tmp/srt_callers.json` を作成します。
+
+```json
+{
+  "srt_callers": [
+    {
+      "id": "cam1",
+      "srt": {
+        "mode": "caller",
+        "host": "127.0.0.1",
+        "port": 9000,
+        "latency_ms": 120
+      },
+      "mpegts": {
+        "auto_detect_program": true,
+        "program_number": null,
+        "video_pid": null,
+        "audio_pid": null
+      },
+      "cmaf": {
+        "fragment_on_keyframe": true,
+        "empty_moov": true,
+        "default_base_moof": true,
+        "separate_moof_per_track": true,
+        "target_fragment_duration_ms": 1000
+      }
+    }
+  ]
+}
+```
+
+最初の terminal で、publisher の接続後に MPEG-TS を送信する FFmpeg SRT listener を起動します。
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+  -i input.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
+```
+
+2 番目の terminal で SRT caller と MoQ publisher を起動します。
+
+```bash
+./build/openmoq-publisher \
+  --live-source srt \
+  --srt-config /tmp/srt_callers.json \
+  --endpoint 127.0.0.1:4443 \
+  --transport raw \
+  --namespace live \
+  --draft 16 \
+  --timeout 120 \
+  --forward 0
+```
+
+対応する SRT mode は `caller` のみです。設定した host と port は既存の SRT listener を指す必要があります。relay への即時 smoke test には `--forward 1`、subscriber interest を待つ場合は `--forward 0` を使用します。
+
+### CTE LL-DASH ingest
+
+HTTP/1.1 chunked CMAF listener と MoQ relay target を指定して publisher を起動します。
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+既存の CMAF/fMP4 stream を HTTP/1.1 chunked transfer encoding で送信します。
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
+```
+
+代わりに FFmpeg で 2 つの video representation と audio を作成し、ingest prefix へ直接送信できます。
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+`/ingest` 配下の各 path は独立した parser state を持ち、path prefix 付きの MoQ track name を生成します。object を直ちに送信するには `--forward 1`、subscriber interest を待つには `--forward 0` を使用します。DASH listener は現在 Unix 系 platform が必要です。
+
+詳細は [CLI quick start](docs/quickstart.md)、[FFmpeg recipe](docs/ffmpeg.md)、[SRT technical note](docs/srt-ingest-technical-note.md) を参照してください。
 
 ## moq5 による公開
 

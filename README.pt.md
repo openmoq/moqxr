@@ -71,7 +71,116 @@ A CLI expõe uma fonte ao vivo por vez:
 | SRT | `--live-source srt --srt-config FILE` | MPEG-TS sobre SRT | Requer libsrt; metadados CENC não estão disponíveis neste caminho |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | Requisições CMAF chunked `POST` ou `PUT` | O listener atualmente requer uma plataforma semelhante a Unix |
 
-Consulte o [início rápido da CLI](docs/quickstart.md), as [receitas de FFmpeg](docs/ffmpeg.md) e a [nota técnica de SRT](docs/srt-ingest-technical-note.md) para configurações e comandos completos.
+### Ingest SRT
+
+O publisher é um caller SRT. Crie `/tmp/srt_callers.json` com o endereço do listener SRT e as configurações MPEG-TS/CMAF:
+
+```json
+{
+  "srt_callers": [
+    {
+      "id": "cam1",
+      "srt": {
+        "mode": "caller",
+        "host": "127.0.0.1",
+        "port": 9000,
+        "latency_ms": 120
+      },
+      "mpegts": {
+        "auto_detect_program": true,
+        "program_number": null,
+        "video_pid": null,
+        "audio_pid": null
+      },
+      "cmaf": {
+        "fragment_on_keyframe": true,
+        "empty_moov": true,
+        "default_base_moof": true,
+        "separate_moof_per_track": true,
+        "target_fragment_duration_ms": 1000
+      }
+    }
+  ]
+}
+```
+
+No primeiro terminal, inicie um listener SRT do FFmpeg que envie MPEG-TS após a conexão do publisher:
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+  -i input.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
+```
+
+No segundo terminal, inicie o caller SRT e o publisher MoQ:
+
+```bash
+./build/openmoq-publisher \
+  --live-source srt \
+  --srt-config /tmp/srt_callers.json \
+  --endpoint 127.0.0.1:4443 \
+  --transport raw \
+  --namespace live \
+  --draft 16 \
+  --timeout 120 \
+  --forward 0
+```
+
+O único modo SRT suportado é `caller`; o host e a porta configurados devem identificar um listener SRT existente. Use `--forward 1` para um teste imediato do relay ou mantenha `--forward 0` para aguardar o interesse de um assinante.
+
+### Ingest CTE LL-DASH
+
+Inicie o publisher com um listener CMAF chunked HTTP/1.1 e um relay MoQ de destino:
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Envie um stream CMAF/fMP4 existente com transferência chunked HTTP/1.1:
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
+```
+
+Como alternativa, o FFmpeg pode criar duas representações de vídeo mais áudio e enviá-las diretamente ao prefixo de ingest:
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+Cada caminho sob `/ingest` mantém um estado de parser independente e produz nomes de tracks MoQ com o prefixo do caminho. Use `--forward 1` para enviar objetos imediatamente ou `--forward 0` para aguardar o interesse de um assinante. O listener DASH atualmente requer uma plataforma semelhante a Unix.
+
+Consulte o [início rápido da CLI](docs/quickstart.md), as [receitas de FFmpeg](docs/ffmpeg.md) e a [nota técnica de SRT](docs/srt-ingest-technical-note.md) para detalhes adicionais.
 
 ## Publicação via moq5
 

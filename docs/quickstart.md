@@ -22,7 +22,7 @@ Inspect the same input with an MSF media timeline track enabled:
 ./build/openmoq-publisher --input sample.mp4 --msf-timeline --dump-plan
 ```
 
-Try the draft-16 compatibility profile:
+Explicitly select the default draft-16 profile:
 
 ```bash
 ./build/openmoq-publisher --input sample.mp4 --draft 16 --dump-plan
@@ -37,7 +37,7 @@ Try the draft-16 compatibility profile:
 Emit the same plan with SAP metadata enabled:
 
 ```bash
-./build/openmoq-publisher --input sample.mp4 --draft 14 --sap --emit-dir out/
+./build/openmoq-publisher --input sample.mp4 --draft 16 --sap --emit-dir out/
 ```
 
 The output directory should contain:
@@ -66,7 +66,7 @@ ffmpeg -i input.mp4 \
   -c:v copy \
   -c:a copy \
   -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
-  -f mp4 - | ./build/openmoq-publisher --input - --draft 14 --dump-plan
+  -f mp4 - | ./build/openmoq-publisher --input - --draft 16 --dump-plan
 ```
 
 ## Publish to a Relay
@@ -106,6 +106,68 @@ cat sample.mp4 | ./build/openmoq-publisher \
   --paced \
   --insecure
 ```
+
+## SRT Live Ingest
+
+The SRT ingest path receives MPEG-TS from one or more configured SRT listeners, discovers the selected MPEG-TS program, converts the elementary streams to CMAF objects, and publishes them to the relay. The publisher supports SRT `caller` mode, so each configured host and port must already be listening.
+
+Create `/tmp/srt_callers.json`:
+
+```json
+{
+  "srt_callers": [
+    {
+      "id": "cam1",
+      "srt": {
+        "mode": "caller",
+        "host": "127.0.0.1",
+        "port": 9000,
+        "latency_ms": 120
+      },
+      "mpegts": {
+        "auto_detect_program": true,
+        "program_number": null,
+        "video_pid": null,
+        "audio_pid": null
+      },
+      "cmaf": {
+        "fragment_on_keyframe": true,
+        "empty_moov": true,
+        "default_base_moof": true,
+        "separate_moof_per_track": true,
+        "target_fragment_duration_ms": 1000
+      }
+    }
+  ]
+}
+```
+
+In the first terminal, start an FFmpeg listener that sends MPEG-TS when the SRT caller connects:
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+  -i input.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
+```
+
+In the second terminal, start the publisher:
+
+```bash
+./build/openmoq-publisher \
+  --live-source srt \
+  --srt-config /tmp/srt_callers.json \
+  --endpoint 127.0.0.1:4443 \
+  --transport raw \
+  --namespace live \
+  --draft 16 \
+  --timeout 120 \
+  --forward 0
+```
+
+The `mpegts` object can either auto-detect the first program or pin `program_number`, `video_pid`, and `audio_pid`. The `cmaf` object controls keyframe fragmentation and generated CMAF layout. Use `--forward 1` for an immediate relay smoke test, or keep `--forward 0` to wait for subscriber interest. SRT ingest requires a build in which libsrt was detected; see [build.md](build.md) and [srt-ingest-technical-note.md](srt-ingest-technical-note.md).
 
 ## CTE LL-DASH Live Ingest
 
@@ -172,7 +234,7 @@ Useful DASH ingest flags:
 - `--forward 1` forwards media objects immediately after publishing to the relay
 - `--forward 0` waits for subscriber interest before media is sent
 
-When `--forward 0` is used, `connection_id=` confirms that the transport connection and MOQT setup completed. It is printed before namespace acceptance and does not indicate subscriber interest. The publisher completes the draft-specific namespace and track signaling, then withholds media until the relay forwards a subscription for a catalog or media track. Drafts 14 and 16 carry that interest on the control stream; drafts 17 and 18 use a bidirectional request stream, which may deliver the request in multiple reads. The publisher reassembles the request and sends `SUBSCRIBE_OK` on the same request stream.
+When `--forward 0` is used, `connection_id=` confirms that the transport connection and MOQT setup completed. It is printed before namespace acceptance and does not indicate subscriber interest. The publisher completes the draft-specific namespace and track signaling, then withholds media until the relay forwards a subscription for a catalog or media track. Draft 16 carries that interest on the control stream; draft 18 uses a bidirectional request stream, which may deliver the request in multiple reads. The publisher reassembles a draft-18 request and sends `SUBSCRIBE_OK` on the same request stream.
 
 `--timeout` bounds the initial wait for subscriber interest. Reaching the timeout with no subscription is an idle, successful exit rather than a transport failure. Use `--forward 1` for a smoke test that should send objects without waiting for a subscriber. Set `OPENMOQ_PICOQUIC_TRACE=1` when diagnosing whether the relay accepted the namespace and delivered the subscriber request.
 
@@ -212,9 +274,7 @@ config, token generation, relay connection, and focused-test workflow.
 - `--sap` additionally creates `*_sap` metadata tracks and objects
 - default packaging emits lower-latency split MOQT objects per group when chunk/sample boundaries are available
 - `--coalesce-cmaf-chunks` restores one media object per group
-- draft-14 defaults to ALPN `moq-00`
 - draft-16 defaults to ALPN `moqt-16`
-- draft-17 defaults to ALPN `moqt-17`
 - draft-18 defaults to ALPN `moqt-18`
-- draft-19 is archived as a local text reference but is not selectable
+- drafts 14, 17, and 19 are retained as local text or implementation-history references but are not selectable in the main CLI
 - `--alpn` overrides the draft default when targeting a specific relay

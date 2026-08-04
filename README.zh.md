@@ -71,7 +71,116 @@ CLI 一次使用一个直播源：
 | SRT | `--live-source srt --srt-config FILE` | SRT 上的 MPEG-TS | 需要 libsrt；此路径无法获得 CENC metadata |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | chunked CMAF `POST` 或 `PUT` 请求 | listener 目前需要类 Unix 平台 |
 
-有关完整配置和命令，请参阅 [CLI 快速开始](docs/quickstart.md)、[FFmpeg 示例](docs/ffmpeg.md)和 [SRT 技术说明](docs/srt-ingest-technical-note.md)。
+### SRT ingest
+
+publisher 作为 SRT caller 运行。创建 `/tmp/srt_callers.json`，其中包含 SRT listener 地址和 MPEG-TS/CMAF 设置：
+
+```json
+{
+  "srt_callers": [
+    {
+      "id": "cam1",
+      "srt": {
+        "mode": "caller",
+        "host": "127.0.0.1",
+        "port": 9000,
+        "latency_ms": 120
+      },
+      "mpegts": {
+        "auto_detect_program": true,
+        "program_number": null,
+        "video_pid": null,
+        "audio_pid": null
+      },
+      "cmaf": {
+        "fragment_on_keyframe": true,
+        "empty_moov": true,
+        "default_base_moof": true,
+        "separate_moof_per_track": true,
+        "target_fragment_duration_ms": 1000
+      }
+    }
+  ]
+}
+```
+
+在第一个终端中，启动 FFmpeg SRT listener，它将在 publisher 连接后发送 MPEG-TS：
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+  -i input.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
+```
+
+在第二个终端中，启动 SRT caller 和 MoQ publisher：
+
+```bash
+./build/openmoq-publisher \
+  --live-source srt \
+  --srt-config /tmp/srt_callers.json \
+  --endpoint 127.0.0.1:4443 \
+  --transport raw \
+  --namespace live \
+  --draft 16 \
+  --timeout 120 \
+  --forward 0
+```
+
+唯一支持的 SRT 模式是 `caller`；配置的 host 和 port 必须指向现有 SRT listener。使用 `--forward 1` 可立即进行 relay smoke test，或保留 `--forward 0` 等待 subscriber interest。
+
+### CTE LL-DASH ingest
+
+使用 HTTP/1.1 chunked CMAF listener 和 MoQ relay 目标启动 publisher：
+
+```bash
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 0.0.0.0:8080 \
+  --dash-path /ingest \
+  --endpoint https://127.0.0.1:4433/moq \
+  --transport webtransport \
+  --namespace live \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+使用 HTTP/1.1 chunked transfer encoding 发送现有 CMAF/fMP4 stream：
+
+```bash
+curl -X PUT \
+  -H 'Transfer-Encoding: chunked' \
+  -H 'Content-Type: video/iso.segment' \
+  --data-binary @live-video.cmaf \
+  http://127.0.0.1:8080/ingest/video
+```
+
+FFmpeg 也可以创建两个视频 representation 和音频，并将它们直接推送到 ingest prefix：
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+`/ingest` 下的每个路径都维护独立的 parser state，并生成带路径前缀的 MoQ track name。使用 `--forward 1` 立即发送 object，或使用 `--forward 0` 等待 subscriber interest。DASH listener 目前需要类 Unix 平台。
+
+有关更多详细信息，请参阅 [CLI 快速开始](docs/quickstart.md)、[FFmpeg 示例](docs/ffmpeg.md)和 [SRT 技术说明](docs/srt-ingest-technical-note.md)。
 
 ## 通过 moq5 发布
 
