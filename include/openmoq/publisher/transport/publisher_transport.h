@@ -42,7 +42,13 @@ struct EndpointConfig {
 struct TlsConfig {
     std::string certificate_path;
     std::string private_key_path;
+    // PEM CA bundle used to verify the server certificate. When empty and
+    // insecure_skip_verify is false, $SSL_CERT_FILE and then the system CA
+    // bundle are used; if no usable bundle is found, connect() fails with an
+    // actionable error rather than silently skipping verification.
     std::string ca_path;
+    // When true, the server certificate is NOT verified. Only use this for
+    // local testing against relays with self-signed certificates.
     bool insecure_skip_verify = false;
 };
 

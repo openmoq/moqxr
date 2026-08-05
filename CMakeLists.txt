@@ -378,6 +378,7 @@ add_library(openmoq_publisher_lib STATIC
     src/transport/moqt_session.cpp
     src/transport/picoquic_client.cpp
     src/transport/publisher_transport.cpp
+    src/transport/tls_verification.cpp
     src/transport/webtransport_client.cpp
 )
 
@@ -590,6 +591,18 @@ if(OPENMOQ_BUILD_TESTS)
             OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
         )
         add_test(NAME openmoq-publisher-picoquic-smoke-tests COMMAND openmoq-publisher-picoquic-smoke-tests)
+
+        add_executable(openmoq-publisher-picoquic-tls-verify-tests
+            tests/picoquic_tls_verify_test.cpp
+        )
+        target_link_libraries(openmoq-publisher-picoquic-tls-verify-tests PRIVATE openmoq_publisher_lib)
+        target_include_directories(openmoq-publisher-picoquic-tls-verify-tests PRIVATE
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
+        )
+        target_compile_definitions(openmoq-publisher-picoquic-tls-verify-tests PRIVATE
+            OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
+        )
+        add_test(NAME openmoq-publisher-picoquic-tls-verify-tests COMMAND openmoq-publisher-picoquic-tls-verify-tests)
     endif()
 endif()
 

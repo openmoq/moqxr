@@ -21,6 +21,8 @@
 #include <h3zero.h>
 #include <h3zero_common.h>
 #include <pico_webtransport.h>
+
+#include "tls_verification.h"
 #endif
 
 namespace openmoq::publisher::transport {
@@ -420,22 +422,37 @@ TransportStatus WebTransportClient::connect() {
         return TransportStatus::failure("failed to resolve webtransport server address");
     }
 
+    const bool verify_peer = !(tls_.has_value() && tls_->insecure_skip_verify);
+    std::string root_certificate_file;
+    {
+        const TlsConfig tls_config = tls_.has_value() ? *tls_ : TlsConfig{};
+        TransportStatus resolved = tlsverify::resolve_root_certificate_file(tls_config, root_certificate_file);
+        if (!resolved.ok) {
+            state_ = ConnectionState::kFailed;
+            return resolved;
+        }
+    }
+
     const char* sni = nullptr;
     if (!endpoint_->sni.empty()) {
         sni = endpoint_->sni.c_str();
-    } else if (is_name) {
+    } else if (is_name || verify_peer) {
+        // When verifying the server certificate, always provide a server name;
+        // picotls handles DNS names and IP literals appropriately and skips
+        // emitting the SNI extension for IP literals (see picoquic_client.cpp).
         sni = endpoint_->host.c_str();
     }
 
     const uint64_t current_time = picoquic_current_time();
-    impl_->quic = picoquic_create(1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    impl_->quic = picoquic_create(1, nullptr, nullptr, verify_peer ? root_certificate_file.c_str() : nullptr,
+                                  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                   current_time, nullptr, nullptr, nullptr, 0);
     if (impl_->quic == nullptr) {
         state_ = ConnectionState::kFailed;
         return TransportStatus::failure("failed to create picoquic context for webtransport");
     }
 
-    if (tls_.has_value() && tls_->insecure_skip_verify) {
+    if (!verify_peer) {
         picoquic_set_null_verifier(impl_->quic);
     }
 
@@ -532,6 +549,23 @@ TransportStatus WebTransportClient::connect() {
         if (!session_ready) {
             impl_->failed = true;
             impl_->last_error = "timed out waiting for webtransport CONNECT acceptance";
+            if (impl_->cnx != nullptr) {
+                const std::uint64_t local_error = picoquic_get_local_error(impl_->cnx);
+                const std::uint64_t remote_error = picoquic_get_remote_error(impl_->cnx);
+                if (local_error != 0) {
+                    impl_->last_error += "; local: " + tlsverify::describe_quic_error(local_error);
+                    if (tlsverify::is_certificate_verification_error(local_error)) {
+                        impl_->last_error +=
+                            " -- server certificate verification failed; check the server "
+                            "certificate, ca_path (--ca), and that the SNI/host matches the "
+                            "certificate, or set insecure_skip_verify (--insecure) to "
+                            "intentionally skip verification";
+                    }
+                }
+                if (remote_error != 0) {
+                    impl_->last_error += "; peer: " + tlsverify::describe_quic_error(remote_error);
+                }
+            }
         }
         if (impl_->failed || impl_->disconnected || impl_->loop_exited || !impl_->connected) {
             state_ = ConnectionState::kFailed;

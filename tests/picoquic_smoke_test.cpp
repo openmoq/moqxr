@@ -19,6 +19,10 @@
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 namespace {
 
 using openmoq::publisher::ByteSpan;
@@ -236,6 +240,16 @@ int smoke_server_loop_callback(picoquic_quic_t* quic,
             } else {
                 trace("server packet loop after receive");
             }
+            {
+                // Current picoquic overwrites the time_check return code on
+                // the poll-timeout path, so also honour stop requests from the
+                // traffic callbacks; stop_server() nudges the socket to
+                // guarantee one fires.
+                std::lock_guard<std::mutex> lock(server->mutex);
+                if (server->stop_requested) {
+                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                }
+            }
             return 0;
         case picoquic_packet_loop_after_send:
             if (callback_arg != nullptr) {
@@ -243,6 +257,12 @@ int smoke_server_loop_callback(picoquic_quic_t* quic,
                       std::to_string(*static_cast<size_t*>(callback_arg)));
             } else {
                 trace("server packet loop after send");
+            }
+            {
+                std::lock_guard<std::mutex> lock(server->mutex);
+                if (server->stop_requested) {
+                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                }
             }
             return 0;
         case picoquic_packet_loop_port_update:
@@ -313,6 +333,28 @@ void stop_server(SmokeServer& server) {
     {
         std::lock_guard<std::mutex> lock(server.mutex);
         server.stop_requested = true;
+    }
+
+    // Wake the packet loop out of poll() so the stop request is observed; see
+    // the comment in smoke_server_loop_callback.
+    if (server.port != 0) {
+        const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd >= 0) {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(server.port);
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const std::uint8_t nudge = 0;
+            for (int attempt = 0; attempt < 20; ++attempt) {
+                (void)sendto(fd, &nudge, sizeof(nudge), 0, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+                std::unique_lock<std::mutex> lock(server.mutex);
+                if (server.condition.wait_for(lock, std::chrono::milliseconds(100),
+                                              [&] { return server.loop_exited; })) {
+                    break;
+                }
+            }
+            close(fd);
+        }
     }
 
     if (server.thread.joinable()) {

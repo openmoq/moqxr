@@ -43,6 +43,8 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
 
 Use `--insecure` only when intentionally testing a relay with an untrusted or self-signed certificate. Public relays should be exercised with normal TLS verification so certificate and SNI regressions are visible.
 
+Server certificate verification is enforced for both the raw QUIC and WebTransport transports unless `--insecure` is passed. The trust anchors are resolved in this order: `--ca <bundle.pem>` if provided, then the `SSL_CERT_FILE` environment variable, then the platform's system CA bundle (e.g. `/etc/ssl/certs/ca-certificates.crt`). If none of these yields a usable PEM bundle, the connection fails with an explanatory error instead of silently skipping verification. Hostname (or IP address) checking is performed against `--sni` when given, otherwise against the host used to connect, so relays reached by IP need a certificate with a matching IP subjectAltName or an explicit `--sni` matching the certificate. Note that verified TLS also broadens the signature algorithms offered in the ClientHello (adding e.g. Ed25519), so relays with Ed25519 certificates require verification to be enabled.
+
 ## Verified-TLS WebTransport Examples
 
 ```bash

@@ -21,6 +21,8 @@
 #include <picoquic_packet_loop.h>
 #include <picoquic_utils.h>
 #include <picosocks.h>
+
+#include "tls_verification.h"
 #endif
 
 namespace openmoq::publisher::transport {
@@ -302,6 +304,22 @@ int client_callback(picoquic_cnx_t* cnx,
             if (!impl->connected) {
                 impl->failed = true;
                 impl->last_error = "connection closed before reaching ready state";
+                if (local_error != 0) {
+                    impl->last_error += "; local: " + tlsverify::describe_quic_error(local_error);
+                    if (tlsverify::is_certificate_verification_error(local_error)) {
+                        impl->last_error +=
+                            " -- server certificate verification failed; check the server "
+                            "certificate, ca_path (--ca), and that the SNI/host matches the "
+                            "certificate, or set insecure_skip_verify (--insecure) to "
+                            "intentionally skip verification";
+                    }
+                }
+                if (remote_error != 0) {
+                    impl->last_error += "; peer: " + tlsverify::describe_quic_error(remote_error);
+                    if (remote_error >= 0x0100 && remote_error <= 0x01ff) {
+                        impl->last_error += " -- the server rejected the TLS handshake";
+                    }
+                }
             } else if (impl->last_error.empty() &&
                        (remote_error != 0 || remote_reason != 0 || remote_application_reason != 0 ||
                         application_error != 0)) {
@@ -472,26 +490,44 @@ TransportStatus PicoquicClient::connect() {
         return TransportStatus::failure("failed to resolve picoquic server address");
     }
 
+    const bool verify_peer = !(tls_.has_value() && tls_->insecure_skip_verify);
+    std::string root_certificate_file;
+    {
+        const TlsConfig tls_config = tls_.has_value() ? *tls_ : TlsConfig{};
+        TransportStatus resolved = tlsverify::resolve_root_certificate_file(tls_config, root_certificate_file);
+        if (!resolved.ok) {
+            state_ = ConnectionState::kFailed;
+            return resolved;
+        }
+    }
+
     const char* sni = nullptr;
     if (!endpoint_->sni.empty()) {
         sni = endpoint_->sni.c_str();
-    } else if (is_name) {
+    } else if (is_name || verify_peer) {
+        // When verifying the server certificate, always provide a server name:
+        // picotls matches DNS names via X509_check_host() and IP literals via
+        // X509_VERIFY_PARAM_set1_ip_asc(), and omits the SNI extension for IP
+        // literals on the wire, so this is safe for both cases. Without a
+        // server name the identity check would be silently skipped.
         sni = endpoint_->host.c_str();
     }
     const char* alpn = endpoint_->alpn.c_str();
     const uint64_t current_time = picoquic_current_time();
     trace("connect start host=" + endpoint_->host + " port=" + std::to_string(endpoint_->port) +
-          " sni=" + (sni != nullptr ? sni : "<none>") + " alpn=" + alpn);
+          " sni=" + (sni != nullptr ? sni : "<none>") + " alpn=" + alpn +
+          " verify=" + (verify_peer ? ("ca=" + root_certificate_file) : "off"));
 
     impl_->quic =
-        picoquic_create(1, nullptr, nullptr, nullptr, alpn, nullptr, nullptr, nullptr, nullptr, nullptr,
+        picoquic_create(1, nullptr, nullptr, verify_peer ? root_certificate_file.c_str() : nullptr, alpn,
+                        nullptr, nullptr, nullptr, nullptr, nullptr,
                         current_time, nullptr, nullptr, nullptr, 0);
     if (impl_->quic == nullptr) {
         state_ = ConnectionState::kFailed;
         return TransportStatus::failure("failed to create picoquic context");
     }
 
-    if (tls_.has_value() && tls_->insecure_skip_verify) {
+    if (!verify_peer) {
         picoquic_set_null_verifier(impl_->quic);
     }
 
