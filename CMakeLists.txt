@@ -489,6 +489,12 @@ if(OPENMOQ_BUILD_TESTS)
     target_link_libraries(openmoq-publisher-packaging-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-packaging-tests COMMAND openmoq-publisher-packaging-tests)
 
+    add_executable(openmoq-publisher-mp4-init-tests
+        tests/mp4_init_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-mp4-init-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-mp4-init-tests COMMAND openmoq-publisher-mp4-init-tests)
+
     add_executable(openmoq-publisher-msf-catalog-tests
         tests/msf_catalog_test.cpp
     )

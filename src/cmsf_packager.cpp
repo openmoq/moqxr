@@ -734,11 +734,13 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
     std::map<std::string, std::string> init_data_by_track;
     for (std::size_t index = 0; index < tracks.size(); ++index) {
         const auto& track = tracks[index];
+        std::vector<std::uint8_t> codec_init_data =
+            build_track_codec_init_data(init_segment, track, index);
         std::vector<std::uint8_t> track_init = build_track_specific_init_segment(init_segment, track, index);
         init_data_by_track.emplace(track.track_name, base64_encode(track_init));
         result.track_initializations.push_back({
             .track_name = track.track_name,
-            .codec_payload = {},
+            .codec_payload = std::move(codec_init_data),
             .init_segment = std::move(track_init),
         });
     }
