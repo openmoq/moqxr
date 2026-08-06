@@ -1548,15 +1548,30 @@ int main() {
     ok &= expect(live_catalog_rejected_bad_track, "expected live catalog to reject missing track init data");
 
     const auto hevc_main_bytes = make_hevc_init_mp4(0x01, 0x60000000, {0xB0, 0x00, 0x00, 0x00, 0x00, 0x00}, 90);
+    // 0x40000000 is bit 30 (0-indexed from the LSB); reversed across 32 bits
+    // that lands at bit 1, i.e. 0x00000002 -- NOT 0x4. A raw-hex-trim of the
+    // un-reversed value would coincidentally also equal "6" for the profile
+    // above, which is exactly how this class of bug hides; this case (0x4
+    // raw vs. 0x2 correctly reversed) catches it.
     const auto hevc_high_bytes = make_hevc_init_mp4(0x22, 0x40000000, {0xB0, 0x00, 0x00, 0x00, 0x00, 0x00}, 150);
+    // Two non-zero constraint bytes: RFC 6381/Annex E.3 requires each to be
+    // its own dot-separated element ("...B0.10"), not concatenated into one
+    // hex blob ("...B010").
+    const auto hevc_multi_constraint_bytes =
+        make_hevc_init_mp4(0x01, 0x60000000, {0xB0, 0x10, 0x00, 0x00, 0x00, 0x00}, 90);
     const auto hevc_main_tracks = extract_tracks(parse_mp4_boxes(hevc_main_bytes), hevc_main_bytes);
     const auto hevc_high_tracks = extract_tracks(parse_mp4_boxes(hevc_high_bytes), hevc_high_bytes);
+    const auto hevc_multi_constraint_tracks =
+        extract_tracks(parse_mp4_boxes(hevc_multi_constraint_bytes), hevc_multi_constraint_bytes);
     ok &= expect(hevc_main_tracks.size() == 1, "expected one HEVC main-profile track");
     ok &= expect(hevc_high_tracks.size() == 1, "expected one HEVC high-tier track");
+    ok &= expect(hevc_multi_constraint_tracks.size() == 1, "expected one HEVC multi-constraint-byte track");
     ok &= expect(hevc_main_tracks.front().codec == "hev1.1.6.L90.B0",
                  "expected compact RFC 6381 HEVC main-profile codec string");
-    ok &= expect(hevc_high_tracks.front().codec == "hev1.2.4.H150.B0",
-                 "expected compact RFC 6381 HEVC high-tier codec string");
+    ok &= expect(hevc_high_tracks.front().codec == "hev1.2.2.H150.B0",
+                 "expected bit-reversed RFC 6381 HEVC high-tier codec string");
+    ok &= expect(hevc_multi_constraint_tracks.front().codec == "hev1.1.6.L90.B0.10",
+                 "expected each non-zero HEVC constraint byte as its own dot-separated element");
 
     const auto hevc_slice_only_bytes =
         make_fragmented_hevc_mp4(hevc_length_prefixed_sample({{0x26, 0x01, 0x80, 0x00}}));

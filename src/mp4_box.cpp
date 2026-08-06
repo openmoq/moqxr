@@ -155,14 +155,23 @@ std::string hex_byte(std::uint8_t value) {
     return out.str();
 }
 
-std::string trim_trailing_zero_nibbles(std::uint32_t value) {
+// RFC 6381 / ISO 14496-15 Annex E.3: general_profile_compatibility_flags are
+// expressed in reverse bit order relative to how they're stored in the
+// HEVCDecoderConfigurationRecord, then hex-encoded with leading zeroes
+// omitted (trailing zeroes are significant and must be kept).
+std::uint32_t reverse_bits32(std::uint32_t value) {
+    std::uint32_t reversed = 0;
+    for (int i = 0; i < 32; ++i) {
+        reversed = (reversed << 1U) | (value & 1U);
+        value >>= 1U;
+    }
+    return reversed;
+}
+
+std::string hex_no_leading_zeroes(std::uint32_t value) {
     std::ostringstream out;
     out << std::uppercase << std::hex << value;
-    std::string text = out.str();
-    while (text.size() > 1 && text.back() == '0') {
-        text.pop_back();
-    }
-    return text;
+    return out.str();
 }
 
 std::string hevc_constraint_string(std::span<const std::uint8_t, 6> constraint_bytes) {
@@ -174,9 +183,11 @@ std::string hevc_constraint_string(std::span<const std::uint8_t, 6> constraint_b
         return {};
     }
 
+    // Each constraint byte is its own dot-separated element (Annex E.3), not
+    // one concatenated hex blob.
     std::ostringstream out;
     for (std::size_t index = 0; index < last_non_zero; ++index) {
-        out << hex_byte(constraint_bytes[index]);
+        out << '.' << hex_byte(constraint_bytes[index]);
     }
     return out.str();
 }
@@ -470,12 +481,9 @@ std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::u
         out << profile_space;
     }
     out << static_cast<unsigned int>(profile_idc) << '.'
-        << trim_trailing_zero_nibbles(compatibility_flags) << '.'
+        << hex_no_leading_zeroes(reverse_bits32(compatibility_flags)) << '.'
         << ((profile_byte & 0x20U) != 0 ? 'H' : 'L') << static_cast<unsigned int>(level_idc);
-    const std::string constraint_string = hevc_constraint_string(constraint_bytes);
-    if (!constraint_string.empty()) {
-        out << '.' << constraint_string;
-    }
+    out << hevc_constraint_string(constraint_bytes);
     return out.str();
 }
 
