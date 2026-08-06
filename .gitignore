@@ -13,6 +13,7 @@ DartConfiguration.tcl
 Makefile
 cmake_install.cmake
 Testing/
+patches/
 
 # In-source build binaries
 /openmoq-publisher
