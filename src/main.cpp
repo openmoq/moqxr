@@ -51,6 +51,7 @@ int main(int argc, char** argv) {
             .track_namespace = options.track_namespace,
             .forward = options.forward,
             .publish_catalog = options.publish_catalog,
+            .preannounce_tracks = options.preannounce_tracks,
             .include_sap = options.include_sap,
             .include_msf_timeline = options.include_msf_timeline,
             .split_cmaf_chunks = options.split_cmaf_chunks,

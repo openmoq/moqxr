@@ -375,6 +375,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.stream_per_object = true;
         } else if (argument == "--timeout") {
             options.subscriber_timeout = parse_timeout(require_value("--timeout"));
+        } else if (argument == "--preannounce-tracks") {
+            options.preannounce_tracks = true;
         } else if (argument == "--paced") {
             options.paced = true;
         } else if (argument == "--loop") {
@@ -495,7 +497,7 @@ std::string build_usage(const char* argv0) {
            " --input <mp4|-> [--live-source auto|stdin|srt|dash] [--srt-config <path>]"
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
            " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
-           " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
+           " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--cert file] [--key file] [--ca file] [--insecure]";
