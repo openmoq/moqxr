@@ -839,6 +839,14 @@ TransportStatus collect_control_acknowledgements(PublisherTransport& transport,
         std::vector<std::uint8_t> chunk;
         const TransportStatus status = transport.read_stream(control_stream_id, chunk, fin, std::chrono::seconds(2));
         if (!status.ok) {
+            // Preserve whatever bytes we already parsed-but-deferred (or received
+            // but hadn't parsed yet) before bailing out. A caller that treats this
+            // failure as non-fatal -- e.g. publish_live() tolerating a missing
+            // namespace acknowledgement -- still needs those bytes available to
+            // its own control-message loop, so a late-arriving ack is not
+            // silently dropped here.
+            deferred_messages.insert(deferred_messages.end(), buffer.begin(), buffer.end());
+            pending_control_bytes = std::move(deferred_messages);
             return status;
         }
         if (trace_enabled()) {
@@ -3766,15 +3774,38 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         if (status.ok) {
             namespace_stream_open_ = true;
         }
+        if (!status.ok) {
+            return status;
+        }
     } else {
         status = write_frame(control_stream_id_, encode_namespace_message(namespace_message), false);
-        if (status.ok) {
-            status = collect_control_acknowledgements(
-                transport_, control_stream_id_, draft_version, 1, 0, pending_control_bytes_);
+        if (!status.ok) {
+            // The write itself failed -- the transport is broken. Always fatal.
+            return status;
         }
-    }
-    if (!status.ok) {
-        return status;
+        status = collect_control_acknowledgements(
+            transport_, control_stream_id_, draft_version, 1, 0, pending_control_bytes_);
+        if (!status.ok) {
+            if (status.message != "timed out waiting for stream data") {
+                // A real transport failure (connection closed/reset, malformed
+                // response, peer rejection, ...) -- still fatal.
+                return status;
+            }
+            // Only the per-read wait (collect_control_acknowledgements's 2s
+            // read_stream timeout) elapsed with no PUBLISH_NAMESPACE_OK/
+            // REQUEST_OK; the connection itself is healthy. Per the live-publish
+            // contract, a missing/late namespace acknowledgement must not tear
+            // the session down: moqxr stays ready, publishes its tracks, and
+            // waits for subscriptions until the RTMP source itself ends. Any
+            // ack that does arrive later is still sitting in
+            // pending_control_bytes_ (collect_control_acknowledgements
+            // preserves it even on this early return) and will be parsed
+            // harmlessly -- and silently, since it isn't one of the message
+            // types process_control_messages() acts on -- once the
+            // await-subscriptions loop below starts draining control bytes.
+            std::cerr << "[moqt-session] live: no namespace acknowledgement within timeout; "
+                         "continuing without waiting further (relay may ack late or not at all)\n";
+        }
     }
 
     // Build track alias map (self-assigned, matching legacy serve_subscriptions behavior)

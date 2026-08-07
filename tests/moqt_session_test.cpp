@@ -2616,6 +2616,95 @@ int main() {
     }
 
     {
+        // Regression for the stack owner's required behavior: once publish_live()
+        // has sent PUBLISH_NAMESPACE, a relay that never acknowledges it must NOT
+        // cause the session to tear down. moqxr should still publish its tracks
+        // and enter the await-subscriptions loop, exiting only via the normal
+        // subscriber-timeout idle path (or when the RTMP/stdin source ends), not
+        // because the ack never arrived. Before the fix, collect_control_
+        // acknowledgements()'s read_stream timeout ("timed out waiting for
+        // stream data") was propagated straight out of publish_live() as fatal.
+        MockTransport no_ack_transport;
+        no_ack_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        // Deliberately no PUBLISH_NAMESPACE_OK/REQUEST_OK queued for stream 0:
+        // once the setup message is consumed, every further read on the control
+        // stream reports the same failure a real transport reports for a
+        // genuine per-read timeout with a healthy connection.
+        no_ack_transport.missing_read_error = "timed out waiting for stream data";
+
+        MoqtSession no_ack_session(
+            no_ack_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        status = no_ack_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected no-ack session connect to succeed");
+
+        const auto no_ack_bytes = make_live_init_mp4();
+        std::string no_ack_input_bytes(no_ack_bytes.begin(), no_ack_bytes.end());
+        std::istringstream no_ack_input(no_ack_input_bytes);
+        status = no_ack_session.publish_live(no_ack_input, DraftVersion::kDraft16, false);
+        ok &= expect(status.ok,
+                     "expected publish_live to tolerate a missing namespace acknowledgement "
+                     "rather than tearing the session down");
+        ok &= expect(control_message_count(no_ack_transport, 0x1d) == 1,
+                     "expected publish_live to still preannounce media tracks after a missing ack");
+        ok &= expect(!no_ack_transport.writes.empty() &&
+                         message_type(no_ack_transport.writes.back().bytes) == 0x09,
+                     "expected publish_live to still reach a clean PUBLISH_NAMESPACE_DONE exit "
+                     "via the normal idle await-subscribe timeout, not an error return");
+    }
+
+    {
+        // Companion regression: an acknowledgement that arrives late (after
+        // collect_control_acknowledgements() has already given up and
+        // publish_live() has moved on) must be consumed harmlessly by the main
+        // control-message loop rather than being lost or mis-parsed as a
+        // protocol violation. PUBLISH_NAMESPACE_OK/REQUEST_OK (type 0x07) is not
+        // one of the message types process_control_messages() acts on, so it
+        // should simply be drained off pending_control_bytes_ once it shows up.
+        MockTransport late_ack_transport;
+        late_ack_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        // No ack queued yet -- the first collect_control_acknowledgements() read
+        // times out (same mechanism as the no-ack case above). on_read injects
+        // the ack just before the *second* read of stream 0, modeling a relay
+        // that answers slightly later than the initial short wait -- this is
+        // read by the main await-subscribe loop, not by
+        // collect_control_acknowledgements() (which has already returned).
+        std::size_t stream0_reads = 0;
+        late_ack_transport.on_read = [&stream0_reads](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id != 0) {
+                return;
+            }
+            ++stream0_reads;
+            if (stream0_reads == 2) {
+                transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+            }
+        };
+
+        MoqtSession late_ack_session(
+            late_ack_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        status = late_ack_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected late-ack session connect to succeed");
+
+        const auto late_ack_bytes = make_live_init_mp4();
+        std::string late_ack_input_bytes(late_ack_bytes.begin(), late_ack_bytes.end());
+        std::istringstream late_ack_input(late_ack_input_bytes);
+        status = late_ack_session.publish_live(late_ack_input, DraftVersion::kDraft16, false);
+        ok &= expect(status.ok,
+                     "expected a late-arriving namespace acknowledgement to be consumed without "
+                     "surfacing as a protocol violation");
+        ok &= expect(stream0_reads >= 2,
+                     "expected the main loop to perform a second read that picks up the late ack");
+        ok &= expect(!late_ack_transport.writes.empty() &&
+                         message_type(late_ack_transport.writes.back().bytes) == 0x09,
+                     "expected the late-ack session to still reach a clean PUBLISH_NAMESPACE_DONE exit");
+    }
+
+    {
         // Phase 5 regression: CMSF 4.1.2 makes an absent contentProtectionRefIDs
         // mean "not protected", so a CENC-protected track (encv/sinf/schm/schi/
         // tenc) whose init segment carries no pssh anywhere makes
