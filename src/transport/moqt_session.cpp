@@ -4792,7 +4792,19 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         ++next_alias;
     }
 
-    if (!uses_request_streams(draft_version)) {
+    // Opt-in preannounce: send a PUBLISH per track before any subscriber exists.
+    //
+    // Relays split into two camps. Some accept tracks this way, answer PUBLISH_OK
+    // and never forward a SUBSCRIBE upstream, so a publisher that waits for one
+    // would stall without this. Others resolve the track namespace only once a
+    // subscriber appears; an early PUBLISH there is at best ignored and at worst
+    // disturbs the namespace registration, after which SUBSCRIBEs are rejected.
+    //
+    // Off by default, because this path never dispatches PUBLISH_OK: the Forward
+    // State in the reply cannot be read, so the request would be made and its
+    // answer discarded. Callers whose relay needs it set
+    // PublisherConfig::preannounce_tracks (CLI: --preannounce-tracks).
+    if (!uses_request_streams(draft_version) && preannounce_tracks_) {
         std::uint64_t request_id = 2;
         for (const auto& [track_name, alias] : alias_by_track) {
             TrackMessage track_message{

@@ -191,6 +191,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         config_.subscriber_timeout,
         config_.authorization);
     active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
+    active->session->set_preannounce_tracks(config_.preannounce_tracks);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, false);
@@ -358,6 +359,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         config_.subscriber_timeout,
         config_.authorization);
     active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
+    active->session->set_preannounce_tracks(config_.preannounce_tracks);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);
@@ -492,6 +494,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         config_.subscriber_timeout,
         config_.authorization);
     active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
+    active->session->set_preannounce_tracks(config_.preannounce_tracks);
 
     const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
     set_active_session(active, resolved_endpoint, true);

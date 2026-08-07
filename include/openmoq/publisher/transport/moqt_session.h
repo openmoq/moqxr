@@ -115,6 +115,11 @@ public:
         catalog_republish_interval_ = interval;
     }
 
+    // See PublisherConfig::preannounce_tracks.
+    void set_preannounce_tracks(bool enabled) {
+        preannounce_tracks_ = enabled;
+    }
+
 private:
     void reset_publish_stats();
     void record_published_object(const std::string& track_name, std::uint64_t group_id, std::size_t payload_bytes);
@@ -137,6 +142,7 @@ private:
     std::string track_namespace_;
     bool auto_forward_ = false;
     bool publish_catalog_ = false;
+    bool preannounce_tracks_ = false;
     bool paced_ = false;
     bool loop_ = false;
     std::chrono::seconds subscriber_timeout_ = std::chrono::seconds(30);

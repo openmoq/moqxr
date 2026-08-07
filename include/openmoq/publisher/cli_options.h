@@ -62,6 +62,8 @@ struct CliOptions {
     bool stream_per_object = false;
     bool paced = false;
     bool loop = false;
+    // See PublisherConfig::preannounce_tracks.
+    bool preannounce_tracks = false;
     bool dump_plan = false;
     bool print_msf_urls = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
