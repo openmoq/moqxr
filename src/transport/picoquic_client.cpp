@@ -543,6 +543,21 @@ TransportStatus PicoquicClient::connect() {
 
     picoquic_set_callback(impl_->cnx, client_callback, impl_.get());
 
+    // Keep the connection alive while the application has nothing to send.
+    //
+    // A publisher in await-subscribe mode parks in a blocking control-stream read
+    // until a SUBSCRIBE arrives, transmitting nothing meanwhile. With no keepalive
+    // the peer's idle timeout expires first and tears the connection down beneath
+    // that read, which surfaces to the caller as "transport close requested" after
+    // roughly 30 seconds. That makes a long-running publisher unusable whenever a
+    // subscriber is absent or between sessions.
+    //
+    // The interval must be comfortably below the negotiated idle timeout. Five
+    // seconds is far enough inside any commonly negotiated value to be safe, and
+    // the traffic is one PING frame, so the cost is negligible.
+    constexpr std::uint64_t kKeepAliveIntervalUs = 5'000'000;
+    picoquic_enable_keep_alive(impl_->cnx, kKeepAliveIntervalUs);
+
     if (picoquic_start_client_cnx(impl_->cnx) != 0) {
         picoquic_free(impl_->quic);
         impl_->cnx = nullptr;

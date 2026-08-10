@@ -3119,6 +3119,8 @@ int main() {
 
         MoqtSession object_live_session(
             object_live_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        // Preannounce is opt-in; this case exists to exercise it.
+        object_live_session.set_preannounce_tracks(true);
         status = object_live_session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected arbitrary live-object session connect to succeed");
         status = object_live_session.publish_live_objects(source, DraftVersion::kDraft14);
@@ -3132,6 +3134,52 @@ int main() {
         ok &= expect(!object_live_transport.writes.empty() &&
                          message_type(object_live_transport.writes.back().bytes) == 0x09,
                      "expected arbitrary live-object publish to finish with PUBLISH_NAMESPACE_DONE");
+    }
+
+    {
+        // Default (preannounce off): no PUBLISH is emitted before a subscriber
+        // exists. The same flow as above with the opt-in left at its default, so a
+        // regression in the gate shows up as a count change rather than silently.
+        MockTransport default_no_preannounce_transport;
+        default_no_preannounce_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft14,
+            .max_request_id = 8,
+        }));
+        default_no_preannounce_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
+        default_no_preannounce_transport.reads[0].push_back({});
+
+        std::vector<LiveObject> objects = {
+            LiveObject{
+                .track_name = "events",
+                .group_id = 7,
+                .subgroup_id = 0,
+                .object_id = 3,
+                .payload = {'O', 'K'},
+            },
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&objects, &object_index]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+        };
+
+        MoqtSession default_no_preannounce_session(default_no_preannounce_transport,
+                                                   std::string(kTestTrackNamespace),
+                                                   false,
+                                                   false,
+                                                   false,
+                                                   std::chrono::seconds(1));
+        status = default_no_preannounce_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected default live-object session connect to succeed");
+        status = default_no_preannounce_session.publish_live_objects(source, DraftVersion::kDraft14);
+        ok &= expect(control_message_count(default_no_preannounce_transport, 0x1d) == 0,
+                     "expected no PUBLISH preannounce when preannounce_tracks is left at its default");
     }
 
     {
@@ -3840,6 +3888,8 @@ int main() {
             true,
             false,
             std::chrono::seconds(1));
+        // Preannounce is opt-in; this case asserts the PUBLISH count it produces.
+        dash_live_session.set_preannounce_tracks(true);
         status = dash_live_session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected FFmpeg-style DASH session connect to succeed");
         status = dash_live_session.publish_live_objects(source, DraftVersion::kDraft16);

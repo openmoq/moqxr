@@ -46,6 +46,14 @@ struct PublisherConfig {
     std::string track_namespace = "media";
     bool forward = false;
     bool publish_catalog = false;
+    // Send a PUBLISH for each track immediately after PUBLISH_NAMESPACE, before any
+    // subscriber exists. Relays differ here: some accept tracks that way and never
+    // forward a SUBSCRIBE upstream, so a publisher waiting for one would stall,
+    // while others resolve the track namespace only once a subscriber appears and
+    // are disturbed by an early PUBLISH. Off by default because the path that
+    // sends it does not process the PUBLISH_OK it would receive, so the request
+    // would be made and its answer ignored.
+    bool preannounce_tracks = false;
     bool include_sap = false;
     bool include_msf_timeline = false;
     bool split_cmaf_chunks = true;
