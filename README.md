@@ -257,3 +257,8 @@ Localized Publisher API guides are available in [Spanish](docs/publisher-api.es.
 The main `openmoq-publisher` CLI accepts drafts 16 and 18; draft 16 remains the default while draft 18 provides the newer request-stream profile. Text for drafts 14, 17, and 19 remains in `docs/` for implementation history and protocol review, but those versions are not selectable in the main CLI. The separate MSFTS example retains draft 14/16/17/18 selection for draft-specific testing.
 
 The default picoquic backend and the opt-in moq5 backend are both under active interoperability testing. For detailed feature coverage, limitations, and roadmap work, see [docs/status.md](docs/status.md) and [docs/protocol-mapping.md](docs/protocol-mapping.md).
+
+## Attribution
+
+Originally created by [Paul Gregoire](https://github.com/mondain) for OpenMOQ
+
