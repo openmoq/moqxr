@@ -401,9 +401,12 @@ if(OPENMOQ_HAS_PICOQUIC)
         target_include_directories(openmoq_publisher_lib PRIVATE
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
     else()
-        target_link_libraries(openmoq_publisher_lib PRIVATE picoquic-core)
+        target_link_libraries(openmoq_publisher_lib PRIVATE
+            "-Wl,--start-group" picohttp-core picoquic-log picoquic-core "-Wl,--end-group")
+        target_include_directories(openmoq_publisher_lib PRIVATE
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
     endif()
-    if(TARGET picohttp-core AND (APPLE OR WIN32 OR CMAKE_VERSION VERSION_LESS "3.24"))
+    if(TARGET picohttp-core AND (APPLE OR WIN32))
         target_link_libraries(openmoq_publisher_lib PRIVATE picohttp-core)
         target_include_directories(openmoq_publisher_lib PRIVATE
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
