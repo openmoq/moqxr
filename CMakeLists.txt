@@ -401,10 +401,15 @@ if(OPENMOQ_HAS_PICOQUIC)
         target_include_directories(openmoq_publisher_lib PRIVATE
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
     else()
-        target_link_libraries(openmoq_publisher_lib PRIVATE
-            "-Wl,--start-group" picohttp-core picoquic-log picoquic-core "-Wl,--end-group")
-        target_include_directories(openmoq_publisher_lib PRIVATE
-            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
+        if(NOT APPLE AND NOT WIN32)
+            # GNU ld: emulate $<LINK_GROUP:RESCAN,...> for CMake < 3.24
+            target_link_libraries(openmoq_publisher_lib PRIVATE
+                "-Wl,--start-group" picohttp-core picoquic-log picoquic-core "-Wl,--end-group")
+            target_include_directories(openmoq_publisher_lib PRIVATE
+                "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
+        else()
+            target_link_libraries(openmoq_publisher_lib PRIVATE picoquic-core)
+        endif()
     endif()
     if(TARGET picohttp-core AND (APPLE OR WIN32))
         target_link_libraries(openmoq_publisher_lib PRIVATE picohttp-core)
