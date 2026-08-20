@@ -53,7 +53,7 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --namespace media \
   --draft 16 \
   --forward 0 \
-  --timeout 10 \
+  --timeout 30 \
   --paced
 ```
 
@@ -70,6 +70,28 @@ The CLI exposes one live source at a time:
 | Fragmented MP4 | `--live-source stdin --input -` | CMAF/fMP4 on standard input | Available on all supported platforms |
 | SRT | `--live-source srt --srt-config FILE` | MPEG-TS over SRT | Requires libsrt; CENC metadata is unavailable in this path |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | Chunked CMAF `POST` or `PUT` requests | Listener currently requires a Unix-like platform |
+
+### Fragmented MP4 ingest
+
+The publisher reads fragmented MP4 from standard input. The input must contain `ftyp` + `moov` + `moof`/`mdat` fragments, and the publisher will emit MSF/CMSF catalogs and media objects.
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+ -i fragmented.mp4 \
+ -map 0:v:0 -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --transport webtransport \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --draft 16 \
+ --publish-catalog \
+ --live-source stdin \
+ --input -
+```
 
 ### SRT ingest
 
@@ -111,7 +133,7 @@ ffmpeg -hide_banner -stream_loop -1 -re \
   -i input.mp4 \
   -map 0:v:0 -map 0:a:0 \
   -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
-  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -c:a aac -b:a 128k -ar 48000 -ac 2 \
   -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
 ```
 
@@ -123,7 +145,7 @@ In the second terminal, start the SRT caller and MoQ publisher:
   --srt-config /tmp/srt_callers.json \
   --endpoint 127.0.0.1:4443 \
   --transport raw \
-  --namespace live \
+  --namespace live/srt \
   --draft 16 \
   --timeout 120 \
   --forward 0
@@ -142,8 +164,8 @@ Start the publisher with an HTTP/1.1 chunked CMAF listener and a MoQ relay targe
   --dash-path /ingest \
   --endpoint https://127.0.0.1:4433/moq \
   --transport webtransport \
-  --namespace live \
-  --draft 18 \
+  --namespace live/dash \
+  --draft 16 \
   --publish-catalog \
   --forward 1 \
   --insecure
@@ -261,4 +283,3 @@ The default picoquic backend and the opt-in moq5 backend are both under active i
 ## Attribution
 
 Originally created by [Paul Gregoire](https://github.com/mondain) for OpenMOQ
-
