@@ -619,6 +619,18 @@ if(OPENMOQ_BUILD_TESTS)
         )
         add_test(NAME openmoq-publisher-webtransport-close-tests COMMAND openmoq-publisher-webtransport-close-tests)
 
+        add_executable(openmoq-publisher-picoquic-close-drain-tests
+            tests/picoquic_close_drain_test.cpp
+        )
+        target_link_libraries(openmoq-publisher-picoquic-close-drain-tests PRIVATE openmoq_publisher_lib)
+        target_include_directories(openmoq-publisher-picoquic-close-drain-tests PRIVATE
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
+        )
+        target_compile_definitions(openmoq-publisher-picoquic-close-drain-tests PRIVATE
+            OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
+        )
+        add_test(NAME openmoq-publisher-picoquic-close-drain-tests COMMAND openmoq-publisher-picoquic-close-drain-tests)
+
         add_executable(openmoq-publisher-picoquic-tls-verify-tests
             tests/picoquic_tls_verify_test.cpp
         )

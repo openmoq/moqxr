@@ -19,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
@@ -36,6 +37,7 @@ namespace {
 
 using openmoq::publisher::transport::ConnectionState;
 using openmoq::publisher::transport::EndpointConfig;
+using openmoq::publisher::transport::StreamDirection;
 using openmoq::publisher::transport::TlsConfig;
 using openmoq::publisher::transport::TransportKind;
 using openmoq::publisher::transport::WebTransportClient;
@@ -60,6 +62,8 @@ struct SilentServer {
     bool stop_requested = false;
     bool loop_exited = false;
     bool connect_accepted = false;
+    std::size_t stream_bytes_received = 0;
+    bool stream_fin_received = false;
     picohttp_server_path_item_t path_item{};
     picohttp_server_parameters_t params{};
 };
@@ -91,6 +95,15 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         stream_ctx->path_callback_ctx = server;
         std::lock_guard<std::mutex> lock(server->mutex);
         server->connect_accepted = true;
+        server->condition.notify_all();
+    } else if (event == picohttp_callback_post_data || event == picohttp_callback_post_fin) {
+        // Count application stream bytes so the drain scenario can verify
+        // everything written before close() actually arrived.
+        std::lock_guard<std::mutex> lock(server->mutex);
+        server->stream_bytes_received += length;
+        if (event == picohttp_callback_post_fin) {
+            server->stream_fin_received = true;
+        }
         server->condition.notify_all();
     }
     return 0;
@@ -284,6 +297,57 @@ int main() {
         std::cerr << "close() is hung; leaking client and exiting\n";
         stop_server(server);
         std::_Exit(1);
+    }
+
+    // Drain scenario: data written with FIN right before close() must reach
+    // the peer before the QUIC connection is closed (MoQT wind-down: stream
+    // FIN -> PUBLISH_DONE -> let delivery complete, -16 9.15 / -18 10.11).
+    {
+        constexpr std::size_t kPayloadBytes = 512 * 1024;
+        auto* drain_client = new WebTransportClient();
+        ok &= expect(drain_client->configure(endpoint, tls).ok, "expected drain client configure to succeed");
+        const auto drain_connect = drain_client->connect();
+        if (!drain_connect.ok) {
+            std::cerr << "drain connect error: " << drain_connect.message << '\n';
+        }
+        ok &= expect(drain_connect.ok, "expected drain client CONNECT to succeed");
+        if (!ok) {
+            stop_server(server);
+            return 1;
+        }
+
+        std::uint64_t stream_id = 0;
+        ok &= expect(drain_client->open_stream(StreamDirection::kUnidirectional, stream_id).ok,
+                     "expected open_stream to succeed");
+        const std::vector<std::uint8_t> payload(kPayloadBytes, 0xAB);
+        ok &= expect(drain_client->write_stream(stream_id, payload, true).ok,
+                     "expected write_stream with FIN to succeed");
+
+        const auto drain_started = std::chrono::steady_clock::now();
+        auto drain_close = std::async(std::launch::async, [drain_client] { return drain_client->close(0); });
+        const bool drain_completed = drain_close.wait_for(std::chrono::seconds(15)) == std::future_status::ready;
+        ok &= expect(drain_completed, "expected close() after a large FIN write to return within 15s");
+        if (!drain_completed) {
+            std::cerr << "close() is hung; leaking client and exiting\n";
+            stop_server(server);
+            std::_Exit(1);
+        }
+        const auto drain_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - drain_started)
+                                          .count();
+        std::cerr << "drain close completed in " << drain_elapsed_ms << " ms\n";
+        ok &= expect(drain_close.get().ok, "expected drain close() to succeed");
+        delete drain_client;
+
+        std::unique_lock<std::mutex> lock(server.mutex);
+        server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+            return server.stream_fin_received && server.stream_bytes_received >= kPayloadBytes;
+        });
+        std::cerr << "server received " << server.stream_bytes_received << " of " << kPayloadBytes
+                  << " bytes, fin=" << (server.stream_fin_received ? "yes" : "no") << '\n';
+        ok &= expect(server.stream_bytes_received == kPayloadBytes,
+                     "expected the server to receive every byte written before close()");
+        ok &= expect(server.stream_fin_received, "expected the server to receive the stream FIN before close()");
     }
 
     stop_server(server);

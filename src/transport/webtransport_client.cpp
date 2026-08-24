@@ -1,5 +1,7 @@
 #include "openmoq/publisher/transport/webtransport_client.h"
 
+#include "picoquic_close_drain.h"
+
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -62,6 +64,9 @@ struct WebTransportClient::Impl {
     bool close_requested = false;
     bool close_sent = false;
     std::uint64_t close_error_code = 0;
+    // Armed by close(): bounds how long the packet loop may hold the QUIC
+    // close while queued/in-flight stream data drains (picoquic_close_drain.h).
+    CloseDrainTracker close_drain;
     bool loop_ready = false;
     bool loop_exited = false;
     std::string last_error;
@@ -224,13 +229,40 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
     if (close_requested) {
         std::uint64_t close_error_code = 0;
         bool already_sent = false;
+        std::chrono::steady_clock::time_point drain_deadline{};
+        std::chrono::milliseconds drain_bound{};
         {
             std::lock_guard<std::mutex> lock(impl.mutex);
             close_error_code = impl.close_error_code;
             already_sent = impl.close_sent;
-            impl.close_sent = true;
+            drain_deadline = impl.close_drain.deadline;
+            drain_bound = impl.close_drain.bound;
         }
         if (!already_sent) {
+            // MoQT wind-down (draft -16 9.15 / -18 10.11): the last objects
+            // and their stream FINs must actually be delivered before the
+            // connection goes away. Hold the close while writes are still
+            // queued locally or picoquic has unsent/unacked stream data; the
+            // time_check callback re-enters here every 10 ms. Bounded by
+            // the negotiated delivery timeout (or a fallback) so a peer that
+            // stops acking cannot hang us.
+            std::string drain_summary;
+            if (close_drain_should_wait(impl.cnx,
+                                        deferred_writes.size(),
+                                        drain_deadline,
+                                        drain_bound,
+                                        impl.close_drain.timeout_logged,
+                                        "[webtransport-client]",
+                                        trace_enabled() ? &drain_summary : nullptr)) {
+                return 0;
+            }
+            if (!drain_summary.empty()) {
+                trace(drain_summary);
+            }
+            {
+                std::lock_guard<std::mutex> lock(impl.mutex);
+                impl.close_sent = true;
+            }
             // Tell the peer the WebTransport session is over, then close the
             // QUIC connection ourselves. The packet loop only exits once the
             // connection reaches picoquic_state_disconnected; relying on the
@@ -428,6 +460,7 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->close_requested = false;
     impl_->close_sent = false;
     impl_->close_error_code = 0;
+    impl_->close_drain.reset();
     impl_->loop_ready = false;
     impl_->loop_exited = false;
     impl_->last_error.clear();
@@ -867,6 +900,17 @@ std::string WebTransportClient::connection_id() const {
     return {};
 }
 
+void WebTransportClient::note_delivery_timeout(std::chrono::milliseconds timeout) {
+#ifdef OPENMOQ_HAS_PICOQUIC
+    if (impl_ != nullptr) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->close_drain.note_delivery_timeout(timeout);
+    }
+#else
+    static_cast<void>(timeout);
+#endif
+}
+
 TransportStatus WebTransportClient::close(std::uint64_t application_error_code) {
     static_cast<void>(application_error_code);
 
@@ -880,6 +924,7 @@ TransportStatus WebTransportClient::close(std::uint64_t application_error_code) 
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->close_requested = true;
         impl_->close_error_code = application_error_code;
+        impl_->close_drain.arm();
     }
     if (impl_->cnx != nullptr && impl_->quic != nullptr) {
         picoquic_set_app_wake_time(impl_->cnx, picoquic_get_quic_time(impl_->quic));

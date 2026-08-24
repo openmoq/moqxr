@@ -241,6 +241,10 @@ struct MockTransport final : PublisherTransport {
         return TransportStatus::success();
     }
 
+    void note_delivery_timeout(std::chrono::milliseconds timeout) override {
+        delivery_timeouts.push_back(timeout);
+    }
+
     TransportStatus reset_stream(std::uint64_t stream_id, std::uint64_t error_code) override {
         reset_calls.emplace_back(stream_id, error_code);
         return TransportStatus::success();
@@ -262,6 +266,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<OpenEvent> opens;
     std::vector<WriteEvent> writes;
     std::vector<std::chrono::milliseconds> read_timeouts;
+    std::vector<std::chrono::milliseconds> delivery_timeouts;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> accepted_streams;
     std::function<void(MockTransport&, StreamDirection)> on_accept_timeout;
@@ -458,7 +463,8 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::string_view track_namespace,
                                                    std::string_view track_name,
                                                    std::uint8_t forward,
-                                                   DraftVersion draft = DraftVersion::kDraft14) {
+                                                   DraftVersion draft = DraftVersion::kDraft14,
+                                                   std::uint64_t delivery_timeout_ms = 0) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     const std::vector<std::uint8_t> tuple_len = encode_moqint(draft, 1);
     const std::vector<std::uint8_t> component_len = encode_moqint(draft, track_namespace.size());
@@ -483,11 +489,19 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     } else {
         // Draft-16: parameters as delta-encoded KVPs.
-        // FORWARD(0x10), SUBSCRIBER_PRIORITY(0x20), SUBSCRIPTION_FILTER(0x21)
-        const std::vector<std::uint8_t> parameter_count = encode_moqint(draft, 3);
+        // [DELIVERY_TIMEOUT(0x02)], FORWARD(0x10), SUBSCRIBER_PRIORITY(0x20), SUBSCRIPTION_FILTER(0x21)
+        const std::vector<std::uint8_t> parameter_count = encode_moqint(draft, delivery_timeout_ms != 0 ? 4 : 3);
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
-        // FORWARD (0x10, even) delta=0x10, value=forward
-        const std::vector<std::uint8_t> forward_delta = encode_moqint(draft, 0x10);
+        std::uint64_t previous_type = 0;
+        if (delivery_timeout_ms != 0) {
+            const std::vector<std::uint8_t> timeout_delta = encode_moqint(draft, 0x02);
+            const std::vector<std::uint8_t> timeout_value = encode_moqint(draft, delivery_timeout_ms);
+            payload.insert(payload.end(), timeout_delta.begin(), timeout_delta.end());
+            payload.insert(payload.end(), timeout_value.begin(), timeout_value.end());
+            previous_type = 0x02;
+        }
+        // FORWARD (0x10, even) delta from previous type, value=forward
+        const std::vector<std::uint8_t> forward_delta = encode_moqint(draft, 0x10 - previous_type);
         const std::vector<std::uint8_t> forward_value = encode_moqint(draft, forward);
         payload.insert(payload.end(), forward_delta.begin(), forward_delta.end());
         payload.insert(payload.end(), forward_value.begin(), forward_value.end());
@@ -1624,6 +1638,31 @@ int main() {
 
     status = failing_session.publish(make_span_backed_plan(DraftVersion::kDraft14));
     ok &= expect(!status.ok, "expected span-backed publish to fail before full transport integration");
+
+    // The largest DELIVERY_TIMEOUT negotiated on any subscription bounds how
+    // long the transport may hold close() while the last objects drain
+    // (draft -16 9.15 / -18 10.11); the session hands it to the transport.
+    {
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        transport.reads[0].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 0, DraftVersion::kDraft16, 1500));
+        transport.reads[0].push_back(
+            encode_subscribe_message(3, kTestTrackNamespace, "vide_1", 0, DraftVersion::kDraft16, 4000));
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected delivery-timeout session connect to succeed");
+        status = session.publish(materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft16), source_bytes));
+        ok &= expect(status.ok, "expected delivery-timeout publish to succeed");
+        ok &= expect(transport.delivery_timeouts ==
+                         std::vector<std::chrono::milliseconds>({std::chrono::milliseconds(1500),
+                                                                 std::chrono::milliseconds(4000)}),
+                     "expected each negotiated DELIVERY_TIMEOUT to be handed to the transport");
+    }
 
     MockTransport draft16_transport;
     draft16_transport.reads[0].push_back(encode_server_setup_message({

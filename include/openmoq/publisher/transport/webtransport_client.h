@@ -29,6 +29,7 @@ public:
     TransportStatus reset_stream(std::uint64_t stream_id,
                                  std::uint64_t error_code) override;
     std::string connection_id() const override;
+    void note_delivery_timeout(std::chrono::milliseconds timeout) override;
     TransportStatus close(std::uint64_t application_error_code) override;
 
 private:

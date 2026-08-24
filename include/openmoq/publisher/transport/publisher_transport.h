@@ -81,6 +81,13 @@ public:
     virtual TransportStatus reset_stream(std::uint64_t stream_id,
                                          std::uint64_t error_code) = 0;
     virtual std::string connection_id() const = 0;
+    // Reports a delivery timeout negotiated on a subscription (MoQT
+    // DELIVERY_TIMEOUT / OBJECT_DELIVERY_TIMEOUT / SUBGROUP_DELIVERY_TIMEOUT).
+    // Transports use the largest value reported as the bound on how long
+    // close() lets queued and in-flight stream data drain before the
+    // connection is torn down (draft -16 9.15 / -18 10.11). Optional: the
+    // default ignores it and transports fall back to a built-in bound.
+    virtual void note_delivery_timeout(std::chrono::milliseconds timeout) { static_cast<void>(timeout); }
     virtual TransportStatus close(std::uint64_t application_error_code) = 0;
 };
 

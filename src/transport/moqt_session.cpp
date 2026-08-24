@@ -37,6 +37,17 @@ namespace openmoq::publisher::transport {
 
 namespace {
 
+// Hands a negotiated delivery timeout to the transport so it can bound the
+// close() drain (draft -16 9.15 / -18 10.11). No-op when the message carried
+// none.
+void note_delivery_timeout(openmoq::publisher::transport::PublisherTransport& transport,
+                           std::uint64_t delivery_timeout_ms) {
+    if (delivery_timeout_ms != 0) {
+        transport.note_delivery_timeout(std::chrono::milliseconds(delivery_timeout_ms));
+    }
+}
+
+
 constexpr std::uint64_t kProtocolViolationErrorCode = 0x3;
 
 TransportStatus protocol_violation(PublisherTransport& transport, std::string_view message) {
@@ -793,6 +804,7 @@ TransportStatus collect_control_acknowledgements(PublisherTransport& transport,
                 if (!decode_publish_ok(message_bytes, draft, message)) {
                     return protocol_violation(transport, "received invalid PUBLISH_OK");
                 }
+                note_delivery_timeout(transport, message.delivery_timeout_ms);
                 if (message.request_id == 0 ||
                     (draft != openmoq::publisher::DraftVersion::kDraft14 && message.request_id % 2 != 0)) {
                     return protocol_violation(transport, "received invalid request_id in PUBLISH_OK");
@@ -964,6 +976,7 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
             if (expect_publish_ack) {
                 PublishOk decoded_publish_ok;
                 if (decode_publish_ok(message_bytes, draft, decoded_publish_ok)) {
+                    note_delivery_timeout(transport, decoded_publish_ok.delivery_timeout_ms);
                     if (publish_ok != nullptr) {
                         *publish_ok = decoded_publish_ok;
                     }
@@ -1685,6 +1698,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         return write_status.ok ? protocol_violation(transport, "received invalid SUBSCRIBE")
                                                : write_status;
                     }
+                    note_delivery_timeout(transport, subscribe.delivery_timeout_ms);
                     if (!namespace_matches(subscribe.track_namespace, track_namespace)) {
                         const TransportStatus write_status =
                             transport.write_stream(request_stream_id,
@@ -2067,6 +2081,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (!decode_subscribe_message(message_bytes, draft, subscribe)) {
                     return protocol_violation(transport, "received invalid SUBSCRIBE");
                 }
+                note_delivery_timeout(transport, subscribe.delivery_timeout_ms);
                 if (!namespace_matches(subscribe.track_namespace, track_namespace)) {
                     return TransportStatus::failure("peer requested unsupported track namespace");
                 }
@@ -3483,6 +3498,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 if (!decode_subscribe_message(message_bytes, draft_version, subscribe)) {
                     return {TransportStatus::failure("received invalid SUBSCRIBE"), 0};
                 }
+                note_delivery_timeout(transport_, subscribe.delivery_timeout_ms);
 
                 const auto track_it = alias_by_track.find(subscribe.track_name);
                 if (track_it == alias_by_track.end()) {
@@ -4222,6 +4238,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                 : write_status,
                                 0};
                     }
+                    note_delivery_timeout(transport_, subscribe.delivery_timeout_ms);
 
                     const auto track_it = alias_by_track.find(subscribe.track_name);
                     if (track_it == alias_by_track.end()) {
@@ -4394,6 +4411,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 if (!decode_subscribe_message(message_bytes, draft_version, subscribe)) {
                     return {protocol_violation(transport_, "received invalid SUBSCRIBE"), 0};
                 }
+                note_delivery_timeout(transport_, subscribe.delivery_timeout_ms);
 
                 const auto track_it = alias_by_track.find(subscribe.track_name);
                 if (track_it == alias_by_track.end()) {
@@ -4464,6 +4482,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 // subscribed so drain_queue will forward fragments.
                 PublishOk publish_ok_msg;
                 if (decode_publish_ok(message_bytes, draft_version, publish_ok_msg)) {
+                    note_delivery_timeout(transport_, publish_ok_msg.delivery_timeout_ms);
                     const auto it = publish_request_id_to_track.find(publish_ok_msg.request_id);
                     if (it != publish_request_id_to_track.end()) {
                         subscribed_tracks.insert(it->second);

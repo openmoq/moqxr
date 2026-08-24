@@ -1,5 +1,7 @@
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 
+#include <algorithm>
+
 #include <array>
 #include <cstddef>
 #include <limits>
@@ -1161,8 +1163,14 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
                 return false;
             }
             switch (parameter_type) {
-                case 0x02:  // DELIVERY_TIMEOUT — spec §9.2.2.2: value 0 is illegal on the wire.
+                case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT) — spec §9.2.2.2: value 0 is illegal on the wire.
                     if (value == 0) { return false; }
+                    message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                    break;
+                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
+                    if (draft == DraftVersion::kDraft18) {
+                        message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                    }
                     break;
                 case 0x10:  // FORWARD
                     if (value > 1) { return false; }
@@ -1618,8 +1626,14 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
                 return false;
             }
             switch (parameter_type) {
-                case 0x02:  // DELIVERY_TIMEOUT
+                case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT)
                     if (value == 0) { return false; }
+                    message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                    break;
+                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
+                    if (draft == DraftVersion::kDraft18) {
+                        message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                    }
                     break;
                 case 0x08:  // EXPIRES
                     break;

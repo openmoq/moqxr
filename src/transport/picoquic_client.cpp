@@ -1,5 +1,7 @@
 #include "openmoq/publisher/transport/picoquic_client.h"
 
+#include "picoquic_close_drain.h"
+
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -61,7 +63,11 @@ struct PicoquicClient::Impl {
     bool failed = false;
     bool disconnected = false;
     bool close_requested = false;
+    bool close_sent = false;
     std::uint64_t close_error_code = 0;
+    // Armed by close(): bounds how long the packet loop may hold the QUIC
+    // close while queued/in-flight stream data drains (picoquic_close_drain.h).
+    CloseDrainTracker close_drain;
     bool loop_ready = false;
     bool loop_exited = false;
     std::size_t total_bytes_sent = 0;
@@ -221,11 +227,46 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
 
     if (close_requested) {
         std::uint64_t close_error_code = 0;
+        bool already_sent = false;
+        std::chrono::steady_clock::time_point drain_deadline{};
+        std::chrono::milliseconds drain_bound{};
         {
             std::lock_guard<std::mutex> lock(impl.mutex);
             close_error_code = impl.close_error_code;
+            already_sent = impl.close_sent;
+            drain_deadline = impl.close_drain.deadline;
+            drain_bound = impl.close_drain.bound;
+        }
+        if (already_sent) {
+            return 0;
+        }
+        // MoQT wind-down (draft -16 9.15 / -18 10.11): the last objects and
+        // their stream FINs must actually be delivered before the connection
+        // goes away. Hold the close while writes are still queued locally or
+        // picoquic has unsent/unacked stream data; the time_check callback
+        // re-enters here every 10 ms. Bounded by the negotiated delivery
+        // timeout (or a fallback) so a peer that stops acking cannot hang us.
+        std::string drain_summary;
+        if (close_drain_should_wait(impl.cnx,
+                                    deferred_writes.size(),
+                                    drain_deadline,
+                                    drain_bound,
+                                    impl.close_drain.timeout_logged,
+                                    "[picoquic-client]",
+                                    trace_enabled() ? &drain_summary : nullptr)) {
+            return 0;
+        }
+        if (!drain_summary.empty()) {
+            trace(drain_summary);
+        }
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            impl.close_sent = true;
         }
         trace("close requested");
+        if (picoquic_get_cnx_state(impl.cnx) >= picoquic_state_disconnecting) {
+            return 0;
+        }
         const int ret = picoquic_close(impl.cnx, close_error_code);
         if (ret != 0) {
             std::lock_guard<std::mutex> lock(impl.mutex);
@@ -461,7 +502,9 @@ TransportStatus PicoquicClient::configure(const EndpointConfig& endpoint, const 
         impl_->failed = false;
         impl_->disconnected = false;
         impl_->close_requested = false;
+        impl_->close_sent = false;
         impl_->close_error_code = 0;
+        impl_->close_drain.reset();
         impl_->loop_ready = false;
         impl_->loop_exited = false;
         impl_->last_error.clear();
@@ -823,6 +866,17 @@ std::string PicoquicClient::connection_id() const {
 #endif
 }
 
+void PicoquicClient::note_delivery_timeout(std::chrono::milliseconds timeout) {
+#ifdef OPENMOQ_HAS_PICOQUIC
+    if (impl_ != nullptr) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->close_drain.note_delivery_timeout(timeout);
+    }
+#else
+    static_cast<void>(timeout);
+#endif
+}
+
 TransportStatus PicoquicClient::close(std::uint64_t application_error_code) {
     static_cast<void>(application_error_code);
 
@@ -832,6 +886,7 @@ TransportStatus PicoquicClient::close(std::uint64_t application_error_code) {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             impl_->close_requested = true;
             impl_->close_error_code = application_error_code;
+            impl_->close_drain.arm();
         }
         trace("joining client packet loop thread");
         {
