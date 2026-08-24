@@ -606,6 +606,19 @@ if(OPENMOQ_BUILD_TESTS)
         )
         add_test(NAME openmoq-publisher-picoquic-smoke-tests COMMAND openmoq-publisher-picoquic-smoke-tests)
 
+        add_executable(openmoq-publisher-webtransport-close-tests
+            tests/webtransport_close_test.cpp
+        )
+        target_link_libraries(openmoq-publisher-webtransport-close-tests PRIVATE openmoq_publisher_lib picohttp-core picoquic-log)
+        target_include_directories(openmoq-publisher-webtransport-close-tests PRIVATE
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp"
+        )
+        target_compile_definitions(openmoq-publisher-webtransport-close-tests PRIVATE
+            OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
+        )
+        add_test(NAME openmoq-publisher-webtransport-close-tests COMMAND openmoq-publisher-webtransport-close-tests)
+
         add_executable(openmoq-publisher-picoquic-tls-verify-tests
             tests/picoquic_tls_verify_test.cpp
         )

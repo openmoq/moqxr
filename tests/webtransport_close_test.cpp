@@ -1,0 +1,291 @@
+// Regression test: WebTransportClient::close() must return even when the
+// peer never tears down the underlying QUIC connection.
+//
+// The publisher's batch path finishes by calling Publisher::disconnect(),
+// which joins the WebTransport packet-loop thread. That loop only exits once
+// the picoquic connection reaches the disconnected state. A relay that keeps
+// the QUIC connection open after the CLOSE_WEBTRANSPORT_SESSION capsule
+// therefore left the process hanging forever. This test stands up a local
+// h3zero WebTransport server that accepts CONNECT and then does nothing, and
+// asserts close() completes in bounded time.
+
+#include "openmoq/publisher/transport/webtransport_client.h"
+
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <future>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include <picoquic.h>
+#include <picoquic_packet_loop.h>
+#include <h3zero_common.h>
+#include <pico_webtransport.h>
+#include <picoquic_set_textlog.h>
+
+#include <cstdlib>
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace {
+
+using openmoq::publisher::transport::ConnectionState;
+using openmoq::publisher::transport::EndpointConfig;
+using openmoq::publisher::transport::TlsConfig;
+using openmoq::publisher::transport::TransportKind;
+using openmoq::publisher::transport::WebTransportClient;
+
+constexpr const char* kPicoquicSourceDir = OPENMOQ_PICOQUIC_SOURCE_DIR;
+
+bool expect(bool condition, const std::string& message) {
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        return false;
+    }
+    return true;
+}
+
+struct SilentServer {
+    picoquic_quic_t* quic = nullptr;
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable condition;
+    uint16_t port = 0;
+    bool loop_ready = false;
+    bool stop_requested = false;
+    bool loop_exited = false;
+    bool connect_accepted = false;
+    picohttp_server_path_item_t path_item{};
+    picohttp_server_parameters_t params{};
+};
+
+// WebTransport path callback for the server. Accepts the CONNECT and then
+// ignores everything: no session close, no QUIC close.
+int silent_path_callback(picoquic_cnx_t* cnx,
+                         uint8_t* bytes,
+                         size_t length,
+                         picohttp_call_back_event_t event,
+                         h3zero_stream_ctx_t* stream_ctx,
+                         void* path_app_ctx) {
+    static_cast<void>(bytes);
+    static_cast<void>(length);
+    auto* server = static_cast<SilentServer*>(path_app_ctx);
+    if (server == nullptr) {
+        return -1;
+    }
+    if (event == picohttp_callback_connect) {
+        auto* h3_ctx = static_cast<h3zero_callback_ctx_t*>(picoquic_get_callback_context(cnx));
+        if (h3_ctx == nullptr || stream_ctx == nullptr) {
+            return -1;
+        }
+        stream_ctx->ps.stream_state.control_stream_id = stream_ctx->stream_id;
+        if (h3zero_declare_stream_prefix(h3_ctx, stream_ctx->stream_id, silent_path_callback, server) != 0) {
+            return -1;
+        }
+        stream_ctx->path_callback = silent_path_callback;
+        stream_ctx->path_callback_ctx = server;
+        std::lock_guard<std::mutex> lock(server->mutex);
+        server->connect_accepted = true;
+        server->condition.notify_all();
+    }
+    return 0;
+}
+
+int silent_server_loop_callback(picoquic_quic_t* quic,
+                                picoquic_packet_loop_cb_enum cb_mode,
+                                void* callback_ctx,
+                                void* callback_arg) {
+    static_cast<void>(quic);
+    auto* server = static_cast<SilentServer*>(callback_ctx);
+    if (server == nullptr) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+    switch (cb_mode) {
+        case picoquic_packet_loop_ready: {
+            auto* options = static_cast<picoquic_packet_loop_options_t*>(callback_arg);
+            if (options != nullptr) {
+                options->do_time_check = 1;
+            }
+            std::lock_guard<std::mutex> lock(server->mutex);
+            server->loop_ready = true;
+            server->condition.notify_all();
+            return 0;
+        }
+        case picoquic_packet_loop_port_update: {
+            auto* addr = static_cast<sockaddr*>(callback_arg);
+            std::lock_guard<std::mutex> lock(server->mutex);
+            // picoquic_store_loopback_addr writes the port in host order.
+            if (addr->sa_family == AF_INET) {
+                server->port = reinterpret_cast<sockaddr_in*>(addr)->sin_port;
+            } else {
+                server->port = reinterpret_cast<sockaddr_in6*>(addr)->sin6_port;
+            }
+            server->condition.notify_all();
+            return 0;
+        }
+        case picoquic_packet_loop_after_receive:
+        case picoquic_packet_loop_after_send:
+        case picoquic_packet_loop_time_check: {
+            if (cb_mode == picoquic_packet_loop_time_check) {
+                auto* time_check = static_cast<packet_loop_time_check_arg_t*>(callback_arg);
+                if (time_check != nullptr && time_check->delta_t > 10000) {
+                    time_check->delta_t = 10000;
+                }
+            }
+            std::lock_guard<std::mutex> lock(server->mutex);
+            return server->stop_requested ? PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP : 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+bool start_server(SilentServer& server) {
+    const std::string cert_path = std::string(kPicoquicSourceDir) + "/certs/cert.pem";
+    const std::string key_path = std::string(kPicoquicSourceDir) + "/certs/key.pem";
+
+    server.path_item.path = "/moq";
+    server.path_item.path_length = 4;
+    server.path_item.path_callback = silent_path_callback;
+    server.path_item.path_app_ctx = &server;
+    server.params.path_table = &server.path_item;
+    server.params.path_table_nb = 1;
+
+    server.quic = picoquic_create(8, cert_path.c_str(), key_path.c_str(), nullptr, "h3",
+                                  h3zero_callback, &server.params, nullptr, nullptr, nullptr,
+                                  picoquic_current_time(), nullptr, nullptr, nullptr, 0);
+    if (server.quic == nullptr) {
+        return false;
+    }
+    picoquic_set_cookie_mode(server.quic, 2);
+    // WebTransport clients (picowt) require the peer to advertise datagram
+    // support and reset_stream_at before they will send the CONNECT.
+    picoquic_tp_t tp = *picoquic_get_default_tp(server.quic);
+    tp.max_datagram_frame_size = PICOQUIC_MAX_PACKET_SIZE;
+    tp.is_reset_stream_at_enabled = 1;
+    picoquic_set_default_tp(server.quic, &tp);
+    if (std::getenv("OPENMOQ_PICOQUIC_TRACE") != nullptr) {
+        picoquic_set_textlog(server.quic, "-");
+    }
+
+    server.thread = std::thread([&server] {
+        const int ret =
+            picoquic_packet_loop(server.quic, 0, AF_INET, 0, 0, 1, silent_server_loop_callback, &server);
+        static_cast<void>(ret);
+        std::lock_guard<std::mutex> lock(server.mutex);
+        server.loop_exited = true;
+        server.condition.notify_all();
+    });
+
+    std::unique_lock<std::mutex> lock(server.mutex);
+    const bool started = server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+        return (server.loop_ready && server.port != 0) || server.loop_exited;
+    });
+    return started && server.loop_ready && server.port != 0 && !server.loop_exited;
+}
+
+void stop_server(SilentServer& server) {
+    {
+        std::lock_guard<std::mutex> lock(server.mutex);
+        server.stop_requested = true;
+    }
+    if (server.port != 0) {
+        const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd >= 0) {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(server.port);
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const std::uint8_t nudge = 0;
+            for (int attempt = 0; attempt < 20; ++attempt) {
+                (void)sendto(fd, &nudge, sizeof(nudge), 0, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+                std::unique_lock<std::mutex> lock(server.mutex);
+                if (server.condition.wait_for(lock, std::chrono::milliseconds(100),
+                                              [&] { return server.loop_exited; })) {
+                    break;
+                }
+            }
+            close(fd);
+        }
+    }
+    if (server.thread.joinable()) {
+        server.thread.join();
+    }
+    if (server.quic != nullptr) {
+        picoquic_free(server.quic);
+        server.quic = nullptr;
+    }
+}
+
+}  // namespace
+
+int main() {
+    bool ok = true;
+
+    SilentServer server;
+    ok &= expect(start_server(server), "expected local webtransport server to start");
+    if (!ok) {
+        stop_server(server);
+        return 1;
+    }
+
+    const EndpointConfig endpoint{
+        .transport = TransportKind::kWebTransport,
+        .host = "127.0.0.1",
+        .port = server.port,
+        .alpn = "h3",
+        .application_protocol = "moq-00",
+        .sni = {},
+        .path = "/moq",
+        .path_explicit = true,
+    };
+    const TlsConfig tls{
+        .certificate_path = {},
+        .private_key_path = {},
+        .ca_path = {},
+        .insecure_skip_verify = true,
+    };
+
+    auto* client = new WebTransportClient();
+    ok &= expect(client->configure(endpoint, tls).ok, "expected configure to succeed");
+    const auto connect_status = client->connect();
+    if (!connect_status.ok) {
+        std::cerr << "connect error: " << connect_status.message << '\n';
+    }
+    ok &= expect(connect_status.ok, "expected webtransport CONNECT to a silent local server to succeed");
+    ok &= expect(client->state() == ConnectionState::kConnected, "expected connected state after connect");
+
+    {
+        std::unique_lock<std::mutex> lock(server.mutex);
+        ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] { return server.connect_accepted; }),
+                     "expected server to observe the CONNECT");
+    }
+
+    // The peer never closes QUIC. close() must still complete in bounded time.
+    const auto started = std::chrono::steady_clock::now();
+    auto close_future = std::async(std::launch::async, [client] { return client->close(0); });
+    const bool completed = close_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    ok &= expect(completed, "expected close() to return within 10s when the peer keeps the QUIC connection open");
+    if (completed) {
+        const auto close_status = close_future.get();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        std::cerr << "close completed in " << elapsed_ms << " ms\n";
+        ok &= expect(close_status.ok, "expected close() to succeed");
+        ok &= expect(client->state() == ConnectionState::kClosed, "expected closed state after close");
+        delete client;
+    } else {
+        // Leak the client on purpose: its destructor would block forever too.
+        std::cerr << "close() is hung; leaking client and exiting\n";
+        stop_server(server);
+        std::_Exit(1);
+    }
+
+    stop_server(server);
+    return ok ? 0 : 1;
+}

@@ -3,8 +3,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -58,6 +60,7 @@ struct WebTransportClient::Impl {
     bool failed = false;
     bool disconnected = false;
     bool close_requested = false;
+    bool close_sent = false;
     std::uint64_t close_error_code = 0;
     bool loop_ready = false;
     bool loop_exited = false;
@@ -76,6 +79,17 @@ struct WebTransportClient::Impl {
 
 #ifdef OPENMOQ_HAS_PICOQUIC
 namespace {
+
+bool trace_enabled() {
+    static const bool enabled = std::getenv("OPENMOQ_PICOQUIC_TRACE") != nullptr;
+    return enabled;
+}
+
+void trace(const std::string& message) {
+    if (trace_enabled()) {
+        std::cerr << "[webtransport-client] " << message << std::endl;
+    }
+}
 
 std::mutex g_connection_impl_mutex;
 std::map<picoquic_cnx_t*, WebTransportClient::Impl*> g_connection_impls;
@@ -207,18 +221,40 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
         impl.condition.notify_all();
     }
 
-    if (close_requested && impl.control_stream_ctx != nullptr) {
+    if (close_requested) {
         std::uint64_t close_error_code = 0;
+        bool already_sent = false;
         {
             std::lock_guard<std::mutex> lock(impl.mutex);
             close_error_code = impl.close_error_code;
+            already_sent = impl.close_sent;
+            impl.close_sent = true;
         }
-        if (picowt_send_close_session_message(impl.cnx, impl.control_stream_ctx, close_error_code, "closed") != 0) {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            impl.failed = true;
-            impl.last_error = "failed to close webtransport session";
-            impl.condition.notify_all();
-            return -1;
+        if (!already_sent) {
+            // Tell the peer the WebTransport session is over, then close the
+            // QUIC connection ourselves. The packet loop only exits once the
+            // connection reaches picoquic_state_disconnected; relying on the
+            // relay to tear QUIC down after the CLOSE_WEBTRANSPORT_SESSION
+            // capsule left close() joining the loop thread forever whenever
+            // the relay kept the connection open. picoquic_close() bounds
+            // the wait: the connection reaches disconnected either when the
+            // peer acknowledges the CONNECTION_CLOSE or when the closing
+            // timer expires. The capsule send is best-effort; a stream whose
+            // FIN already went out cannot carry it and that is fine.
+            if (impl.control_stream_ctx != nullptr) {
+                const int capsule_ret = picowt_send_close_session_message(
+                    impl.cnx, impl.control_stream_ctx, close_error_code, "closed");
+                trace("close session capsule queued ret=" + std::to_string(capsule_ret));
+            }
+            trace("closing quic connection state=" + std::to_string(picoquic_get_cnx_state(impl.cnx)));
+            if (picoquic_get_cnx_state(impl.cnx) < picoquic_state_disconnecting &&
+                picoquic_close(impl.cnx, close_error_code) != 0) {
+                std::lock_guard<std::mutex> lock(impl.mutex);
+                impl.failed = true;
+                impl.last_error = "failed to close webtransport connection";
+                impl.condition.notify_all();
+                return -1;
+            }
         }
     }
 
@@ -390,6 +426,7 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->failed = false;
     impl_->disconnected = false;
     impl_->close_requested = false;
+    impl_->close_sent = false;
     impl_->close_error_code = 0;
     impl_->loop_ready = false;
     impl_->loop_exited = false;
@@ -850,7 +887,9 @@ TransportStatus WebTransportClient::close(std::uint64_t application_error_code) 
     impl_->condition.notify_all();
 
     if (impl_->packet_loop_thread.joinable()) {
+        trace("close requested; joining packet loop thread");
         impl_->packet_loop_thread.join();
+        trace("packet loop thread joined rc=" + std::to_string(impl_->packet_loop_return_code));
     }
 
     unregister_connection_impl(impl_->cnx);
