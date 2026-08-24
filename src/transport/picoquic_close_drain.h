@@ -94,7 +94,9 @@ struct CloseDrainTracker {
         if (timeout <= std::chrono::milliseconds::zero()) {
             return;
         }
-        bound = bound_negotiated ? std::max(bound, timeout) : timeout;
+        // Parenthesised: picoquic_internal.h pulls in windows.h on MSVC, whose
+        // max() macro would otherwise mangle the call.
+        bound = bound_negotiated ? (std::max)(bound, timeout) : timeout;
         bound_negotiated = true;
     }
 
