@@ -6,7 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(openmoq_publisher
-    VERSION 0.1.0
+    VERSION 0.3.13
     DESCRIPTION "OpenMOQ contribution project: C++20 publisher for fragmented MP4 to CMSF/MOQT"
     LANGUAGES C CXX)
 
@@ -26,6 +26,7 @@ option(OPENMOQ_USE_LIBMOQ_PUBLISHER "Use libmoq as the production publish backen
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(OpenMoqDependencies)
+include(OpenMoqVersion)
 include(FetchContent)
 
 set(OPENMOQ_DEPENDENCY_REFRESH_INTERVAL_HOURS "24" CACHE STRING
@@ -380,6 +381,7 @@ add_library(openmoq_publisher_lib STATIC
     src/transport/publisher_transport.cpp
     src/transport/tls_verification.cpp
     src/transport/webtransport_client.cpp
+    src/version.cpp
 )
 
 set_target_properties(openmoq_publisher_lib PROPERTIES
@@ -389,6 +391,8 @@ set_target_properties(openmoq_publisher_lib PROPERTIES
 target_include_directories(openmoq_publisher_lib
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${OPENMOQ_VERSION_CONFIG_DIR}
 )
 
 target_compile_features(openmoq_publisher_lib PUBLIC cxx_std_20)

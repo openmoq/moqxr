@@ -66,6 +66,9 @@ struct CliOptions {
     bool preannounce_tracks = false;
     bool dump_plan = false;
     bool print_msf_urls = false;
+    // --version: parse_cli_options returns as soon as it is seen, skipping
+    // input/endpoint validation, so "openmoq-publisher --version" works alone.
+    bool show_version = false;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     // This publisher is live, or simulating live, unless explicitly told
     // otherwise (PublisherConfig::vod's own rule). --vod is the only way to
@@ -83,5 +86,7 @@ struct CliOptions {
 
 CliOptions parse_cli_options(int argc, char** argv);
 std::string build_usage(const char* argv0);
+// "openmoq-publisher <version_full> (commit <hash>)", the --version output.
+std::string build_version_banner();
 
 }  // namespace openmoq::publisher

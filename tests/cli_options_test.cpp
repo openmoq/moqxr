@@ -1,5 +1,6 @@
 #include "openmoq/publisher/cli_options.h"
 #include "openmoq/publisher/msf_url.h"
+#include "openmoq/publisher/version.h"
 
 #include <chrono>
 #include <filesystem>
@@ -14,6 +15,8 @@ namespace {
 using openmoq::publisher::CliOptions;
 using openmoq::publisher::ConnectionRequirement;
 using openmoq::publisher::build_track_msf_url;
+using openmoq::publisher::build_usage;
+using openmoq::publisher::build_version_banner;
 using openmoq::publisher::parse_cli_options;
 
 bool expect(bool condition, const std::string& message) {
@@ -743,6 +746,39 @@ int main() {
         {"prog", "--input", "sample.mp4", "--url", "moqt://h/p#msf:ns--t", "--url",
          "moqt://h2/p2#msf:ns2--t2"},
         "already given", "expected a repeated --url to report its own dedicated message");
+
+    // --version must short-circuit parsing: no --input, no endpoint, and any
+    // later arguments are ignored rather than validated.
+    {
+        const auto options = parse({"prog", "--version"});
+        ok &= expect(options.show_version, "expected --version to set show_version");
+    }
+    {
+        const auto options = parse({"prog", "-V", "--bogus-flag"});
+        ok &= expect(options.show_version,
+                     "expected -V to short-circuit before validating later arguments");
+    }
+    {
+        const auto options = parse({"prog", "--input", "sample.mp4"});
+        ok &= expect(!options.show_version, "expected show_version to default to false");
+    }
+    {
+        const std::string banner = build_version_banner();
+        const std::string version(openmoq::publisher::version());
+        const std::string full(openmoq::publisher::version_full());
+        const std::string commit(openmoq::publisher::git_commit());
+        ok &= expect(!version.empty() && version.find('.') != std::string::npos,
+                     "expected version() to be a dotted release number");
+        ok &= expect(full.rfind(version, 0) == 0,
+                     "expected version_full() to start with version()");
+        ok &= expect(!commit.empty(), "expected git_commit() to be non-empty");
+        ok &= expect(banner == "openmoq-publisher " + full + " (commit " + commit + ")",
+                     "expected the version banner to carry version_full and the commit");
+        ok &= expect(build_usage("prog").rfind(banner, 0) == 0,
+                     "expected --help output to begin with the version banner");
+        ok &= expect(build_usage("prog").find("--version") != std::string::npos,
+                     "expected usage to list --version");
+    }
 
     return ok ? 0 : 1;
 }

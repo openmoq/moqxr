@@ -32,6 +32,14 @@ ctest --test-dir build --output-on-failure
 
 默认 build 会生成 `openmoq-publisher` 可执行文件和 Publisher 静态库：Linux/macOS 上为 `build/libopenmoq_publisher.a`，Windows Visual Studio generator 上为 `build\<config>\openmoq_publisher.lib`。
 
+查看当前运行的 build：
+
+```bash
+./build/openmoq-publisher --version
+```
+
+输出 `openmoq-publisher <version> (commit <hash>)`。version 来自 `CMakeLists.txt` 中的 `project(VERSION)`；从对应的 `v<version>` release tag 构建时按原样输出，其他任何 build 都会追加 `-dev+g<commit>`（存在未提交更改时再加 `.dirty`），以便 bug 报告能定位到确切的源码。`--help` 输出同样的横幅。库的集成方可通过 `openmoq/publisher/version.h`（`version()`、`version_full()`、`git_commit()`）获取相同的值。
+
 检查发布计划：
 
 ```bash

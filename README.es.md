@@ -32,6 +32,14 @@ ctest --test-dir build --output-on-failure
 
 El build predeterminado crea el ejecutable `openmoq-publisher` y la biblioteca estática Publisher: `build/libopenmoq_publisher.a` en Linux/macOS, o `build\<config>\openmoq_publisher.lib` con generadores de Visual Studio en Windows.
 
+Comprobar qué build se está ejecutando:
+
+```bash
+./build/openmoq-publisher --version
+```
+
+Imprime `openmoq-publisher <versión> (commit <hash>)`. La versión es `project(VERSION)` de `CMakeLists.txt`; un build hecho desde la etiqueta de release `v<versión>` correspondiente la reporta tal cual, mientras que cualquier otro build añade `-dev+g<commit>` (más `.dirty` si hay cambios sin confirmar) para que un informe de error identifique la fuente exacta. `--help` imprime el mismo encabezado. Quienes integran la biblioteca obtienen los mismos valores desde `openmoq/publisher/version.h` (`version()`, `version_full()`, `git_commit()`).
+
 Inspeccionar un plan de publicación:
 
 ```bash

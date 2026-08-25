@@ -19,6 +19,11 @@ int main(int argc, char** argv) {
     try {
         const CliOptions options = parse_cli_options(argc, argv);
 
+        if (options.show_version) {
+            std::cout << build_version_banner() << '\n';
+            return 0;
+        }
+
         if (options.print_msf_urls) {
             if (!options.endpoint.has_value()) {
                 throw std::runtime_error("--print-msf-urls requires --endpoint or --url");

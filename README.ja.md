@@ -32,6 +32,14 @@ ctest --test-dir build --output-on-failure
 
 デフォルトの build では、`openmoq-publisher` executable と Publisher static library が生成されます。Linux/macOS では `build/libopenmoq_publisher.a`、Windows の Visual Studio generator では `build\<config>\openmoq_publisher.lib` です。
 
+実行中の build を確認:
+
+```bash
+./build/openmoq-publisher --version
+```
+
+`openmoq-publisher <version> (commit <hash>)` を出力します。version は `CMakeLists.txt` の `project(VERSION)` です。対応する `v<version>` release tag から build した場合はそのまま出力され、それ以外の build では `-dev+g<commit>`（未コミットの変更がある場合はさらに `.dirty`）が付加されるため、バグ報告で正確なソースを特定できます。`--help` も同じバナーを出力します。ライブラリ利用側は `openmoq/publisher/version.h`（`version()`、`version_full()`、`git_commit()`）から同じ値を取得できます。
+
 publish plan を検査:
 
 ```bash
