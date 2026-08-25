@@ -78,6 +78,9 @@ struct WebTransportClient::Impl {
     sockaddr_storage server_address{};
     h3zero_callback_ctx_t* h3_ctx = nullptr;
     h3zero_stream_ctx_t* control_stream_ctx = nullptr;
+    // Bidirectional streams (MoQT control stream, draft-16+ request streams) already raised
+    // above picoquic's default priority; see kControlStreamPriority.
+    std::set<std::uint64_t> prioritized_streams;
     int packet_loop_return_code = 0;
 #endif
 };
@@ -141,6 +144,20 @@ h3zero_stream_ctx_t* find_local_stream_context(WebTransportClient::Impl& impl,
     return h3zero_find_stream(impl.h3_ctx, stream_id);
 }
 
+// Same rationale as PicoquicClient: SUBSCRIBE_OK / PUBLISH_OK on the control stream must not
+// be overtaken by the data stream that uses the alias they establish (draft-ietf-moq-transport-16
+// section 10.4). picoquic schedules the lowest value first; the default is 9.
+constexpr std::uint8_t kControlStreamPriority = 1;
+
+void prioritize_control_stream(WebTransportClient::Impl& impl, std::uint64_t stream_id) {
+    const bool bidirectional = (stream_id & 0x2) == 0;
+    if (!bidirectional || !impl.prioritized_streams.insert(stream_id).second) {
+        return;
+    }
+    // Packet loop thread, as picoquic requires; the stream already exists (created by picowt).
+    static_cast<void>(picoquic_set_stream_priority(impl.cnx, stream_id, kControlStreamPriority));
+}
+
 int apply_pending_writes(WebTransportClient::Impl& impl) {
     if (impl.cnx == nullptr) {
         return 0;
@@ -196,6 +213,7 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
             impl.condition.notify_all();
             return -1;
         }
+        prioritize_control_stream(impl, write.stream_id);
 
         if (picoquic_add_to_stream_with_ctx(
                 impl.cnx, write.stream_id, write.bytes.data(), write.bytes.size(), write.fin ? 1 : 0, stream_ctx) != 0) {

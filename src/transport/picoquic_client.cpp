@@ -59,6 +59,9 @@ struct PicoquicClient::Impl {
     std::deque<AcceptedWrite> accepted_writes_waiting_for_send;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> accepted_streams;
+    // Bidirectional streams (MoQT control stream, draft-16+ request streams) that have been
+    // raised above picoquic's default priority; see kControlStreamPriority.
+    std::set<std::uint64_t> prioritized_streams;
     bool connected = false;
     bool failed = false;
     bool disconnected = false;
@@ -121,6 +124,31 @@ std::string hex_dump(std::span<const std::uint8_t> bytes) {
     return out.str();
 }
 
+// picoquic schedules the lowest priority value first and defaults every stream to 9 (FIFO).
+// The MoQT control stream carries SUBSCRIBE_OK / PUBLISH_OK, which establish the track alias
+// a data stream is about to use; if a freshly opened data stream is scheduled ahead of it the
+// relay sees objects for an alias it does not know yet and may drop the first group.
+// draft-ietf-moq-transport-16 section 10.4: "the publisher MUST allocate connection flow
+// control to the control stream before allocating it any data streams". Bidirectional streams
+// are control / request streams for this publisher; data always goes on unidirectional ones.
+constexpr std::uint8_t kControlStreamPriority = 1;
+
+bool is_bidirectional_stream(std::uint64_t stream_id) {
+    return (stream_id & 0x2) == 0;
+}
+
+void prioritize_control_stream(PicoquicClient::Impl& impl, std::uint64_t stream_id) {
+    if (!is_bidirectional_stream(stream_id) || !impl.prioritized_streams.insert(stream_id).second) {
+        return;
+    }
+    // Creates the stream if picoquic has not seen it yet, so ordering before the first write
+    // is safe. Runs on the packet loop thread, as picoquic requires.
+    const int ret = picoquic_set_stream_priority(impl.cnx, stream_id, kControlStreamPriority);
+    if (ret != 0) {
+        trace("set_stream_priority failed for stream " + std::to_string(stream_id) + " ret=" + std::to_string(ret));
+    }
+}
+
 int apply_pending_operations(PicoquicClient::Impl& impl) {
     if (impl.cnx == nullptr) {
         return 0;
@@ -163,6 +191,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
               " queue_age_ms=" + std::to_string(age_ms) +
               " defer_count=" + std::to_string(write.defer_count) +
               " now_ms=" + std::to_string(trace_elapsed_ms(now)));
+        prioritize_control_stream(impl, write.stream_id);
         const int ret = picoquic_add_to_stream(
             impl.cnx, write.stream_id, write.bytes.data(), write.bytes.size(), write.fin ? 1 : 0);
         if (ret != 0) {
