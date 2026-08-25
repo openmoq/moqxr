@@ -3842,7 +3842,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // PUBLISH before subscribing can discover them. Do not wait for PUBLISH_OK
     // here: some relays first send SUBSCRIBE or stay idle until a subscriber
     // appears, and live await-subscribe mode must keep draining control bytes.
-    if (!uses_request_streams(draft_version) && !auto_forward_) {
+    //
+    // In forward mode this is not optional: draft-ietf-moq-transport-16
+    // section 9.13 defines "start transmitting objects immediately, possibly
+    // before PUBLISH_OK" as the FORWARD=1 behaviour of a PUBLISH. The PUBLISH
+    // is what tells the relay which track alias the data streams carry;
+    // pushing objects without it leaves the relay holding data for an alias it
+    // cannot resolve until its own SUBSCRIBE round-trips, and the first group
+    // of every track is at the relay's mercy. Draft-17/18 send the PUBLISH on
+    // request streams instead, see the forward-mode loop below.
+    if (!uses_request_streams(draft_version)) {
         std::uint64_t pub_req_id = 2;
         for (const auto& track : tracks) {
             const TrackMessage track_msg{
@@ -4141,20 +4150,19 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         return TransportStatus::success();
     };
 
-    auto publish_live_tracks_for_subscribe_tracks = [&]() -> TransportStatus {
+    // PUBLISH each named track on its own request stream (draft-17/18), waiting
+    // for the reply. Idempotent per track: a name already published is skipped,
+    // so the forward-mode preannounce (media tracks only) and a later
+    // SUBSCRIBE_TRACKS (catalog plus media) compose without duplicate PUBLISHes.
+    auto publish_live_tracks = [&](const std::vector<std::string>& live_track_names) -> TransportStatus {
         if (!uses_request_streams(draft_version)) {
             return TransportStatus::success();
         }
-        if (!subscribe_tracks_publish_request_ids.empty()) {
-            return TransportStatus::success();
-        }
-
-        std::vector<std::string> live_track_names = {"catalog"};
-        for (const auto& track : tracks) {
-            live_track_names.push_back(track.track_name);
-        }
 
         for (const auto& track_name : live_track_names) {
+            if (subscribe_tracks_publish_request_ids.contains(track_name)) {
+                continue;
+            }
             const auto alias_it = alias_by_track.find(track_name);
             if (alias_it == alias_by_track.end()) {
                 continue;
@@ -4186,11 +4194,19 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                                   next_subscribe_tracks_publish_request_id);
             publish_stream_id_by_request_id_.insert_or_assign(next_subscribe_tracks_publish_request_id,
                                                               track_stream_id);
-            std::cerr << "[moqt-session] live: SUBSCRIBE_TRACKS PUBLISH track=" << track_name
-                      << " request_id=" << next_subscribe_tracks_publish_request_id << '\n';
+            std::cerr << "[moqt-session] live: PUBLISH track=" << track_name
+                      << " request_id=" << next_subscribe_tracks_publish_request_id << " (request stream)\n";
             next_subscribe_tracks_publish_request_id += 2;
         }
         return TransportStatus::success();
+    };
+
+    auto publish_live_tracks_for_subscribe_tracks = [&]() -> TransportStatus {
+        std::vector<std::string> live_track_names = {"catalog"};
+        for (const auto& track : tracks) {
+            live_track_names.push_back(track.track_name);
+        }
+        return publish_live_tracks(live_track_names);
     };
 
     // Helper: process pending SUBSCRIBE/SUBSCRIBE_NAMESPACE messages
@@ -4503,6 +4519,28 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
     if (auto_forward_) {
         // Forward mode: publish media as fragments arrive, independent of downstream subscriptions.
+        //
+        // Draft-17/18: PUBLISH each media track on its own request stream before
+        // the first object goes out -- same reasoning as the control-stream
+        // preannounce above, through the shared request-stream PUBLISH path so
+        // request-id / stream bookkeeping (and PUBLISH_DONE at exit) is common
+        // with SUBSCRIBE_TRACKS. The catalog stays SUBSCRIBE-driven, as on the
+        // control-stream drafts: it is a one-shot object, and a subscriber that
+        // arrives after a proactive push would find nothing new to receive. A
+        // relay that does not answer within the request-stream wait is logged
+        // and tolerated: forward mode has always pushed regardless, and the
+        // relay-side recovery (placeholder track / parked stream) still applies.
+        if (uses_request_streams(draft_version)) {
+            std::vector<std::string> media_track_names;
+            for (const auto& track : tracks) {
+                media_track_names.push_back(track.track_name);
+            }
+            const TransportStatus preannounce_status = publish_live_tracks(media_track_names);
+            if (!preannounce_status.ok) {
+                std::cerr << "[moqt-session] live: forward-mode PUBLISH preannounce failed ("
+                          << preannounce_status.message << "); continuing without it\n";
+            }
+        }
         std::optional<std::chrono::steady_clock::time_point> eof_deadline;
         while (true) {
             // Drain media continuously in auto-forward mode.

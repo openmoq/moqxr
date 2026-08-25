@@ -339,7 +339,7 @@ std::vector<std::uint8_t> make_live_init_mp4() {
     const auto tkhd = make_full_box("tkhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
     const auto mdhd = make_full_box("mdhd",
-                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});  // timescale 24000 at bytes 8-11
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
     auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
@@ -354,6 +354,27 @@ std::vector<std::uint8_t> make_live_init_mp4() {
     const auto trak = make_box("trak", concat({tkhd, mdia}));
     const auto moov = make_box("moov", trak);
     return concat({ftyp, moov});
+}
+
+// One CMAF media fragment (moof + 1-byte mdat) for track 1 of make_live_init_mp4(),
+// so a live publish actually pushes an object. Box layout mirrors
+// tests/live_dash_ingest_test.cpp's make_media_fragment().
+std::vector<std::uint8_t> make_live_media_fragment(std::uint32_t decode_time, std::uint8_t payload_byte) {
+    auto be32 = [](std::uint32_t value) {
+        std::vector<std::uint8_t> out;
+        append_be32(out, value);
+        return out;
+    };
+    auto flagged_full_box = [&](std::string_view type, std::uint32_t version_flags, std::vector<std::uint8_t> payload) {
+        return make_box(type, concat({be32(version_flags), std::move(payload)}));
+    };
+    const auto tfhd = flagged_full_box("tfhd", 0x000038, concat({be32(1), be32(1000), be32(1), be32(0x02000000)}));
+    const auto tfdt = flagged_full_box("tfdt", 0, be32(decode_time));
+    const auto trun = flagged_full_box("trun", 0x000201, concat({be32(1), be32(16), be32(1)}));
+    const auto traf = make_box("traf", concat({tfhd, tfdt, trun}));
+    const auto moof = make_box("moof", traf);
+    const auto mdat = make_box("mdat", {payload_byte});
+    return concat({moof, mdat});
 }
 
 // CENC fixture builders, ported from tests/cmaf_segmenter_test.cpp (each test
@@ -395,7 +416,7 @@ std::vector<std::uint8_t> make_live_init_mp4_cenc_no_pssh() {
     const auto tkhd = make_full_box("tkhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
     const auto mdhd = make_full_box("mdhd",
-                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0});
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});  // timescale 24000 at bytes 8-11
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
     auto visual_header = std::vector<std::uint8_t>(78, 0);
     visual_header[24] = 0x01;
@@ -723,6 +744,22 @@ std::optional<std::uint64_t> message_type(const std::vector<std::uint8_t>& bytes
         decode_vi64(bytes, offset, type);
     }
     return type;
+}
+
+// True for a write that opens an object data stream: a SUBGROUP_HEADER type
+// (draft-14 0x10-0x1D, draft-16 0x30-0x3D, draft-18 FIRST_OBJECT 0x50-0x7D).
+// Draft-17+ also puts the control stream on a unidirectional stream, so
+// "any unidirectional write" is not a usable definition of data.
+bool is_data_stream_write(const MockTransport::WriteEvent& write) {
+    if ((write.stream_id & 0x3ULL) != 0x2ULL) {
+        return false;
+    }
+    const auto type = message_type(write.bytes);
+    if (!type) {
+        return false;
+    }
+    return (*type >= 0x10 && *type <= 0x1d) || (*type >= 0x30 && *type <= 0x3d) ||
+           (*type >= 0x50 && *type <= 0x7d);
 }
 
 std::vector<std::uint8_t> encode_draft18_setup_response() {
@@ -4013,6 +4050,94 @@ int main() {
         ok &= expect(saw_subscribe_tracks_ok, "expected live SUBSCRIBE_TRACKS response stream REQUEST_OK");
         ok &= expect(saw_catalog_publish && saw_media_publish,
                      "expected live SUBSCRIBE_TRACKS to PUBLISH catalog and media tracks");
+    }
+
+    {
+        // Forward mode (--forward 1) on a control-stream draft: draft-16 section
+        // 9.13 makes "objects immediately, possibly before PUBLISH_OK" the
+        // FORWARD=1 semantics of a PUBLISH, so the media track must be
+        // PUBLISHed before its first object is pushed -- otherwise the relay
+        // receives data for an alias nothing has established.
+        MockTransport forward_transport;
+        forward_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        forward_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+
+        MoqtSession forward_session(
+            forward_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = forward_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected forward-mode draft-16 session connect to succeed");
+
+        const auto forward_bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::string forward_input_bytes(forward_bytes.begin(), forward_bytes.end());
+        std::istringstream forward_input(forward_input_bytes);
+        status = forward_session.publish_live(forward_input, DraftVersion::kDraft16, true);
+        ok &= expect(status.ok, "expected forward-mode draft-16 live publish to succeed");
+        ok &= expect(control_message_count(forward_transport, 0x1d) == 1,
+                     "expected forward mode to PUBLISH the media track on the control stream");
+        ok &= expect(forward_session.publish_stats().objects_published >= 1,
+                     "expected forward mode to push the media fragment");
+
+        std::optional<std::size_t> first_publish;
+        std::optional<std::size_t> first_data;
+        for (std::size_t i = 0; i < forward_transport.writes.size(); ++i) {
+            const auto& write = forward_transport.writes[i];
+            if (!first_publish && write.stream_id == 0 && message_type(write.bytes) == 0x1d) {
+                first_publish = i;
+            }
+            if (!first_data && is_data_stream_write(write)) {
+                first_data = i;
+            }
+        }
+        ok &= expect(first_publish && first_data && *first_publish < *first_data,
+                     "expected forward-mode PUBLISH to be written before the first data stream");
+    }
+
+    {
+        // Forward mode on a request-stream draft: each media track is PUBLISHed
+        // on its own request stream before any object is pushed. The catalog is
+        // not preannounced -- it stays SUBSCRIBE-driven, as on draft-14/16.
+        MockTransport forward_draft18_transport;
+        forward_draft18_transport.reads[3].push_back(encode_draft18_setup_response());
+        forward_draft18_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        forward_draft18_transport.reads[4].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 2));
+
+        MoqtSession forward_draft18_session(
+            forward_draft18_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = forward_draft18_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected forward-mode draft-18 session connect to succeed");
+
+        const auto forward_bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xCD)});
+        std::string forward_input_bytes(forward_bytes.begin(), forward_bytes.end());
+        std::istringstream forward_input(forward_input_bytes);
+        status = forward_draft18_session.publish_live(forward_input, DraftVersion::kDraft18, true);
+        ok &= expect(status.ok, "expected forward-mode draft-18 live publish to succeed");
+        ok &= expect(control_message_count(forward_draft18_transport, 0x1d) == 0,
+                     "expected forward-mode draft-18 to keep PUBLISH off the control stream");
+
+        std::optional<std::size_t> media_publish;
+        std::optional<std::size_t> first_data;
+        std::size_t request_stream_publishes = 0;
+        for (std::size_t i = 0; i < forward_draft18_transport.writes.size(); ++i) {
+            const auto& write = forward_draft18_transport.writes[i];
+            if (write.stream_id != 0 && (write.stream_id & 0x3ULL) == 0 && message_type(write.bytes) == 0x1d) {
+                ++request_stream_publishes;
+                if (!media_publish && write.stream_id == 4) {
+                    media_publish = i;
+                }
+            }
+            if (!first_data && is_data_stream_write(write)) {
+                first_data = i;
+            }
+        }
+        ok &= expect(request_stream_publishes == 1 && media_publish,
+                     "expected forward-mode draft-18 to PUBLISH only the media track, on the first request stream");
+        ok &= expect(media_publish && first_data && *media_publish < *first_data,
+                     "expected forward-mode draft-18 PUBLISH before the first data stream");
+        ok &= expect(forward_draft18_session.publish_stats().objects_published >= 1,
+                     "expected forward-mode draft-18 to push the media fragment");
     }
 
     {
