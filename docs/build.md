@@ -39,6 +39,11 @@ cmake --build build --target openmoq-publisher-msfts-example
 Its CMake target links only `openmoq_publisher_lib`; it does not consume moq5
 or picoquic APIs directly.
 
+To omit this and the other example executables (for instance in embedded or
+packaging builds), configure with `-DOPENMOQ_BUILD_EXAMPLES=OFF`. See
+`docs/dependencies.md` for details, including the interaction with
+`OPENMOQ_BUILD_TESTS`.
+
 ## Managed Pico Dependencies
 
 By default, CMake owns dependency checkouts under `<build>/_deps` and follows:

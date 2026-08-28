@@ -102,7 +102,24 @@ that test.
 
 Set `-DOPENMOQ_BUILD_TESTS=OFF` to omit all moqxr test executables and CTest
 registrations. This flag does not disable the example executables built outside
-the test block.
+the test block; use `OPENMOQ_BUILD_EXAMPLES` for those.
+
+## `OPENMOQ_BUILD_EXAMPLES`
+
+Default: `OFF`
+
+The default build compiles the example executables under `examples/`
+(`openmoq-publisher-psychedelic-example`, `openmoq-publisher-auth-example`, and
+`openmoq-publisher-msfts-example`). Set `-DOPENMOQ_BUILD_EXAMPLES=OFF` to omit
+all of them, for instance when consuming this repository via
+`add_subdirectory(...)` and only the `openmoq_publisher_lib` target and CLI are
+wanted.
+
+The MSFTS example's companion test (`openmoq-publisher-msfts-tests`) compiles
+example sources, so it is built and registered with CTest only when both
+`OPENMOQ_BUILD_EXAMPLES=ON` and `OPENMOQ_BUILD_TESTS=ON`. The project defines
+no `install()` rules, so disabling examples also guarantees they never appear
+in downstream packaging steps that stage built artifacts.
 
 ## `OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS`
 

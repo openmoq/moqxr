@@ -15,6 +15,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(OPENMOQ_BUILD_TESTS "Build OpenMOQ publisher tests" ON)
+option(OPENMOQ_BUILD_EXAMPLES "Build OpenMOQ publisher example executables" OFF)
 option(OPENMOQ_ENABLE_PICOQUIC "Enable picoquic transport integration when picoquic is available" ON)
 option(OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS "Build and run picoquic loopback smoke tests" OFF)
 option(OPENMOQ_ENABLE_SRT "Enable libsrt ingest support when libsrt is available" ON)
@@ -473,20 +474,29 @@ if(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER)
     target_compile_definitions(openmoq-publisher PRIVATE OPENMOQ_ENABLE_LIBMOQ_PUBLISHER=1)
 endif()
 
-add_executable(openmoq-publisher-psychedelic-example
-    examples/psychedelic/Psychedelic.cpp
-)
-target_link_libraries(openmoq-publisher-psychedelic-example PRIVATE openmoq_publisher_lib)
-
-add_executable(openmoq-publisher-auth-example
-    examples/auth/AuthPublisher.cpp
-    examples/auth/catapult_client.cpp
-)
-target_link_libraries(openmoq-publisher-auth-example PRIVATE openmoq_publisher_lib)
-
 include(CTest)
 
-add_subdirectory(examples/msfts-publisher)
+# Example executables (and the MSFTS example's companion test, which compiles
+# example sources) are part of the default build but can be omitted entirely
+# with -DOPENMOQ_BUILD_EXAMPLES=OFF. The project defines no install() rules,
+# so this gate also keeps examples out of any downstream packaging that stages
+# built artifacts.
+if(OPENMOQ_BUILD_EXAMPLES)
+    add_executable(openmoq-publisher-psychedelic-example
+        examples/psychedelic/Psychedelic.cpp
+    )
+    target_link_libraries(openmoq-publisher-psychedelic-example PRIVATE openmoq_publisher_lib)
+
+    add_executable(openmoq-publisher-auth-example
+        examples/auth/AuthPublisher.cpp
+        examples/auth/catapult_client.cpp
+    )
+    target_link_libraries(openmoq-publisher-auth-example PRIVATE openmoq_publisher_lib)
+
+    add_subdirectory(examples/msfts-publisher)
+else()
+    message(STATUS "OpenMOQ: example executables disabled (OPENMOQ_BUILD_EXAMPLES=OFF)")
+endif()
 
 if(OPENMOQ_BUILD_TESTS)
     add_test(NAME openmoq-dependency-refresh-policy-tests
