@@ -888,7 +888,9 @@ if(OPENMOQ_INSTALL)
             set(_openmoq_bundle_helper
                 "${CMAKE_CURRENT_BINARY_DIR}/bundled/openmoq_run_ar_mri.cmake")
             file(WRITE "${_openmoq_bundle_helper}"
-"execute_process(COMMAND \"\${AR}\" -M INPUT_FILE \"\${MRI}\"
+"execute_process(
+    COMMAND \"\${AR}\" -M
+    INPUT_FILE \"\${MRI}\"
     RESULT_VARIABLE _openmoq_ar_result)
 if(NOT _openmoq_ar_result EQUAL 0)
     message(FATAL_ERROR
