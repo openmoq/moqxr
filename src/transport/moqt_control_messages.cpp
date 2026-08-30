@@ -74,6 +74,23 @@ bool decode_moqint_impl(std::span<const std::uint8_t> bytes,
     return uses_moq_vi64(draft) ? decode_vi64_impl(bytes, offset, value) : decode_varint_impl(bytes, offset, value);
 }
 
+bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
+                                      std::size_t& offset,
+                                      DraftVersion draft,
+                                      std::uint64_t parameter_type,
+                                      std::uint64_t& value) {
+    const bool is_uint8 = draft == DraftVersion::kDraft18 &&
+                          (parameter_type == 0x10 || parameter_type == 0x20 || parameter_type == 0x22);
+    if (!is_uint8) {
+        return decode_moqint_impl(bytes, offset, draft, value);
+    }
+    if (offset >= bytes.size()) {
+        return false;
+    }
+    value = bytes[offset++];
+    return true;
+}
+
 std::vector<std::uint8_t> to_bytes(std::string_view value) {
     return std::vector<std::uint8_t>(value.begin(), value.end());
 }
@@ -1157,9 +1174,8 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         }
 
         if ((parameter_type & 0x1ULL) == 0) {
-            // Even type: varint value.
             std::uint64_t value = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, value)) {
+            if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
                 return false;
             }
             switch (parameter_type) {
@@ -1258,7 +1274,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, value)) {
+            if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
                 return false;
             }
             if (parameter_type == 0x10) {
@@ -1622,7 +1638,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, value)) {
+            if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
                 return false;
             }
             switch (parameter_type) {

@@ -313,6 +313,14 @@ std::string draft_label(DraftVersion draft) {
     return "unknown";
 }
 
+void append_message_uint8(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint8_t value) {
+    if (draft == DraftVersion::kDraft18) {
+        out.push_back(value);
+    } else {
+        append_moqint(out, draft, value);
+    }
+}
+
 std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft) {
     std::vector<std::uint8_t> payload;
     append_moqint(payload, draft, 77);
@@ -330,9 +338,9 @@ std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft) {
     } else {
         append_moqint(payload, draft, 4);   // parameter count
         append_moqint(payload, draft, 16);  // FORWARD, delta from 0x00
-        append_moqint(payload, draft, 1);
+        append_message_uint8(payload, draft, 1);
         append_moqint(payload, draft, 16);  // SUBSCRIBER_PRIORITY, delta from 0x10 to 0x20
-        append_moqint(payload, draft, 127);
+        append_message_uint8(payload, draft, 200);
         append_moqint(payload, draft, 1);   // SUBSCRIPTION_FILTER, delta from 0x20 to 0x21
         std::vector<std::uint8_t> filter;
         append_moqint(filter, draft, 3);
@@ -341,7 +349,7 @@ std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft) {
         append_moqint(payload, draft, filter.size());
         payload.insert(payload.end(), filter.begin(), filter.end());
         append_moqint(payload, draft, 1);   // GROUP_ORDER, delta from 0x21 to 0x22
-        append_moqint(payload, draft, 1);
+        append_message_uint8(payload, draft, 1);
     }
 
     std::vector<std::uint8_t> bytes;
@@ -361,9 +369,9 @@ std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeout(DraftVer
     append_moqint(payload, draft, 0x02);  // DELIVERY_TIMEOUT, delta from 0x00
     append_moqint(payload, draft, delivery_timeout_ms);
     append_moqint(payload, draft, 0x10 - 0x02);  // FORWARD
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
     append_moqint(payload, draft, 0x20 - 0x10);  // SUBSCRIBER_PRIORITY
-    append_moqint(payload, draft, 127);
+    append_message_uint8(payload, draft, 200);
     append_moqint(payload, draft, 1);            // SUBSCRIPTION_FILTER
     std::vector<std::uint8_t> filter;
     append_moqint(filter, draft, 3);
@@ -372,7 +380,7 @@ std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeout(DraftVer
     append_moqint(payload, draft, filter.size());
     payload.insert(payload.end(), filter.begin(), filter.end());
     append_moqint(payload, draft, 1);            // GROUP_ORDER
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
 
     std::vector<std::uint8_t> bytes;
     append_uint16_length_message(bytes, 0x03, payload);
@@ -399,9 +407,9 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
         previous = 0x06;
     }
     append_moqint(payload, draft, 0x10 - previous);        // FORWARD
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
     append_moqint(payload, draft, 0x20 - 0x10);            // SUBSCRIBER_PRIORITY
-    append_moqint(payload, draft, 127);
+    append_message_uint8(payload, draft, 200);
     append_moqint(payload, draft, 1);                      // SUBSCRIPTION_FILTER
     std::vector<std::uint8_t> filter;
     append_moqint(filter, draft, 3);
@@ -410,7 +418,7 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
     append_moqint(payload, draft, filter.size());
     payload.insert(payload.end(), filter.begin(), filter.end());
     append_moqint(payload, draft, 1);                      // GROUP_ORDER
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
 
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
@@ -448,7 +456,7 @@ std::vector<std::uint8_t> build_subscribe_tracks_message() {
     append_track_namespace(payload, draft, {"live", "alpha"});
     append_moqint(payload, draft, 1);     // one parameter
     append_moqint(payload, draft, 0x10);  // FORWARD
-    append_moqint(payload, draft, 0);
+    payload.push_back(0);
 
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, 0x51);
@@ -490,9 +498,9 @@ std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     } else {
         append_moqint(payload, draft, 4);   // parameter count
         append_moqint(payload, draft, 16);  // FORWARD
-        append_moqint(payload, draft, 1);
+        append_message_uint8(payload, draft, 1);
         append_moqint(payload, draft, 16);  // SUBSCRIBER_PRIORITY
-        append_moqint(payload, draft, 127);
+        append_message_uint8(payload, draft, 200);
         append_moqint(payload, draft, 1);   // SUBSCRIPTION_FILTER
         std::vector<std::uint8_t> filter;
         append_moqint(filter, draft, 3);
@@ -501,7 +509,7 @@ std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
         append_moqint(payload, draft, filter.size());
         payload.insert(payload.end(), filter.begin(), filter.end());
         append_moqint(payload, draft, 1);   // GROUP_ORDER
-        append_moqint(payload, draft, 1);
+        append_message_uint8(payload, draft, 1);
     }
 
     std::vector<std::uint8_t> bytes;
@@ -792,7 +800,9 @@ bool test_peer_control_message_decoders_for_all_drafts() {
         ok &= expect(subscribe.track_namespace == std::vector<std::string>({"live", "alpha"}),
                      label + " subscribe namespace tuple");
         ok &= expect(subscribe.track_name == "catalog", label + " subscribe track name");
-        ok &= expect(subscribe.forward == 1 && subscribe.filter_type == 3 && subscribe.start_group_id == 9 &&
+        ok &= expect(subscribe.forward == 1 &&
+                         subscribe.subscriber_priority == (draft == DraftVersion::kDraft14 ? 128 : 200) &&
+                         subscribe.filter_type == 3 && subscribe.start_group_id == 9 &&
                          subscribe.start_object_id == 4,
                      label + " subscribe filter fields");
 
@@ -819,7 +829,9 @@ bool test_peer_control_message_decoders_for_all_drafts() {
         PublishOk publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message(draft), draft, publish_ok), label + " publish ok decode");
         ok &= expect(publish_ok.request_id == (draft == DraftVersion::kDraft18 ? 0 : 55) &&
-                         publish_ok.forward == 1 && publish_ok.filter_type == 3,
+                         publish_ok.forward == 1 &&
+                         publish_ok.subscriber_priority == (draft == DraftVersion::kDraft14 ? 128 : 200) &&
+                         publish_ok.filter_type == 3,
                      label + " publish ok fields");
 
         PublishError publish_error;
