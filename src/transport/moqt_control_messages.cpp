@@ -74,23 +74,6 @@ bool decode_moqint_impl(std::span<const std::uint8_t> bytes,
     return uses_moq_vi64(draft) ? decode_vi64_impl(bytes, offset, value) : decode_varint_impl(bytes, offset, value);
 }
 
-bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
-                                      std::size_t& offset,
-                                      DraftVersion draft,
-                                      std::uint64_t parameter_type,
-                                      std::uint64_t& value) {
-    const bool is_uint8 = draft == DraftVersion::kDraft18 &&
-                          (parameter_type == 0x10 || parameter_type == 0x20 || parameter_type == 0x22);
-    if (!is_uint8) {
-        return decode_moqint_impl(bytes, offset, draft, value);
-    }
-    if (offset >= bytes.size()) {
-        return false;
-    }
-    value = bytes[offset++];
-    return true;
-}
-
 std::vector<std::uint8_t> to_bytes(std::string_view value) {
     return std::vector<std::uint8_t>(value.begin(), value.end());
 }
@@ -455,6 +438,25 @@ std::uint64_t draft_version_number(DraftVersion draft) {
 }
 
 }  // namespace
+
+bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
+                                      std::size_t& offset,
+                                      DraftVersion draft,
+                                      std::uint64_t parameter_type,
+                                      std::uint64_t& value) {
+    const bool is_uint8 =
+        (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) &&
+        (parameter_type == kParamForward || parameter_type == kParamSubscriberPriority ||
+         parameter_type == kParamGroupOrder);
+    if (!is_uint8) {
+        return decode_moqint_impl(bytes, offset, draft, value);
+    }
+    if (offset >= bytes.size()) {
+        return false;
+    }
+    value = bytes[offset++];
+    return true;
+}
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value) {
     std::vector<std::uint8_t> bytes;
@@ -882,7 +884,7 @@ bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t ignored_value = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, ignored_value)) {
+            if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, ignored_value)) {
                 return false;
             }
         } else {
@@ -1007,13 +1009,13 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
         }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, value)) {
+            if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
                 return false;
             }
-            if (draft == DraftVersion::kDraft16 && parameter_type == 0x10 && value > 1) {
+            if (draft == DraftVersion::kDraft16 && parameter_type == kParamForward && value > 1) {
                 return false;
             }
-            if (draft == DraftVersion::kDraft16 && parameter_type != 0x10) {
+            if (draft == DraftVersion::kDraft16 && parameter_type != kParamForward) {
                 return false;
             }
             continue;
@@ -1188,15 +1190,15 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
                         message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
                     }
                     break;
-                case 0x10:  // FORWARD
+                case kParamForward:  // FORWARD
                     if (value > 1) { return false; }
                     message.forward = static_cast<std::uint8_t>(value);
                     break;
-                case 0x20:  // SUBSCRIBER_PRIORITY
+                case kParamSubscriberPriority:  // SUBSCRIBER_PRIORITY
                     if (value > 255) { return false; }
                     message.subscriber_priority = static_cast<std::uint8_t>(value);
                     break;
-                case 0x22:  // GROUP_ORDER — only Ascending (0x1) and Descending (0x2) are legal on the wire.
+                case kParamGroupOrder:  // GROUP_ORDER — only Ascending (0x1) and Descending (0x2) are legal on the wire.
                     if (value != 0x1 && value != 0x2) { return false; }
                     message.group_order = static_cast<std::uint8_t>(value);
                     break;
@@ -1277,7 +1279,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
             if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
                 return false;
             }
-            if (parameter_type == 0x10) {
+            if (parameter_type == kParamForward) {
                 if (value > 1) {
                     return false;
                 }
@@ -1653,15 +1655,15 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
                     break;
                 case 0x08:  // EXPIRES
                     break;
-                case 0x10:  // FORWARD
+                case kParamForward:  // FORWARD
                     if (value > 1) { return false; }
                     message.forward = static_cast<std::uint8_t>(value);
                     break;
-                case 0x20:  // SUBSCRIBER_PRIORITY
+                case kParamSubscriberPriority:  // SUBSCRIBER_PRIORITY
                     if (value > 255) { return false; }
                     message.subscriber_priority = static_cast<std::uint8_t>(value);
                     break;
-                case 0x22:  // GROUP_ORDER
+                case kParamGroupOrder:  // GROUP_ORDER
                     if (value != 0x1 && value != 0x2) { return false; }
                     message.group_order = static_cast<std::uint8_t>(value);
                     break;

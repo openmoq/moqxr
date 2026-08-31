@@ -526,9 +526,13 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         const std::vector<std::uint8_t> forward_value = encode_moqint(draft, forward);
         payload.insert(payload.end(), forward_delta.begin(), forward_delta.end());
         payload.insert(payload.end(), forward_value.begin(), forward_value.end());
-        // SUBSCRIBER_PRIORITY (0x20, even) delta=0x10
+        // SUBSCRIBER_PRIORITY (0x20, even) delta=0x10. draft-17/18 encode the
+        // value as a single uint8 byte; earlier drafts use a varint.
         const std::vector<std::uint8_t> priority_delta = encode_moqint(draft, 0x20 - 0x10);
-        const std::vector<std::uint8_t> priority_value = encode_moqint(draft, 0x80);
+        const bool uint8_params =
+            draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+        const std::vector<std::uint8_t> priority_value =
+            uint8_params ? std::vector<std::uint8_t>{0x80} : encode_moqint(draft, 0x80);
         payload.insert(payload.end(), priority_delta.begin(), priority_delta.end());
         payload.insert(payload.end(), priority_value.begin(), priority_value.end());
         // SUBSCRIPTION_FILTER (0x21, odd) delta=0x01
