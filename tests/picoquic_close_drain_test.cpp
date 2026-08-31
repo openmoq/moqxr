@@ -12,6 +12,8 @@
 
 #include "openmoq/publisher/transport/picoquic_client.h"
 
+#include "picoquic_close_drain.h"
+
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -208,6 +210,36 @@ void stop_server(DrainServer& server) {
 
 }  // namespace
 
+// The drain bound is negotiated by the peer (SUBSCRIBE / PUBLISH_OK
+// delivery_timeout_ms, an arbitrary varint off the wire). A relay that
+// advertises an absurd value must not be able to pin close() for that long:
+// the tracker clamps the negotiated bound to kMaxCloseDrainTimeout.
+bool run_clamp_scenario() {
+    using openmoq::publisher::transport::CloseDrainTracker;
+    using openmoq::publisher::transport::kMaxCloseDrainTimeout;
+
+    bool ok = true;
+    CloseDrainTracker tracker;
+    tracker.note_delivery_timeout(std::chrono::hours(24));
+    ok &= expect(tracker.bound <= kMaxCloseDrainTimeout,
+                 "expected an absurd negotiated delivery timeout to be clamped");
+    const auto before = std::chrono::steady_clock::now();
+    tracker.arm();
+    ok &= expect(tracker.deadline <= before + kMaxCloseDrainTimeout + std::chrono::seconds(1),
+                 "expected the armed drain deadline to be bounded by the clamp");
+
+    // Multiple negotiated timeouts still take the largest, but never above the clamp.
+    CloseDrainTracker merged;
+    merged.note_delivery_timeout(std::chrono::seconds(2));
+    merged.note_delivery_timeout(std::chrono::seconds(5));
+    ok &= expect(merged.bound == std::chrono::seconds(5),
+                 "expected the larger of two sane negotiated timeouts to win");
+    merged.note_delivery_timeout(std::chrono::hours(1));
+    ok &= expect(merged.bound == kMaxCloseDrainTimeout,
+                 "expected a later absurd timeout to raise the bound only to the clamp");
+    return ok;
+}
+
 // Second scenario: the peer vanishes after the write, so nothing is ever
 // acknowledged. close() must give up after the drain bound instead of
 // hanging. The bound is the negotiated MoQT delivery timeout, which the
@@ -257,6 +289,8 @@ bool run_timeout_scenario(const TlsConfig& tls) {
 
 int main() {
     bool ok = true;
+
+    ok &= run_clamp_scenario();
 
     DrainServer server;
     ok &= expect(start_server(server), "expected local picoquic server to start");

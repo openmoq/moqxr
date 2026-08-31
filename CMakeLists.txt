@@ -6,7 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(openmoq_publisher
-    VERSION 0.3.14
+    VERSION 0.3.15
     DESCRIPTION "OpenMOQ contribution project: C++20 publisher for fragmented MP4 to CMSF/MOQT"
     LANGUAGES C CXX)
 
@@ -639,6 +639,7 @@ if(OPENMOQ_BUILD_TESTS)
         target_link_libraries(openmoq-publisher-picoquic-close-drain-tests PRIVATE openmoq_publisher_lib)
         target_include_directories(openmoq-publisher-picoquic-close-drain-tests PRIVATE
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/transport"
         )
         target_compile_definitions(openmoq-publisher-picoquic-close-drain-tests PRIVATE
             OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"

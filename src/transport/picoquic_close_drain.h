@@ -26,6 +26,12 @@ namespace openmoq::publisher::transport {
 // on the session.
 inline constexpr std::chrono::milliseconds kDefaultCloseDrainTimeout{10000};
 
+// Ceiling on the negotiated bound. delivery_timeout_ms arrives as an
+// arbitrary varint chosen by the peer; without a clamp a relay advertising a
+// huge value pins close() (and the thread joining the packet loop) for that
+// long whenever it also stops acknowledging data.
+inline constexpr std::chrono::milliseconds kMaxCloseDrainTimeout{30000};
+
 struct CloseDrainState {
     // Bytes queued in picoquic stream send queues but not yet packetised.
     std::uint64_t unsent_bytes = 0;
@@ -95,7 +101,8 @@ struct CloseDrainTracker {
             return;
         }
         // Parenthesised: picoquic_internal.h pulls in windows.h on MSVC, whose
-        // max() macro would otherwise mangle the call.
+        // max()/min() macros would otherwise mangle the calls.
+        timeout = (std::min)(timeout, kMaxCloseDrainTimeout);
         bound = bound_negotiated ? (std::max)(bound, timeout) : timeout;
         bound_negotiated = true;
     }
