@@ -52,10 +52,16 @@ struct PicoquicClient::Impl {
         long long queue_age_ms = 0;
     };
 
+    struct PendingReset {
+        std::uint64_t stream_id = 0;
+        std::uint64_t error_code = 0;
+    };
+
     std::mutex mutex;
     std::mutex join_mutex; // serialises concurrent close()/disconnect() join attempts
     std::condition_variable condition;
     std::deque<PendingWrite> pending_writes;
+    std::deque<PendingReset> pending_resets;
     std::deque<AcceptedWrite> accepted_writes_waiting_for_send;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> accepted_streams;
@@ -78,6 +84,9 @@ struct PicoquicClient::Impl {
     std::size_t nonzero_send_events = 0;
     std::size_t nonzero_receive_events = 0;
     std::size_t consecutive_zero_send_events = 0;
+    // Hex connection id captured in connect() before the packet loop starts;
+    // picoquic_get_logging_cnxid may only run on the loop thread afterwards.
+    std::string connection_id_hex;
     std::string last_error;
     std::thread packet_loop_thread;
 
@@ -155,6 +164,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
     }
 
     std::deque<PicoquicClient::Impl::PendingWrite> writes;
+    std::deque<PicoquicClient::Impl::PendingReset> resets;
     std::size_t queued_count = 0;
     std::size_t queued_bytes = 0;
     bool close_requested = false;
@@ -162,6 +172,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         writes.swap(impl.pending_writes);
+        resets.swap(impl.pending_resets);
         queued_count = writes.size();
         for (const auto& write : writes) {
             queued_bytes += write.bytes.size();
@@ -252,6 +263,10 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
               " deferred_bytes=" + std::to_string(deferred_bytes) +
               " pending_after=" + std::to_string(deferred_writes.size()) +
               " now_ms=" + std::to_string(trace_elapsed_ms(std::chrono::steady_clock::now())));
+    }
+
+    for (const auto& reset : resets) {
+        picoquic_reset_stream(impl.cnx, reset.stream_id, reset.error_code);
     }
 
     if (close_requested) {
@@ -538,7 +553,9 @@ TransportStatus PicoquicClient::configure(const EndpointConfig& endpoint, const 
         impl_->loop_exited = false;
         impl_->last_error.clear();
         impl_->pending_writes.clear();
+        impl_->pending_resets.clear();
         impl_->accepted_writes_waiting_for_send.clear();
+        impl_->connection_id_hex.clear();
     }
 
     return TransportStatus::success();
@@ -614,6 +631,18 @@ TransportStatus PicoquicClient::connect() {
     }
 
     picoquic_set_callback(impl_->cnx, client_callback, impl_.get());
+
+    // Capture the connection id now, while this thread still owns the QUIC
+    // context (the packet loop has not started); connection_id() serves it
+    // from this cache afterwards.
+    {
+        char cid_buffer[513] = {};
+        const picoquic_connection_id_t cid = picoquic_get_logging_cnxid(impl_->cnx);
+        if (picoquic_print_connection_id_hexa(cid_buffer, sizeof(cid_buffer), &cid) == 0) {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->connection_id_hex = cid_buffer;
+        }
+    }
 
     // Keep the connection alive while the application has nothing to send.
     //
@@ -872,7 +901,14 @@ TransportStatus PicoquicClient::reset_stream(std::uint64_t stream_id,
     if (impl_ == nullptr || impl_->cnx == nullptr) {
         return TransportStatus::failure("transport is not connected");
     }
-    picoquic_reset_stream(impl_->cnx, stream_id, error_code);
+    // Queued for the packet-loop thread: picoquic_reset_stream mutates stream
+    // state that only that thread may touch. Applied within one 10 ms
+    // time_check tick.
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->pending_resets.push_back({.stream_id = stream_id, .error_code = error_code});
+    }
+    impl_->condition.notify_all();
     return TransportStatus::success();
 #endif
 }
@@ -881,17 +917,13 @@ std::string PicoquicClient::connection_id() const {
 #ifndef OPENMOQ_HAS_PICOQUIC
     return {};
 #else
+    if (impl_ == nullptr) {
+        return {};
+    }
+    // Captured in connect() before the packet loop starts; querying picoquic
+    // here would race with the loop thread.
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_ == nullptr || impl_->cnx == nullptr) {
-        return {};
-    }
-
-    char buffer[513] = {};
-    const picoquic_connection_id_t cid = picoquic_get_logging_cnxid(impl_->cnx);
-    if (picoquic_print_connection_id_hexa(buffer, sizeof(buffer), &cid) != 0) {
-        return {};
-    }
-    return buffer;
+    return impl_->connection_id_hex;
 #endif
 }
 
@@ -927,6 +959,9 @@ TransportStatus PicoquicClient::close(std::uint64_t application_error_code) {
     }
 
     if (impl_ && impl_->quic != nullptr) {
+        // The loop thread is gone; this thread now owns the QUIC context.
+        // No-op unless built with thread checking.
+        PICOQUIC_THREAD_DISABLE_CHECK(impl_->quic);
         picoquic_free(impl_->quic);
         impl_->quic = nullptr;
         impl_->cnx = nullptr;

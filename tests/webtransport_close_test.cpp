@@ -23,6 +23,7 @@
 
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
+#include <picoquic_internal.h>
 #include <h3zero_common.h>
 #include <pico_webtransport.h>
 #include <picoquic_set_textlog.h>
@@ -230,6 +231,9 @@ void stop_server(SilentServer& server) {
         server.thread.join();
     }
     if (server.quic != nullptr) {
+        // The loop thread is gone; disarm the cross-thread check (no-op
+        // unless built with PICOQUIC_WITH_THREAD_CHECK) before freeing.
+        PICOQUIC_THREAD_DISABLE_CHECK(server.quic);
         picoquic_free(server.quic);
         server.quic = nullptr;
     }

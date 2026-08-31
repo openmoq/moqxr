@@ -18,6 +18,14 @@ option(OPENMOQ_BUILD_TESTS "Build OpenMOQ publisher tests" ON)
 option(OPENMOQ_BUILD_EXAMPLES "Build OpenMOQ publisher example executables" OFF)
 option(OPENMOQ_ENABLE_PICOQUIC "Enable picoquic transport integration when picoquic is available" ON)
 option(OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS "Build and run picoquic loopback smoke tests" OFF)
+# Compiles picoquic (and this project) with PICOQUIC_WITH_THREAD_CHECK so any
+# picoquic API call from a thread other than the packet-loop thread aborts.
+# picoquic's internals (notably the wake-time splay tree) are single-threaded;
+# a cross-thread call is a data race that can silently corrupt the scheduler.
+# Defaults to the smoke-test setting so loopback CI runs catch regressions.
+option(OPENMOQ_PICOQUIC_THREAD_CHECK
+    "Abort on cross-thread picoquic API calls (test builds)"
+    ${OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS})
 option(OPENMOQ_ENABLE_SRT "Enable libsrt ingest support when libsrt is available" ON)
 # Temporary migration gate: route the production Publisher through libmoq instead
 # of the legacy MoqtSession path. Requires libmoq to be available. OFF keeps the
@@ -188,6 +196,11 @@ if(OPENMOQ_ENABLE_PICOQUIC)
     set(CMAKE_POLICY_VERSION_MINIMUM "3.5" CACHE STRING "" FORCE)
     set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "" FORCE)
     set(picoquic_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+        set(WITH_THREAD_CHECK ON CACHE BOOL "" FORCE)
+    else()
+        set(WITH_THREAD_CHECK OFF CACHE BOOL "" FORCE)
+    endif()
     set(BUILD_DEMO OFF CACHE BOOL "" FORCE)
     set(BUILD_HTTP ON CACHE BOOL "" FORCE)
     set(BUILD_PQBENCH OFF CACHE BOOL "" FORCE)
@@ -453,6 +466,11 @@ target_compile_features(openmoq_publisher_lib PUBLIC cxx_std_20)
 
 if(OPENMOQ_HAS_PICOQUIC)
     target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_HAS_PICOQUIC=1)
+    if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+        # Activates the PICOQUIC_THREAD_DISABLE_CHECK macro in our sources;
+        # picoquic itself gets the define via WITH_THREAD_CHECK above.
+        target_compile_definitions(openmoq_publisher_lib PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+    endif()
     if(TARGET picohttp-core AND TARGET picoquic-log AND NOT APPLE AND NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
         # Linux with modern CMake: RESCAN resolves circular deps between picohttp/picoquic via --start-group/--end-group.
         target_link_libraries(openmoq_publisher_lib PRIVATE "$<LINK_GROUP:RESCAN,picohttp-core,picoquic-log,picoquic-core>")
@@ -698,6 +716,15 @@ if(OPENMOQ_BUILD_TESTS)
             OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
         )
         add_test(NAME openmoq-publisher-picoquic-close-drain-tests COMMAND openmoq-publisher-picoquic-close-drain-tests)
+
+        if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+            target_compile_definitions(openmoq-publisher-picoquic-smoke-tests
+                PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+            target_compile_definitions(openmoq-publisher-webtransport-close-tests
+                PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+            target_compile_definitions(openmoq-publisher-picoquic-close-drain-tests
+                PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+        endif()
 
         add_executable(openmoq-publisher-picoquic-tls-verify-tests
             tests/picoquic_tls_verify_test.cpp
