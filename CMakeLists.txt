@@ -6,7 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(openmoq_publisher
-    VERSION 0.3.14
+    VERSION 0.3.16
     DESCRIPTION "OpenMOQ contribution project: C++20 publisher for fragmented MP4 to CMSF/MOQT"
     LANGUAGES C CXX)
 
@@ -18,6 +18,14 @@ option(OPENMOQ_BUILD_TESTS "Build OpenMOQ publisher tests" ON)
 option(OPENMOQ_BUILD_EXAMPLES "Build OpenMOQ publisher example executables" OFF)
 option(OPENMOQ_ENABLE_PICOQUIC "Enable picoquic transport integration when picoquic is available" ON)
 option(OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS "Build and run picoquic loopback smoke tests" OFF)
+# Compiles picoquic (and this project) with PICOQUIC_WITH_THREAD_CHECK so any
+# picoquic API call from a thread other than the packet-loop thread aborts.
+# picoquic's internals (notably the wake-time splay tree) are single-threaded;
+# a cross-thread call is a data race that can silently corrupt the scheduler.
+# Defaults to the smoke-test setting so loopback CI runs catch regressions.
+option(OPENMOQ_PICOQUIC_THREAD_CHECK
+    "Abort on cross-thread picoquic API calls (test builds)"
+    ${OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS})
 option(OPENMOQ_ENABLE_SRT "Enable libsrt ingest support when libsrt is available" ON)
 # Temporary migration gate: route the production Publisher through libmoq instead
 # of the legacy MoqtSession path. Requires libmoq to be available. OFF keeps the
@@ -25,10 +33,58 @@ option(OPENMOQ_ENABLE_SRT "Enable libsrt ingest support when libsrt is available
 # libmoq integration code still builds and is tested whenever libmoq is present.
 option(OPENMOQ_USE_LIBMOQ_PUBLISHER "Use libmoq as the production publish backend (requires libmoq)" OFF)
 
+# Install rules default to ON only for top-level builds; when moqxr is vendored
+# via add_subdirectory or FetchContent, the consuming project owns the install
+# stage. PROJECT_IS_TOP_LEVEL requires CMake 3.21, so derive it to keep the
+# 3.20 minimum.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(_openmoq_is_top_level ON)
+else()
+    set(_openmoq_is_top_level OFF)
+endif()
+option(OPENMOQ_INSTALL
+    "Generate install rules for the openmoq-publisher CLI" ${_openmoq_is_top_level})
+# The development install ships the Publisher API headers plus a
+# self-contained static archive: the vendored picotls/picoquic (and moq5 when
+# enabled) static libraries are merged into the installed libopenmoq_publisher
+# archive, so consumers only link the genuinely external dependencies
+# (OpenSSL, plus libsrt when OPENMOQ_ENABLE_SRT is ON).
+option(OPENMOQ_INSTALL_DEVELOPMENT
+    "Additionally install a self-contained static Publisher library and public headers" OFF)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(OpenMoqDependencies)
 include(OpenMoqVersion)
 include(FetchContent)
+
+# The managed picotls and picoquic trees are build-time-only dependencies:
+# their targets must stay out of the default build, and -- critically -- none
+# of their install() rules may be generated. `cmake --install` must ship only
+# first-party artifacts, and picoquic additionally bakes the configure-time
+# ${CMAKE_INSTALL_PREFIX} into absolute install DESTINATIONs that ignore
+# `cmake --install --prefix`. Directory-level EXCLUDE_FROM_ALL provides
+# exactly this on every supported CMake version; FetchContent only learned to
+# forward it from FetchContent_Declare() in CMake 3.28, so older versions
+# take the FetchContent_Populate() + add_subdirectory(EXCLUDE_FROM_ALL) path
+# instead. (Single-argument FetchContent_Populate() is only deprecated
+# starting with CMake 3.30, which never reaches that branch.)
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
+    set(_openmoq_fetchcontent_exclude_from_all EXCLUDE_FROM_ALL)
+else()
+    set(_openmoq_fetchcontent_exclude_from_all "")
+endif()
+macro(openmoq_make_dependency_available name)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
+        FetchContent_MakeAvailable(${name})
+    else()
+        FetchContent_GetProperties(${name})
+        if(NOT ${name}_POPULATED)
+            FetchContent_Populate(${name})
+            add_subdirectory("${${name}_SOURCE_DIR}" "${${name}_BINARY_DIR}"
+                EXCLUDE_FROM_ALL)
+        endif()
+    endif()
+endmacro()
 
 set(OPENMOQ_DEPENDENCY_REFRESH_INTERVAL_HOURS "24" CACHE STRING
     "Minimum hours between checks for newer managed dependency branch heads")
@@ -140,6 +196,11 @@ if(OPENMOQ_ENABLE_PICOQUIC)
     set(CMAKE_POLICY_VERSION_MINIMUM "3.5" CACHE STRING "" FORCE)
     set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "" FORCE)
     set(picoquic_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+        set(WITH_THREAD_CHECK ON CACHE BOOL "" FORCE)
+    else()
+        set(WITH_THREAD_CHECK OFF CACHE BOOL "" FORCE)
+    endif()
     set(BUILD_DEMO OFF CACHE BOOL "" FORCE)
     set(BUILD_HTTP ON CACHE BOOL "" FORCE)
     set(BUILD_PQBENCH OFF CACHE BOOL "" FORCE)
@@ -155,7 +216,8 @@ if(OPENMOQ_ENABLE_PICOQUIC)
                 "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}")
         endif()
         FetchContent_Declare(picotls
-            SOURCE_DIR "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}")
+            SOURCE_DIR "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}"
+            ${_openmoq_fetchcontent_exclude_from_all})
     else()
         set(OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR
             "${CMAKE_CURRENT_BINARY_DIR}/_deps/picotls-src")
@@ -166,7 +228,8 @@ if(OPENMOQ_ENABLE_PICOQUIC)
             GIT_PROGRESS TRUE
             GIT_SUBMODULES_RECURSE TRUE
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
-            SOURCE_DIR "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}")
+            SOURCE_DIR "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}"
+            ${_openmoq_fetchcontent_exclude_from_all})
         set(_openmoq_managed_dependency_used ON)
     endif()
 
@@ -185,7 +248,7 @@ if(OPENMOQ_ENABLE_PICOQUIC)
         set(ENV{PKG_CONFIG_PATH} "${CMAKE_CURRENT_BINARY_DIR}/openmoq-empty-pkgconfig")
         file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/openmoq-empty-pkgconfig")
     endif()
-    FetchContent_MakeAvailable(picotls)
+    openmoq_make_dependency_available(picotls)
     if(NOT WIN32)
         set(ENV{PKG_CONFIG_LIBDIR} "${_openmoq_saved_pkg_config_libdir}")
         set(ENV{PKG_CONFIG_PATH} "${_openmoq_saved_pkg_config_path}")
@@ -228,8 +291,10 @@ if(OPENMOQ_ENABLE_PICOQUIC)
                 "OPENMOQ_PICOQUIC_SOURCE_DIR does not contain CMakeLists.txt: "
                 "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}")
         endif()
+        # Build-time-only dependency: EXCLUDE_FROM_ALL keeps its install()
+        # rules out of the generated install scripts.
         add_subdirectory("${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
-            "${CMAKE_CURRENT_BINARY_DIR}/picoquic")
+            "${CMAKE_CURRENT_BINARY_DIR}/picoquic" EXCLUDE_FROM_ALL)
     else()
         set(OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR
             "${CMAKE_CURRENT_BINARY_DIR}/_deps/picoquic-src")
@@ -240,8 +305,9 @@ if(OPENMOQ_ENABLE_PICOQUIC)
             GIT_PROGRESS TRUE
             GIT_SUBMODULES_RECURSE TRUE
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
-            SOURCE_DIR "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}")
-        FetchContent_MakeAvailable(picoquic)
+            SOURCE_DIR "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
+            ${_openmoq_fetchcontent_exclude_from_all})
+        openmoq_make_dependency_available(picoquic)
         set(_openmoq_managed_dependency_used ON)
     endif()
 
@@ -400,6 +466,11 @@ target_compile_features(openmoq_publisher_lib PUBLIC cxx_std_20)
 
 if(OPENMOQ_HAS_PICOQUIC)
     target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_HAS_PICOQUIC=1)
+    if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+        # Activates the PICOQUIC_THREAD_DISABLE_CHECK macro in our sources;
+        # picoquic itself gets the define via WITH_THREAD_CHECK above.
+        target_compile_definitions(openmoq_publisher_lib PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+    endif()
     if(TARGET picohttp-core AND TARGET picoquic-log AND NOT APPLE AND NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
         # Linux with modern CMake: RESCAN resolves circular deps between picohttp/picoquic via --start-group/--end-group.
         target_link_libraries(openmoq_publisher_lib PRIVATE "$<LINK_GROUP:RESCAN,picohttp-core,picoquic-log,picoquic-core>")
@@ -639,11 +710,21 @@ if(OPENMOQ_BUILD_TESTS)
         target_link_libraries(openmoq-publisher-picoquic-close-drain-tests PRIVATE openmoq_publisher_lib)
         target_include_directories(openmoq-publisher-picoquic-close-drain-tests PRIVATE
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/transport"
         )
         target_compile_definitions(openmoq-publisher-picoquic-close-drain-tests PRIVATE
             OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
         )
         add_test(NAME openmoq-publisher-picoquic-close-drain-tests COMMAND openmoq-publisher-picoquic-close-drain-tests)
+
+        if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+            target_compile_definitions(openmoq-publisher-picoquic-smoke-tests
+                PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+            target_compile_definitions(openmoq-publisher-webtransport-close-tests
+                PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+            target_compile_definitions(openmoq-publisher-picoquic-close-drain-tests
+                PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+        endif()
 
         add_executable(openmoq-publisher-picoquic-tls-verify-tests
             tests/picoquic_tls_verify_test.cpp
@@ -663,4 +744,210 @@ if(_openmoq_managed_dependency_used)
     openmoq_record_dependency_refresh_if_due(
         REFRESH_DUE "${_openmoq_dependency_refresh_due}"
         STAMP_FILE "${_openmoq_dependency_stamp}")
+endif()
+
+# -- Installation ---------------------------------------------------------
+# Only first-party artifacts are installed. The managed picotls, picoquic, and
+# moq5 trees are build-time dependencies added with EXCLUDE_FROM_ALL, so none
+# of their install() rules are generated. Because those dependencies are never
+# installed, installation is only sound when every
+# in-tree dependency in the Publisher's link closure is a static library that
+# can be linked (and, for the development install, bundled) into the
+# first-party artifacts; this is validated below and holds for the default
+# configuration. BUILD_SHARED_LIBS=ON would turn the dependency libraries into
+# shared objects living only in the build tree, so it is rejected when
+# installation is requested.
+#
+# The development install ships a SELF-CONTAINED static archive: every
+# non-imported static library in openmoq_publisher_lib's transitive link
+# closure (picotls-*, picoquic-core, picoquic-log, picohttp-core, and moq5
+# when enabled) is merged into the installed archive. Consumers then link only
+# the genuinely external dependencies (OpenSSL, plus libsrt when
+# OPENMOQ_ENABLE_SRT is ON) and MUST NOT additionally link their own
+# picotls/picoquic copies, which would duplicate the embedded symbols. The
+# archive is built without PIC by default; packagers who need to link it into
+# shared objects should configure with -DCMAKE_POSITION_INDEPENDENT_CODE=ON.
+# No install(EXPORT) package is generated on purpose: the library target
+# references the excluded dependency targets, so a faithful export set cannot
+# be produced until those are consumed as installed packages.
+if(OPENMOQ_INSTALL)
+    include(GNUInstallDirs)
+
+    # Walk the transitive link closure of the given target and classify every
+    # non-imported library target it reaches: static libraries (which the
+    # development install bundles) versus anything else -- shared, module, or
+    # object libraries -- which this project cannot install and therefore
+    # cannot allow in the closure of an installed artifact.
+    # $<LINK_ONLY:...> wrappers -- created by CMake for PRIVATE dependencies
+    # of static libraries -- are unwrapped, as are the $<LINK_GROUP:...>
+    # expressions this project uses for the mutually dependent picoquic
+    # archives and $<LINK_LIBRARY:...>. All other generator expressions and
+    # non-target entries (system libraries, imported packages such as
+    # OpenSSL::Crypto, bare link flags) are deliberately treated as external.
+    function(_openmoq_classify_link_closure root out_static out_nonstatic)
+        set(_static "")
+        set(_nonstatic "")
+        set(_visited "")
+        set(_pending "${root}")
+        while(_pending)
+            list(POP_FRONT _pending _current)
+            if(_current MATCHES "^\\$<LINK_ONLY:(.+)>$")
+                set(_current "${CMAKE_MATCH_1}")
+            endif()
+            if(_current MATCHES "^\\$<LINK_(GROUP|LIBRARY):[^,]+,(.+)>$")
+                string(REPLACE "," ";" _group_members "${CMAKE_MATCH_2}")
+                list(APPEND _pending ${_group_members})
+                continue()
+            endif()
+            if(NOT TARGET "${_current}")
+                continue()
+            endif()
+            get_target_property(_alias "${_current}" ALIASED_TARGET)
+            if(_alias)
+                set(_current "${_alias}")
+            endif()
+            if(_current IN_LIST _visited)
+                continue()
+            endif()
+            list(APPEND _visited "${_current}")
+            get_target_property(_type "${_current}" TYPE)
+            get_target_property(_imported "${_current}" IMPORTED)
+            if(NOT _imported)
+                if(_type STREQUAL "STATIC_LIBRARY")
+                    list(APPEND _static "${_current}")
+                elseif(_type MATCHES "^(SHARED|MODULE|OBJECT)_LIBRARY$")
+                    list(APPEND _nonstatic "${_current}")
+                endif()
+            endif()
+            if(NOT _type STREQUAL "INTERFACE_LIBRARY")
+                get_target_property(_private_deps "${_current}" LINK_LIBRARIES)
+                if(_private_deps)
+                    list(APPEND _pending ${_private_deps})
+                endif()
+            endif()
+            get_target_property(_interface_deps "${_current}" INTERFACE_LINK_LIBRARIES)
+            if(_interface_deps)
+                list(APPEND _pending ${_interface_deps})
+            endif()
+        endwhile()
+        set("${out_static}" "${_static}" PARENT_SCOPE)
+        set("${out_nonstatic}" "${_nonstatic}" PARENT_SCOPE)
+    endfunction()
+
+    _openmoq_classify_link_closure(openmoq_publisher_lib
+        _openmoq_bundled_libs _openmoq_nonstatic_libs)
+
+    if(_openmoq_nonstatic_libs)
+        message(FATAL_ERROR
+            "OPENMOQ_INSTALL requires the in-tree dependency libraries to be "
+            "static, but the following are not: ${_openmoq_nonstatic_libs}. "
+            "This project installs only first-party artifacts, so an installed "
+            "openmoq-publisher (or the bundled development archive) would "
+            "reference shared libraries that exist only in the build tree. "
+            "Configure with -DBUILD_SHARED_LIBS=OFF (the default), or set "
+            "-DOPENMOQ_INSTALL=OFF for a build-tree-only configuration.")
+    endif()
+
+    install(TARGETS openmoq-publisher
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+        COMPONENT openmoq_runtime)
+
+    if(OPENMOQ_INSTALL_DEVELOPMENT)
+        set(_openmoq_bundle_dir "${CMAKE_CURRENT_BINARY_DIR}/bundled/$<CONFIG>")
+        # add_custom_command(OUTPUT) forbids target-dependent generator
+        # expressions, so resolve the archive file name at configure time.
+        get_target_property(_openmoq_lib_output_name openmoq_publisher_lib OUTPUT_NAME)
+        if(NOT _openmoq_lib_output_name)
+            set(_openmoq_lib_output_name openmoq_publisher_lib)
+        endif()
+        set(_openmoq_bundled_archive
+            "${_openmoq_bundle_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}${_openmoq_lib_output_name}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+
+        if(MSVC)
+            set(_openmoq_bundle_inputs "")
+            foreach(_openmoq_lib IN LISTS _openmoq_bundled_libs)
+                list(APPEND _openmoq_bundle_inputs "$<TARGET_FILE:${_openmoq_lib}>")
+            endforeach()
+            add_custom_command(OUTPUT "${_openmoq_bundled_archive}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${_openmoq_bundle_dir}"
+                COMMAND "${CMAKE_AR}" /NOLOGO "/OUT:${_openmoq_bundled_archive}"
+                    ${_openmoq_bundle_inputs}
+                DEPENDS ${_openmoq_bundled_libs}
+                COMMENT "Bundling static dependencies into the Publisher library"
+                VERBATIM)
+        elseif(APPLE)
+            set(_openmoq_bundle_inputs "")
+            foreach(_openmoq_lib IN LISTS _openmoq_bundled_libs)
+                list(APPEND _openmoq_bundle_inputs "$<TARGET_FILE:${_openmoq_lib}>")
+            endforeach()
+            add_custom_command(OUTPUT "${_openmoq_bundled_archive}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${_openmoq_bundle_dir}"
+                COMMAND libtool -static -no_warning_for_no_symbols
+                    -o "${_openmoq_bundled_archive}" ${_openmoq_bundle_inputs}
+                DEPENDS ${_openmoq_bundled_libs}
+                COMMENT "Bundling static dependencies into the Publisher library"
+                VERBATIM)
+        else()
+            # GNU ar, llvm-ar, and FreeBSD's ELF Tool Chain ar all understand
+            # MRI scripts (ar -M); merging with addlib keeps the original
+            # archive members intact without extracting objects to disk, so
+            # identically named members from different archives cannot
+            # clobber one another. The script is fed through a small CMake
+            # helper because add_custom_command() has no portable stdin
+            # redirection. The MRI grammar has no quoting, hence the check
+            # for spaces in the build path.
+            if(CMAKE_CURRENT_BINARY_DIR MATCHES " ")
+                message(FATAL_ERROR
+                    "OPENMOQ_INSTALL_DEVELOPMENT merges archives with an ar "
+                    "MRI script, which cannot represent paths containing "
+                    "spaces. Use a build directory without spaces: "
+                    "'${CMAKE_CURRENT_BINARY_DIR}'")
+            endif()
+            set(_openmoq_bundle_mri_file "${_openmoq_bundle_dir}/bundle.mri")
+            set(_openmoq_bundle_mri "create ${_openmoq_bundled_archive}\n")
+            foreach(_openmoq_lib IN LISTS _openmoq_bundled_libs)
+                string(APPEND _openmoq_bundle_mri
+                    "addlib $<TARGET_FILE:${_openmoq_lib}>\n")
+            endforeach()
+            string(APPEND _openmoq_bundle_mri "save\nend\n")
+            file(GENERATE OUTPUT "${_openmoq_bundle_mri_file}"
+                CONTENT "${_openmoq_bundle_mri}")
+
+            set(_openmoq_bundle_helper
+                "${CMAKE_CURRENT_BINARY_DIR}/bundled/openmoq_run_ar_mri.cmake")
+            file(WRITE "${_openmoq_bundle_helper}"
+"execute_process(
+    COMMAND \"\${AR}\" -M
+    INPUT_FILE \"\${MRI}\"
+    RESULT_VARIABLE _openmoq_ar_result)
+if(NOT _openmoq_ar_result EQUAL 0)
+    message(FATAL_ERROR
+        \"Bundling static Publisher library failed: \"
+        \"\${AR} -M < \${MRI} (exit \${_openmoq_ar_result})\")
+endif()
+")
+            add_custom_command(OUTPUT "${_openmoq_bundled_archive}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${_openmoq_bundle_dir}"
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DAR=${CMAKE_AR}"
+                    "-DMRI=${_openmoq_bundle_mri_file}"
+                    -P "${_openmoq_bundle_helper}"
+                DEPENDS ${_openmoq_bundled_libs} "${_openmoq_bundle_mri_file}"
+                COMMENT "Bundling static dependencies into the Publisher library"
+                VERBATIM)
+        endif()
+
+        add_custom_target(openmoq_publisher_bundled ALL
+            DEPENDS "${_openmoq_bundled_archive}")
+
+        install(FILES "${_openmoq_bundled_archive}"
+            DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+            COMPONENT openmoq_development)
+
+        # Public Publisher API headers (include/openmoq/publisher/...).
+        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/openmoq"
+            DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+            COMPONENT openmoq_development
+            FILES_MATCHING PATTERN "*.h")
+    endif()
 endif()

@@ -51,10 +51,16 @@ struct WebTransportClient::Impl {
         bool fin = false;
     };
 
+    struct PendingReset {
+        std::uint64_t stream_id = 0;
+        std::uint64_t error_code = 0;
+    };
+
     std::mutex mutex;
     std::condition_variable condition;
     std::deque<PendingOpen*> pending_opens;
     std::deque<PendingWrite> pending_writes;
+    std::deque<PendingReset> pending_resets;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> application_streams;
     std::set<std::uint64_t> accepted_streams;
@@ -69,6 +75,11 @@ struct WebTransportClient::Impl {
     CloseDrainTracker close_drain;
     bool loop_ready = false;
     bool loop_exited = false;
+    // QUIC error codes mirrored from the packet-loop thread each cycle.
+    // picoquic_get_local_error/get_remote_error may only run on the loop
+    // thread, so connect()'s failure path reads these caches instead.
+    std::uint64_t quic_local_error = 0;
+    std::uint64_t quic_remote_error = 0;
     std::string last_error;
     std::thread packet_loop_thread;
 
@@ -165,11 +176,13 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
 
     std::deque<WebTransportClient::Impl::PendingOpen*> opens;
     std::deque<WebTransportClient::Impl::PendingWrite> writes;
+    std::deque<WebTransportClient::Impl::PendingReset> resets;
     bool close_requested = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         opens.swap(impl.pending_opens);
         writes.swap(impl.pending_writes);
+        resets.swap(impl.pending_resets);
         close_requested = impl.close_requested;
     }
 
@@ -242,6 +255,14 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
             impl.pending_writes.push_front(std::move(*it));
         }
         impl.condition.notify_all();
+    }
+
+    for (const auto& reset : resets) {
+        h3zero_stream_ctx_t* stream_ctx = find_local_stream_context(impl, reset.stream_id);
+        if (stream_ctx != nullptr && picowt_reset_stream(impl.cnx, stream_ctx, reset.error_code) == 0) {
+            continue;
+        }
+        picoquic_reset_stream(impl.cnx, reset.stream_id, reset.error_code);
     }
 
     if (close_requested) {
@@ -428,6 +449,10 @@ int loop_callback(picoquic_quic_t* quic,
                 impl->connected = true;
                 impl->condition.notify_all();
             }
+            if (impl->cnx != nullptr) {
+                impl->quic_local_error = picoquic_get_local_error(impl->cnx);
+                impl->quic_remote_error = picoquic_get_remote_error(impl->cnx);
+            }
             if (impl->cnx != nullptr && picoquic_get_cnx_state(impl->cnx) == picoquic_state_disconnected) {
                 impl->disconnected = true;
                 impl->condition.notify_all();
@@ -481,8 +506,11 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->close_drain.reset();
     impl_->loop_ready = false;
     impl_->loop_exited = false;
+    impl_->quic_local_error = 0;
+    impl_->quic_remote_error = 0;
     impl_->last_error.clear();
     impl_->pending_writes.clear();
+    impl_->pending_resets.clear();
     impl_->received_streams.clear();
     return TransportStatus::success();
 }
@@ -638,8 +666,10 @@ TransportStatus WebTransportClient::connect() {
             impl_->failed = true;
             impl_->last_error = "timed out waiting for webtransport CONNECT acceptance";
             if (impl_->cnx != nullptr) {
-                const std::uint64_t local_error = picoquic_get_local_error(impl_->cnx);
-                const std::uint64_t remote_error = picoquic_get_remote_error(impl_->cnx);
+                // Mirrored from the loop thread in after_send; reading them
+                // via picoquic here would race with the running loop.
+                const std::uint64_t local_error = impl_->quic_local_error;
+                const std::uint64_t remote_error = impl_->quic_remote_error;
                 if (local_error != 0) {
                     impl_->last_error += "; local: " + tlsverify::describe_quic_error(local_error);
                     if (tlsverify::is_certificate_verification_error(local_error)) {
@@ -700,9 +730,9 @@ TransportStatus WebTransportClient::open_stream(StreamDirection direction, std::
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->pending_opens.push_back(&pending_open);
     }
-    if (impl_->cnx != nullptr && impl_->quic != nullptr) {
-        picoquic_set_app_wake_time(impl_->cnx, picoquic_get_quic_time(impl_->quic));
-    }
+    // No picoquic call here: the packet loop polls pending work every 10 ms
+    // (time_check clamp) and picoquic APIs are loop-thread-only. Waking the
+    // scheduler from this thread raced with the loop's splay-tree updates.
     impl_->condition.notify_all();
 
     std::unique_lock<std::mutex> lock(impl_->mutex);
@@ -774,9 +804,7 @@ TransportStatus WebTransportClient::write_stream(std::uint64_t stream_id,
         });
     }
 
-    if (impl_->cnx != nullptr && impl_->quic != nullptr) {
-        picoquic_set_app_wake_time(impl_->cnx, picoquic_get_quic_time(impl_->quic));
-    }
+    // Loop-thread pickup within one 10 ms time_check tick; see open_stream.
     impl_->condition.notify_all();
     return TransportStatus::success();
 #endif
@@ -896,15 +924,14 @@ TransportStatus WebTransportClient::reset_stream(std::uint64_t stream_id,
     if (impl_ == nullptr || impl_->cnx == nullptr) {
         return TransportStatus::failure("transport is not connected");
     }
-    h3zero_stream_ctx_t* stream_ctx = find_local_stream_context(*impl_, stream_id);
-    if (stream_ctx != nullptr) {
-        if (picowt_reset_stream(impl_->cnx, stream_ctx, error_code) == 0) {
-            return TransportStatus::success();
-        }
-        picoquic_reset_stream(impl_->cnx, stream_id, error_code);
-        return TransportStatus::success();
+    // Queued for the packet-loop thread: picowt/picoquic reset calls walk
+    // stream state that only that thread may touch. Applied within one
+    // 10 ms time_check tick.
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->pending_resets.push_back({.stream_id = stream_id, .error_code = error_code});
     }
-    picoquic_reset_stream(impl_->cnx, stream_id, error_code);
+    impl_->condition.notify_all();
     return TransportStatus::success();
 #endif
 }
@@ -944,15 +971,19 @@ TransportStatus WebTransportClient::close(std::uint64_t application_error_code) 
         impl_->close_error_code = application_error_code;
         impl_->close_drain.arm();
     }
-    if (impl_->cnx != nullptr && impl_->quic != nullptr) {
-        picoquic_set_app_wake_time(impl_->cnx, picoquic_get_quic_time(impl_->quic));
-    }
+    // Loop-thread pickup within one 10 ms time_check tick; see open_stream.
     impl_->condition.notify_all();
 
     if (impl_->packet_loop_thread.joinable()) {
         trace("close requested; joining packet loop thread");
         impl_->packet_loop_thread.join();
         trace("packet loop thread joined rc=" + std::to_string(impl_->packet_loop_return_code));
+    }
+
+    if (impl_->quic != nullptr) {
+        // The loop thread is gone; this thread now owns the QUIC context for
+        // the cleanup calls below. No-op unless built with thread checking.
+        PICOQUIC_THREAD_DISABLE_CHECK(impl_->quic);
     }
 
     unregister_connection_impl(impl_->cnx);
