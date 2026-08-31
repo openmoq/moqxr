@@ -1292,12 +1292,12 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
         }
         previous_parameter_type = parameter_type;
 
-        if (parameter_type != 0x10) {
+        if (parameter_type != kParamForward) {
             switch (parameter_type) {
                 case 0x02:
                 case 0x03:
                 case 0x06:
-                case 0x20:
+                case kParamSubscriberPriority:
                 case 0x21:
                 case 0x32:
                     update.has_unsupported_parameter = true;
@@ -1307,8 +1307,10 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
             }
         }
 
+        // FORWARD is a uint8 under draft-17/18 (varint before); the shared
+        // decoder applies the right framing per draft.
         std::uint64_t value = 0;
-        if (!decode_moqint(bytes, offset, draft, value) || value > 1) {
+        if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value) || value > 1) {
             return false;
         }
         update.forward = static_cast<std::uint8_t>(value);

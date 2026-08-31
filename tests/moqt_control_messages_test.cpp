@@ -313,9 +313,30 @@ std::string draft_label(DraftVersion draft) {
     return "unknown";
 }
 
-std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft) {
+void append_message_uint8(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint8_t value) {
+    // draft-17 and draft-18 define FORWARD (0x10), SUBSCRIBER_PRIORITY (0x20)
+    // and GROUP_ORDER (0x22) as uint8; earlier drafts encode them as varints.
+    if (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) {
+        out.push_back(value);
+    } else {
+        append_moqint(out, draft, value);
+    }
+}
+
+// Optional off-spec encodings for the uint8 message parameters, used by the
+// negative tests below: a two-byte varint where draft-17/18 require a single
+// uint8 byte.
+struct SubscribeParamEncoding {
+    bool priority_as_varint = false;     // vi64 0x80 0xC8 instead of the uint8 byte 200
+    bool group_order_as_varint = false;  // vi64 0x80 0x01 instead of the uint8 byte 1
+};
+
+std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft, SubscribeParamEncoding encoding = {}) {
     std::vector<std::uint8_t> payload;
     append_moqint(payload, draft, 77);
+    if (draft == DraftVersion::kDraft17) {
+        append_moqint(payload, draft, 0);  // required request id delta
+    }
     append_track_namespace(payload, draft, {"live", "alpha"});
     append_string(payload, draft, "catalog");
 
@@ -330,9 +351,14 @@ std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft) {
     } else {
         append_moqint(payload, draft, 4);   // parameter count
         append_moqint(payload, draft, 16);  // FORWARD, delta from 0x00
-        append_moqint(payload, draft, 1);
+        append_message_uint8(payload, draft, 1);
         append_moqint(payload, draft, 16);  // SUBSCRIBER_PRIORITY, delta from 0x10 to 0x20
-        append_moqint(payload, draft, 127);
+        if (encoding.priority_as_varint) {
+            payload.push_back(0x80);
+            payload.push_back(200);
+        } else {
+            append_message_uint8(payload, draft, 200);
+        }
         append_moqint(payload, draft, 1);   // SUBSCRIPTION_FILTER, delta from 0x20 to 0x21
         std::vector<std::uint8_t> filter;
         append_moqint(filter, draft, 3);
@@ -341,7 +367,12 @@ std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft) {
         append_moqint(payload, draft, filter.size());
         payload.insert(payload.end(), filter.begin(), filter.end());
         append_moqint(payload, draft, 1);   // GROUP_ORDER, delta from 0x21 to 0x22
-        append_moqint(payload, draft, 1);
+        if (encoding.group_order_as_varint) {
+            payload.push_back(0x80);
+            payload.push_back(1);
+        } else {
+            append_message_uint8(payload, draft, 1);
+        }
     }
 
     std::vector<std::uint8_t> bytes;
@@ -361,9 +392,9 @@ std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeout(DraftVer
     append_moqint(payload, draft, 0x02);  // DELIVERY_TIMEOUT, delta from 0x00
     append_moqint(payload, draft, delivery_timeout_ms);
     append_moqint(payload, draft, 0x10 - 0x02);  // FORWARD
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
     append_moqint(payload, draft, 0x20 - 0x10);  // SUBSCRIBER_PRIORITY
-    append_moqint(payload, draft, 127);
+    append_message_uint8(payload, draft, 200);
     append_moqint(payload, draft, 1);            // SUBSCRIPTION_FILTER
     std::vector<std::uint8_t> filter;
     append_moqint(filter, draft, 3);
@@ -372,7 +403,7 @@ std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeout(DraftVer
     append_moqint(payload, draft, filter.size());
     payload.insert(payload.end(), filter.begin(), filter.end());
     append_moqint(payload, draft, 1);            // GROUP_ORDER
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
 
     std::vector<std::uint8_t> bytes;
     append_uint16_length_message(bytes, 0x03, payload);
@@ -399,9 +430,9 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
         previous = 0x06;
     }
     append_moqint(payload, draft, 0x10 - previous);        // FORWARD
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
     append_moqint(payload, draft, 0x20 - 0x10);            // SUBSCRIBER_PRIORITY
-    append_moqint(payload, draft, 127);
+    append_message_uint8(payload, draft, 200);
     append_moqint(payload, draft, 1);                      // SUBSCRIPTION_FILTER
     std::vector<std::uint8_t> filter;
     append_moqint(filter, draft, 3);
@@ -410,7 +441,7 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
     append_moqint(payload, draft, filter.size());
     payload.insert(payload.end(), filter.begin(), filter.end());
     append_moqint(payload, draft, 1);                      // GROUP_ORDER
-    append_moqint(payload, draft, 1);
+    append_message_uint8(payload, draft, 1);
 
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
@@ -441,14 +472,30 @@ std::vector<std::uint8_t> build_subscribe_namespace_message(DraftVersion draft) 
     return bytes;
 }
 
-std::vector<std::uint8_t> build_subscribe_tracks_message() {
+enum class ForwardEncoding {
+    kUint8,      // spec-conformant single byte
+    kVarint,     // vi64 0x80 0x01: two-byte varint where draft-18 requires uint8
+    kTruncated,  // parameter type present but the value byte is missing
+};
+
+std::vector<std::uint8_t> build_subscribe_tracks_message(ForwardEncoding forward_encoding = ForwardEncoding::kUint8) {
     constexpr DraftVersion draft = DraftVersion::kDraft18;
     std::vector<std::uint8_t> payload;
     append_moqint(payload, draft, 93);
     append_track_namespace(payload, draft, {"live", "alpha"});
     append_moqint(payload, draft, 1);     // one parameter
     append_moqint(payload, draft, 0x10);  // FORWARD
-    append_moqint(payload, draft, 0);
+    switch (forward_encoding) {
+        case ForwardEncoding::kUint8:
+            append_message_uint8(payload, draft, 0);
+            break;
+        case ForwardEncoding::kVarint:
+            payload.push_back(0x80);
+            payload.push_back(1);
+            break;
+        case ForwardEncoding::kTruncated:
+            break;
+    }
 
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, 0x51);
@@ -490,9 +537,9 @@ std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     } else {
         append_moqint(payload, draft, 4);   // parameter count
         append_moqint(payload, draft, 16);  // FORWARD
-        append_moqint(payload, draft, 1);
+        append_message_uint8(payload, draft, 1);
         append_moqint(payload, draft, 16);  // SUBSCRIBER_PRIORITY
-        append_moqint(payload, draft, 127);
+        append_message_uint8(payload, draft, 200);
         append_moqint(payload, draft, 1);   // SUBSCRIPTION_FILTER
         std::vector<std::uint8_t> filter;
         append_moqint(filter, draft, 3);
@@ -501,7 +548,7 @@ std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
         append_moqint(payload, draft, filter.size());
         payload.insert(payload.end(), filter.begin(), filter.end());
         append_moqint(payload, draft, 1);   // GROUP_ORDER
-        append_moqint(payload, draft, 1);
+        append_message_uint8(payload, draft, 1);
     }
 
     std::vector<std::uint8_t> bytes;
@@ -792,7 +839,10 @@ bool test_peer_control_message_decoders_for_all_drafts() {
         ok &= expect(subscribe.track_namespace == std::vector<std::string>({"live", "alpha"}),
                      label + " subscribe namespace tuple");
         ok &= expect(subscribe.track_name == "catalog", label + " subscribe track name");
-        ok &= expect(subscribe.forward == 1 && subscribe.filter_type == 3 && subscribe.start_group_id == 9 &&
+        ok &= expect(subscribe.forward == 1 &&
+                         subscribe.subscriber_priority == (draft == DraftVersion::kDraft14 ? 128 : 200) &&
+                         subscribe.group_order == 1 &&
+                         subscribe.filter_type == 3 && subscribe.start_group_id == 9 &&
                          subscribe.start_object_id == 4,
                      label + " subscribe filter fields");
 
@@ -819,7 +869,9 @@ bool test_peer_control_message_decoders_for_all_drafts() {
         PublishOk publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message(draft), draft, publish_ok), label + " publish ok decode");
         ok &= expect(publish_ok.request_id == (draft == DraftVersion::kDraft18 ? 0 : 55) &&
-                         publish_ok.forward == 1 && publish_ok.filter_type == 3,
+                         publish_ok.forward == 1 &&
+                         publish_ok.subscriber_priority == (draft == DraftVersion::kDraft14 ? 128 : 200) &&
+                         publish_ok.filter_type == 3,
                      label + " publish ok fields");
 
         PublishError publish_error;
@@ -1063,9 +1115,52 @@ bool test_control_message_framing_and_parameter_regressions() {
 
 }  // namespace
 
+// draft-17 and draft-18 define FORWARD (0x10), SUBSCRIBER_PRIORITY (0x20) and
+// GROUP_ORDER (0x22) as uint8 message parameters (draft-17 sections 9.3.5,
+// 9.3.6, 9.3.8; draft-18 sections 10.2.16-10.2.18). These regressions pin the
+// decoder to the single-byte rule: legal uint8 values above 0x3f decode
+// correctly, and the varint framing older drafts used is rejected.
+bool test_uint8_message_parameter_decoding() {
+    bool ok = true;
+
+    for (DraftVersion draft : {DraftVersion::kDraft17, DraftVersion::kDraft18}) {
+        const std::string label = draft_label(draft);
+
+        SubscribeMessage subscribe;
+        ok &= expect(decode_subscribe_message(build_subscribe_message(draft), draft, subscribe),
+                     label + " subscribe decodes uint8 message parameters");
+        ok &= expect(subscribe.subscriber_priority == 200 && subscribe.forward == 1 && subscribe.group_order == 1,
+                     label + " subscribe uint8 parameter values");
+
+        // A two-byte vi64 encoding of SUBSCRIBER_PRIORITY 200 (0x80 0xC8):
+        // the uint8 rule reads 0x80 = 128 as the priority and the stray 0xC8
+        // desyncs the parameter framing, so the message must be rejected.
+        ok &= expect(!decode_subscribe_message(
+                         build_subscribe_message(draft, {.priority_as_varint = true}), draft, subscribe),
+                     label + " subscribe rejects varint-encoded SUBSCRIBER_PRIORITY");
+
+        // A two-byte vi64 encoding of GROUP_ORDER 1 (0x80 0x01): the uint8
+        // rule reads 0x80 = 128, which is not a legal group order.
+        ok &= expect(!decode_subscribe_message(
+                         build_subscribe_message(draft, {.group_order_as_varint = true}), draft, subscribe),
+                     label + " subscribe rejects varint-encoded GROUP_ORDER");
+    }
+
+    SubscribeTracksMessage subscribe_tracks;
+    ok &= expect(!decode_subscribe_tracks_message(build_subscribe_tracks_message(ForwardEncoding::kVarint),
+                                                  DraftVersion::kDraft18, subscribe_tracks),
+                 "draft-18 subscribe tracks rejects varint-encoded FORWARD");
+    ok &= expect(!decode_subscribe_tracks_message(build_subscribe_tracks_message(ForwardEncoding::kTruncated),
+                                                  DraftVersion::kDraft18, subscribe_tracks),
+                 "draft-18 subscribe tracks rejects truncated uint8 FORWARD");
+
+    return ok;
+}
+
 int main() {
     bool ok = true;
     ok &= test_setup_serdes_for_all_drafts();
+    ok &= test_uint8_message_parameter_decoding();
     ok &= test_publisher_control_message_encoders_for_all_drafts();
     ok &= test_peer_control_message_decoders_for_all_drafts();
     ok &= test_subgroup_header_and_object_serdes_for_all_drafts();

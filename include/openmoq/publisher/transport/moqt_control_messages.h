@@ -124,6 +124,23 @@ struct PublishError {
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 
+// Message-parameter ids shared by the SUBSCRIBE-family decoders. draft-17 and
+// draft-18 define these three as uint8 on the wire (draft-17 sections 9.3.5,
+// 9.3.6, 9.3.8; draft-18 sections 10.2.16-10.2.18); drafts up to 16 encode
+// them as variable-length integers.
+inline constexpr std::uint64_t kParamForward = 0x10;
+inline constexpr std::uint64_t kParamSubscriberPriority = 0x20;
+inline constexpr std::uint64_t kParamGroupOrder = 0x22;
+
+// Decodes the value of a numeric (even-typed) message parameter, applying the
+// draft-17/18 uint8 rule for the three parameter types above and the draft's
+// variable-length integer encoding otherwise.
+bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
+                                      std::size_t& offset,
+                                      DraftVersion draft,
+                                      std::uint64_t parameter_type,
+                                      std::uint64_t& value);
+
 std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message);
 bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetupMessage& message);
 bool decode_setup_response_message(std::span<const std::uint8_t> bytes,
