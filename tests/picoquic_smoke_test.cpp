@@ -472,8 +472,11 @@ int main() {
     const auto second_result =
         transport.try_write_object(media_stream_id, second_media, true, ObjectWriteOptions{});
     const auto admission_elapsed = std::chrono::steady_clock::now() - admission_started;
-    ok &= expect(oversized_result.disposition == ObjectWriteDisposition::kWouldBlock,
-                 "expected an individually oversized media object to report nonfatal backpressure");
+    ok &= expect(oversized_result.disposition == ObjectWriteDisposition::kFailed,
+                 "expected an individually oversized media object to report a resource-limit failure");
+    ok &= expect(!oversized_result.message.empty() &&
+                     oversized_result.message.find("budget") != std::string::npos,
+                 "expected oversized media failure to explain the admission budget");
     ok &= expect(first_result.disposition == ObjectWriteDisposition::kAccepted,
                  "expected first media write within 10-byte budget to be accepted");
     ok &= expect(second_result.disposition == ObjectWriteDisposition::kWouldBlock,

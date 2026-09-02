@@ -977,12 +977,13 @@ ObjectWriteResult WebTransportClient::try_write_object(std::uint64_t stream_id,
     if (bytes.empty() && !fin) {
         return {ObjectWriteDisposition::kAccepted, {}};
     }
-    if (bytes.size() > impl_->media_capacity ||
-        bytes.size() > impl_->media_capacity - impl_->pending_media.queued_bytes()) {
+    if (bytes.size() > impl_->media_capacity) {
+        return {ObjectWriteDisposition::kFailed,
+                "media object exceeds the connection admission budget"};
+    }
+    if (bytes.size() > impl_->media_capacity - impl_->pending_media.queued_bytes()) {
         return {ObjectWriteDisposition::kWouldBlock,
-                bytes.size() > impl_->media_capacity
-                    ? "media object exceeds the connection admission budget"
-                    : "media admission budget is full"};
+                "media admission budget is full"};
     }
 
     MediaAdmission admission = MediaAdmission::kWouldBlock;
@@ -1011,7 +1012,8 @@ ObjectWriteResult WebTransportClient::try_write_object(std::uint64_t stream_id,
         return {ObjectWriteDisposition::kFailed, impl_->last_error};
     }
     if (admission != MediaAdmission::kAccepted) {
-        return {ObjectWriteDisposition::kWouldBlock,
+        return {admission == MediaAdmission::kOversized ? ObjectWriteDisposition::kFailed
+                                                        : ObjectWriteDisposition::kWouldBlock,
                 admission == MediaAdmission::kOversized
                     ? "media object exceeds the connection admission budget"
                     : "media admission budget is full"};

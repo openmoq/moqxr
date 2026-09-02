@@ -398,8 +398,11 @@ int main() {
     const auto second_result =
         capacity_client.try_write_object(media_stream_id, second_media, true, {});
     const auto admission_elapsed = std::chrono::steady_clock::now() - admission_started;
-    ok &= expect(oversized_result.disposition == ObjectWriteDisposition::kWouldBlock,
-                 "expected oversized webtransport media to report nonfatal backpressure");
+    ok &= expect(oversized_result.disposition == ObjectWriteDisposition::kFailed,
+                 "expected oversized webtransport media to report a resource-limit failure");
+    ok &= expect(!oversized_result.message.empty() &&
+                     oversized_result.message.find("budget") != std::string::npos,
+                 "expected oversized webtransport failure to explain the admission budget");
     ok &= expect(first_result.disposition == ObjectWriteDisposition::kAccepted,
                  "expected webtransport media within the 10-byte budget to be accepted");
     ok &= expect(second_result.disposition == ObjectWriteDisposition::kWouldBlock,
