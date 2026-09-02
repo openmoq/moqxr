@@ -38,6 +38,7 @@ public:
 
         const std::uint64_t stream_id = write.stream_id;
         const std::size_t write_size = write.bytes.size();
+        write.offset = 0;
         const bool new_stream = streams_.find(stream_id) == streams_.end();
         try {
             streams_[stream_id].push_back(std::move(write));
@@ -76,12 +77,23 @@ public:
 
     std::size_t consume(std::uint64_t stream_id, std::size_t bytes) {
         auto stream = streams_.find(stream_id);
-        if (stream == streams_.end() || stream->second.empty() || bytes == 0) {
+        if (stream == streams_.end() || stream->second.empty()) {
             return 0;
         }
 
         auto& writes = stream->second;
         PendingMediaWrite& write = writes.front();
+        if (bytes == 0) {
+            if (!write.bytes.empty() || !write.fin) {
+                return 0;
+            }
+            writes.pop_front();
+            if (writes.empty()) {
+                streams_.erase(stream);
+            }
+            return 0;
+        }
+
         const std::size_t remaining = remaining_bytes(write);
         const std::size_t consumed = bytes < remaining ? bytes : remaining;
         write.offset += consumed;

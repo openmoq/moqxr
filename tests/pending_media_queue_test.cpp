@@ -86,6 +86,42 @@ int main() {
     }
 
     {
+        PendingMediaQueue queue(4);
+        PendingMediaWrite offset_write = make_write(8, 4);
+        offset_write.offset = 3;
+        ok &= expect(queue.try_push(std::move(offset_write)) == MediaAdmission::kAccepted,
+                     "expected a write with caller-supplied offset to be admitted");
+        ok &= expect(queue.front(8, Clock::now()) != nullptr &&
+                         queue.front(8, Clock::now())->offset == 0,
+                     "expected admission to normalize the write offset to zero");
+        ok &= expect(queue.consume(8, 4) == 4,
+                     "expected full consumption to account for all admitted bytes");
+        ok &= expect(queue.queued_bytes() == 0,
+                     "expected full consumption to restore the complete capacity");
+        ok &= expect(queue.try_push(make_write(8, 4)) == MediaAdmission::kAccepted,
+                     "expected capacity to be reusable after consuming an offset write");
+    }
+
+    {
+        PendingMediaQueue queue(4);
+        PendingMediaWrite fin = make_write(9, 0);
+        fin.fin = true;
+        ok &= expect(queue.try_push(std::move(fin)) == MediaAdmission::kAccepted,
+                     "expected an empty FIN to be admitted");
+        ok &= expect(queue.try_push(make_write(9, 2)) == MediaAdmission::kAccepted,
+                     "expected a write after an empty FIN to be admitted");
+        ok &= expect(queue.front(9, Clock::now()) != nullptr && queue.front(9, Clock::now())->fin,
+                     "expected the empty FIN at the stream front");
+        ok &= expect(queue.consume(9, 0) == 0,
+                     "expected callback-style zero-byte consumption to retire an empty FIN");
+        ok &= expect(queue.front(9, Clock::now()) != nullptr &&
+                         queue.front(9, Clock::now())->bytes.size() == 2,
+                     "expected the following write after the empty FIN to become visible");
+        ok &= expect(queue.consume(9, 2) == 2 && queue.front(9, Clock::now()) == nullptr,
+                     "expected the stream to empty after consuming the following write");
+    }
+
+    {
         PendingMediaQueue queue(20);
         queue.try_push(make_write(1, 4));
         queue.try_push(make_write(2, 6));
@@ -116,6 +152,19 @@ int main() {
         ok &= expect(queue.front(5, now + std::chrono::seconds(1)) != nullptr,
                      "expected expiry not to discard a write after its first byte");
         ok &= expect(queue.clear_connection() == 3, "expected the partially consumed remainder to clear");
+    }
+
+    {
+        PendingMediaQueue queue(4);
+        const auto now = Clock::now();
+        PendingMediaWrite expired_subgroup = make_write(6, 3);
+        expired_subgroup.subgroup_deadline = now - std::chrono::milliseconds(1);
+        ok &= expect(queue.try_push(std::move(expired_subgroup)) == MediaAdmission::kAccepted,
+                     "expected a subgroup-expired write to be admitted before eligibility is checked");
+        ok &= expect(queue.front(6, now) == nullptr,
+                     "expected an offset-zero write with an expired subgroup deadline to be discarded");
+        ok &= expect(queue.queued_bytes() == 0,
+                     "expected subgroup expiry to remove all of the queued bytes");
     }
 
     return ok ? 0 : 1;
