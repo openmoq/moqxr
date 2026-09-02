@@ -16,7 +16,9 @@
 #include <cstdint>
 #include <future>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +41,7 @@ namespace {
 using openmoq::publisher::transport::ConnectionState;
 using openmoq::publisher::transport::EndpointConfig;
 using openmoq::publisher::transport::ObjectWriteDisposition;
+using openmoq::publisher::transport::ObjectWriteOptions;
 using openmoq::publisher::transport::StreamDirection;
 using openmoq::publisher::transport::TlsConfig;
 using openmoq::publisher::transport::TransportKind;
@@ -67,6 +70,8 @@ struct SilentServer {
     std::size_t stream_bytes_received = 0;
     std::size_t request_stream_bytes_received = 0;
     bool stream_fin_received = false;
+    std::set<std::uint64_t> stream_fins;
+    std::map<std::uint64_t, std::uint64_t> stream_reset_errors;
     picohttp_server_path_item_t path_item{};
     picohttp_server_parameters_t params{};
 };
@@ -110,7 +115,16 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         }
         if (event == picohttp_callback_post_fin) {
             server->stream_fin_received = true;
+            if (stream_ctx != nullptr) {
+                server->stream_fins.insert(stream_ctx->stream_id);
+            }
         }
+        server->condition.notify_all();
+    } else if (event == picohttp_callback_reset && stream_ctx != nullptr) {
+        std::lock_guard<std::mutex> lock(server->mutex);
+        server->stream_reset_errors.insert_or_assign(
+            stream_ctx->stream_id,
+            picoquic_get_remote_stream_error(cnx, stream_ctx->stream_id));
         server->condition.notify_all();
     }
     return 0;
@@ -329,6 +343,36 @@ int main() {
             return 1;
         }
 
+        std::uint64_t ack_stream_id = 0;
+        ok &= expect(drain_client->open_stream(StreamDirection::kUnidirectional,
+                                               ack_stream_id).ok,
+                     "expected ACK-wins webtransport stream open to succeed");
+        ObjectWriteOptions ack_wins_options;
+        ack_wins_options.subgroup_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        const std::vector<std::uint8_t> ack_payload = {0x7A};
+        const auto ack_result = drain_client->try_write_object(
+            ack_stream_id, ack_payload, true, ack_wins_options);
+        ok &= expect(ack_result.disposition == ObjectWriteDisposition::kAccepted,
+                     "expected deadline-bearing webtransport FIN to be admitted");
+        {
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return server.stream_fins.contains(ack_stream_id);
+                         }),
+                         "expected the webtransport peer to receive the ACK-wins FIN");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        ok &= expect(!drain_client->media_stream_expired(ack_stream_id),
+                     "expected h3zero stream free after ACK to cancel the subgroup timer");
+        std::size_t bytes_before_drain = 0;
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            ok &= expect(!server.stream_reset_errors.contains(ack_stream_id),
+                         "expected no webtransport timeout reset after the acknowledged deadline-bearing FIN");
+            bytes_before_drain = server.stream_bytes_received;
+        }
+
         std::uint64_t stream_id = 0;
         ok &= expect(drain_client->open_stream(StreamDirection::kUnidirectional, stream_id).ok,
                      "expected open_stream to succeed");
@@ -355,13 +399,88 @@ int main() {
 
         std::unique_lock<std::mutex> lock(server.mutex);
         server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
-            return server.stream_fin_received && server.stream_bytes_received >= kPayloadBytes;
+            return server.stream_fins.contains(stream_id) &&
+                   server.stream_bytes_received >= bytes_before_drain + kPayloadBytes;
         });
-        std::cerr << "server received " << server.stream_bytes_received << " of " << kPayloadBytes
+        std::cerr << "server received " << server.stream_bytes_received - bytes_before_drain
+                  << " of " << kPayloadBytes
                   << " bytes, fin=" << (server.stream_fin_received ? "yes" : "no") << '\n';
-        ok &= expect(server.stream_bytes_received == kPayloadBytes,
+        ok &= expect(server.stream_bytes_received == bytes_before_drain + kPayloadBytes,
                      "expected the server to receive every byte written before close()");
-        ok &= expect(server.stream_fin_received, "expected the server to receive the stream FIN before close()");
+        ok &= expect(server.stream_fins.contains(stream_id),
+                     "expected the server to receive the stream FIN before close()");
+    }
+
+    // Timer-wins uses a separate 10-byte client on the normally flowing
+    // loopback connection. A one-byte probe lets h3zero establish the stream
+    // context; the already-due final admission is then reset before provide
+    // data, and a full-size replacement proves the queue was cleared.
+    {
+        WebTransportClient deadline_client(10);
+        ok &= expect(deadline_client.configure(endpoint, tls).ok,
+                     "expected timer-wins webtransport client configure to succeed");
+        ok &= expect(deadline_client.connect().ok,
+                     "expected timer-wins webtransport client connect to succeed");
+        std::uint64_t timeout_stream_id = 0;
+        ok &= expect(deadline_client.open_stream(StreamDirection::kUnidirectional,
+                                                 timeout_stream_id).ok,
+                     "expected timer-wins webtransport stream open to succeed");
+        std::size_t bytes_before_timer_stream = 0;
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            bytes_before_timer_stream = server.stream_bytes_received;
+        }
+        const std::vector<std::uint8_t> prefix_probe = {0xE1};
+        ok &= expect(deadline_client.try_write_object(timeout_stream_id,
+                                                      prefix_probe,
+                                                      false,
+                                                      {}).disposition == ObjectWriteDisposition::kAccepted,
+                     "expected webtransport timer stream probe to be admitted");
+        {
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return server.stream_bytes_received >=
+                                    bytes_before_timer_stream + prefix_probe.size();
+                         }),
+                         "expected the server to establish the timer stream context");
+        }
+        ObjectWriteOptions timer_wins_options;
+        timer_wins_options.subgroup_deadline =
+            std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+        const std::vector<std::uint8_t> timed_media(10, 0xE2);
+        ok &= expect(deadline_client.try_write_object(timeout_stream_id,
+                                                      timed_media,
+                                                      true,
+                                                      timer_wins_options).disposition ==
+                         ObjectWriteDisposition::kAccepted,
+                     "expected already-due webtransport subgroup to enter bounded admission");
+        {
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return server.stream_reset_errors.contains(timeout_stream_id);
+                         }),
+                         "expected the webtransport subgroup timer to reset its stream");
+            const auto reset = server.stream_reset_errors.find(timeout_stream_id);
+            if (reset != server.stream_reset_errors.end()) {
+                ok &= expect(reset->second == 0x02,
+                             "expected webtransport timer-wins reset error 0x02");
+            }
+        }
+        ok &= expect(deadline_client.media_stream_expired(timeout_stream_id),
+                     "expected webtransport timer expiry to remain queryable by stream ID");
+        std::uint64_t replacement_stream_id = 0;
+        ok &= expect(deadline_client.open_stream(StreamDirection::kUnidirectional,
+                                                 replacement_stream_id).ok,
+                     "expected replacement webtransport timer stream open to succeed");
+        const std::vector<std::uint8_t> exact_budget(10, 0xE3);
+        ok &= expect(deadline_client.try_write_object(replacement_stream_id,
+                                                      exact_budget,
+                                                      true,
+                                                      {}).disposition == ObjectWriteDisposition::kAccepted,
+                     "expected webtransport timeout reset to release the full admission budget");
+        deadline_client.note_delivery_timeout(std::chrono::milliseconds(1));
+        ok &= expect(deadline_client.close(0).ok,
+                     "expected timer-wins webtransport client close to succeed");
     }
 
     stop_server(server);

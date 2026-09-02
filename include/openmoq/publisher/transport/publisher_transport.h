@@ -115,6 +115,14 @@ public:
     // connection is torn down (draft -16 9.15 / -18 10.11). Optional: the
     // default ignores it and transports fall back to a built-in bound.
     virtual void note_delivery_timeout(std::chrono::milliseconds timeout) { static_cast<void>(timeout); }
+    // Stable, non-destructive notification that the transport has already
+    // reset this media stream because a delivery deadline won. Sessions use
+    // it to retire the owning subgroup without conflating timeout with the
+    // three admission outcomes. Optional transports never report expiry.
+    virtual bool media_stream_expired(std::uint64_t stream_id) const {
+        static_cast<void>(stream_id);
+        return false;
+    }
     virtual TransportStatus close(std::uint64_t application_error_code) = 0;
 };
 

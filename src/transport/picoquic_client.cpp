@@ -1210,6 +1210,19 @@ void PicoquicClient::note_delivery_timeout(std::chrono::milliseconds timeout) {
 #endif
 }
 
+bool PicoquicClient::media_stream_expired(std::uint64_t stream_id) const {
+#ifndef OPENMOQ_HAS_PICOQUIC
+    static_cast<void>(stream_id);
+    return false;
+#else
+    if (impl_ == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->timed_out_media_streams.contains(stream_id);
+#endif
+}
+
 TransportStatus PicoquicClient::close(std::uint64_t application_error_code) {
     static_cast<void>(application_error_code);
 

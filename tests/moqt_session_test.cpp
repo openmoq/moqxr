@@ -280,6 +280,10 @@ struct MockTransport final : PublisherTransport {
         delivery_timeouts.push_back(timeout);
     }
 
+    bool media_stream_expired(std::uint64_t stream_id) const override {
+        return expired_media_streams.contains(stream_id);
+    }
+
     TransportStatus reset_stream(std::uint64_t stream_id, std::uint64_t error_code) override {
         reset_calls.emplace_back(stream_id, error_code);
         return TransportStatus::success();
@@ -303,6 +307,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<ObjectWriteEvent> object_write_attempts;
     std::vector<std::chrono::milliseconds> read_timeouts;
     std::vector<std::chrono::milliseconds> delivery_timeouts;
+    std::set<std::uint64_t> expired_media_streams;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> accepted_streams;
     std::function<void(MockTransport&, StreamDirection)> on_accept_timeout;
@@ -1150,6 +1155,92 @@ PublishPlan make_delivery_deadline_plan(DraftVersion draft,
     return plan;
 }
 
+PublishPlan make_transport_expiry_plan(DraftVersion draft) {
+    return {
+        .draft = openmoq::publisher::draft_profile(draft),
+        .tracks = {
+            TrackDescription{.track_id = 1,
+                             .handler_type = "vide",
+                             .codec = "avc1.64000C",
+                             .sample_entry_type = "avc1",
+                             .track_name = "events"},
+        },
+        .objects = {
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 7,
+                .subgroup_id = 3,
+                .object_id = 0,
+                .owned_payload = {'A'},
+            },
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 7,
+                .subgroup_id = 3,
+                .object_id = 1,
+                .owned_payload = {'B'},
+            },
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 7,
+                .subgroup_id = 4,
+                .object_id = 2,
+                .owned_payload = {'C'},
+            },
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 7,
+                .subgroup_id = 3,
+                .object_id = 3,
+                .owned_payload = {'D'},
+            },
+        },
+    };
+}
+
+PublishPlan make_completed_subgroup_reopen_plan(DraftVersion draft) {
+    return {
+        .draft = openmoq::publisher::draft_profile(draft),
+        .tracks = {
+            TrackDescription{.track_id = 1,
+                             .handler_type = "vide",
+                             .codec = "avc1.64000C",
+                             .sample_entry_type = "avc1",
+                             .track_name = "events"},
+        },
+        .objects = {
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 9,
+                .subgroup_id = 1,
+                .object_id = 0,
+                .owned_payload = {'A'},
+            },
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 9,
+                .subgroup_id = 2,
+                .object_id = 1,
+                .owned_payload = {'B'},
+            },
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 9,
+                .subgroup_id = 1,
+                .object_id = 0,
+                .owned_payload = {'C'},
+            },
+        },
+    };
+}
+
 }  // namespace
 
 int main() {
@@ -1978,6 +2069,122 @@ int main() {
                                   transport.reset_calls.end(),
                                   [](const auto& reset) { return reset.second == 0x02; }),
                      "expected the session not to substitute close drain for transport ACK monitoring");
+    }
+
+    {
+        // A timeout can win on the packet-loop thread after admission has
+        // returned. The next application object must observe that stable
+        // per-stream state before writing: the expired subgroup is retired
+        // without failing the subscription, while an independent subgroup
+        // still publishes and the later expired-key object stays suppressed.
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        transport.reads[0].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "events",
+                                     0,
+                                     DraftVersion::kDraft16,
+                                     1000));
+        transport.on_try_write_object =
+            [](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+                if (current.object_write_attempts.size() == 1) {
+                    current.expired_media_streams.insert(event.stream_id);
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected pre-admission-expiry session connect to succeed");
+        status = session.publish(make_transport_expiry_plan(DraftVersion::kDraft16));
+        ok &= expect(status.ok, "expected transport-owned expiry to remain nonfatal");
+        ok &= expect(transport.object_write_attempts.size() == 2,
+                     "expected both later objects for the expired subgroup to be suppressed while another subgroup publishes");
+        if (transport.object_write_attempts.size() == 2) {
+            ok &= expect(transport.object_write_attempts[0].stream_id !=
+                             transport.object_write_attempts[1].stream_id,
+                         "expected the post-expiry write to belong to the independent subgroup");
+        }
+    }
+
+    {
+        // Close the check-versus-write race: the stream is healthy at the
+        // pre-admission query, then expires while try_write_object decides its
+        // result. The post-failure query must distinguish timeout from a
+        // terminal transport failure and let another subgroup continue.
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        transport.reads[0].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "events",
+                                     0,
+                                     DraftVersion::kDraft16,
+                                     1000));
+        transport.on_try_write_object =
+            [](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+                if (current.object_write_attempts.size() == 2) {
+                    current.expired_media_streams.insert(event.stream_id);
+                    return ObjectWriteResult{ObjectWriteDisposition::kFailed,
+                                             "simulated packet-loop expiry"};
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected check-write-race session connect to succeed");
+        status = session.publish(make_transport_expiry_plan(DraftVersion::kDraft16));
+        ok &= expect(status.ok,
+                     "expected kFailed paired with stable stream expiry to retire only that subgroup");
+        ok &= expect(transport.object_write_attempts.size() == 3,
+                     "expected one raced failure, one continuing subgroup write, and no expired-key reopen");
+        if (transport.object_write_attempts.size() == 3) {
+            ok &= expect(transport.object_write_attempts[0].stream_id ==
+                             transport.object_write_attempts[1].stream_id &&
+                             transport.object_write_attempts[2].stream_id !=
+                                 transport.object_write_attempts[0].stream_id,
+                         "expected the race on the original stream followed by progress on an independent stream");
+        }
+    }
+
+    {
+        // Once a FIN is accepted the subgroup is permanently complete. A
+        // duplicate late application publication for that exact key must not
+        // open a second stream; an intervening subgroup remains unaffected.
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        transport.reads[0].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "events",
+                                     0,
+                                     DraftVersion::kDraft16,
+                                     1000));
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected completed-subgroup session connect to succeed");
+        status = session.publish(make_completed_subgroup_reopen_plan(DraftVersion::kDraft16));
+        ok &= expect(status.ok, "expected a duplicate completed-key publication to be ignored nonfatally");
+        ok &= expect(transport.object_write_attempts.size() == 2,
+                     "expected a completed subgroup not to reopen while another subgroup publishes");
     }
 
     MockTransport draft16_transport;
@@ -3224,6 +3431,82 @@ int main() {
         }
         ok &= expect(found_final_catalog,
                      "expected end_broadcast to publish an isComplete final catalog on the wire");
+    }
+
+    {
+        // The catalog timeout pair is negotiated inside publish_live(), but
+        // the final independent catalog is sent later by end_broadcast().
+        // Keep both draft-18 values across that boundary: stalling the final
+        // object beyond its shorter object deadline must reset the exact new
+        // catalog stream with DELIVERY_TIMEOUT rather than taking the legacy
+        // timeout-free write path.
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        bool final_catalog_phase = false;
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "catalog",
+                                     0,
+                                     DraftVersion::kDraft18,
+                                     100,
+                                     250));
+        transport.on_try_write_object =
+            [&now, &final_catalog_phase](MockTransport&,
+                                         const MockTransport::ObjectWriteEvent&) {
+                if (final_catalog_phase) {
+                    now += std::chrono::milliseconds(101);
+                    return ObjectWriteResult{ObjectWriteDisposition::kWouldBlock,
+                                             "stall final catalog"};
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            true,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 final-catalog deadline session connect to succeed");
+
+        const auto live_bytes = make_live_init_mp4();
+        std::string live_input_bytes(live_bytes.begin(), live_bytes.end());
+        std::istringstream live_input(live_input_bytes);
+        status = session.publish_live(live_input, DraftVersion::kDraft18, false);
+        ok &= expect(status.ok, "expected initial draft-18 live catalog publish to succeed");
+
+        const std::size_t attempts_before_final = transport.object_write_attempts.size();
+        const std::size_t resets_before_final = transport.reset_calls.size();
+        final_catalog_phase = true;
+        status = session.end_broadcast(
+            openmoq::publisher::EndBroadcastMode::kTerminate, DraftVersion::kDraft18);
+        ok &= expect(status.ok, "expected final catalog deadline expiry to remain nonfatal");
+        ok &= expect(transport.object_write_attempts.size() == attempts_before_final + 1,
+                     "expected end_broadcast to forward the retained timeout pair through object admission");
+        ok &= expect(transport.reset_calls.size() == resets_before_final + 1,
+                     "expected one final-catalog delivery-timeout reset");
+        if (transport.object_write_attempts.size() == attempts_before_final + 1 &&
+            transport.reset_calls.size() == resets_before_final + 1) {
+            const auto& attempt = transport.object_write_attempts.back();
+            ok &= expect(attempt.options.object_deadline ==
+                             Clock::time_point{} + std::chrono::milliseconds(100),
+                         "expected final catalog to retain the 100 ms object timeout");
+            ok &= expect(attempt.options.subgroup_deadline ==
+                             Clock::time_point{} + std::chrono::milliseconds(250),
+                         "expected final catalog to retain the independent 250 ms subgroup timeout");
+            ok &= expect(transport.reset_calls.back() ==
+                             std::pair<std::uint64_t, std::uint64_t>{attempt.stream_id, 0x02},
+                         "expected final catalog expiry to reset its exact stream with 0x02");
+        }
     }
 
     {

@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -145,6 +146,8 @@ private:
                                          const std::vector<openmoq::publisher::CatalogObject>& objects,
                                          DeliveryTimeouts delivery_timeouts = {},
                                          std::size_t* streams_opened = nullptr);
+    void remember_catalog_delivery_timeouts(DeliveryTimeouts delivery_timeouts);
+    DeliveryTimeouts catalog_delivery_timeouts_snapshot() const;
 
     PublisherTransport& transport_;
     std::string track_namespace_;
@@ -195,6 +198,8 @@ private:
     std::chrono::steady_clock::time_point last_catalog_published_at_{};
     std::uint64_t catalog_track_alias_ = 0;
     bool catalog_track_alias_known_ = false;
+    mutable std::mutex catalog_delivery_timeouts_mutex_;
+    DeliveryTimeouts catalog_delivery_timeouts_;
 };
 
 }  // namespace openmoq::publisher::transport

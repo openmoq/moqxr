@@ -1510,7 +1510,8 @@ public:
             *published = false;
         }
         const Key key{static_cast<std::uint64_t>(object.group_id), object.subgroup_id};
-        if (expired_subgroups_.contains(key)) {
+        observe_transport_expiries(transport);
+        if (closed_subgroups_.contains(key)) {
             return TransportStatus::success();
         }
 
@@ -1523,7 +1524,7 @@ public:
                                                             delivery_timeouts.subgroup_ms)
                                            : std::nullopt;
         if (deadline_reached(read_now(now_function), object_deadline, subgroup_deadline)) {
-            expired_subgroups_.insert(key);
+            closed_subgroups_.insert(key);
             return TransportStatus::success();
         }
 
@@ -1543,6 +1544,7 @@ public:
                 object.subgroup_id, subgroup_contains_group_largest);
             ++stream_count_;
             it = streams_.emplace(key, OpenStream{stream_id, 0}).first;
+            stream_keys_.insert_or_assign(stream_id, key);
         } else {
             stream_id = it->second.stream_id;
             previous_object_id = it->second.last_object_id;
@@ -1592,8 +1594,7 @@ public:
         } else {
             while (true) {
                 if (deadline_reached(read_now(now_function), object_deadline, subgroup_deadline)) {
-                    expired_subgroups_.insert(key);
-                    streams_.erase(it);
+                    close_subgroup(key);
                     return transport.reset_stream(stream_id, kDeliveryTimeoutErrorCode);
                 }
 
@@ -1605,6 +1606,10 @@ public:
                 ObjectWriteResult result = transport.try_write_object(
                     stream_id, wire_bytes, is_final_in_subgroup, std::move(options));
                 if (result.disposition == ObjectWriteDisposition::kFailed) {
+                    observe_transport_expiries(transport);
+                    if (closed_subgroups_.contains(key)) {
+                        return TransportStatus::success();
+                    }
                     return TransportStatus::failure(
                         result.message.empty() ? "transport object admission failed" : result.message);
                 }
@@ -1617,7 +1622,7 @@ public:
         }
 
         if (is_final_in_subgroup) {
-            streams_.erase(it);
+            close_subgroup(key);
         } else {
             it->second.last_object_id = object.object_id;
         }
@@ -1644,19 +1649,25 @@ public:
         delivery_timeouts = timeouts_for_draft(draft, delivery_timeouts);
         const auto subgroup_deadline =
             deadline_after(read_now(now_function), delivery_timeouts.subgroup_ms);
-        for (auto& [key, stream] : streams_) {
+        observe_transport_expiries(transport);
+        const std::vector<std::pair<Key, OpenStream>> open_streams(streams_.begin(), streams_.end());
+        for (const auto& [key, stream] : open_streams) {
+            if (closed_subgroups_.contains(key)) {
+                continue;
+            }
             if (delivery_timeouts.subgroup_ms == 0) {
                 const TransportStatus status = transport.write_stream(stream.stream_id, {}, true);
                 if (!status.ok) {
                     return status;
                 }
+                close_subgroup(key);
                 continue;
             }
 
             while (true) {
                 if (deadline_reached(read_now(now_function), std::nullopt, subgroup_deadline)) {
                     const std::uint64_t stream_id = stream.stream_id;
-                    expired_subgroups_.insert(key);
+                    close_subgroup(key);
                     const TransportStatus status =
                         transport.reset_stream(stream_id, kDeliveryTimeoutErrorCode);
                     if (!status.ok) {
@@ -1674,6 +1685,10 @@ public:
                         .subgroup_deadline = subgroup_deadline,
                     });
                 if (result.disposition == ObjectWriteDisposition::kFailed) {
+                    observe_transport_expiries(transport);
+                    if (closed_subgroups_.contains(key)) {
+                        break;
+                    }
                     return TransportStatus::failure(
                         result.message.empty() ? "transport subgroup FIN admission failed"
                                                : result.message);
@@ -1683,8 +1698,10 @@ public:
                 }
                 std::this_thread::yield();
             }
+            close_subgroup(key);
         }
         streams_.clear();
+        stream_keys_.clear();
         return TransportStatus::success();
     }
 
@@ -1700,8 +1717,36 @@ private:
         std::uint64_t stream_id;
         std::uint64_t last_object_id;
     };
+
+    void close_subgroup(const Key& key) {
+        const auto stream_it = streams_.find(key);
+        if (stream_it != streams_.end()) {
+            stream_keys_.erase(stream_it->second.stream_id);
+            streams_.erase(stream_it);
+        }
+        closed_subgroups_.insert(key);
+    }
+
+    void observe_transport_expiries(PublisherTransport& transport) {
+        for (auto it = stream_keys_.begin(); it != stream_keys_.end();) {
+            if (!transport.media_stream_expired(it->first)) {
+                ++it;
+                continue;
+            }
+            const std::uint64_t stream_id = it->first;
+            const Key key = it->second;
+            const auto stream_it = streams_.find(key);
+            if (stream_it != streams_.end() && stream_it->second.stream_id == stream_id) {
+                streams_.erase(stream_it);
+            }
+            closed_subgroups_.insert(key);
+            it = stream_keys_.erase(it);
+        }
+    }
+
     std::map<Key, OpenStream> streams_;
-    std::set<Key> expired_subgroups_;
+    std::map<std::uint64_t, Key> stream_keys_;
+    std::set<Key> closed_subgroups_;
     std::uint64_t stream_count_ = 0;
 };
 
@@ -3167,6 +3212,16 @@ MoqtSession::PublishStats MoqtSession::publish_stats() const {
     return publish_stats_;
 }
 
+void MoqtSession::remember_catalog_delivery_timeouts(DeliveryTimeouts delivery_timeouts) {
+    std::lock_guard<std::mutex> lock(catalog_delivery_timeouts_mutex_);
+    catalog_delivery_timeouts_ = delivery_timeouts;
+}
+
+DeliveryTimeouts MoqtSession::catalog_delivery_timeouts_snapshot() const {
+    std::lock_guard<std::mutex> lock(catalog_delivery_timeouts_mutex_);
+    return catalog_delivery_timeouts_;
+}
+
 TransportStatus MoqtSession::send_catalog_objects(
     openmoq::publisher::DraftVersion draft_version,
     std::uint64_t track_alias,
@@ -3465,6 +3520,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     // catalog at all to this broadcast's subscribers.
     catalog_publisher_.reset();
     catalog_track_alias_known_ = false;
+    remember_catalog_delivery_timeouts({});
     last_catalog_published_at_ = std::chrono::steady_clock::time_point{};
 
     struct LiveMediaQueue {
@@ -3778,6 +3834,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     if (subscribe.track_name == "catalog") {
                         catalog_delivery_timeouts = delivery_timeouts_for_track(
                             active_subscriptions, "catalog");
+                        remember_catalog_delivery_timeouts(catalog_delivery_timeouts);
                         ws = send_catalog(track_it->second);
                         if (!ws.ok) {
                             return {ws, 0};
@@ -3976,6 +4033,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // catalog at all to this broadcast's subscribers.
     catalog_publisher_.reset();
     catalog_track_alias_known_ = false;
+    remember_catalog_delivery_timeouts({});
     last_catalog_published_at_ = std::chrono::steady_clock::time_point{};
 
     // Phase 1: Read stdin until we have ftyp + moov (track discovery).
@@ -4485,6 +4543,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (track_name == "catalog") {
                 catalog_delivery_timeouts = merge_delivery_timeouts(
                     catalog_delivery_timeouts, publish_ok.delivery_timeouts);
+                remember_catalog_delivery_timeouts(catalog_delivery_timeouts);
             }
             subscribe_tracks_publish_request_ids.insert_or_assign(track_name,
                                                                   next_subscribe_tracks_publish_request_id);
@@ -4588,6 +4647,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                             active_subscriptions,
                             "catalog",
                             catalog_delivery_timeouts);
+                        remember_catalog_delivery_timeouts(catalog_delivery_timeouts);
                         write_status = send_catalog(track_it->second);
                         if (!write_status.ok) {
                             return {write_status, 0};
@@ -4762,6 +4822,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                             active_subscriptions,
                             "catalog",
                             catalog_delivery_timeouts);
+                        remember_catalog_delivery_timeouts(catalog_delivery_timeouts);
                         ws = send_catalog(track_it->second);
                         if (!ws.ok) {
                             return {ws, 0};
@@ -5978,7 +6039,10 @@ TransportStatus MoqtSession::end_broadcast(openmoq::publisher::EndBroadcastMode 
     if (catalog_track_alias_known_ && !catalog_publisher_.ended()) {
         const auto catalog_objects = catalog_publisher_.end_broadcast(mode, {});
         const TransportStatus catalog_status =
-            send_catalog_objects(draft_version, catalog_track_alias_, catalog_objects);
+            send_catalog_objects(draft_version,
+                                 catalog_track_alias_,
+                                 catalog_objects,
+                                 catalog_delivery_timeouts_snapshot());
         if (!catalog_status.ok) {
             status = catalog_status;
         }

@@ -38,6 +38,7 @@ public:
                                  std::uint64_t error_code) override;
     std::string connection_id() const override;
     void note_delivery_timeout(std::chrono::milliseconds timeout) override;
+    bool media_stream_expired(std::uint64_t stream_id) const override;
     TransportStatus close(std::uint64_t application_error_code) override;
 
 private:

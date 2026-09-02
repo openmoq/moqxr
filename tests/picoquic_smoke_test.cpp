@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <set>
 #include <span>
@@ -60,6 +61,7 @@ struct SmokeServer {
     std::vector<std::uint8_t> media_stream_bytes;
     bool media_stream_fin_received = false;
     std::set<std::uint64_t> media_stream_fins;
+    std::map<std::uint64_t, std::uint64_t> media_stream_reset_errors;
     std::vector<std::uint8_t> control_bytes;
     std::size_t publish_response_count = 0;
     bool loop_ready = false;
@@ -224,6 +226,13 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
         case picoquic_callback_stateless_reset:
             trace("server connection close event");
             return 0;
+        case picoquic_callback_stream_reset: {
+            std::lock_guard<std::mutex> lock(server->mutex);
+            server->media_stream_reset_errors.insert_or_assign(
+                stream_id, picoquic_get_remote_stream_error(cnx, stream_id));
+            server->condition.notify_all();
+            return 0;
+        }
         default:
             static_cast<void>(bytes);
             return 0;
@@ -501,6 +510,32 @@ int main() {
 
     status = transport.reset_stream(media_stream_id, 0);
     ok &= expect(status.ok, "expected media reset to succeed");
+    std::uint64_t timeout_stream_id = 0;
+    status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kUnidirectional,
+                                   timeout_stream_id);
+    ok &= expect(status.ok, "expected timer-wins raw-QUIC stream open to succeed");
+    ObjectWriteOptions timer_wins_options;
+    timer_wins_options.subgroup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    const std::vector<std::uint8_t> timed_media(10, 0xE4);
+    const auto timed_result = transport.try_write_object(
+        timeout_stream_id, timed_media, true, timer_wins_options);
+    ok &= expect(timed_result.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected raw-QUIC timer stream to fill the bounded media queue");
+    {
+        std::unique_lock<std::mutex> lock(server.mutex);
+        ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                         return server.media_stream_reset_errors.contains(timeout_stream_id);
+                     }),
+                     "expected the raw-QUIC subgroup timer to reset the flow-controlled stream");
+        const auto reset = server.media_stream_reset_errors.find(timeout_stream_id);
+        if (reset != server.media_stream_reset_errors.end()) {
+            ok &= expect(reset->second == 0x02,
+                         "expected raw-QUIC timer-wins reset error 0x02");
+        }
+    }
+    ok &= expect(transport.media_stream_expired(timeout_stream_id),
+                 "expected raw-QUIC timer expiry to remain queryable by stream ID");
     std::uint64_t replacement_stream_id = 0;
     status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kUnidirectional,
                                    replacement_stream_id);
@@ -509,7 +544,7 @@ int main() {
     const auto after_reset =
         transport.try_write_object(replacement_stream_id, exact_budget, true, ObjectWriteOptions{});
     ok &= expect(after_reset.disposition == ObjectWriteDisposition::kAccepted,
-                 "expected reset to release the complete media admission budget");
+                 "expected timeout reset to release the complete media admission budget");
 
     transport.note_delivery_timeout(std::chrono::milliseconds(1));
 
@@ -562,11 +597,14 @@ int main() {
         std::span<const std::uint8_t>(delivery_bytes.data(), 3000),
         false,
         ObjectWriteOptions{});
+    ObjectWriteOptions ack_wins_options;
+    ack_wins_options.subgroup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     const auto delivery_second = delivery_client.try_write_object(
         delivery_stream_id,
         std::span<const std::uint8_t>(delivery_bytes.data() + 3000, 2000),
         true,
-        ObjectWriteOptions{});
+        ack_wins_options);
     ok &= expect(delivery_first.disposition == ObjectWriteDisposition::kAccepted &&
                      delivery_second.disposition == ObjectWriteDisposition::kAccepted,
                  "expected multi-write pull delivery to accept both media objects");
@@ -578,6 +616,14 @@ int main() {
                      "expected pull delivery to send the media stream FIN");
         ok &= expect(delivery_server.media_stream_bytes == delivery_bytes,
                      "expected partial provide callbacks to deliver every media byte in order");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    ok &= expect(!delivery_client.media_stream_expired(delivery_stream_id),
+                 "expected raw-QUIC stream release after ACK to cancel the subgroup timer");
+    {
+        std::lock_guard<std::mutex> lock(delivery_server.mutex);
+        ok &= expect(!delivery_server.media_stream_reset_errors.contains(delivery_stream_id),
+                     "expected no raw-QUIC timeout reset after the acknowledged deadline-bearing FIN");
     }
     std::uint64_t empty_fin_stream_id = 0;
     status = delivery_client.open_stream(
