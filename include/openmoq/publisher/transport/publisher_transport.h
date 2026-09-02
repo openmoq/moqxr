@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace openmoq::publisher::transport {
@@ -60,6 +62,19 @@ struct TransportStatus {
     static TransportStatus failure(std::string_view error_message);
 };
 
+struct ObjectWriteOptions {
+    std::uint8_t transport_priority = 255;
+    std::optional<std::chrono::steady_clock::time_point> object_deadline;
+    std::optional<std::chrono::steady_clock::time_point> subgroup_deadline;
+};
+
+enum class ObjectWriteDisposition { kAccepted, kWouldBlock, kFailed };
+
+struct ObjectWriteResult {
+    ObjectWriteDisposition disposition = ObjectWriteDisposition::kFailed;
+    std::string message;
+};
+
 class PublisherTransport {
 public:
     virtual ~PublisherTransport() = default;
@@ -74,6 +89,18 @@ public:
     virtual TransportStatus write_stream(std::uint64_t stream_id,
                                          std::span<const std::uint8_t> bytes,
                                          bool fin) = 0;
+    virtual ObjectWriteResult try_write_object(std::uint64_t stream_id,
+                                               std::span<const std::uint8_t> bytes,
+                                               bool fin,
+                                               ObjectWriteOptions options) {
+        static_cast<void>(options);
+        TransportStatus status = write_stream(stream_id, bytes, fin);
+        return {
+            .disposition = status.ok ? ObjectWriteDisposition::kAccepted
+                                     : ObjectWriteDisposition::kFailed,
+            .message = std::move(status.message),
+        };
+    }
     virtual TransportStatus read_stream(std::uint64_t stream_id,
                                         std::vector<std::uint8_t>& bytes,
                                         bool& fin,

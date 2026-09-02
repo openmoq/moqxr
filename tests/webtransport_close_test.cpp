@@ -38,6 +38,7 @@ namespace {
 
 using openmoq::publisher::transport::ConnectionState;
 using openmoq::publisher::transport::EndpointConfig;
+using openmoq::publisher::transport::ObjectWriteDisposition;
 using openmoq::publisher::transport::StreamDirection;
 using openmoq::publisher::transport::TlsConfig;
 using openmoq::publisher::transport::TransportKind;
@@ -64,6 +65,7 @@ struct SilentServer {
     bool loop_exited = false;
     bool connect_accepted = false;
     std::size_t stream_bytes_received = 0;
+    std::size_t request_stream_bytes_received = 0;
     bool stream_fin_received = false;
     picohttp_server_path_item_t path_item{};
     picohttp_server_parameters_t params{};
@@ -102,6 +104,10 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         // everything written before close() actually arrived.
         std::lock_guard<std::mutex> lock(server->mutex);
         server->stream_bytes_received += length;
+        if (stream_ctx != nullptr && stream_ctx->stream_id != 0 &&
+            (stream_ctx->stream_id & 0x2) == 0) {
+            server->request_stream_bytes_received += length;
+        }
         if (event == picohttp_callback_post_fin) {
             server->stream_fin_received = true;
         }
@@ -159,7 +165,7 @@ int silent_server_loop_callback(picoquic_quic_t* quic,
     }
 }
 
-bool start_server(SilentServer& server) {
+bool start_server(SilentServer& server, bool hold_unidirectional_data = false) {
     const std::string cert_path = std::string(kPicoquicSourceDir) + "/certs/cert.pem";
     const std::string key_path = std::string(kPicoquicSourceDir) + "/certs/key.pem";
 
@@ -182,6 +188,9 @@ bool start_server(SilentServer& server) {
     picoquic_tp_t tp = *picoquic_get_default_tp(server.quic);
     tp.max_datagram_frame_size = PICOQUIC_MAX_PACKET_SIZE;
     tp.is_reset_stream_at_enabled = 1;
+    if (hold_unidirectional_data) {
+        tp.initial_max_stream_data_uni = 0;
+    }
     picoquic_set_default_tp(server.quic, &tp);
     if (std::getenv("OPENMOQ_PICOQUIC_TRACE") != nullptr) {
         picoquic_set_textlog(server.quic, "-");
@@ -324,8 +333,9 @@ int main() {
         ok &= expect(drain_client->open_stream(StreamDirection::kUnidirectional, stream_id).ok,
                      "expected open_stream to succeed");
         const std::vector<std::uint8_t> payload(kPayloadBytes, 0xAB);
-        ok &= expect(drain_client->write_stream(stream_id, payload, true).ok,
-                     "expected write_stream with FIN to succeed");
+        const auto media_result = drain_client->try_write_object(stream_id, payload, true, {});
+        ok &= expect(media_result.disposition == ObjectWriteDisposition::kAccepted,
+                     "expected try_write_object with FIN to succeed");
 
         const auto drain_started = std::chrono::steady_clock::now();
         auto drain_close = std::async(std::launch::async, [drain_client] { return drain_client->close(0); });
@@ -355,5 +365,95 @@ int main() {
     }
 
     stop_server(server);
+
+    // Deterministic admission contract: zero peer credit keeps media queued,
+    // while bidirectional request traffic remains independently writable.
+    SilentServer capacity_server;
+    ok &= expect(start_server(capacity_server, true),
+                 "expected capacity-test webtransport server to start");
+    if (!ok) {
+        stop_server(capacity_server);
+        return 1;
+    }
+    EndpointConfig capacity_endpoint = endpoint;
+    capacity_endpoint.port = capacity_server.port;
+    WebTransportClient capacity_client(10);
+    ok &= expect(capacity_client.configure(capacity_endpoint, tls).ok,
+                 "expected capacity client configure to succeed");
+    ok &= expect(capacity_client.connect().ok,
+                 "expected capacity client CONNECT to succeed");
+
+    std::uint64_t media_stream_id = 0;
+    ok &= expect(capacity_client.open_stream(StreamDirection::kUnidirectional,
+                                             media_stream_id).ok,
+                 "expected capacity media stream open to succeed");
+    const std::vector<std::uint8_t> oversized_media(11, 0xC1);
+    const std::vector<std::uint8_t> first_media(8, 0xC2);
+    const std::vector<std::uint8_t> second_media(3, 0xC3);
+    const auto admission_started = std::chrono::steady_clock::now();
+    const auto oversized_result =
+        capacity_client.try_write_object(media_stream_id, oversized_media, false, {});
+    const auto first_result =
+        capacity_client.try_write_object(media_stream_id, first_media, false, {});
+    const auto second_result =
+        capacity_client.try_write_object(media_stream_id, second_media, true, {});
+    const auto admission_elapsed = std::chrono::steady_clock::now() - admission_started;
+    ok &= expect(oversized_result.disposition == ObjectWriteDisposition::kWouldBlock,
+                 "expected oversized webtransport media to report nonfatal backpressure");
+    ok &= expect(first_result.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected webtransport media within the 10-byte budget to be accepted");
+    ok &= expect(second_result.disposition == ObjectWriteDisposition::kWouldBlock,
+                 "expected combined webtransport media over the 10-byte budget to would-block");
+    ok &= expect(admission_elapsed < std::chrono::seconds(1),
+                 "expected full webtransport admission to return synchronously");
+
+    std::uint64_t request_stream_id = 0;
+    ok &= expect(capacity_client.open_stream(StreamDirection::kBidirectional,
+                                             request_stream_id).ok,
+                 "expected request stream open while webtransport media is full");
+    const std::vector<std::uint8_t> request_bytes = {0x5A};
+    ok &= expect(capacity_client.write_stream(request_stream_id, request_bytes, true).ok,
+                 "expected reliable request write while webtransport media is full");
+    {
+        std::unique_lock<std::mutex> lock(capacity_server.mutex);
+        ok &= expect(capacity_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                         return capacity_server.request_stream_bytes_received >= request_bytes.size();
+                     }),
+                     "expected reliable request bytes while webtransport media is full");
+    }
+
+    ok &= expect(capacity_client.reset_stream(media_stream_id, 0).ok,
+                 "expected webtransport media reset to succeed");
+    std::uint64_t replacement_stream_id = 0;
+    ok &= expect(capacity_client.open_stream(StreamDirection::kUnidirectional,
+                                             replacement_stream_id).ok,
+                 "expected replacement webtransport media stream open to succeed");
+    const std::vector<std::uint8_t> exact_budget(10, 0xC4);
+    ok &= expect(capacity_client.try_write_object(replacement_stream_id,
+                                                  exact_budget,
+                                                  true,
+                                                  {}).disposition == ObjectWriteDisposition::kAccepted,
+                 "expected webtransport reset to release the full admission budget");
+    capacity_client.note_delivery_timeout(std::chrono::milliseconds(1));
+    ok &= expect(capacity_client.close(0).ok,
+                 "expected capacity client close to succeed");
+
+    ok &= expect(capacity_client.configure(capacity_endpoint, tls).ok,
+                 "expected webtransport reconfigure after close to succeed");
+    ok &= expect(capacity_client.connect().ok,
+                 "expected webtransport reconnect after close to succeed");
+    std::uint64_t post_close_stream_id = 0;
+    ok &= expect(capacity_client.open_stream(StreamDirection::kUnidirectional,
+                                             post_close_stream_id).ok,
+                 "expected post-close webtransport media stream open to succeed");
+    ok &= expect(capacity_client.try_write_object(post_close_stream_id,
+                                                  exact_budget,
+                                                  true,
+                                                  {}).disposition == ObjectWriteDisposition::kAccepted,
+                 "expected webtransport close to clear the media admission budget");
+    capacity_client.note_delivery_timeout(std::chrono::milliseconds(1));
+    ok &= expect(capacity_client.close(0).ok,
+                 "expected reconnected capacity client close to succeed");
+    stop_server(capacity_server);
     return ok ? 0 : 1;
 }

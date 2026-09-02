@@ -1,12 +1,17 @@
 #include "openmoq/publisher/transport/webtransport_client.h"
 
+#include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
 using openmoq::publisher::transport::ConnectionState;
 using openmoq::publisher::transport::EndpointConfig;
+using openmoq::publisher::transport::ObjectWriteDisposition;
+using openmoq::publisher::transport::ObjectWriteOptions;
 using openmoq::publisher::transport::StreamDirection;
 using openmoq::publisher::transport::TlsConfig;
 using openmoq::publisher::transport::TransportKind;
@@ -26,7 +31,18 @@ int main() {
     bool ok = true;
 
     {
-        WebTransportClient client;
+        WebTransportClient client(10);
+        const std::vector<std::uint8_t> bytes(8, 0x11);
+        const auto started = std::chrono::steady_clock::now();
+        const auto result = client.try_write_object(2, bytes, true, ObjectWriteOptions{});
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        ok &= expect(result.disposition == ObjectWriteDisposition::kFailed,
+                     "expected media admission on a disconnected WebTransport client to fail");
+        ok &= expect(!result.message.empty(),
+                     "expected failed WebTransport media admission to explain the failure");
+        ok &= expect(elapsed < std::chrono::seconds(1),
+                     "expected failed WebTransport media admission to return synchronously");
+
         const auto status = client.connect();
         ok &= expect(!status.ok, "expected connect without configure to fail");
         ok &= expect(status.message == "webtransport transport is not configured",

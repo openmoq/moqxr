@@ -167,5 +167,17 @@ int main() {
                      "expected subgroup expiry to remove all of the queued bytes");
     }
 
+    {
+        PendingMediaQueue queue(10);
+        ok &= expect(queue.try_push(make_write(11, 8)) == MediaAdmission::kAccepted,
+                     "expected a media write to occupy the literal transport-test budget");
+        ok &= expect(queue.try_push(make_write(13, 3)) == MediaAdmission::kWouldBlock,
+                     "expected combined media writes over the literal transport-test budget to block");
+        ok &= expect(queue.clear_connection() == 8,
+                     "expected connection close cleanup to report every queued byte");
+        ok &= expect(queue.try_push(make_write(15, 10)) == MediaAdmission::kAccepted,
+                     "expected connection close cleanup to wake full-budget admission");
+    }
+
     return ok ? 0 : 1;
 }

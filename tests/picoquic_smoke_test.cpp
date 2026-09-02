@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <thread>
@@ -36,6 +37,8 @@ using openmoq::publisher::draft_profile;
 using openmoq::publisher::materialize_publish_plan;
 using openmoq::publisher::transport::EndpointConfig;
 using openmoq::publisher::transport::MoqtSession;
+using openmoq::publisher::transport::ObjectWriteDisposition;
+using openmoq::publisher::transport::ObjectWriteOptions;
 using openmoq::publisher::transport::PicoquicClient;
 using openmoq::publisher::transport::ServerSetupMessage;
 using openmoq::publisher::transport::TlsConfig;
@@ -53,6 +56,10 @@ struct SmokeServer {
     std::condition_variable condition;
     uint16_t port = 0;
     std::size_t bytes_received = 0;
+    std::size_t request_stream_bytes_received = 0;
+    std::vector<std::uint8_t> media_stream_bytes;
+    bool media_stream_fin_received = false;
+    std::set<std::uint64_t> media_stream_fins;
     std::vector<std::uint8_t> control_bytes;
     std::size_t publish_response_count = 0;
     bool loop_ready = false;
@@ -156,6 +163,18 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
             trace("server stream data event bytes=" + std::to_string(length));
             std::lock_guard<std::mutex> lock(server->mutex);
             server->bytes_received += length;
+            if (stream_id != 0 && (stream_id & 0x2) == 0) {
+                server->request_stream_bytes_received += length;
+            }
+            if ((stream_id & 0x3) == 0x2) {
+                if (bytes != nullptr && length != 0) {
+                    server->media_stream_bytes.insert(server->media_stream_bytes.end(), bytes, bytes + length);
+                }
+                if (event == picoquic_callback_stream_fin) {
+                    server->media_stream_fin_received = true;
+                    server->media_stream_fins.insert(stream_id);
+                }
+            }
             if (stream_id == 0) {
                 server->control_bytes.insert(server->control_bytes.end(), bytes, bytes + length);
                 std::size_t message_size = 0;
@@ -293,7 +312,7 @@ int smoke_server_loop_callback(picoquic_quic_t* quic,
     }
 }
 
-bool start_server(SmokeServer& server) {
+bool start_server(SmokeServer& server, bool hold_unidirectional_data = true) {
     const std::string cert_path = std::string(kPicoquicSourceDir) + "/certs/cert.pem";
     const std::string key_path = std::string(kPicoquicSourceDir) + "/certs/key.pem";
 
@@ -305,6 +324,15 @@ bool start_server(SmokeServer& server) {
     }
 
     picoquic_set_cookie_mode(server.quic, 2);
+    picoquic_tp_t tp = *picoquic_get_default_tp(server.quic);
+    // Hold client-initiated unidirectional data at the sender so the
+    // transport's literal 10-byte admission budget can be exercised without
+    // racing the packet loop. Bidirectional control/request traffic remains
+    // flow-controlled independently and must still be delivered.
+    if (hold_unidirectional_data) {
+        tp.initial_max_stream_data_uni = 0;
+    }
+    picoquic_set_default_tp(server.quic, &tp);
     server.thread = std::thread([&server] {
         trace("server packet loop thread start");
         // Mirror the client-side socket loop configuration and avoid UDP GSO in
@@ -398,7 +426,7 @@ int main() {
         .insecure_skip_verify = true,
     };
 
-    PicoquicClient transport;
+    PicoquicClient transport(10);
     MoqtSession session(transport, "media", true);
 
     auto status = session.connect(endpoint, tls);
@@ -429,9 +457,158 @@ int main() {
                      "expected server to acknowledge setup, namespace, and track publishing");
     }
 
+    std::uint64_t media_stream_id = 0;
+    status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kUnidirectional,
+                                   media_stream_id);
+    ok &= expect(status.ok, "expected media stream open to succeed");
+    const std::vector<std::uint8_t> first_media(8, 0xA1);
+    const std::vector<std::uint8_t> second_media(3, 0xB2);
+    const std::vector<std::uint8_t> oversized_media(11, 0xD4);
+    const auto admission_started = std::chrono::steady_clock::now();
+    const auto oversized_result =
+        transport.try_write_object(media_stream_id, oversized_media, false, ObjectWriteOptions{});
+    const auto first_result =
+        transport.try_write_object(media_stream_id, first_media, false, ObjectWriteOptions{});
+    const auto second_result =
+        transport.try_write_object(media_stream_id, second_media, true, ObjectWriteOptions{});
+    const auto admission_elapsed = std::chrono::steady_clock::now() - admission_started;
+    ok &= expect(oversized_result.disposition == ObjectWriteDisposition::kWouldBlock,
+                 "expected an individually oversized media object to report nonfatal backpressure");
+    ok &= expect(first_result.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected first media write within 10-byte budget to be accepted");
+    ok &= expect(second_result.disposition == ObjectWriteDisposition::kWouldBlock,
+                 "expected combined media writes over 10-byte budget to would-block");
+    ok &= expect(admission_elapsed < std::chrono::seconds(1),
+                 "expected full media admission to return synchronously without the 30-second wait");
+
+    std::uint64_t request_stream_id = 0;
+    status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kBidirectional,
+                                   request_stream_id);
+    ok &= expect(status.ok, "expected request stream open while media is full to succeed");
+    const std::vector<std::uint8_t> request_bytes = {0x5A};
+    status = transport.write_stream(request_stream_id, request_bytes, true);
+    ok &= expect(status.ok, "expected reliable request write while media is full to succeed");
+    {
+        std::unique_lock<std::mutex> lock(server.mutex);
+        ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                         return server.request_stream_bytes_received >= request_bytes.size();
+                     }),
+                     "expected reliable request bytes to arrive while media is full");
+    }
+
+    status = transport.reset_stream(media_stream_id, 0);
+    ok &= expect(status.ok, "expected media reset to succeed");
+    std::uint64_t replacement_stream_id = 0;
+    status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kUnidirectional,
+                                   replacement_stream_id);
+    ok &= expect(status.ok, "expected replacement media stream open to succeed");
+    const std::vector<std::uint8_t> exact_budget(10, 0xC3);
+    const auto after_reset =
+        transport.try_write_object(replacement_stream_id, exact_budget, true, ObjectWriteOptions{});
+    ok &= expect(after_reset.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected reset to release the complete media admission budget");
+
+    transport.note_delivery_timeout(std::chrono::milliseconds(1));
+
     status = session.close(0);
     ok &= expect(status.ok, "expected picoquic session close to succeed");
 
+    status = transport.configure(endpoint, tls);
+    ok &= expect(status.ok, "expected reconfigure after close to succeed");
+    status = transport.connect();
+    ok &= expect(status.ok, "expected reconnect after close to succeed");
+    std::uint64_t post_close_stream_id = 0;
+    status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kUnidirectional,
+                                   post_close_stream_id);
+    ok &= expect(status.ok, "expected post-close media stream open to succeed");
+    const auto after_close =
+        transport.try_write_object(post_close_stream_id, exact_budget, true, ObjectWriteOptions{});
+    ok &= expect(after_close.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected close to clear queued media before the next connection");
+    transport.note_delivery_timeout(std::chrono::milliseconds(1));
+    status = transport.close(0);
+    ok &= expect(status.ok, "expected reconnected picoquic transport close to succeed");
+
     stop_server(server);
+
+    SmokeServer delivery_server;
+    ok &= expect(start_server(delivery_server, false),
+                 "expected pull-delivery picoquic smoke server to start");
+    if (!ok) {
+        stop_server(delivery_server);
+        return 1;
+    }
+    EndpointConfig delivery_endpoint = endpoint;
+    delivery_endpoint.port = delivery_server.port;
+    PicoquicClient delivery_client;
+    ok &= expect(delivery_client.configure(delivery_endpoint, tls).ok,
+                 "expected pull-delivery client configure to succeed");
+    status = delivery_client.connect();
+    ok &= expect(status.ok, "expected pull-delivery client connect to succeed");
+    std::uint64_t delivery_stream_id = 0;
+    status = delivery_client.open_stream(
+        openmoq::publisher::transport::StreamDirection::kUnidirectional,
+        delivery_stream_id);
+    ok &= expect(status.ok, "expected pull-delivery media stream open to succeed");
+    std::vector<std::uint8_t> delivery_bytes(5000);
+    for (std::size_t index = 0; index < delivery_bytes.size(); ++index) {
+        delivery_bytes[index] = static_cast<std::uint8_t>(index % 251);
+    }
+    const auto delivery_first = delivery_client.try_write_object(
+        delivery_stream_id,
+        std::span<const std::uint8_t>(delivery_bytes.data(), 3000),
+        false,
+        ObjectWriteOptions{});
+    const auto delivery_second = delivery_client.try_write_object(
+        delivery_stream_id,
+        std::span<const std::uint8_t>(delivery_bytes.data() + 3000, 2000),
+        true,
+        ObjectWriteOptions{});
+    ok &= expect(delivery_first.disposition == ObjectWriteDisposition::kAccepted &&
+                     delivery_second.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected multi-write pull delivery to accept both media objects");
+    {
+        std::unique_lock<std::mutex> lock(delivery_server.mutex);
+        ok &= expect(delivery_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                         return delivery_server.media_stream_fin_received;
+                     }),
+                     "expected pull delivery to send the media stream FIN");
+        ok &= expect(delivery_server.media_stream_bytes == delivery_bytes,
+                     "expected partial provide callbacks to deliver every media byte in order");
+    }
+    std::uint64_t empty_fin_stream_id = 0;
+    status = delivery_client.open_stream(
+        openmoq::publisher::transport::StreamDirection::kUnidirectional,
+        empty_fin_stream_id);
+    ok &= expect(status.ok, "expected empty-FIN media stream open to succeed");
+    const auto empty_fin = delivery_client.try_write_object(
+        empty_fin_stream_id, {}, true, ObjectWriteOptions{});
+    ok &= expect(empty_fin.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected zero-byte FIN media write to be admitted");
+    std::uint64_t expired_stream_id = 0;
+    status = delivery_client.open_stream(
+        openmoq::publisher::transport::StreamDirection::kUnidirectional,
+        expired_stream_id);
+    ok &= expect(status.ok, "expected expired-object media stream open to succeed");
+    ObjectWriteOptions expired_options;
+    expired_options.object_deadline = std::chrono::steady_clock::now() -
+                                      std::chrono::milliseconds(1);
+    const std::vector<std::uint8_t> expired_bytes(5, 0xE5);
+    const auto expired_result = delivery_client.try_write_object(
+        expired_stream_id, expired_bytes, false, expired_options);
+    ok &= expect(expired_result.disposition == ObjectWriteDisposition::kAccepted,
+                 "expected already-expired media to enter admission before callback pruning");
+    delivery_client.note_delivery_timeout(std::chrono::seconds(5));
+    const auto close_started = std::chrono::steady_clock::now();
+    status = delivery_client.close(0);
+    ok &= expect(status.ok, "expected pull-delivery client close to drain an empty FIN");
+    ok &= expect(std::chrono::steady_clock::now() - close_started < std::chrono::seconds(2),
+                 "expected callback-pruned media not to strand close until its timeout");
+    {
+        std::lock_guard<std::mutex> lock(delivery_server.mutex);
+        ok &= expect(delivery_server.media_stream_fins.contains(empty_fin_stream_id),
+                     "expected close drain to deliver the zero-byte stream FIN");
+    }
+    stop_server(delivery_server);
     return ok ? 0 : 1;
 }

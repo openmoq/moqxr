@@ -1,10 +1,14 @@
 #include "openmoq/publisher/transport/picoquic_client.h"
 
+#include "pending_media_queue.h"
 #include "picoquic_close_drain.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <cstdlib>
 #include <iomanip>
@@ -29,7 +33,13 @@
 
 namespace openmoq::publisher::transport {
 
+namespace {
+constexpr std::size_t kMediaAdmissionCapacity = 4ULL * 1024 * 1024;
+}
+
 struct PicoquicClient::Impl {
+    explicit Impl(std::size_t capacity) : media_capacity(capacity), pending_media(capacity) {}
+
     struct PendingWrite {
         std::uint64_t stream_id = 0;
         std::vector<std::uint8_t> bytes;
@@ -62,6 +72,10 @@ struct PicoquicClient::Impl {
     std::condition_variable condition;
     std::deque<PendingWrite> pending_writes;
     std::deque<PendingReset> pending_resets;
+    const std::size_t media_capacity;
+    PendingMediaQueue pending_media;
+    std::set<std::uint64_t> pending_media_activations;
+    std::set<std::uint64_t> media_streams_with_pending;
     std::deque<AcceptedWrite> accepted_writes_waiting_for_send;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> accepted_streams;
@@ -158,6 +172,73 @@ void prioritize_control_stream(PicoquicClient::Impl& impl, std::uint64_t stream_
     }
 }
 
+int fail_media_delivery(PicoquicClient::Impl& impl, std::string message, int error_code) {
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    impl.failed = true;
+    impl.last_error = std::move(message);
+    impl.pending_media.clear_connection();
+    impl.pending_media_activations.clear();
+    impl.media_streams_with_pending.clear();
+    impl.condition.notify_all();
+    return error_code;
+}
+
+int provide_media_data(PicoquicClient::Impl& impl,
+                       std::uint64_t stream_id,
+                       void* context,
+                       std::size_t available) {
+    std::array<std::uint8_t, PICOQUIC_MAX_PACKET_SIZE> scratch{};
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    const std::size_t queued_before = impl.pending_media.queued_bytes();
+    const PendingMediaWrite* write =
+        impl.pending_media.front(stream_id, std::chrono::steady_clock::now());
+    if (write == nullptr) {
+        impl.media_streams_with_pending.erase(stream_id);
+        static_cast<void>(picoquic_provide_stream_data_buffer(context, 0, 0, 0));
+        if (impl.pending_media.queued_bytes() != queued_before) {
+            impl.condition.notify_all();
+        }
+        return 0;
+    }
+
+    const std::size_t remaining = write->bytes.size() - write->offset;
+    const std::size_t to_send = (std::min)({available, remaining, scratch.size()});
+    if (to_send != 0) {
+        std::memcpy(scratch.data(), write->bytes.data() + write->offset, to_send);
+    }
+    const bool send_fin = write->fin && to_send == remaining;
+
+    // Retire the queue entry before choosing is_still_active. The packet-sized
+    // copy above avoids retaining a front pointer across that mutation.
+    impl.pending_media.consume(stream_id, to_send);
+    if (send_fin) {
+        // Nothing may follow a stream FIN. Discard any invalid later admission
+        // rather than retaining unreachable bytes against the connection cap.
+        impl.pending_media.clear_stream(stream_id);
+    }
+    const bool still_active = !send_fin &&
+                              impl.pending_media.front(stream_id, std::chrono::steady_clock::now()) != nullptr;
+    if (!still_active) {
+        impl.media_streams_with_pending.erase(stream_id);
+    }
+    std::uint8_t* output = picoquic_provide_stream_data_buffer(
+        context, to_send, send_fin ? 1 : 0, still_active ? 1 : 0);
+    if (output == nullptr) {
+        impl.failed = true;
+        impl.last_error = "picoquic failed to provide a media stream buffer";
+        impl.pending_media.clear_connection();
+        impl.pending_media_activations.clear();
+        impl.media_streams_with_pending.clear();
+        impl.condition.notify_all();
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+    if (to_send != 0) {
+        std::memcpy(output, scratch.data(), to_send);
+    }
+    impl.condition.notify_all();
+    return 0;
+}
+
 int apply_pending_operations(PicoquicClient::Impl& impl) {
     if (impl.cnx == nullptr) {
         return 0;
@@ -165,6 +246,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
 
     std::deque<PicoquicClient::Impl::PendingWrite> writes;
     std::deque<PicoquicClient::Impl::PendingReset> resets;
+    std::set<std::uint64_t> media_activations;
     std::size_t queued_count = 0;
     std::size_t queued_bytes = 0;
     bool close_requested = false;
@@ -173,6 +255,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
         std::lock_guard<std::mutex> lock(impl.mutex);
         writes.swap(impl.pending_writes);
         resets.swap(impl.pending_resets);
+        media_activations.swap(impl.pending_media_activations);
         queued_count = writes.size();
         for (const auto& write : writes) {
             queued_bytes += write.bytes.size();
@@ -269,17 +352,40 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
         picoquic_reset_stream(impl.cnx, reset.stream_id, reset.error_code);
     }
 
+    for (const std::uint64_t stream_id : media_activations) {
+        std::uint8_t priority = 255;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const PendingMediaWrite* write =
+                impl.pending_media.front(stream_id, std::chrono::steady_clock::now());
+            if (write == nullptr) {
+                impl.media_streams_with_pending.erase(stream_id);
+                impl.condition.notify_all();
+                continue;
+            }
+            priority = write->transport_priority;
+        }
+        if (picoquic_set_stream_priority(impl.cnx, stream_id, priority) != 0) {
+            return fail_media_delivery(impl, "picoquic failed to set media stream priority", -1);
+        }
+        if (picoquic_mark_active_stream(impl.cnx, stream_id, 1, &impl) != 0) {
+            return fail_media_delivery(impl, "picoquic failed to activate media stream", -1);
+        }
+    }
+
     if (close_requested) {
         std::uint64_t close_error_code = 0;
         bool already_sent = false;
         std::chrono::steady_clock::time_point drain_deadline{};
         std::chrono::milliseconds drain_bound{};
+        std::size_t queued_media_streams = 0;
         {
             std::lock_guard<std::mutex> lock(impl.mutex);
             close_error_code = impl.close_error_code;
             already_sent = impl.close_sent;
             drain_deadline = impl.close_drain.deadline;
             drain_bound = impl.close_drain.bound;
+            queued_media_streams = impl.media_streams_with_pending.size();
         }
         if (already_sent) {
             return 0;
@@ -292,7 +398,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
         // timeout (or a fallback) so a peer that stops acking cannot hang us.
         std::string drain_summary;
         if (close_drain_should_wait(impl.cnx,
-                                    deferred_writes.size(),
+                                    deferred_writes.size() + queued_media_streams,
                                     drain_deadline,
                                     drain_bound,
                                     impl.close_drain.timeout_logged,
@@ -340,6 +446,8 @@ int client_callback(picoquic_cnx_t* cnx,
     }
 
     switch (event) {
+        case picoquic_callback_prepare_to_send:
+            return provide_media_data(*impl, stream_id, bytes, length);
         case picoquic_callback_stream_data:
         case picoquic_callback_stream_fin: {
             std::lock_guard<std::mutex> lock(impl->mutex);
@@ -386,6 +494,9 @@ int client_callback(picoquic_cnx_t* cnx,
                   " remote_application_reason=" + std::to_string(remote_application_reason));
             std::lock_guard<std::mutex> lock(impl->mutex);
             impl->disconnected = true;
+            impl->pending_media.clear_connection();
+            impl->pending_media_activations.clear();
+            impl->media_streams_with_pending.clear();
             if (!impl->connected) {
                 impl->failed = true;
                 impl->last_error = "connection closed before reaching ready state";
@@ -413,6 +524,23 @@ int client_callback(picoquic_cnx_t* cnx,
                                    ", remote_application_reason=" + std::to_string(remote_application_reason) +
                                    ", application_error=" + std::to_string(application_error);
             }
+            impl->condition.notify_all();
+            return 0;
+        }
+        case picoquic_callback_stream_reset:
+        case picoquic_callback_stop_sending: {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->pending_media.clear_stream(stream_id);
+            impl->pending_media_activations.erase(stream_id);
+            impl->media_streams_with_pending.erase(stream_id);
+            impl->condition.notify_all();
+            return 0;
+        }
+        case picoquic_callback_stream_released: {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->pending_media.clear_stream(stream_id);
+            impl->pending_media_activations.erase(stream_id);
+            impl->media_streams_with_pending.erase(stream_id);
             impl->condition.notify_all();
             return 0;
         }
@@ -526,7 +654,10 @@ int loop_callback(picoquic_quic_t* quic,
 }  // namespace
 #endif
 
-PicoquicClient::PicoquicClient() : impl_(std::make_unique<Impl>()) {}
+PicoquicClient::PicoquicClient() : PicoquicClient(kMediaAdmissionCapacity) {}
+
+PicoquicClient::PicoquicClient(std::size_t media_capacity_for_testing)
+    : impl_(std::make_unique<Impl>(media_capacity_for_testing)) {}
 
 PicoquicClient::~PicoquicClient() {
     const auto status = close(0);
@@ -554,6 +685,9 @@ TransportStatus PicoquicClient::configure(const EndpointConfig& endpoint, const 
         impl_->last_error.clear();
         impl_->pending_writes.clear();
         impl_->pending_resets.clear();
+        impl_->pending_media.clear_connection();
+        impl_->pending_media_activations.clear();
+        impl_->media_streams_with_pending.clear();
         impl_->accepted_writes_waiting_for_send.clear();
         impl_->connection_id_hex.clear();
     }
@@ -677,6 +811,9 @@ TransportStatus PicoquicClient::connect() {
         trace("client packet loop thread exit rc=" + std::to_string(impl->packet_loop_return_code));
         std::lock_guard<std::mutex> lock(impl->mutex);
         impl->loop_exited = true;
+        impl->pending_media.clear_connection();
+        impl->pending_media_activations.clear();
+        impl->media_streams_with_pending.clear();
         if (!impl->connected && !impl->failed && !impl->disconnected) {
             impl->failed = true;
             impl->last_error = "picoquic packet loop exited before handshake completed";
@@ -749,10 +886,9 @@ TransportStatus PicoquicClient::write_stream(std::uint64_t stream_id,
     static_cast<void>(fin);
     return TransportStatus::failure("picoquic support is not enabled in this build");
 #else
-    // Back-pressure: apply_pending_operations re-queues writes that picoquic
-    // temporarily rejects, so pending_writes can accumulate during congestion.
-    // Cap total queued bytes and block the producer until the queue drains.
-    constexpr std::size_t kMaxPendingBytes = 4ULL * 1024 * 1024;
+    // Preserve the reliable queued behavior for control/request writes.
+    // Object media uses try_write_object's separate nonblocking budget.
+    constexpr std::size_t kMaxReliablePendingBytes = 4ULL * 1024 * 1024;
     {
         std::unique_lock<std::mutex> lock(impl_->mutex);
         const auto has_room = [&]() {
@@ -762,7 +898,7 @@ TransportStatus PicoquicClient::write_stream(std::uint64_t stream_id,
             std::size_t queued = 0;
             for (const auto& write : impl_->pending_writes) {
                 queued += write.bytes.size();
-                if (queued >= kMaxPendingBytes) {
+                if (queued >= kMaxReliablePendingBytes) {
                     return false;
                 }
             }
@@ -787,6 +923,78 @@ TransportStatus PicoquicClient::write_stream(std::uint64_t stream_id,
     }
 
     return TransportStatus::success();
+#endif
+}
+
+ObjectWriteResult PicoquicClient::try_write_object(std::uint64_t stream_id,
+                                                   std::span<const std::uint8_t> bytes,
+                                                   bool fin,
+                                                   ObjectWriteOptions options) {
+#ifndef OPENMOQ_HAS_PICOQUIC
+    static_cast<void>(stream_id);
+    static_cast<void>(bytes);
+    static_cast<void>(fin);
+    static_cast<void>(options);
+    return {ObjectWriteDisposition::kFailed,
+            state_ == ConnectionState::kConnected
+                ? "picoquic support is not enabled in this build"
+                : "transport is not connected"};
+#else
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->failed) {
+        return {ObjectWriteDisposition::kFailed,
+                impl_->last_error.empty() ? "picoquic transport failed" : impl_->last_error};
+    }
+    if (impl_->close_requested || impl_->disconnected || impl_->cnx == nullptr) {
+        return {ObjectWriteDisposition::kFailed, "transport close requested"};
+    }
+    if (!impl_->connected) {
+        return {ObjectWriteDisposition::kFailed, "transport is not connected"};
+    }
+    if (bytes.empty() && !fin) {
+        return {ObjectWriteDisposition::kAccepted, {}};
+    }
+    if (bytes.size() > impl_->media_capacity ||
+        bytes.size() > impl_->media_capacity - impl_->pending_media.queued_bytes()) {
+        return {ObjectWriteDisposition::kWouldBlock,
+                bytes.size() > impl_->media_capacity
+                    ? "media object exceeds the connection admission budget"
+                    : "media admission budget is full"};
+    }
+
+    MediaAdmission admission = MediaAdmission::kWouldBlock;
+    try {
+        PendingMediaWrite write{
+            .stream_id = stream_id,
+            .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
+            .offset = 0,
+            .fin = fin,
+            .transport_priority = options.transport_priority,
+            .object_deadline = options.object_deadline,
+            .subgroup_deadline = options.subgroup_deadline,
+        };
+        admission = impl_->pending_media.try_push(std::move(write));
+        if (admission == MediaAdmission::kAccepted) {
+            impl_->pending_media_activations.insert(stream_id);
+            impl_->media_streams_with_pending.insert(stream_id);
+        }
+    } catch (...) {
+        impl_->failed = true;
+        impl_->last_error = "failed to allocate picoquic media admission storage";
+        impl_->pending_media.clear_connection();
+        impl_->pending_media_activations.clear();
+        impl_->media_streams_with_pending.clear();
+        impl_->condition.notify_all();
+        return {ObjectWriteDisposition::kFailed, impl_->last_error};
+    }
+    if (admission != MediaAdmission::kAccepted) {
+        return {ObjectWriteDisposition::kWouldBlock,
+                admission == MediaAdmission::kOversized
+                    ? "media object exceeds the connection admission budget"
+                    : "media admission budget is full"};
+    }
+    impl_->condition.notify_all();
+    return {ObjectWriteDisposition::kAccepted, {}};
 #endif
 }
 
@@ -906,6 +1114,9 @@ TransportStatus PicoquicClient::reset_stream(std::uint64_t stream_id,
     // time_check tick.
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->pending_media.clear_stream(stream_id);
+        impl_->pending_media_activations.erase(stream_id);
+        impl_->media_streams_with_pending.erase(stream_id);
         impl_->pending_resets.push_back({.stream_id = stream_id, .error_code = error_code});
     }
     impl_->condition.notify_all();
@@ -955,6 +1166,13 @@ TransportStatus PicoquicClient::close(std::uint64_t application_error_code) {
             if (impl_->packet_loop_thread.joinable()) {
                 impl_->packet_loop_thread.join();
             }
+        }
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->pending_media.clear_connection();
+            impl_->pending_media_activations.clear();
+            impl_->media_streams_with_pending.clear();
+            impl_->condition.notify_all();
         }
     }
 

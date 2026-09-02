@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -12,6 +13,7 @@ namespace openmoq::publisher::transport {
 class PicoquicClient final : public PublisherTransport {
 public:
     PicoquicClient();
+    explicit PicoquicClient(std::size_t media_capacity_for_testing);
     ~PicoquicClient() override;
 
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override;
@@ -24,6 +26,10 @@ public:
     TransportStatus write_stream(std::uint64_t stream_id,
                                  std::span<const std::uint8_t> bytes,
                                  bool fin) override;
+    ObjectWriteResult try_write_object(std::uint64_t stream_id,
+                                       std::span<const std::uint8_t> bytes,
+                                       bool fin,
+                                       ObjectWriteOptions options) override;
     TransportStatus read_stream(std::uint64_t stream_id,
                                 std::vector<std::uint8_t>& bytes,
                                 bool& fin,

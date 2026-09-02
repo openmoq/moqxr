@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 
@@ -10,6 +11,7 @@ namespace openmoq::publisher::transport {
 class WebTransportClient final : public PublisherTransport {
 public:
     WebTransportClient();
+    explicit WebTransportClient(std::size_t media_capacity_for_testing);
     ~WebTransportClient() override;
 
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override;
@@ -22,6 +24,10 @@ public:
     TransportStatus write_stream(std::uint64_t stream_id,
                                  std::span<const std::uint8_t> bytes,
                                  bool fin) override;
+    ObjectWriteResult try_write_object(std::uint64_t stream_id,
+                                       std::span<const std::uint8_t> bytes,
+                                       bool fin,
+                                       ObjectWriteOptions options) override;
     TransportStatus read_stream(std::uint64_t stream_id,
                                 std::vector<std::uint8_t>& bytes,
                                 bool& fin,

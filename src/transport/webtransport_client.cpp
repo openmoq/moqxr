@@ -1,7 +1,10 @@
 #include "openmoq/publisher/transport/webtransport_client.h"
 
+#include "pending_media_queue.h"
 #include "picoquic_close_drain.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -31,7 +34,13 @@
 
 namespace openmoq::publisher::transport {
 
+namespace {
+constexpr std::size_t kMediaAdmissionCapacity = 4ULL * 1024 * 1024;
+}
+
 struct WebTransportClient::Impl {
+    explicit Impl(std::size_t capacity) : media_capacity(capacity), pending_media(capacity) {}
+
     struct PendingWrite {
         std::uint64_t stream_id = 0;
         std::vector<std::uint8_t> bytes;
@@ -61,6 +70,10 @@ struct WebTransportClient::Impl {
     std::deque<PendingOpen*> pending_opens;
     std::deque<PendingWrite> pending_writes;
     std::deque<PendingReset> pending_resets;
+    const std::size_t media_capacity;
+    PendingMediaQueue pending_media;
+    std::set<std::uint64_t> pending_media_activations;
+    std::set<std::uint64_t> media_streams_with_pending;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> application_streams;
     std::set<std::uint64_t> accepted_streams;
@@ -169,6 +182,77 @@ void prioritize_control_stream(WebTransportClient::Impl& impl, std::uint64_t str
     static_cast<void>(picoquic_set_stream_priority(impl.cnx, stream_id, kControlStreamPriority));
 }
 
+int fail_media_delivery(WebTransportClient::Impl& impl, std::string message, int error_code) {
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    impl.failed = true;
+    impl.last_error = std::move(message);
+    impl.pending_media.clear_connection();
+    impl.pending_media_activations.clear();
+    impl.media_streams_with_pending.clear();
+    impl.condition.notify_all();
+    return error_code;
+}
+
+int provide_media_data(WebTransportClient::Impl& impl,
+                       void* context,
+                       std::size_t available,
+                       h3zero_stream_ctx_t* stream_ctx) {
+    if (stream_ctx == nullptr) {
+        return fail_media_delivery(impl, "missing webtransport media stream context", -1);
+    }
+
+    std::array<std::uint8_t, PICOQUIC_MAX_PACKET_SIZE> scratch{};
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    const std::size_t queued_before = impl.pending_media.queued_bytes();
+    const std::uint64_t stream_id = stream_ctx->stream_id;
+    const PendingMediaWrite* write =
+        impl.pending_media.front(stream_id, std::chrono::steady_clock::now());
+    if (write == nullptr) {
+        impl.media_streams_with_pending.erase(stream_id);
+        static_cast<void>(picoquic_provide_stream_data_buffer(context, 0, 0, 0));
+        if (impl.pending_media.queued_bytes() != queued_before) {
+            impl.condition.notify_all();
+        }
+        return 0;
+    }
+
+    const std::size_t remaining = write->bytes.size() - write->offset;
+    const std::size_t to_send = (std::min)({available, remaining, scratch.size()});
+    if (to_send != 0) {
+        std::memcpy(scratch.data(), write->bytes.data() + write->offset, to_send);
+    }
+    const bool send_fin = write->fin && to_send == remaining;
+
+    impl.pending_media.consume(stream_id, to_send);
+    if (send_fin) {
+        impl.pending_media.clear_stream(stream_id);
+    }
+    const bool still_active = !send_fin &&
+                              impl.pending_media.front(stream_id, std::chrono::steady_clock::now()) != nullptr;
+    if (!still_active) {
+        impl.media_streams_with_pending.erase(stream_id);
+    }
+    std::uint8_t* output = picoquic_provide_stream_data_buffer(
+        context, to_send, send_fin ? 1 : 0, still_active ? 1 : 0);
+    if (output == nullptr) {
+        impl.failed = true;
+        impl.last_error = "picoquic failed to provide a webtransport media buffer";
+        impl.pending_media.clear_connection();
+        impl.pending_media_activations.clear();
+        impl.media_streams_with_pending.clear();
+        impl.condition.notify_all();
+        return -1;
+    }
+    if (to_send != 0) {
+        std::memcpy(output, scratch.data(), to_send);
+    }
+    if (send_fin) {
+        stream_ctx->ps.stream_state.is_fin_sent = 1;
+    }
+    impl.condition.notify_all();
+    return 0;
+}
+
 int apply_pending_writes(WebTransportClient::Impl& impl) {
     if (impl.cnx == nullptr) {
         return 0;
@@ -177,12 +261,14 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
     std::deque<WebTransportClient::Impl::PendingOpen*> opens;
     std::deque<WebTransportClient::Impl::PendingWrite> writes;
     std::deque<WebTransportClient::Impl::PendingReset> resets;
+    std::set<std::uint64_t> media_activations;
     bool close_requested = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         opens.swap(impl.pending_opens);
         writes.swap(impl.pending_writes);
         resets.swap(impl.pending_resets);
+        media_activations.swap(impl.pending_media_activations);
         close_requested = impl.close_requested;
     }
 
@@ -265,17 +351,44 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
         picoquic_reset_stream(impl.cnx, reset.stream_id, reset.error_code);
     }
 
+    for (const std::uint64_t stream_id : media_activations) {
+        std::uint8_t priority = 255;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const PendingMediaWrite* write =
+                impl.pending_media.front(stream_id, std::chrono::steady_clock::now());
+            if (write == nullptr) {
+                impl.media_streams_with_pending.erase(stream_id);
+                impl.condition.notify_all();
+                continue;
+            }
+            priority = write->transport_priority;
+        }
+        h3zero_stream_ctx_t* stream_ctx = find_local_stream_context(impl, stream_id);
+        if (stream_ctx == nullptr) {
+            return fail_media_delivery(impl, "failed to find webtransport media stream context", -1);
+        }
+        if (picoquic_set_stream_priority(impl.cnx, stream_id, priority) != 0) {
+            return fail_media_delivery(impl, "failed to set webtransport media stream priority", -1);
+        }
+        if (picoquic_mark_active_stream(impl.cnx, stream_id, 1, stream_ctx) != 0) {
+            return fail_media_delivery(impl, "failed to activate webtransport media stream", -1);
+        }
+    }
+
     if (close_requested) {
         std::uint64_t close_error_code = 0;
         bool already_sent = false;
         std::chrono::steady_clock::time_point drain_deadline{};
         std::chrono::milliseconds drain_bound{};
+        std::size_t queued_media_streams = 0;
         {
             std::lock_guard<std::mutex> lock(impl.mutex);
             close_error_code = impl.close_error_code;
             already_sent = impl.close_sent;
             drain_deadline = impl.close_drain.deadline;
             drain_bound = impl.close_drain.bound;
+            queued_media_streams = impl.media_streams_with_pending.size();
         }
         if (!already_sent) {
             // MoQT wind-down (draft -16 9.15 / -18 10.11): the last objects
@@ -287,7 +400,7 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
             // stops acking cannot hang us.
             std::string drain_summary;
             if (close_drain_should_wait(impl.cnx,
-                                        deferred_writes.size(),
+                                        deferred_writes.size() + queued_media_streams,
                                         drain_deadline,
                                         drain_bound,
                                         impl.close_drain.timeout_logged,
@@ -350,10 +463,20 @@ int webtransport_callback(picoquic_cnx_t* cnx,
         case picohttp_callback_connect:
         case picohttp_callback_post_datagram:
         case picohttp_callback_provide_datagram:
-        case picohttp_callback_free:
         case picohttp_callback_connecting:
-        case picohttp_callback_provide_data:
             return 0;
+        case picohttp_callback_free: {
+            if (stream_ctx != nullptr) {
+                std::lock_guard<std::mutex> lock(impl->mutex);
+                impl->pending_media.clear_stream(stream_ctx->stream_id);
+                impl->pending_media_activations.erase(stream_ctx->stream_id);
+                impl->media_streams_with_pending.erase(stream_ctx->stream_id);
+                impl->condition.notify_all();
+            }
+            return 0;
+        }
+        case picohttp_callback_provide_data:
+            return provide_media_data(*impl, bytes, length, stream_ctx);
         case picohttp_callback_connect_refused: {
             std::lock_guard<std::mutex> lock(impl->mutex);
             impl->failed = true;
@@ -392,6 +515,9 @@ int webtransport_callback(picoquic_cnx_t* cnx,
         case picohttp_callback_stop_sending: {
             if (stream_ctx != nullptr) {
                 std::lock_guard<std::mutex> lock(impl->mutex);
+                impl->pending_media.clear_stream(stream_ctx->stream_id);
+                impl->pending_media_activations.erase(stream_ctx->stream_id);
+                impl->media_streams_with_pending.erase(stream_ctx->stream_id);
                 impl->received_streams[stream_ctx->stream_id].fin = true;
                 impl->condition.notify_all();
             }
@@ -403,6 +529,9 @@ int webtransport_callback(picoquic_cnx_t* cnx,
                 impl->connected = true;
             }
             impl->disconnected = true;
+            impl->pending_media.clear_connection();
+            impl->pending_media_activations.clear();
+            impl->media_streams_with_pending.clear();
             impl->condition.notify_all();
             return 0;
         }
@@ -455,6 +584,9 @@ int loop_callback(picoquic_quic_t* quic,
             }
             if (impl->cnx != nullptr && picoquic_get_cnx_state(impl->cnx) == picoquic_state_disconnected) {
                 impl->disconnected = true;
+                impl->pending_media.clear_connection();
+                impl->pending_media_activations.clear();
+                impl->media_streams_with_pending.clear();
                 impl->condition.notify_all();
                 return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
             }
@@ -482,7 +614,10 @@ int webtransport_connection_callback(picoquic_cnx_t* cnx,
 }  // namespace
 #endif
 
-WebTransportClient::WebTransportClient() : impl_(std::make_unique<Impl>()) {}
+WebTransportClient::WebTransportClient() : WebTransportClient(kMediaAdmissionCapacity) {}
+
+WebTransportClient::WebTransportClient(std::size_t media_capacity_for_testing)
+    : impl_(std::make_unique<Impl>(media_capacity_for_testing)) {}
 
 WebTransportClient::~WebTransportClient() {
     const auto status = close(0);
@@ -511,6 +646,9 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->last_error.clear();
     impl_->pending_writes.clear();
     impl_->pending_resets.clear();
+    impl_->pending_media.clear_connection();
+    impl_->pending_media_activations.clear();
+    impl_->media_streams_with_pending.clear();
     impl_->received_streams.clear();
     return TransportStatus::success();
 }
@@ -639,6 +777,9 @@ TransportStatus WebTransportClient::connect() {
             picoquic_packet_loop(impl->quic, 0, impl->server_address.ss_family, 0, 0, 1, loop_callback, impl);
         std::lock_guard<std::mutex> lock(impl->mutex);
         impl->loop_exited = true;
+        impl->pending_media.clear_connection();
+        impl->pending_media_activations.clear();
+        impl->media_streams_with_pending.clear();
         if (!impl->loop_ready && !impl->failed && !impl->disconnected) {
             impl->failed = true;
             impl->last_error = "webtransport packet loop exited before becoming ready";
@@ -770,11 +911,9 @@ TransportStatus WebTransportClient::write_stream(std::uint64_t stream_id,
     static_cast<void>(fin);
     return TransportStatus::failure("picoquic support is not enabled in this build");
 #else
-    // Back-pressure: when picoquic's send buffer fills up, apply_pending_writes
-    // defers rejected writes back onto pending_writes. If the producer keeps
-    // pushing, pending_writes would grow without bound. Cap the queue by total
-    // queued bytes and block here until the picoquic thread drains it.
-    constexpr std::size_t kMaxPendingBytes = 4ULL * 1024 * 1024;
+    // Preserve the reliable queued behavior for control/request writes.
+    // Object media uses try_write_object's separate nonblocking budget.
+    constexpr std::size_t kMaxReliablePendingBytes = 4ULL * 1024 * 1024;
     {
         std::unique_lock<std::mutex> lock(impl_->mutex);
         const auto has_room = [&]() {
@@ -784,7 +923,7 @@ TransportStatus WebTransportClient::write_stream(std::uint64_t stream_id,
             std::size_t queued = 0;
             for (const auto& write : impl_->pending_writes) {
                 queued += write.bytes.size();
-                if (queued >= kMaxPendingBytes) {
+                if (queued >= kMaxReliablePendingBytes) {
                     return false;
                 }
             }
@@ -807,6 +946,78 @@ TransportStatus WebTransportClient::write_stream(std::uint64_t stream_id,
     // Loop-thread pickup within one 10 ms time_check tick; see open_stream.
     impl_->condition.notify_all();
     return TransportStatus::success();
+#endif
+}
+
+ObjectWriteResult WebTransportClient::try_write_object(std::uint64_t stream_id,
+                                                       std::span<const std::uint8_t> bytes,
+                                                       bool fin,
+                                                       ObjectWriteOptions options) {
+#ifndef OPENMOQ_HAS_PICOQUIC
+    static_cast<void>(stream_id);
+    static_cast<void>(bytes);
+    static_cast<void>(fin);
+    static_cast<void>(options);
+    return {ObjectWriteDisposition::kFailed,
+            state_ == ConnectionState::kConnected
+                ? "picoquic support is not enabled in this build"
+                : "transport is not connected"};
+#else
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->failed) {
+        return {ObjectWriteDisposition::kFailed,
+                impl_->last_error.empty() ? "webtransport connection failed" : impl_->last_error};
+    }
+    if (impl_->close_requested || impl_->disconnected || impl_->cnx == nullptr) {
+        return {ObjectWriteDisposition::kFailed, "transport close requested"};
+    }
+    if (!impl_->connected) {
+        return {ObjectWriteDisposition::kFailed, "transport is not connected"};
+    }
+    if (bytes.empty() && !fin) {
+        return {ObjectWriteDisposition::kAccepted, {}};
+    }
+    if (bytes.size() > impl_->media_capacity ||
+        bytes.size() > impl_->media_capacity - impl_->pending_media.queued_bytes()) {
+        return {ObjectWriteDisposition::kWouldBlock,
+                bytes.size() > impl_->media_capacity
+                    ? "media object exceeds the connection admission budget"
+                    : "media admission budget is full"};
+    }
+
+    MediaAdmission admission = MediaAdmission::kWouldBlock;
+    try {
+        PendingMediaWrite write{
+            .stream_id = stream_id,
+            .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
+            .offset = 0,
+            .fin = fin,
+            .transport_priority = options.transport_priority,
+            .object_deadline = options.object_deadline,
+            .subgroup_deadline = options.subgroup_deadline,
+        };
+        admission = impl_->pending_media.try_push(std::move(write));
+        if (admission == MediaAdmission::kAccepted) {
+            impl_->pending_media_activations.insert(stream_id);
+            impl_->media_streams_with_pending.insert(stream_id);
+        }
+    } catch (...) {
+        impl_->failed = true;
+        impl_->last_error = "failed to allocate webtransport media admission storage";
+        impl_->pending_media.clear_connection();
+        impl_->pending_media_activations.clear();
+        impl_->media_streams_with_pending.clear();
+        impl_->condition.notify_all();
+        return {ObjectWriteDisposition::kFailed, impl_->last_error};
+    }
+    if (admission != MediaAdmission::kAccepted) {
+        return {ObjectWriteDisposition::kWouldBlock,
+                admission == MediaAdmission::kOversized
+                    ? "media object exceeds the connection admission budget"
+                    : "media admission budget is full"};
+    }
+    impl_->condition.notify_all();
+    return {ObjectWriteDisposition::kAccepted, {}};
 #endif
 }
 
@@ -929,6 +1140,9 @@ TransportStatus WebTransportClient::reset_stream(std::uint64_t stream_id,
     // 10 ms time_check tick.
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->pending_media.clear_stream(stream_id);
+        impl_->pending_media_activations.erase(stream_id);
+        impl_->media_streams_with_pending.erase(stream_id);
         impl_->pending_resets.push_back({.stream_id = stream_id, .error_code = error_code});
     }
     impl_->condition.notify_all();
@@ -978,6 +1192,14 @@ TransportStatus WebTransportClient::close(std::uint64_t application_error_code) 
         trace("close requested; joining packet loop thread");
         impl_->packet_loop_thread.join();
         trace("packet loop thread joined rc=" + std::to_string(impl_->packet_loop_return_code));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->pending_media.clear_connection();
+        impl_->pending_media_activations.clear();
+        impl_->media_streams_with_pending.clear();
+        impl_->condition.notify_all();
     }
 
     if (impl_->quic != nullptr) {
