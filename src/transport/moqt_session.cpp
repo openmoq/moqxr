@@ -50,6 +50,89 @@ void note_delivery_timeouts(openmoq::publisher::transport::PublisherTransport& t
 
 
 constexpr std::uint64_t kProtocolViolationErrorCode = 0x3;
+constexpr std::uint64_t kDeliveryTimeoutErrorCode = 0x02;
+
+const NowFunction& steady_now_function() {
+    static const NowFunction now = std::chrono::steady_clock::now;
+    return now;
+}
+
+std::chrono::steady_clock::time_point read_now(const NowFunction& now_function) {
+    return now_function ? now_function() : std::chrono::steady_clock::now();
+}
+
+std::optional<std::chrono::steady_clock::time_point> deadline_after(
+    std::chrono::steady_clock::time_point start,
+    std::uint64_t timeout_ms) {
+    if (timeout_ms == 0) {
+        return std::nullopt;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    using Milliseconds = std::chrono::milliseconds;
+    using Rep = Milliseconds::rep;
+    const auto nonnegative_start = (std::max)(start, Clock::time_point{});
+    const auto remaining_ms = std::chrono::duration_cast<Milliseconds>(
+        Clock::time_point::max() - nonnegative_start);
+    if (timeout_ms > static_cast<std::uint64_t>(remaining_ms.count()) ||
+        timeout_ms > static_cast<std::uint64_t>((std::numeric_limits<Rep>::max)())) {
+        return std::chrono::steady_clock::time_point::max();
+    }
+    const Milliseconds timeout(static_cast<Rep>(timeout_ms));
+    return start + timeout;
+}
+
+DeliveryTimeouts timeouts_for_draft(openmoq::publisher::DraftVersion draft,
+                                    DeliveryTimeouts timeouts) {
+    if (draft != openmoq::publisher::DraftVersion::kDraft16 &&
+        draft != openmoq::publisher::DraftVersion::kDraft18) {
+        return {};
+    }
+    if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+        timeouts.subgroup_ms = 0;
+    }
+    return timeouts;
+}
+
+std::uint64_t smaller_nonzero_timeout(std::uint64_t first,
+                                      std::uint64_t second) {
+    if (first == 0) {
+        return second;
+    }
+    if (second == 0) {
+        return first;
+    }
+    return (std::min)(first, second);
+}
+
+DeliveryTimeouts merge_delivery_timeouts(DeliveryTimeouts first,
+                                         const DeliveryTimeouts& second) {
+    first.object_ms = smaller_nonzero_timeout(first.object_ms, second.object_ms);
+    first.subgroup_ms = smaller_nonzero_timeout(first.subgroup_ms, second.subgroup_ms);
+    return first;
+}
+
+DeliveryTimeouts delivery_timeouts_for_track(
+    const std::map<std::uint64_t, SubscribeMessage>& subscriptions,
+    std::string_view track_name,
+    DeliveryTimeouts publisher_timeouts = {}) {
+    DeliveryTimeouts effective = publisher_timeouts;
+    for (const auto& [request_id, subscribe] : subscriptions) {
+        static_cast<void>(request_id);
+        if (subscribe.track_name == track_name) {
+            effective = merge_delivery_timeouts(effective, subscribe.delivery_timeouts);
+        }
+    }
+    return effective;
+}
+
+bool deadline_reached(
+    std::chrono::steady_clock::time_point now,
+    const std::optional<std::chrono::steady_clock::time_point>& object_deadline,
+    const std::optional<std::chrono::steady_clock::time_point>& subgroup_deadline) {
+    return (object_deadline.has_value() && now >= *object_deadline) ||
+           (subgroup_deadline.has_value() && now >= *subgroup_deadline);
+}
 
 TransportStatus protocol_violation(PublisherTransport& transport, std::string_view message) {
     const TransportStatus close_status = transport.close(kProtocolViolationErrorCode);
@@ -1419,8 +1502,31 @@ public:
                           const openmoq::publisher::CmsfObject& object,
                           bool subgroup_contains_group_largest,
                           bool is_final_in_subgroup,
-                          std::span<const std::uint8_t> payload) {
+                          std::span<const std::uint8_t> payload,
+                          DeliveryTimeouts delivery_timeouts = {},
+                          const NowFunction& now_function = steady_now_function(),
+                          bool* published = nullptr) {
+        if (published != nullptr) {
+            *published = false;
+        }
         const Key key{static_cast<std::uint64_t>(object.group_id), object.subgroup_id};
+        if (expired_subgroups_.contains(key)) {
+            return TransportStatus::success();
+        }
+
+        delivery_timeouts = timeouts_for_draft(draft, delivery_timeouts);
+        const auto first_available_at = read_now(now_function);
+        const auto object_deadline = deadline_after(first_available_at,
+                                                    delivery_timeouts.object_ms);
+        const auto subgroup_deadline = is_final_in_subgroup
+                                           ? deadline_after(first_available_at,
+                                                            delivery_timeouts.subgroup_ms)
+                                           : std::nullopt;
+        if (deadline_reached(read_now(now_function), object_deadline, subgroup_deadline)) {
+            expired_subgroups_.insert(key);
+            return TransportStatus::success();
+        }
+
         auto it = streams_.find(key);
         std::optional<std::uint64_t> previous_object_id;
         std::uint64_t stream_id = 0;
@@ -1446,6 +1552,13 @@ public:
             encode_subgroup_object(draft, previous_object_id, object.object_id, payload);
         wire_bytes.insert(wire_bytes.end(), object_bytes.begin(), object_bytes.end());
 
+        if (!payload.empty() &&
+            (object_bytes.size() < payload.size() ||
+             !std::equal(payload.begin(), payload.end(),
+                         object_bytes.end() - static_cast<std::ptrdiff_t>(payload.size())))) {
+            return TransportStatus::failure("encoded subgroup object payload mismatch");
+        }
+
         if (trace_enabled()) {
             const auto now_ms = trace_elapsed_ms(std::chrono::steady_clock::now());
             std::cerr << "[moqt-session] enqueue object stream=" << stream_id
@@ -1470,15 +1583,36 @@ public:
                                     is_final_in_subgroup);
         }
 
-        const TransportStatus status = transport.write_stream(stream_id, wire_bytes, is_final_in_subgroup);
-        if (!status.ok) {
-            return status;
-        }
+        if (delivery_timeouts.object_ms == 0 && delivery_timeouts.subgroup_ms == 0) {
+            const TransportStatus status =
+                transport.write_stream(stream_id, wire_bytes, is_final_in_subgroup);
+            if (!status.ok) {
+                return status;
+            }
+        } else {
+            while (true) {
+                if (deadline_reached(read_now(now_function), object_deadline, subgroup_deadline)) {
+                    expired_subgroups_.insert(key);
+                    streams_.erase(it);
+                    return transport.reset_stream(stream_id, kDeliveryTimeoutErrorCode);
+                }
 
-        if (!payload.empty()) {
-            if (object_bytes.size() < payload.size() ||
-                !std::equal(payload.begin(), payload.end(), object_bytes.end() - static_cast<std::ptrdiff_t>(payload.size()))) {
-                return TransportStatus::failure("encoded subgroup object payload mismatch");
+                ObjectWriteOptions options{
+                    .transport_priority = 255,
+                    .object_deadline = object_deadline,
+                    .subgroup_deadline = subgroup_deadline,
+                };
+                ObjectWriteResult result = transport.try_write_object(
+                    stream_id, wire_bytes, is_final_in_subgroup, std::move(options));
+                if (result.disposition == ObjectWriteDisposition::kFailed) {
+                    return TransportStatus::failure(
+                        result.message.empty() ? "transport object admission failed" : result.message);
+                }
+                if (result.disposition == ObjectWriteDisposition::kWouldBlock) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                break;
             }
         }
 
@@ -1487,6 +1621,9 @@ public:
         } else {
             it->second.last_object_id = object.object_id;
         }
+        if (published != nullptr) {
+            *published = true;
+        }
         return TransportStatus::success();
     }
 
@@ -1494,10 +1631,57 @@ public:
 
     // FIN all currently open streams (used when transitioning to a new group).
     TransportStatus finish_group(PublisherTransport& transport) {
+        return finish_group(transport,
+                            openmoq::publisher::DraftVersion::kDraft14,
+                            {},
+                            steady_now_function());
+    }
+
+    TransportStatus finish_group(PublisherTransport& transport,
+                                 openmoq::publisher::DraftVersion draft,
+                                 DeliveryTimeouts delivery_timeouts,
+                                 const NowFunction& now_function) {
+        delivery_timeouts = timeouts_for_draft(draft, delivery_timeouts);
+        const auto subgroup_deadline =
+            deadline_after(read_now(now_function), delivery_timeouts.subgroup_ms);
         for (auto& [key, stream] : streams_) {
-            TransportStatus status = transport.write_stream(stream.stream_id, {}, true);
-            if (!status.ok) {
-                return status;
+            if (delivery_timeouts.subgroup_ms == 0) {
+                const TransportStatus status = transport.write_stream(stream.stream_id, {}, true);
+                if (!status.ok) {
+                    return status;
+                }
+                continue;
+            }
+
+            while (true) {
+                if (deadline_reached(read_now(now_function), std::nullopt, subgroup_deadline)) {
+                    const std::uint64_t stream_id = stream.stream_id;
+                    expired_subgroups_.insert(key);
+                    const TransportStatus status =
+                        transport.reset_stream(stream_id, kDeliveryTimeoutErrorCode);
+                    if (!status.ok) {
+                        return status;
+                    }
+                    break;
+                }
+                ObjectWriteResult result = transport.try_write_object(
+                    stream.stream_id,
+                    {},
+                    true,
+                    ObjectWriteOptions{
+                        .transport_priority = 255,
+                        .object_deadline = std::nullopt,
+                        .subgroup_deadline = subgroup_deadline,
+                    });
+                if (result.disposition == ObjectWriteDisposition::kFailed) {
+                    return TransportStatus::failure(
+                        result.message.empty() ? "transport subgroup FIN admission failed"
+                                               : result.message);
+                }
+                if (result.disposition == ObjectWriteDisposition::kAccepted) {
+                    break;
+                }
+                std::this_thread::yield();
             }
         }
         streams_.clear();
@@ -1517,6 +1701,7 @@ private:
         std::uint64_t last_object_id;
     };
     std::map<Key, OpenStream> streams_;
+    std::set<Key> expired_subgroups_;
     std::uint64_t stream_count_ = 0;
 };
 
@@ -1582,6 +1767,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         std::map<std::uint64_t, std::uint64_t>& publish_stream_ids,
                                         std::map<std::uint64_t, DormantPublishedTrack>* dormant_published_tracks,
                                         std::map<std::uint64_t, std::uint64_t>* request_id_by_track_alias,
+                                        const NowFunction& now_function,
                                         std::uint64_t first_request_id = 2);
 
 using PublishedObjectSink = std::function<void(const std::string&, std::uint64_t, std::size_t)>;
@@ -1636,7 +1822,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     const std::map<std::uint64_t, std::uint64_t>* request_id_by_track_alias = nullptr,
                                     std::uint64_t peer_max_request_id = 0,
                                     std::uint64_t subscribe_tracks_next_request_id = 2,
-                                    const std::optional<std::vector<std::uint8_t>>& authorization_token = std::nullopt) {
+                                    const std::optional<std::vector<std::uint8_t>>& authorization_token = std::nullopt,
+                                    const NowFunction& now_function = steady_now_function()) {
     std::vector<std::uint8_t> buffer = std::move(pending_control_bytes);
     pending_control_bytes.clear();
     std::set<std::uint64_t> completed_request_ids;
@@ -1842,6 +2029,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                             publish_stream_ids,
                                             dormant_published_tracks,
                                             nullptr,
+                                            now_function,
                                             subscribe_tracks_next_request_id);
                 if (!publish_status.ok) {
                     return publish_status;
@@ -2286,6 +2474,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         continue;
                     }
 
+                    bool object_published = false;
                     const TransportStatus write_status = active.sender->serve(
                         transport,
                         draft,
@@ -2294,30 +2483,35 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         object,
                         subgroup_contains_group_largest(plan, next_plan_index),
                         is_final_object_in_subgroup(plan, next_plan_index),
-                        payload);
+                        payload,
+                        active.subscribe.delivery_timeouts,
+                        now_function,
+                        &object_published);
                     if (!write_status.ok) {
                         return write_status;
                     }
                     // Record stats for the batch/file path too. Without this,
                     // Publisher::stats() returns zeros for everything except
                     // publish_live, even though objects are flowing.
-                    if (published_sink) {
+                    if (object_published && published_sink) {
                         published_sink(object.track_name,
                                        object.group_id,
                                        object_payload_size(source_object));
                     }
-                    std::cerr << "[moqt-session] served object send_seq=" << send_seq
-                              << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
-                              << " track=" << object.track_name
-                              << " group=" << object.group_id << " object=" << object.object_id
-                              << " bytes=" << object_payload_size(source_object) << '\n';
-                    if (object.track_name == "catalog") {
-                        catalog_last_served_at = std::chrono::steady_clock::now();
+                    if (object_published) {
+                        std::cerr << "[moqt-session] served object send_seq=" << send_seq
+                                  << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                                  << " track=" << object.track_name
+                                  << " group=" << object.group_id << " object=" << object.object_id
+                                  << " bytes=" << object_payload_size(source_object) << '\n';
+                        if (object.track_name == "catalog") {
+                            catalog_last_served_at = std::chrono::steady_clock::now();
+                        }
+                        trace_csv_write_served("served",
+                                               send_seq,
+                                               trace_elapsed_ms(std::chrono::steady_clock::now()),
+                                               object);
                     }
-                    trace_csv_write_served("served",
-                                           send_seq,
-                                           trace_elapsed_ms(std::chrono::steady_clock::now()),
-                                           object);
 
                     std::size_t upcoming_object_index = 0;
                     if (find_next_matching_object_index(plan,
@@ -2418,7 +2612,8 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                          bool paced,
                                          std::chrono::milliseconds subscriber_timeout,
                                          std::vector<std::uint8_t>& pending_control_bytes,
-                                         std::map<std::uint64_t, std::uint64_t>& publish_stream_ids) {
+                                         std::map<std::uint64_t, std::uint64_t>& publish_stream_ids,
+                                         const NowFunction& now_function) {
     std::map<std::string, std::uint64_t> request_id_by_track;
     std::map<std::string, PublishedTrack> tracks_by_name;
     std::map<std::uint64_t, PublishOk> publish_ok_by_request_id;
@@ -2521,6 +2716,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             pace_until(pacing_start, first_media_time_us, object, paced);
             trace_pacing_decision("after", send_seq, pacing_start, first_media_time_us, object, paced);
 
+            bool object_published = false;
             status = sender_by_track[source_object.track_name].serve(
                 transport,
                 plan.draft.version,
@@ -2529,9 +2725,15 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                 object,
                 subgroup_contains_group_largest(plan, object_index),
                 is_final_object_in_subgroup(plan, object_index),
-                payload);
+                payload,
+                publish_ok_it->second.delivery_timeouts,
+                now_function,
+                &object_published);
             if (!status.ok) {
                 return status;
+            }
+            if (!object_published) {
+                continue;
             }
             std::cerr << "[moqt-session] sent object send_seq=" << send_seq
                       << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
@@ -2604,7 +2806,8 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                      nullptr,
                                      0,
                                      2,
-                                     authorization_token);
+                                     authorization_token,
+                                     now_function);
         if (!status.ok) {
             return status;
         }
@@ -2639,6 +2842,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         std::map<std::uint64_t, std::uint64_t>& publish_stream_ids,
                                         std::map<std::uint64_t, DormantPublishedTrack>* dormant_published_tracks,
                                         std::map<std::uint64_t, std::uint64_t>* request_id_by_track_alias,
+                                        const NowFunction& now_function,
                                         std::uint64_t first_request_id) {
     if (tracks.empty()) {
         return TransportStatus::success();
@@ -2768,6 +2972,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
             pace_until(pacing_start, first_media_time_us, object, paced);
             trace_pacing_decision("after", send_seq, pacing_start, first_media_time_us, object, paced);
 
+            bool object_published = false;
             status = sender_by_track[source_object.track_name].serve(
                 transport,
                 plan.draft.version,
@@ -2776,9 +2981,15 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                 object,
                 subgroup_contains_group_largest(plan, object_index),
                 is_final_object_in_subgroup(plan, object_index),
-                payload);
+                payload,
+                publish_ok_it->second.delivery_timeouts,
+                now_function,
+                &object_published);
             if (!status.ok) {
                 return status;
+            }
+            if (!object_published) {
+                continue;
             }
             std::cerr << "[moqt-session] sent selected object send_seq=" << send_seq
                       << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
@@ -2904,7 +3115,8 @@ MoqtSession::MoqtSession(PublisherTransport& transport,
                          bool publish_catalog,
                          bool paced,
                          std::chrono::seconds subscriber_timeout,
-                         openmoq::publisher::cat4moq::AuthorizationConfig authorization)
+                         openmoq::publisher::cat4moq::AuthorizationConfig authorization,
+                         NowFunction now_function)
     : MoqtSession(transport,
                   std::move(track_namespace),
                   auto_forward,
@@ -2912,7 +3124,8 @@ MoqtSession::MoqtSession(PublisherTransport& transport,
                   paced,
                   false,
                   subscriber_timeout,
-                  std::move(authorization)) {}
+                  std::move(authorization),
+                  std::move(now_function)) {}
 
 MoqtSession::MoqtSession(PublisherTransport& transport,
                          std::string track_namespace,
@@ -2921,7 +3134,8 @@ MoqtSession::MoqtSession(PublisherTransport& transport,
                          bool paced,
                          bool loop,
                          std::chrono::seconds subscriber_timeout,
-                         openmoq::publisher::cat4moq::AuthorizationConfig authorization)
+                         openmoq::publisher::cat4moq::AuthorizationConfig authorization,
+                         NowFunction now_function)
     : transport_(transport),
       track_namespace_(std::move(track_namespace)),
       auto_forward_(auto_forward),
@@ -2929,7 +3143,8 @@ MoqtSession::MoqtSession(PublisherTransport& transport,
       paced_(paced),
       loop_(loop),
       subscriber_timeout_(subscriber_timeout),
-      authorization_(std::move(authorization)) {}
+      authorization_(std::move(authorization)),
+      now_function_(now_function ? std::move(now_function) : steady_now_function()) {}
 
 void MoqtSession::reset_publish_stats() {
     publish_stats_ = PublishStats{};
@@ -2955,7 +3170,12 @@ MoqtSession::PublishStats MoqtSession::publish_stats() const {
 TransportStatus MoqtSession::send_catalog_objects(
     openmoq::publisher::DraftVersion draft_version,
     std::uint64_t track_alias,
-    const std::vector<openmoq::publisher::CatalogObject>& objects) {
+    const std::vector<openmoq::publisher::CatalogObject>& objects,
+    DeliveryTimeouts delivery_timeouts,
+    std::size_t* streams_opened) {
+    if (streams_opened != nullptr) {
+        *streams_opened = 0;
+    }
     for (const auto& object : objects) {
         // Precondition this function relies on, not an invariant that always
         // holds: a fresh SubgroupSenderState per call only opens a stream
@@ -2989,14 +3209,23 @@ TransportStatus MoqtSession::send_catalog_objects(
             .owned_payload = std::vector<std::uint8_t>(object.payload.begin(), object.payload.end()),
         };
         SubgroupSenderState catalog_sender;
+        bool object_published = false;
         const TransportStatus status = catalog_sender.serve(
             transport_, draft_version, track_alias, 0,
             catalog_object, true, true,
-            std::span<const std::uint8_t>(catalog_object.owned_payload));
+            std::span<const std::uint8_t>(catalog_object.owned_payload),
+            delivery_timeouts,
+            now_function_,
+            &object_published);
+        if (streams_opened != nullptr) {
+            *streams_opened += catalog_sender.stream_count();
+        }
         if (!status.ok) {
             return status;
         }
-        record_published_object("catalog", object.group_id, object.payload.size());
+        if (object_published) {
+            record_published_object("catalog", object.group_id, object.payload.size());
+        }
     }
     return TransportStatus::success();
 }
@@ -3110,7 +3339,8 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
             paced_,
             subscriber_timeout_,
             pending_control_bytes_,
-            publish_stream_id_by_request_id_);
+            publish_stream_id_by_request_id_,
+            now_function_);
         if (status.ok && uses_request_streams(plan.draft.version) && !loop_state.enabled) {
             namespace_stream_open_ = false;
         }
@@ -3139,7 +3369,8 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                              pending_control_bytes_,
                                              publish_stream_id_by_request_id_,
                                              &dormant_published_tracks,
-                                             &request_id_by_track_alias);
+                                             &request_id_by_track_alias,
+                                             now_function_);
             if (!status.ok) {
                 return status;
             }
@@ -3162,7 +3393,8 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                        &request_id_by_track_alias,
                                        peer_max_request_id_,
                                        2 + (selected_tracks.size() * 2),
-                                       action_token);
+                                       action_token,
+                                       now_function_);
         }
     }
 
@@ -3190,7 +3422,8 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                nullptr,
                                peer_max_request_id_,
                                2,
-                               action_token);
+                               action_token,
+                               now_function_);
 }
 
 TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
@@ -3348,6 +3581,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     // instead of hand-editing every early return.
     bool catalog_publish_done_deferred = false;
     std::uint64_t catalog_stream_count = 0;
+    DeliveryTimeouts catalog_delivery_timeouts;
     std::function<TransportStatus()> catalog_publish_done_sender;
     DeferredCatalogPublishDoneGuard catalog_publish_done_guard(catalog_publish_done_deferred,
                                                                catalog_publish_done_sender);
@@ -3374,10 +3608,16 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         if (objects.empty()) {
             return TransportStatus::success();
         }
-        const TransportStatus status = send_catalog_objects(draft_version, track_alias, objects);
+        std::size_t streams_opened = 0;
+        const TransportStatus status = send_catalog_objects(
+            draft_version,
+            track_alias,
+            objects,
+            catalog_delivery_timeouts,
+            &streams_opened);
         if (status.ok) {
             last_catalog_published_at_ = std::chrono::steady_clock::now();
-            catalog_stream_count += objects.size();
+            catalog_stream_count += streams_opened;
         }
         return status;
     };
@@ -3408,10 +3648,16 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         if (objects.empty()) {
             return TransportStatus::success();
         }
-        const TransportStatus status = send_catalog_objects(draft_version, catalog_track_alias_, objects);
+        std::size_t streams_opened = 0;
+        const TransportStatus status = send_catalog_objects(
+            draft_version,
+            catalog_track_alias_,
+            objects,
+            catalog_delivery_timeouts,
+            &streams_opened);
         if (status.ok) {
             last_catalog_published_at_ = now;
-            catalog_stream_count += objects.size();
+            catalog_stream_count += streams_opened;
         }
         return status;
     };
@@ -3453,9 +3699,12 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             };
 
             auto& sender = sender_by_track[fragment.track_name];
+            const DeliveryTimeouts delivery_timeouts =
+                delivery_timeouts_for_track(active_subscriptions, fragment.track_name);
             const auto group_it = last_group_id_by_track.find(fragment.track_name);
             if (group_it != last_group_id_by_track.end() && group_it->second != static_cast<std::uint64_t>(fragment.group_id)) {
-                TransportStatus finish_status = sender.finish_group(transport_);
+                TransportStatus finish_status = sender.finish_group(
+                    transport_, draft_version, delivery_timeouts, now_function_);
                 if (!finish_status.ok) {
                     return finish_status;
                 }
@@ -3463,11 +3712,16 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
             const std::uint64_t send_seq = next_send_seq();
             const std::span<const std::uint8_t> payload(fragment.payload.owned_bytes);
+            bool object_published = false;
             TransportStatus write_status = sender.serve(
                 transport_, draft_version, alias_it->second, send_seq,
-                object, true, false, payload);
+                object, true, false, payload, delivery_timeouts, now_function_,
+                &object_published);
             if (!write_status.ok) {
                 return write_status;
+            }
+            if (!object_published) {
+                continue;
             }
             last_group_id_by_track[fragment.track_name] = static_cast<std::uint64_t>(fragment.group_id);
             record_published_object(fragment.track_name,
@@ -3522,6 +3776,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     ++new_subs;
 
                     if (subscribe.track_name == "catalog") {
+                        catalog_delivery_timeouts = delivery_timeouts_for_track(
+                            active_subscriptions, "catalog");
                         ws = send_catalog(track_it->second);
                         if (!ws.ok) {
                             return {ws, 0};
@@ -3608,11 +3864,13 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     }
 
     for (auto& [track_name, sender] : sender_by_track) {
-        TransportStatus finish_status = sender.finish_group(transport_);
+        const DeliveryTimeouts delivery_timeouts =
+            delivery_timeouts_for_track(active_subscriptions, track_name);
+        TransportStatus finish_status = sender.finish_group(
+            transport_, draft_version, delivery_timeouts, now_function_);
         if (!finish_status.ok && status.ok) {
             status = finish_status;
         }
-        static_cast<void>(track_name);
     }
 
     if (!status.ok) {
@@ -3916,6 +4174,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // hand-editing every early return.
     bool catalog_publish_done_deferred = false;
     std::uint64_t catalog_stream_count = 0;
+    DeliveryTimeouts catalog_delivery_timeouts;
     std::function<TransportStatus()> catalog_publish_done_sender;
     DeferredCatalogPublishDoneGuard catalog_publish_done_guard(catalog_publish_done_deferred,
                                                                catalog_publish_done_sender);
@@ -3936,10 +4195,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         if (objects.empty()) {
             return TransportStatus::success();
         }
-        const TransportStatus status = send_catalog_objects(draft_version, track_alias, objects);
+        std::size_t streams_opened = 0;
+        const TransportStatus status = send_catalog_objects(
+            draft_version,
+            track_alias,
+            objects,
+            catalog_delivery_timeouts,
+            &streams_opened);
         if (status.ok) {
             last_catalog_published_at_ = std::chrono::steady_clock::now();
-            catalog_stream_count += objects.size();
+            catalog_stream_count += streams_opened;
             std::cerr << "[moqt-session] live: catalog published (" << objects.back().payload.size() << " bytes)\n";
         }
         return status;
@@ -3971,10 +4236,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         if (objects.empty()) {
             return TransportStatus::success();
         }
-        const TransportStatus status = send_catalog_objects(draft_version, catalog_track_alias_, objects);
+        std::size_t streams_opened = 0;
+        const TransportStatus status = send_catalog_objects(
+            draft_version,
+            catalog_track_alias_,
+            objects,
+            catalog_delivery_timeouts,
+            &streams_opened);
         if (status.ok) {
             last_catalog_published_at_ = now;
-            catalog_stream_count += objects.size();
+            catalog_stream_count += streams_opened;
         }
         return status;
     };
@@ -4083,6 +4354,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     std::map<std::uint64_t, std::uint64_t> active_subscription_stream_ids;
     std::set<std::string> subscribed_tracks;
     std::map<std::string, std::uint64_t> subscribe_tracks_publish_request_ids;
+    std::map<std::string, DeliveryTimeouts> published_track_delivery_timeouts;
     std::uint64_t next_subscribe_tracks_publish_request_id = 2;
 
     auto drain_queue = [&]() -> TransportStatus {
@@ -4124,9 +4396,18 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             };
 
             auto& sender = sender_by_track[fragment.track_name];
+            const auto publisher_timeout_it =
+                published_track_delivery_timeouts.find(fragment.track_name);
+            const DeliveryTimeouts delivery_timeouts = delivery_timeouts_for_track(
+                active_subscriptions,
+                fragment.track_name,
+                publisher_timeout_it != published_track_delivery_timeouts.end()
+                    ? publisher_timeout_it->second
+                    : DeliveryTimeouts{});
             const auto group_it = last_group_id_by_track.find(fragment.track_name);
             if (group_it != last_group_id_by_track.end() && group_it->second != static_cast<std::uint64_t>(fragment.group_id)) {
-                TransportStatus finish_status = sender.finish_group(transport_);
+                TransportStatus finish_status = sender.finish_group(
+                    transport_, draft_version, delivery_timeouts, now_function_);
                 if (!finish_status.ok) {
                     return finish_status;
                 }
@@ -4134,11 +4415,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
             const std::uint64_t send_seq = next_send_seq();
             const std::span<const std::uint8_t> payload(fragment.payload.owned_bytes);
+            bool object_published = false;
             TransportStatus write_status = sender.serve(
                 transport_, draft_version, alias_it->second, send_seq,
-                object, true, stream_per_object, payload);
+                object, true, stream_per_object, payload, delivery_timeouts,
+                now_function_, &object_published);
             if (!write_status.ok) {
                 return write_status;
+            }
+            if (!object_published) {
+                continue;
             }
             last_group_id_by_track[fragment.track_name] = static_cast<std::uint64_t>(fragment.group_id);
             record_published_object(fragment.track_name,
@@ -4193,6 +4479,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                              &track_stream_id);
             if (!publish_status.ok) {
                 return publish_status;
+            }
+            published_track_delivery_timeouts.insert_or_assign(
+                track_name, publish_ok.delivery_timeouts);
+            if (track_name == "catalog") {
+                catalog_delivery_timeouts = merge_delivery_timeouts(
+                    catalog_delivery_timeouts, publish_ok.delivery_timeouts);
             }
             subscribe_tracks_publish_request_ids.insert_or_assign(track_name,
                                                                   next_subscribe_tracks_publish_request_id);
@@ -4292,6 +4584,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                               << " request_id=" << subscribe.request_id << '\n';
 
                     if (subscribe.track_name == "catalog") {
+                        catalog_delivery_timeouts = delivery_timeouts_for_track(
+                            active_subscriptions,
+                            "catalog",
+                            catalog_delivery_timeouts);
                         write_status = send_catalog(track_it->second);
                         if (!write_status.ok) {
                             return {write_status, 0};
@@ -4462,6 +4758,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     // catalog subscription is always deferred to this loop's
                     // own exit instead -- see catalog_publish_done_deferred.
                     if (subscribe.track_name == "catalog") {
+                        catalog_delivery_timeouts = delivery_timeouts_for_track(
+                            active_subscriptions,
+                            "catalog",
+                            catalog_delivery_timeouts);
                         ws = send_catalog(track_it->second);
                         if (!ws.ok) {
                             return {ws, 0};
@@ -4505,6 +4805,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     note_delivery_timeouts(transport_, publish_ok_msg.delivery_timeouts);
                     const auto it = publish_request_id_to_track.find(publish_ok_msg.request_id);
                     if (it != publish_request_id_to_track.end()) {
+                        published_track_delivery_timeouts.insert_or_assign(
+                            it->second, publish_ok_msg.delivery_timeouts);
                         subscribed_tracks.insert(it->second);
                         ++new_subs;
                         std::cerr << "[moqt-session] live: PUBLISH_OK track=" << it->second
@@ -4714,11 +5016,18 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     join_stdin_thread();
 
     for (auto& [track_name, sender] : sender_by_track) {
-        status = sender.finish_group(transport_);
+        const auto publisher_timeout_it = published_track_delivery_timeouts.find(track_name);
+        const DeliveryTimeouts delivery_timeouts = delivery_timeouts_for_track(
+            active_subscriptions,
+            track_name,
+            publisher_timeout_it != published_track_delivery_timeouts.end()
+                ? publisher_timeout_it->second
+                : DeliveryTimeouts{});
+        status = sender.finish_group(
+            transport_, draft_version, delivery_timeouts, now_function_);
         if (!status.ok) {
             return status;
         }
-        static_cast<void>(track_name);
     }
 
     // Send PUBLISH_DONE for each subscribed media track. The catalog
@@ -4894,6 +5203,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     std::map<std::uint64_t, std::uint64_t> active_subscription_stream_ids;
     std::set<std::string> subscribed_tracks;
     std::map<std::string, std::uint64_t> published_track_request_ids;
+    std::map<std::string, DeliveryTimeouts> published_track_delivery_timeouts;
     std::map<std::uint64_t, std::vector<std::uint8_t>> pending_publish_request_bytes;
     std::set<std::uint64_t> terminated_publish_request_ids;
     std::uint64_t next_publish_request_id = 2;
@@ -4927,6 +5237,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             if (!publish_status.ok) {
                 return publish_status;
             }
+            published_track_delivery_timeouts.insert_or_assign(
+                track_name, publish_ok.delivery_timeouts);
             published_track_request_ids.insert_or_assign(track_name, next_publish_request_id);
             publish_stream_id_by_request_id_.insert_or_assign(next_publish_request_id, stream_id);
             if (publish_ok.forward != 0) {
@@ -4935,6 +5247,17 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             next_publish_request_id += 2;
         }
         return TransportStatus::success();
+    };
+
+    const auto effective_delivery_timeouts = [&](std::string_view track_name) {
+        const auto publisher_timeout_it =
+            published_track_delivery_timeouts.find(std::string(track_name));
+        return delivery_timeouts_for_track(
+            active_subscriptions,
+            track_name,
+            publisher_timeout_it != published_track_delivery_timeouts.end()
+                ? publisher_timeout_it->second
+                : DeliveryTimeouts{});
     };
 
     if (auto_forward_ && uses_request_streams(draft_version)) {
@@ -4946,6 +5269,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
     auto accept_subscribe = [&](const SubscribeMessage& subscribe,
                                 std::uint64_t response_stream_id) -> TransportStatus {
+        note_delivery_timeouts(transport_, subscribe.delivery_timeouts);
         const auto track_it = alias_by_track.find(subscribe.track_name);
         if (track_it == alias_by_track.end()) {
             if (uses_request_streams(draft_version)) {
@@ -5011,7 +5335,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                         if (!response_status.ok) {
                             return response_status;
                         }
-                        response_status = sender_by_track[track_name].finish_group(transport_);
+                        response_status = sender_by_track[track_name].finish_group(
+                            transport_,
+                            draft_version,
+                            effective_delivery_timeouts(track_name),
+                            now_function_);
                         if (!response_status.ok) {
                             return response_status;
                         }
@@ -5306,6 +5634,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             .owned_payload = catalog.payload,
         };
         const std::uint64_t send_seq = next_send_seq();
+        const DeliveryTimeouts delivery_timeouts =
+            effective_delivery_timeouts("catalog");
+        bool object_published = false;
         TransportStatus send_status = sender_by_track["catalog"].serve(
             transport_,
             draft_version,
@@ -5314,12 +5645,17 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             object,
             catalog.subgroup_contains_group_largest,
             catalog.final_in_subgroup,
-            std::span<const std::uint8_t>(catalog.payload));
+            std::span<const std::uint8_t>(catalog.payload),
+            delivery_timeouts,
+            now_function_,
+            &object_published);
         if (!send_status.ok) {
             return send_status;
         }
-        record_published_object(
-            "catalog", static_cast<std::uint64_t>(catalog.group_id), catalog.payload.size());
+        if (object_published) {
+            record_published_object(
+                "catalog", static_cast<std::uint64_t>(catalog.group_id), catalog.payload.size());
+        }
         live_object_catalog_sent = true;
         served_catalog_subscription_count = subscription_count;
         return TransportStatus::success();
@@ -5478,14 +5814,18 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             pace_until(*object_pacing_start, *object_first_media_time_us, object, true);
         }
         auto& sender = sender_by_track[next->track_name];
+        const DeliveryTimeouts delivery_timeouts =
+            effective_delivery_timeouts(next->track_name);
         const auto group_it = last_group_id_by_track.find(next->track_name);
         if (group_it != last_group_id_by_track.end() &&
             group_it->second != static_cast<std::uint64_t>(next->group_id)) {
-            status = sender.finish_group(transport_);
+            status = sender.finish_group(
+                transport_, draft_version, delivery_timeouts, now_function_);
             if (!status.ok) {
                 return status;
             }
         }
+        bool object_published = false;
         status = sender.serve(
             transport_,
             draft_version,
@@ -5494,7 +5834,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             object,
             next->subgroup_contains_group_largest,
             next->final_in_subgroup,
-            std::span<const std::uint8_t>(next->payload));
+            std::span<const std::uint8_t>(next->payload),
+            delivery_timeouts,
+            now_function_,
+            &object_published);
         if (!status.ok) {
             // A send failure that races with a concurrent close() is a benign
             // stop, not a transport error: break to the flush.
@@ -5502,6 +5845,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 break;
             }
             return status;
+        }
+        if (!object_published) {
+            continue;
         }
         record_published_object(next->track_name,
                                 static_cast<std::uint64_t>(next->group_id),
@@ -5527,11 +5873,14 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     };
 
     for (auto& [track_name, sender] : sender_by_track) {
-        static_cast<void>(track_name);
         if (flush_budget_exhausted()) {
             return TransportStatus::success();
         }
-        status = sender.finish_group(transport_);
+        status = sender.finish_group(
+            transport_,
+            draft_version,
+            effective_delivery_timeouts(track_name),
+            now_function_);
         if (!status.ok) {
             return stopping() ? TransportStatus::success() : status;
         }

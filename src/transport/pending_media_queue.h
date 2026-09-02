@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -22,6 +23,54 @@ struct PendingMediaWrite {
     std::uint8_t transport_priority = 255;
     std::optional<std::chrono::steady_clock::time_point> object_deadline;
     std::optional<std::chrono::steady_clock::time_point> subgroup_deadline;
+};
+
+enum class PendingMediaFrontStatus { kAvailable, kEmpty, kExpired };
+
+struct PendingMediaFront {
+    PendingMediaFrontStatus status = PendingMediaFrontStatus::kEmpty;
+    const PendingMediaWrite* write = nullptr;
+};
+
+inline constexpr std::uint64_t kDeliveryTimeoutErrorCode = 0x02;
+
+struct DeliveryTimeoutReset {
+    std::uint64_t stream_id;
+    std::uint64_t error_code = kDeliveryTimeoutErrorCode;
+};
+
+class SubgroupDeadlineTracker {
+public:
+    using TimePoint = std::chrono::steady_clock::time_point;
+
+    void arm(std::uint64_t stream_id, TimePoint deadline) {
+        auto [it, inserted] = deadlines_.emplace(stream_id, deadline);
+        if (!inserted && deadline < it->second) {
+            it->second = deadline;
+        }
+    }
+
+    void mark_all_data_committed(std::uint64_t stream_id) { deadlines_.erase(stream_id); }
+
+    void cancel(std::uint64_t stream_id) { deadlines_.erase(stream_id); }
+
+    std::vector<DeliveryTimeoutReset> take_expired(TimePoint now) {
+        std::vector<DeliveryTimeoutReset> expired;
+        for (auto it = deadlines_.begin(); it != deadlines_.end();) {
+            if (now < it->second) {
+                ++it;
+                continue;
+            }
+            expired.push_back({it->first, kDeliveryTimeoutErrorCode});
+            it = deadlines_.erase(it);
+        }
+        return expired;
+    }
+
+    void clear() { deadlines_.clear(); }
+
+private:
+    std::map<std::uint64_t, TimePoint> deadlines_;
 };
 
 class PendingMediaQueue {
@@ -52,27 +101,32 @@ public:
         return MediaAdmission::kAccepted;
     }
 
-    const PendingMediaWrite* front(
+    PendingMediaFront inspect_front(
         std::uint64_t stream_id,
         std::chrono::steady_clock::time_point now) {
         auto stream = streams_.find(stream_id);
         if (stream == streams_.end()) {
-            return nullptr;
+            return {};
         }
 
         auto& writes = stream->second;
-        while (!writes.empty()) {
+        if (!writes.empty()) {
             const PendingMediaWrite& write = writes.front();
             if (write.offset == 0 && expired(write, now)) {
-                queued_bytes_ -= remaining_bytes(write);
-                writes.pop_front();
-                continue;
+                clear_stream(stream_id);
+                return {.status = PendingMediaFrontStatus::kExpired, .write = nullptr};
             }
-            return &write;
+            return {.status = PendingMediaFrontStatus::kAvailable, .write = &write};
         }
 
         streams_.erase(stream);
-        return nullptr;
+        return {};
+    }
+
+    const PendingMediaWrite* front(
+        std::uint64_t stream_id,
+        std::chrono::steady_clock::time_point now) {
+        return inspect_front(stream_id, now).write;
     }
 
     std::size_t consume(std::uint64_t stream_id, std::size_t bytes) {

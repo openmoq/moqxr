@@ -10,8 +10,10 @@
 namespace {
 
 using openmoq::publisher::transport::MediaAdmission;
+using openmoq::publisher::transport::PendingMediaFrontStatus;
 using openmoq::publisher::transport::PendingMediaQueue;
 using openmoq::publisher::transport::PendingMediaWrite;
+using openmoq::publisher::transport::SubgroupDeadlineTracker;
 
 bool expect(bool condition, const std::string& message) {
     if (!condition) {
@@ -140,8 +142,13 @@ int main() {
         expired.object_deadline = now - std::chrono::milliseconds(1);
         ok &= expect(queue.try_push(std::move(expired)) == MediaAdmission::kAccepted,
                      "expected an expired write to be admitted before eligibility is checked");
-        ok &= expect(queue.front(4, now) == nullptr, "expected an expired front write to be discarded");
+        const auto expired_front = queue.inspect_front(4, now);
+        ok &= expect(expired_front.status == PendingMediaFrontStatus::kExpired &&
+                         expired_front.write == nullptr,
+                     "expected an expired front write to report expiry explicitly");
         ok &= expect(queue.queued_bytes() == 0, "expected expiry to decrement accounting");
+        ok &= expect(queue.inspect_front(4, now).status == PendingMediaFrontStatus::kEmpty,
+                     "expected expiry to be reported exactly once");
 
         PendingMediaWrite partial = make_write(5, 4);
         partial.subgroup_deadline = now + std::chrono::milliseconds(1);
@@ -165,6 +172,44 @@ int main() {
                      "expected an offset-zero write with an expired subgroup deadline to be discarded");
         ok &= expect(queue.queued_bytes() == 0,
                      "expected subgroup expiry to remove all of the queued bytes");
+    }
+
+    {
+        PendingMediaQueue queue(4);
+        const auto now = Clock::now();
+        PendingMediaWrite expired_fin = make_write(17, 0);
+        expired_fin.fin = true;
+        expired_fin.object_deadline = now;
+        ok &= expect(queue.try_push(std::move(expired_fin)) == MediaAdmission::kAccepted,
+                     "expected an empty FIN with a deadline to be admitted");
+        ok &= expect(queue.try_push(make_write(17, 4)) == MediaAdmission::kAccepted,
+                     "expected a later write for the same stream to be admitted");
+        const auto front = queue.inspect_front(17, now);
+        ok &= expect(front.status == PendingMediaFrontStatus::kExpired && front.write == nullptr,
+                     "expected an expired empty FIN to remain distinguishable from no data");
+        ok &= expect(queue.queued_bytes() == 0,
+                     "expected one expiry to clear every queued object for the stream");
+        ok &= expect(queue.inspect_front(17, now).status == PendingMediaFrontStatus::kEmpty,
+                     "expected an expired empty FIN to be reported exactly once");
+    }
+
+    {
+        SubgroupDeadlineTracker tracker;
+        const auto now = Clock::now();
+        tracker.arm(41, now + std::chrono::milliseconds(100));
+        ok &= expect(tracker.take_expired(now + std::chrono::milliseconds(99)).empty(),
+                     "expected an unacknowledged subgroup not to expire early");
+        const auto resets = tracker.take_expired(now + std::chrono::milliseconds(100));
+        ok &= expect(resets.size() == 1 && resets.front().stream_id == 41 &&
+                         resets.front().error_code == 0x02,
+                     "expected subgroup expiry to request the exact stream reset and error code");
+        ok &= expect(tracker.take_expired(now + std::chrono::milliseconds(101)).empty(),
+                     "expected an expired subgroup reset to be reported exactly once");
+
+        tracker.arm(43, now + std::chrono::milliseconds(100));
+        tracker.mark_all_data_committed(43);
+        ok &= expect(tracker.take_expired(now + std::chrono::milliseconds(101)).empty(),
+                     "expected all-data-committed notification to cancel subgroup expiry");
     }
 
     {

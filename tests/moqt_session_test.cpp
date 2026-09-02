@@ -39,6 +39,9 @@ using openmoq::publisher::transport::SubscribeMessage;
 using openmoq::publisher::transport::SubscribeNamespaceMessage;
 using openmoq::publisher::transport::EndpointConfig;
 using openmoq::publisher::transport::MoqtSession;
+using openmoq::publisher::transport::ObjectWriteDisposition;
+using openmoq::publisher::transport::ObjectWriteOptions;
+using openmoq::publisher::transport::ObjectWriteResult;
 using openmoq::publisher::transport::PublisherTransport;
 using openmoq::publisher::transport::StreamDirection;
 using openmoq::publisher::transport::TlsConfig;
@@ -126,6 +129,12 @@ struct MockTransport final : PublisherTransport {
         StreamDirection direction = StreamDirection::kBidirectional;
         std::uint64_t stream_id = 0;
     };
+    struct ObjectWriteEvent {
+        std::uint64_t stream_id = 0;
+        std::vector<std::uint8_t> bytes;
+        bool fin = false;
+        ObjectWriteOptions options;
+    };
 
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override {
         endpoint_ = endpoint;
@@ -203,6 +212,32 @@ struct MockTransport final : PublisherTransport {
         return TransportStatus::success();
     }
 
+    ObjectWriteResult try_write_object(std::uint64_t stream_id,
+                                       std::span<const std::uint8_t> bytes,
+                                       bool fin,
+                                       ObjectWriteOptions options) override {
+        ObjectWriteEvent event{
+            .stream_id = stream_id,
+            .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
+            .fin = fin,
+            .options = std::move(options),
+        };
+        object_write_attempts.push_back(event);
+        ObjectWriteResult result{ObjectWriteDisposition::kAccepted, {}};
+        if (on_try_write_object) {
+            result = on_try_write_object(*this, event);
+        }
+        if (result.disposition != ObjectWriteDisposition::kAccepted) {
+            return result;
+        }
+        const TransportStatus status = write_stream(stream_id, bytes, fin);
+        return {
+            .disposition = status.ok ? ObjectWriteDisposition::kAccepted
+                                     : ObjectWriteDisposition::kFailed,
+            .message = std::move(status.message),
+        };
+    }
+
     TransportStatus read_stream(std::uint64_t stream_id,
                                 std::vector<std::uint8_t>& bytes,
                                 bool& fin,
@@ -265,12 +300,15 @@ struct MockTransport final : PublisherTransport {
     std::string missing_read_error;
     std::vector<OpenEvent> opens;
     std::vector<WriteEvent> writes;
+    std::vector<ObjectWriteEvent> object_write_attempts;
     std::vector<std::chrono::milliseconds> read_timeouts;
     std::vector<std::chrono::milliseconds> delivery_timeouts;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> accepted_streams;
     std::function<void(MockTransport&, StreamDirection)> on_accept_timeout;
     std::function<void(MockTransport&, std::uint64_t)> on_read;
+    std::function<ObjectWriteResult(MockTransport&, const ObjectWriteEvent&)>
+        on_try_write_object;
     std::atomic<bool> block_writes{false};
     std::atomic<bool> release_writes{false};
 };
@@ -485,7 +523,8 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::string_view track_name,
                                                    std::uint8_t forward,
                                                    DraftVersion draft = DraftVersion::kDraft14,
-                                                   std::uint64_t delivery_timeout_ms = 0) {
+                                                   std::uint64_t delivery_timeout_ms = 0,
+                                                   std::uint64_t subgroup_delivery_timeout_ms = 0) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     const std::vector<std::uint8_t> tuple_len = encode_moqint(draft, 1);
     const std::vector<std::uint8_t> component_len = encode_moqint(draft, track_namespace.size());
@@ -509,9 +548,14 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         payload.insert(payload.end(), start_object.begin(), start_object.end());
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     } else {
-        // Draft-16: parameters as delta-encoded KVPs.
-        // [DELIVERY_TIMEOUT(0x02)], FORWARD(0x10), SUBSCRIBER_PRIORITY(0x20), SUBSCRIPTION_FILTER(0x21)
-        const std::vector<std::uint8_t> parameter_count = encode_moqint(draft, delivery_timeout_ms != 0 ? 4 : 3);
+        // Draft-16/18: parameters as delta-encoded KVPs. Draft 16 has the
+        // single DELIVERY_TIMEOUT (0x02); draft 18 independently adds
+        // SUBGROUP_DELIVERY_TIMEOUT (0x06).
+        const std::uint64_t timeout_parameter_count =
+            (delivery_timeout_ms != 0 ? 1 : 0) +
+            (draft == DraftVersion::kDraft18 && subgroup_delivery_timeout_ms != 0 ? 1 : 0);
+        const std::vector<std::uint8_t> parameter_count =
+            encode_moqint(draft, 3 + timeout_parameter_count);
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
         std::uint64_t previous_type = 0;
         if (delivery_timeout_ms != 0) {
@@ -520,6 +564,15 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             payload.insert(payload.end(), timeout_delta.begin(), timeout_delta.end());
             payload.insert(payload.end(), timeout_value.begin(), timeout_value.end());
             previous_type = 0x02;
+        }
+        if (draft == DraftVersion::kDraft18 && subgroup_delivery_timeout_ms != 0) {
+            const std::vector<std::uint8_t> timeout_delta =
+                encode_moqint(draft, 0x06 - previous_type);
+            const std::vector<std::uint8_t> timeout_value =
+                encode_moqint(draft, subgroup_delivery_timeout_ms);
+            payload.insert(payload.end(), timeout_delta.begin(), timeout_delta.end());
+            payload.insert(payload.end(), timeout_value.begin(), timeout_value.end());
+            previous_type = 0x06;
         }
         // FORWARD (0x10, even) delta from previous type, value=forward
         const std::vector<std::uint8_t> forward_delta = encode_moqint(draft, 0x10 - previous_type);
@@ -1058,6 +1111,43 @@ PublishPlan make_multi_object_subgroup_plan() {
             },
         },
     };
+}
+
+PublishPlan make_delivery_deadline_plan(DraftVersion draft,
+                                        bool include_later_object = true) {
+    PublishPlan plan{
+        .draft = openmoq::publisher::draft_profile(draft),
+        .tracks = {
+            TrackDescription{.track_id = 1,
+                             .handler_type = "vide",
+                             .codec = "avc1.64000C",
+                             .sample_entry_type = "avc1",
+                             .track_name = "events"},
+        },
+        .objects = {
+            CmsfObject{
+                .kind = CmsfObjectKind::kMedia,
+                .track_name = "events",
+                .group_id = 7,
+                .subgroup_id = 3,
+                .object_id = 0,
+                .media_time_us = 0,
+                .owned_payload = {'A'},
+            },
+        },
+    };
+    if (include_later_object) {
+        plan.objects.push_back(CmsfObject{
+            .kind = CmsfObjectKind::kMedia,
+            .track_name = "events",
+            .group_id = 7,
+            .subgroup_id = 3,
+            .object_id = 1,
+            .media_time_us = 1000,
+            .owned_payload = {'B'},
+        });
+    }
+    return plan;
 }
 
 }  // namespace
@@ -1703,6 +1793,191 @@ int main() {
                          std::vector<std::chrono::milliseconds>({std::chrono::milliseconds(1500),
                                                                  std::chrono::milliseconds(4000)}),
                      "expected each negotiated DELIVERY_TIMEOUT to be handed to the transport");
+    }
+
+    {
+        // Draft 16 section 9.2.2.2: a session-owned object that remains
+        // blocked beyond DELIVERY_TIMEOUT resets its already-open subgroup
+        // exactly once. The second object proves that the expired subgroup is
+        // remembered rather than reopened on a fresh stream.
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        transport.reads[0].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "events",
+                                     0,
+                                     DraftVersion::kDraft16,
+                                     100));
+        transport.on_try_write_object =
+            [&now](MockTransport&, const MockTransport::ObjectWriteEvent&) {
+                now += std::chrono::milliseconds(101);
+                return ObjectWriteResult{ObjectWriteDisposition::kWouldBlock,
+                                         "test transport stalled"};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-16 deadline session connect to succeed");
+        status = session.publish(make_delivery_deadline_plan(DraftVersion::kDraft16));
+        ok &= expect(status.ok, "expected draft-16 object expiry to complete the subscription");
+        ok &= expect(transport.object_write_attempts.size() == 1,
+                     "expected the later object in an expired draft-16 subgroup not to be retried");
+        ok &= expect(transport.reset_calls.size() == 1,
+                     "expected exactly one draft-16 DELIVERY_TIMEOUT reset");
+        if (!transport.object_write_attempts.empty() && !transport.reset_calls.empty()) {
+            const auto stream_id = transport.object_write_attempts.front().stream_id;
+            ok &= expect(transport.reset_calls.front() == std::pair<std::uint64_t, std::uint64_t>{stream_id, 0x02},
+                         "expected draft-16 expiry to reset the exact subgroup stream with 0x02");
+            ok &= expect(transport.object_write_attempts.front().options.object_deadline ==
+                             Clock::time_point{} + std::chrono::milliseconds(100),
+                         "expected draft-16 object deadline to retain the first-availability timestamp");
+            ok &= expect(!transport.object_write_attempts.front().options.subgroup_deadline.has_value(),
+                         "expected draft-16 not to arm a draft-18 subgroup deadline");
+        }
+        const auto unidirectional_opens = static_cast<std::size_t>(std::count_if(
+            transport.opens.begin(), transport.opens.end(), [](const MockTransport::OpenEvent& event) {
+                return event.direction == StreamDirection::kUnidirectional;
+            }));
+        ok &= expect(unidirectional_opens == 1,
+                     "expected an expired draft-16 subgroup never to reopen");
+    }
+
+    {
+        // Draft 18 section 8 keeps OBJECT_DELIVERY_TIMEOUT independent from
+        // the longer subgroup value. No subgroup timer is handed off for the
+        // non-final first object, and its stalled admission expires at 100 ms.
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "events",
+                                     0,
+                                     DraftVersion::kDraft18,
+                                     100,
+                                     500));
+        transport.on_try_write_object =
+            [&now](MockTransport&, const MockTransport::ObjectWriteEvent&) {
+                now += std::chrono::milliseconds(101);
+                return ObjectWriteResult{ObjectWriteDisposition::kWouldBlock,
+                                         "test transport stalled"};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 object-deadline session connect to succeed");
+        status = session.publish(make_delivery_deadline_plan(DraftVersion::kDraft18));
+        ok &= expect(status.ok, "expected draft-18 object expiry to complete the subscription");
+        ok &= expect(transport.object_write_attempts.size() == 1,
+                     "expected draft-18 object expiry to suppress the later subgroup object");
+        const auto delivery_timeout_resets = static_cast<std::size_t>(std::count_if(
+            transport.reset_calls.begin(), transport.reset_calls.end(),
+            [](const auto& reset) { return reset.second == 0x02; }));
+        ok &= expect(delivery_timeout_resets == 1,
+                     "expected exactly one draft-18 object-timeout reset");
+        const auto delivery_reset = std::find_if(
+            transport.reset_calls.begin(), transport.reset_calls.end(),
+            [](const auto& reset) { return reset.second == 0x02; });
+        if (!transport.object_write_attempts.empty() && delivery_reset != transport.reset_calls.end()) {
+            const auto& attempt = transport.object_write_attempts.front();
+            ok &= expect(attempt.options.object_deadline ==
+                             Clock::time_point{} + std::chrono::milliseconds(100),
+                         "expected draft-18 object timeout to use its independent 100 ms value");
+            ok &= expect(!attempt.options.subgroup_deadline.has_value(),
+                         "expected the subgroup timer not to start before final publication");
+            ok &= expect(*delivery_reset ==
+                             std::pair<std::uint64_t, std::uint64_t>{attempt.stream_id, 0x02},
+                         "expected draft-18 object expiry to reset the exact subgroup stream with 0x02");
+        }
+    }
+
+    {
+        // Reverse the draft-18 timeout values. The first, non-final object is
+        // accepted without a subgroup deadline. The mock advances 101 ms only
+        // after accepting it, so the final object's subgroup deadline must be
+        // 201 ms: application final-publication time plus 100 ms, not object
+        // availability or admission completion plus the 500 ms object value.
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "events",
+                                     0,
+                                     DraftVersion::kDraft18,
+                                     500,
+                                     100));
+        transport.on_try_write_object =
+            [&now](MockTransport&, const MockTransport::ObjectWriteEvent& event) {
+                if (!event.fin) {
+                    now += std::chrono::milliseconds(101);
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 subgroup-deadline session connect to succeed");
+        status = session.publish(make_delivery_deadline_plan(DraftVersion::kDraft18));
+        ok &= expect(status.ok, "expected draft-18 final subgroup publication to succeed");
+        ok &= expect(transport.object_write_attempts.size() == 2,
+                     "expected both draft-18 subgroup objects to be admitted");
+        if (transport.object_write_attempts.size() == 2) {
+            const auto& first = transport.object_write_attempts[0];
+            const auto& final = transport.object_write_attempts[1];
+            ok &= expect(!first.options.subgroup_deadline.has_value(),
+                         "expected no subgroup timer before final publication");
+            ok &= expect(final.options.object_deadline ==
+                             Clock::time_point{} + std::chrono::milliseconds(601),
+                         "expected the final object's independent 500 ms deadline");
+            ok &= expect(final.options.subgroup_deadline ==
+                             Clock::time_point{} + std::chrono::milliseconds(201),
+                         "expected subgroup timeout to start at the 101 ms final-publication time");
+        }
+        ok &= expect(std::none_of(transport.reset_calls.begin(),
+                                  transport.reset_calls.end(),
+                                  [](const auto& reset) { return reset.second == 0x02; }),
+                     "expected the session not to substitute close drain for transport ACK monitoring");
     }
 
     MockTransport draft16_transport;
