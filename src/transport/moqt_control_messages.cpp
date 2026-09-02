@@ -1181,13 +1181,15 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
                 return false;
             }
             switch (parameter_type) {
-                case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT) — spec §9.2.2.2: value 0 is illegal on the wire.
-                    if (value == 0) { return false; }
+                case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT).
+                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
                     message.delivery_timeouts.object_ms = value;
                     break;
-                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
+                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
                     if (draft == DraftVersion::kDraft18) {
                         message.delivery_timeouts.subgroup_ms = value;
+                    } else if (draft == DraftVersion::kDraft16) {
+                        return false;
                     }
                     break;
                 case kParamForward:  // FORWARD
@@ -1645,12 +1647,14 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             }
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT)
-                    if (value == 0) { return false; }
+                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
                     message.delivery_timeouts.object_ms = value;
                     break;
-                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
+                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
                     if (draft == DraftVersion::kDraft18) {
                         message.delivery_timeouts.subgroup_ms = value;
+                    } else if (draft == DraftVersion::kDraft16) {
+                        return false;
                     }
                     break;
                 case 0x08:  // EXPIRES

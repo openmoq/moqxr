@@ -380,17 +380,18 @@ std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft, SubscribeP
     return bytes;
 }
 
-// SUBSCRIBE (draft-16+) carrying DELIVERY_TIMEOUT (0x02) and, when non-zero,
+// SUBSCRIBE (draft-16+) carrying DELIVERY_TIMEOUT (0x02) and, when requested,
 // draft-18 SUBGROUP_DELIVERY_TIMEOUT (0x06), ahead of the usual FORWARD /
 // SUBSCRIBER_PRIORITY / SUBSCRIPTION_FILTER / GROUP_ORDER set.
 std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeouts(DraftVersion draft,
                                                                          std::uint64_t object_timeout_ms,
-                                                                         std::uint64_t subgroup_timeout_ms) {
+                                                                         std::uint64_t subgroup_timeout_ms,
+                                                                         bool include_subgroup_timeout = false) {
     std::vector<std::uint8_t> payload;
     append_moqint(payload, draft, 77);
     append_track_namespace(payload, draft, {"live", "alpha"});
     append_string(payload, draft, "catalog");
-    const bool with_subgroup = subgroup_timeout_ms != 0;
+    const bool with_subgroup = include_subgroup_timeout || subgroup_timeout_ms != 0;
     append_moqint(payload, draft, with_subgroup ? 6 : 5);  // parameter count
     append_moqint(payload, draft, 0x02);                   // DELIVERY_TIMEOUT, delta from 0x00
     append_moqint(payload, draft, object_timeout_ms);
@@ -420,15 +421,16 @@ std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeouts(DraftVe
 }
 
 // PUBLISH_OK (draft-16+) carrying OBJECT_DELIVERY_TIMEOUT (0x02) and, when
-// non-zero, SUBGROUP_DELIVERY_TIMEOUT (0x06, draft-18).
+// requested, SUBGROUP_DELIVERY_TIMEOUT (0x06, draft-18).
 std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftVersion draft,
                                                                           std::uint64_t object_timeout_ms,
-                                                                          std::uint64_t subgroup_timeout_ms) {
+                                                                          std::uint64_t subgroup_timeout_ms,
+                                                                          bool include_subgroup_timeout = false) {
     std::vector<std::uint8_t> payload;
     if (draft != DraftVersion::kDraft18) {
         append_moqint(payload, draft, 55);
     }
-    const bool with_subgroup = subgroup_timeout_ms != 0;
+    const bool with_subgroup = include_subgroup_timeout || subgroup_timeout_ms != 0;
     append_moqint(payload, draft, with_subgroup ? 6 : 5);  // parameter count
     append_moqint(payload, draft, 0x02);                   // OBJECT_DELIVERY_TIMEOUT
     append_moqint(payload, draft, object_timeout_ms);
@@ -1048,6 +1050,60 @@ bool test_control_message_framing_and_parameter_regressions() {
                      "draft-18 PUBLISH_OK object delivery timeout remains independent");
         ok &= expect(draft18_publish_ok.delivery_timeouts.subgroup_ms == 2500,
                      "draft-18 PUBLISH_OK subgroup delivery timeout remains independent");
+
+        SubscribeMessage draft18_object_zero_subscribe;
+        ok &= expect(decode_subscribe_message(
+                         build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft18, 0, 2500, true),
+                         DraftVersion::kDraft18,
+                         draft18_object_zero_subscribe),
+                     "draft-18 SUBSCRIBE accepts explicit zero object delivery timeout");
+        ok &= expect(draft18_object_zero_subscribe.delivery_timeouts.object_ms == 0 &&
+                         draft18_object_zero_subscribe.delivery_timeouts.subgroup_ms == 2500,
+                     "draft-18 SUBSCRIBE retains zero object and non-zero subgroup timeouts");
+
+        SubscribeMessage draft18_subgroup_zero_subscribe;
+        ok &= expect(decode_subscribe_message(
+                         build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft18, 700, 0, true),
+                         DraftVersion::kDraft18,
+                         draft18_subgroup_zero_subscribe),
+                     "draft-18 SUBSCRIBE accepts explicit zero subgroup delivery timeout");
+        ok &= expect(draft18_subgroup_zero_subscribe.delivery_timeouts.object_ms == 700 &&
+                         draft18_subgroup_zero_subscribe.delivery_timeouts.subgroup_ms == 0,
+                     "draft-18 SUBSCRIBE retains non-zero object and zero subgroup timeouts");
+
+        PublishOk draft18_object_zero_publish_ok;
+        ok &= expect(decode_publish_ok(
+                         build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft18, 0, 2500, true),
+                         DraftVersion::kDraft18,
+                         draft18_object_zero_publish_ok),
+                     "draft-18 PUBLISH_OK accepts explicit zero object delivery timeout");
+        ok &= expect(draft18_object_zero_publish_ok.delivery_timeouts.object_ms == 0 &&
+                         draft18_object_zero_publish_ok.delivery_timeouts.subgroup_ms == 2500,
+                     "draft-18 PUBLISH_OK retains zero object and non-zero subgroup timeouts");
+
+        PublishOk draft18_subgroup_zero_publish_ok;
+        ok &= expect(decode_publish_ok(
+                         build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft18, 700, 0, true),
+                         DraftVersion::kDraft18,
+                         draft18_subgroup_zero_publish_ok),
+                     "draft-18 PUBLISH_OK accepts explicit zero subgroup delivery timeout");
+        ok &= expect(draft18_subgroup_zero_publish_ok.delivery_timeouts.object_ms == 700 &&
+                         draft18_subgroup_zero_publish_ok.delivery_timeouts.subgroup_ms == 0,
+                     "draft-18 PUBLISH_OK retains non-zero object and zero subgroup timeouts");
+
+        SubscribeMessage draft16_subgroup_timeout_subscribe;
+        ok &= expect(!decode_subscribe_message(
+                         build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft16, 1500, 2500, true),
+                         DraftVersion::kDraft16,
+                         draft16_subgroup_timeout_subscribe),
+                     "draft-16 SUBSCRIBE rejects unknown subgroup delivery timeout parameter");
+
+        PublishOk draft16_subgroup_timeout_publish_ok;
+        ok &= expect(!decode_publish_ok(
+                         build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft16, 1500, 2500, true),
+                         DraftVersion::kDraft16,
+                         draft16_subgroup_timeout_publish_ok),
+                     "draft-16 PUBLISH_OK rejects unknown subgroup delivery timeout parameter");
     }
 
     std::vector<std::uint8_t> request_ok_payload;

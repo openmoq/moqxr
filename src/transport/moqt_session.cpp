@@ -2741,7 +2741,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                     .start_group_id = 0,
                                     .start_object_id = 0,
                                     .end_group_id = 0,
-                                    .delivery_timeouts = {},
+                                    .delivery_timeouts = publish_ok_it->second.delivery_timeouts,
                                 },
                             .track = track_it->second,
                         });
