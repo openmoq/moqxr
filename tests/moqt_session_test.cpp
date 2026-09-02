@@ -21,6 +21,16 @@
 #include <thread>
 #include <vector>
 
+namespace openmoq::publisher::transport::priority_scheduler_internal {
+
+bool publisher_priority_precedes_for_testing(std::uint8_t first,
+                                             std::uint8_t second);
+std::uint8_t object_transport_priority_for_testing(
+    std::uint8_t subscriber_priority,
+    std::uint8_t publisher_priority);
+
+}  // namespace openmoq::publisher::transport::priority_scheduler_internal
+
 namespace {
 
 using openmoq::publisher::ByteSpan;
@@ -263,8 +273,8 @@ struct MockTransport final : PublisherTransport {
 
         bytes = it->second.front();
         it->second.erase(it->second.begin());
-        fin = it->second.empty();
-        if (fin) {
+        fin = it->second.empty() && !keep_open_streams.contains(stream_id);
+        if (it->second.empty()) {
             reads.erase(it);
         }
         return TransportStatus::success();
@@ -309,6 +319,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<std::chrono::milliseconds> delivery_timeouts;
     std::set<std::uint64_t> expired_media_streams;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
+    std::set<std::uint64_t> keep_open_streams;
     std::set<std::uint64_t> accepted_streams;
     std::function<void(MockTransport&, StreamDirection)> on_accept_timeout;
     std::function<void(MockTransport&, std::uint64_t)> on_read;
@@ -529,7 +540,11 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::uint8_t forward,
                                                    DraftVersion draft = DraftVersion::kDraft14,
                                                    std::uint64_t delivery_timeout_ms = 0,
-                                                   std::uint64_t subgroup_delivery_timeout_ms = 0) {
+                                                   std::uint64_t subgroup_delivery_timeout_ms = 0,
+                                                   std::uint8_t subscriber_priority = 128,
+                                                   std::uint8_t group_order = 0,
+                                                   std::size_t start_group_id = 0,
+                                                   std::size_t start_object_id = 0) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     const std::vector<std::uint8_t> tuple_len = encode_moqint(draft, 1);
     const std::vector<std::uint8_t> component_len = encode_moqint(draft, track_namespace.size());
@@ -541,12 +556,12 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
     payload.insert(payload.end(), track_name.begin(), track_name.end());
 
     if (draft == DraftVersion::kDraft14) {
-        payload.push_back(0x80);  // subscriber_priority
-        payload.push_back(0x01);  // group_order
+        payload.push_back(subscriber_priority);
+        payload.push_back(group_order == 0 ? 0x01 : group_order);
         payload.push_back(forward);  // forward
         const std::vector<std::uint8_t> filter_type = encode_varint(0x03);  // AbsoluteStart
-        const std::vector<std::uint8_t> start_group = encode_varint(0);
-        const std::vector<std::uint8_t> start_object = encode_varint(0);
+        const std::vector<std::uint8_t> start_group = encode_varint(start_group_id);
+        const std::vector<std::uint8_t> start_object = encode_varint(start_object_id);
         const std::vector<std::uint8_t> parameter_count = encode_varint(0);
         payload.insert(payload.end(), filter_type.begin(), filter_type.end());
         payload.insert(payload.end(), start_group.begin(), start_group.end());
@@ -560,7 +575,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             (delivery_timeout_ms != 0 ? 1 : 0) +
             (draft == DraftVersion::kDraft18 && subgroup_delivery_timeout_ms != 0 ? 1 : 0);
         const std::vector<std::uint8_t> parameter_count =
-            encode_moqint(draft, 3 + timeout_parameter_count);
+            encode_moqint(draft, 3 + timeout_parameter_count + (group_order != 0 ? 1 : 0));
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
         std::uint64_t previous_type = 0;
         if (delivery_timeout_ms != 0) {
@@ -590,7 +605,8 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         const bool uint8_params =
             draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
         const std::vector<std::uint8_t> priority_value =
-            uint8_params ? std::vector<std::uint8_t>{0x80} : encode_moqint(draft, 0x80);
+            uint8_params ? std::vector<std::uint8_t>{subscriber_priority}
+                         : encode_moqint(draft, subscriber_priority);
         payload.insert(payload.end(), priority_delta.begin(), priority_delta.end());
         payload.insert(payload.end(), priority_value.begin(), priority_value.end());
         // SUBSCRIPTION_FILTER (0x21, odd) delta=0x01
@@ -598,8 +614,8 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         const std::vector<std::uint8_t> filter_delta = encode_moqint(draft, 0x21 - 0x20);
         std::vector<std::uint8_t> filter_value;
         const std::vector<std::uint8_t> ft = encode_moqint(draft, 0x03);
-        const std::vector<std::uint8_t> sg = encode_moqint(draft, 0);
-        const std::vector<std::uint8_t> so = encode_moqint(draft, 0);
+        const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
+        const std::vector<std::uint8_t> so = encode_moqint(draft, start_object_id);
         filter_value.insert(filter_value.end(), ft.begin(), ft.end());
         filter_value.insert(filter_value.end(), sg.begin(), sg.end());
         filter_value.insert(filter_value.end(), so.begin(), so.end());
@@ -607,6 +623,14 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         payload.insert(payload.end(), filter_delta.begin(), filter_delta.end());
         payload.insert(payload.end(), filter_len.begin(), filter_len.end());
         payload.insert(payload.end(), filter_value.begin(), filter_value.end());
+        if (group_order != 0) {
+            const std::vector<std::uint8_t> group_order_delta = encode_moqint(draft, 0x22 - 0x21);
+            const std::vector<std::uint8_t> group_order_value =
+                uint8_params ? std::vector<std::uint8_t>{group_order}
+                             : encode_moqint(draft, group_order);
+            payload.insert(payload.end(), group_order_delta.begin(), group_order_delta.end());
+            payload.insert(payload.end(), group_order_value.begin(), group_order_value.end());
+        }
     }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x03);
@@ -644,19 +668,23 @@ std::vector<std::uint8_t> encode_subscribe_tracks_message(std::uint64_t request_
 }
 
 std::vector<std::uint8_t> encode_subscribe_update_message(std::uint64_t request_id,
-                                                          std::uint64_t subscription_request_id = 6) {
+                                                          std::uint64_t subscription_request_id = 6,
+                                                          std::uint8_t subscriber_priority = 128,
+                                                          std::uint8_t forward = 1,
+                                                          std::size_t end_group_plus_one_value = 1) {
     std::vector<std::uint8_t> payload = encode_varint(request_id);
     const std::vector<std::uint8_t> subscription_request_id_bytes = encode_varint(subscription_request_id);
     const std::vector<std::uint8_t> start_group = encode_varint(0);
     const std::vector<std::uint8_t> start_object = encode_varint(0);
-    const std::vector<std::uint8_t> end_group_plus_one = encode_varint(1);
+    const std::vector<std::uint8_t> end_group_plus_one =
+        encode_varint(end_group_plus_one_value);
     const std::vector<std::uint8_t> parameter_count = encode_varint(0);
     payload.insert(payload.end(), subscription_request_id_bytes.begin(), subscription_request_id_bytes.end());
     payload.insert(payload.end(), start_group.begin(), start_group.end());
     payload.insert(payload.end(), start_object.begin(), start_object.end());
     payload.insert(payload.end(), end_group_plus_one.begin(), end_group_plus_one.end());
-    payload.push_back(0x80);
-    payload.push_back(0x01);
+    payload.push_back(subscriber_priority);
+    payload.push_back(forward);
     payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     std::vector<std::uint8_t> message = encode_varint(0x02);
     append_be16(message, static_cast<std::uint16_t>(payload.size()));
@@ -1241,6 +1269,78 @@ PublishPlan make_completed_subgroup_reopen_plan(DraftVersion draft) {
     };
 }
 
+struct SchedulingObjectSpec {
+    std::string track_name;
+    std::size_t group_id = 0;
+    std::uint64_t subgroup_id = 0;
+    std::size_t object_id = 0;
+    std::uint64_t media_time_us = 0;
+    std::uint8_t marker = 0;
+};
+
+PublishPlan make_scheduling_plan(std::vector<SchedulingObjectSpec> specs) {
+    PublishPlan plan;
+    plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft16);
+    std::set<std::string> track_names;
+    for (const auto& spec : specs) {
+        if (track_names.insert(spec.track_name).second) {
+            plan.tracks.push_back(TrackDescription{
+                .track_id = static_cast<std::uint32_t>(plan.tracks.size() + 1),
+                .handler_type = "meta",
+                .codec = "mett",
+                .sample_entry_type = "mett",
+                .track_name = spec.track_name,
+            });
+        }
+        plan.objects.push_back(CmsfObject{
+            .kind = CmsfObjectKind::kMedia,
+            .track_name = spec.track_name,
+            .group_id = spec.group_id,
+            .subgroup_id = spec.subgroup_id,
+            .object_id = spec.object_id,
+            .media_time_us = spec.media_time_us,
+            .owned_payload = {spec.marker},
+        });
+    }
+    return plan;
+}
+
+struct ScheduledObjectIdentity {
+    std::uint64_t request_id = 0;
+    std::uint64_t group_id = 0;
+    std::uint64_t subgroup_id = 0;
+    std::uint64_t object_id = 0;
+    friend bool operator==(const ScheduledObjectIdentity&,
+                           const ScheduledObjectIdentity&) = default;
+};
+
+template <typename Event>
+std::vector<ScheduledObjectIdentity> scheduled_identities(
+    const std::vector<Event>& events,
+    const std::map<std::uint8_t, ScheduledObjectIdentity>& identity_by_marker) {
+    std::vector<ScheduledObjectIdentity> identities;
+    for (const auto& event : events) {
+        if (event.bytes.empty()) {
+            continue;
+        }
+        const auto identity_it = identity_by_marker.find(event.bytes.back());
+        if (identity_it != identity_by_marker.end()) {
+            identities.push_back(identity_it->second);
+        }
+    }
+    return identities;
+}
+
+void queue_draft16_scheduling_prefix(MockTransport& transport,
+                                     std::uint64_t max_request_id = 32) {
+    transport.reads[0].push_back(encode_server_setup_message({
+        .draft = DraftVersion::kDraft16,
+        .max_request_id = max_request_id,
+    }));
+    transport.reads[0].push_back(
+        encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+}
+
 }  // namespace
 
 int main() {
@@ -1263,6 +1363,376 @@ int main() {
     std::string authority;
     std::string path;
     std::uint64_t max_request_id = 1;
+
+    ok &= expect(
+        openmoq::publisher::transport::priority_scheduler_internal::
+            publisher_priority_precedes_for_testing(7, 201),
+        "expected lower publisher priority to win the internal scheduler tie-break");
+    ok &= expect(
+        !openmoq::publisher::transport::priority_scheduler_internal::
+             publisher_priority_precedes_for_testing(201, 7),
+        "expected higher publisher priority not to precede the lower value");
+    const std::array<std::uint64_t, 4> publisher_priority_winner =
+        openmoq::publisher::transport::priority_scheduler_internal::
+                publisher_priority_precedes_for_testing(201, 7)
+            ? std::array<std::uint64_t, 4>{1, 1, 0, 0}
+            : std::array<std::uint64_t, 4>{3, 9, 2, 4};
+    ok &= expect(publisher_priority_winner ==
+                     std::array<std::uint64_t, 4>{3, 9, 2, 4},
+                 "expected literal request 3/group 9/subgroup 2/object 4 to win by publisher priority");
+    ok &= expect(
+        openmoq::publisher::transport::priority_scheduler_internal::
+            object_transport_priority_for_testing(0, 0) == 2,
+        "expected the highest object tuple to start after control and request classes");
+    ok &= expect(
+        openmoq::publisher::transport::priority_scheduler_internal::
+            object_transport_priority_for_testing(255, 255) == 255,
+        "expected the lowest object tuple to saturate without uint8 overflow");
+    ok &= expect(
+        openmoq::publisher::transport::priority_scheduler_internal::
+            object_transport_priority_for_testing(42, 0) <
+            openmoq::publisher::transport::priority_scheduler_internal::
+                object_transport_priority_for_testing(42, 255),
+        "expected transport mapping to retain publisher priority where one class permits it");
+    ok &= expect(
+        openmoq::publisher::transport::priority_scheduler_internal::
+            object_transport_priority_for_testing(42, 255) <=
+            openmoq::publisher::transport::priority_scheduler_internal::
+                object_transport_priority_for_testing(43, 0),
+        "expected transport mapping to preserve subscriber-priority precedence");
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "low", 0, DraftVersion::kDraft16,
+            0, 0, 200, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "high", 0, DraftVersion::kDraft16,
+            0, 0, 7, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "low", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 0, .marker = 'L'},
+            {.track_name = "high", .group_id = 9, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 9000, .marker = 'H'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected subscriber-priority session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected subscriber-priority publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'L', {1, 1, 0, 0}},
+            {'H', {3, 9, 0, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.writes, identities) ==
+                std::vector<ScheduledObjectIdentity>({{3, 9, 0, 0},
+                                                      {1, 1, 0, 0}}),
+            "expected literal request 3/group 9 before request 1/group 1 by subscriber priority");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            0, 0, 20, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 9, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 0, .marker = 'N'},
+            {.track_name = "events", .group_id = 2, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 9000, .marker = 'A'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected ascending-order session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected ascending-order publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'N', {1, 9, 0, 0}},
+            {'A', {1, 2, 0, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.writes, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 2, 0, 0},
+                                                      {1, 9, 0, 0}}),
+            "expected ascending request 1 to write literal group 2 before group 9");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            0, 0, 20, 2));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 2, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 9, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 9000, .marker = 'D'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected descending-order session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected descending-order publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'A', {1, 2, 0, 0}},
+            {'D', {1, 9, 0, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.writes, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 9, 0, 0},
+                                                      {1, 2, 0, 0}}),
+            "expected descending request 1 to write literal group 9 before group 2");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            0, 0, 20, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 4, .subgroup_id = 9,
+             .object_id = 0, .media_time_us = 0, .marker = 'N'},
+            {.track_name = "events", .group_id = 4, .subgroup_id = 2,
+             .object_id = 0, .media_time_us = 9000, .marker = 'S'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected subgroup-order session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected subgroup-order publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'N', {1, 4, 9, 0}},
+            {'S', {1, 4, 2, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.writes, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 4, 2, 0},
+                                                      {1, 4, 9, 0}}),
+            "expected request 1/group 4/subgroup 2 before subgroup 9");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            0, 0, 20, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 4, .subgroup_id = 2,
+             .object_id = 9, .media_time_us = 0, .marker = 'N'},
+            {.track_name = "events", .group_id = 4, .subgroup_id = 2,
+             .object_id = 2, .media_time_us = 9000, .marker = 'O'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected object-order session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected object-order publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'N', {1, 4, 2, 9}},
+            {'O', {1, 4, 2, 2}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.writes, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 4, 2, 2},
+                                                      {1, 4, 2, 9}}),
+            "expected request 1/group 4/subgroup 2/object 2 before object 9");
+    }
+
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "high", 0, DraftVersion::kDraft16,
+            1000, 0, 1, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "low", 0, DraftVersion::kDraft16,
+            1000, 0, 100, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "high", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 0, .marker = 'H'},
+            {.track_name = "low", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .media_time_us = 9000, .marker = 'L'},
+        });
+        bool blocked_high_once = false;
+        transport.on_try_write_object =
+            [&blocked_high_once, &now](MockTransport&,
+                                       const MockTransport::ObjectWriteEvent& event) {
+                now += std::chrono::milliseconds(10);
+                if (!blocked_high_once && !event.bytes.empty() &&
+                    event.bytes.back() == 'H') {
+                    blocked_high_once = true;
+                    return ObjectWriteResult{ObjectWriteDisposition::kWouldBlock,
+                                             "high-priority test stream blocked"};
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected blocked-priority session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected blocked-priority publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'H', {1, 1, 0, 0}},
+            {'L', {3, 1, 0, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.object_write_attempts, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 1, 0, 0},
+                                                      {3, 1, 0, 0},
+                                                      {1, 1, 0, 0}}),
+            "expected blocked request 1, eligible request 3, then retried request 1");
+        if (transport.object_write_attempts.size() >= 3) {
+            ok &= expect(
+                transport.object_write_attempts[0].stream_id ==
+                    transport.object_write_attempts[2].stream_id,
+                "expected blocked retry to retain the original subgroup stream");
+            ok &= expect(
+                transport.object_write_attempts[0].options.object_deadline ==
+                    transport.object_write_attempts[2].options.object_deadline,
+                "expected blocked retry to retain first availability and absolute deadline");
+        }
+        ok &= expect(transport.reset_calls.empty(),
+                     "expected would-block scheduling not to reset any subgroup");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            0, 0, 20, 1, 0, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 0, .subgroup_id = 0,
+             .object_id = 0, .marker = 'X'},
+            {.track_name = "events", .group_id = 0, .subgroup_id = 0,
+             .object_id = 1, .marker = 'O'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected filtered-predecessor session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected filtered-predecessor publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'X', {1, 0, 0, 0}},
+            {'O', {1, 0, 0, 1}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.object_write_attempts, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 0, 0, 1}}),
+            "expected an object before the subscription start not to block its eligible successor");
+    }
+
+    {
+        MockTransport transport;
+        transport.keep_open_streams.insert(0);
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "high", 0, DraftVersion::kDraft16,
+            1000, 0, 1, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "middle", 0, DraftVersion::kDraft16,
+            1000, 0, 50, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            5, kTestTrackNamespace, "low", 0, DraftVersion::kDraft16,
+            1000, 0, 100, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "high", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'H'},
+            {.track_name = "middle", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'M'},
+            {.track_name = "low", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'L'},
+        });
+        bool update_queued = false;
+        transport.on_try_write_object =
+            [&update_queued](MockTransport& current,
+                             const MockTransport::ObjectWriteEvent& event) {
+                if (!update_queued && !event.bytes.empty() &&
+                    event.bytes.back() == 'H') {
+                    current.reads[0].push_back(
+                        encode_subscribe_update_message(7, 1, 200, 1, 0));
+                    update_queued = true;
+                    return ObjectWriteResult{ObjectWriteDisposition::kWouldBlock,
+                                             "update-priority test stream blocked"};
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected update-priority session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected update-priority publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'H', {1, 1, 0, 0}},
+            {'M', {3, 1, 0, 0}},
+            {'L', {5, 1, 0, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.object_write_attempts, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 1, 0, 0},
+                                                      {3, 1, 0, 0},
+                                                      {5, 1, 0, 0},
+                                                      {1, 1, 0, 0}}),
+            "expected SUBSCRIBE_UPDATE priority to reorder the not-yet-admitted retry");
+        if (transport.object_write_attempts.size() >= 4) {
+            ok &= expect(
+                transport.object_write_attempts[0].options.transport_priority <
+                    transport.object_write_attempts[3].options.transport_priority,
+                "expected SUBSCRIBE_UPDATE to reprioritize the session-owned object in the transport");
+        }
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            0, 0, 0, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 5, .subgroup_id = 0,
+             .object_id = 0, .marker = 'Z'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected zero-timeout admission session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected zero-timeout object publish to succeed");
+        ok &= expect(transport.object_write_attempts.size() == 1,
+                     "expected a timeout-free object to use bounded try_write_object");
+        if (!transport.object_write_attempts.empty()) {
+            const auto& options = transport.object_write_attempts.front().options;
+            ok &= expect(!options.object_deadline.has_value() &&
+                             !options.subgroup_deadline.has_value(),
+                         "expected zero timeout to retain absent object and subgroup deadlines");
+            ok &= expect(options.transport_priority >= 2,
+                         "expected object traffic never to outrank control or request classes");
+        }
+    }
 
     {
         MockTransport transport;

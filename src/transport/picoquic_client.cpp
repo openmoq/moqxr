@@ -15,6 +15,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -32,6 +33,26 @@
 #endif
 
 namespace openmoq::publisher::transport {
+
+namespace picoquic_priority_internal {
+
+constexpr std::uint8_t kMoqtControlPriority = 0;
+constexpr std::uint8_t kMoqtRequestPriority = 1;
+
+std::uint8_t reliable_stream_priority(
+    std::uint64_t stream_id,
+    std::uint64_t moqt_control_stream_id) {
+    return stream_id == moqt_control_stream_id ? kMoqtControlPriority
+                                               : kMoqtRequestPriority;
+}
+
+std::uint8_t reliable_stream_priority_for_testing(
+    std::uint64_t stream_id,
+    std::uint64_t moqt_control_stream_id) {
+    return reliable_stream_priority(stream_id, moqt_control_stream_id);
+}
+
+}  // namespace picoquic_priority_internal
 
 namespace {
 constexpr std::size_t kMediaAdmissionCapacity = 4ULL * 1024 * 1024;
@@ -81,8 +102,10 @@ struct PicoquicClient::Impl {
     std::deque<AcceptedWrite> accepted_writes_waiting_for_send;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> accepted_streams;
-    // Bidirectional streams (MoQT control stream, draft-16+ request streams) that have been
-    // raised above picoquic's default priority; see kControlStreamPriority.
+    // The first reliable application write identifies the local MOQT control
+    // stream. Draft-18 control is unidirectional, while later bidirectional
+    // application streams carry requests.
+    std::optional<std::uint64_t> moqt_control_stream_id;
     std::set<std::uint64_t> prioritized_streams;
     bool connected = false;
     bool failed = false;
@@ -149,26 +172,20 @@ std::string hex_dump(std::span<const std::uint8_t> bytes) {
     return out.str();
 }
 
-// picoquic schedules the lowest priority value first and defaults every stream to 9 (FIFO).
-// The MoQT control stream carries SUBSCRIBE_OK / PUBLISH_OK, which establish the track alias
-// a data stream is about to use; if a freshly opened data stream is scheduled ahead of it the
-// relay sees objects for an alias it does not know yet and may drop the first group.
-// draft-ietf-moq-transport-16 section 10.4: "the publisher MUST allocate connection flow
-// control to the control stream before allocating it any data streams". Bidirectional streams
-// are control / request streams for this publisher; data always goes on unidirectional ones.
-constexpr std::uint8_t kControlStreamPriority = 1;
-
-bool is_bidirectional_stream(std::uint64_t stream_id) {
-    return (stream_id & 0x2) == 0;
-}
-
-void prioritize_control_stream(PicoquicClient::Impl& impl, std::uint64_t stream_id) {
-    if (!is_bidirectional_stream(stream_id) || !impl.prioritized_streams.insert(stream_id).second) {
+// picoquic schedules the lowest priority value first. MOQT control is class
+// 0, draft-18 request streams are class 1, and objects start at class 2.
+void prioritize_reliable_stream(PicoquicClient::Impl& impl,
+                                std::uint64_t stream_id,
+                                std::uint64_t moqt_control_stream_id) {
+    if (!impl.prioritized_streams.insert(stream_id).second) {
         return;
     }
     // Creates the stream if picoquic has not seen it yet, so ordering before the first write
     // is safe. Runs on the packet loop thread, as picoquic requires.
-    const int ret = picoquic_set_stream_priority(impl.cnx, stream_id, kControlStreamPriority);
+    const std::uint8_t priority =
+        picoquic_priority_internal::reliable_stream_priority(
+            stream_id, moqt_control_stream_id);
+    const int ret = picoquic_set_stream_priority(impl.cnx, stream_id, priority);
     if (ret != 0) {
         trace("set_stream_priority failed for stream " + std::to_string(stream_id) + " ret=" + std::to_string(ret));
     }
@@ -279,6 +296,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
     std::size_t queued_count = 0;
     std::size_t queued_bytes = 0;
     bool close_requested = false;
+    std::optional<std::uint64_t> moqt_control_stream_id;
 
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -294,6 +312,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
             queued_bytes += write.bytes.size();
         }
         close_requested = impl.close_requested;
+        moqt_control_stream_id = impl.moqt_control_stream_id;
     }
 
     if (trace_enabled() && (queued_count != 0 || close_requested)) {
@@ -318,7 +337,10 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
               " queue_age_ms=" + std::to_string(age_ms) +
               " defer_count=" + std::to_string(write.defer_count) +
               " now_ms=" + std::to_string(trace_elapsed_ms(now)));
-        prioritize_control_stream(impl, write.stream_id);
+        if (moqt_control_stream_id.has_value()) {
+            prioritize_reliable_stream(
+                impl, write.stream_id, *moqt_control_stream_id);
+        }
         const int ret = picoquic_add_to_stream(
             impl.cnx, write.stream_id, write.bytes.data(), write.bytes.size(), write.fin ? 1 : 0);
         if (ret != 0) {
@@ -733,6 +755,8 @@ TransportStatus PicoquicClient::configure(const EndpointConfig& endpoint, const 
         impl_->media_streams_with_pending.clear();
         impl_->timed_out_media_streams.clear();
         impl_->accepted_writes_waiting_for_send.clear();
+        impl_->moqt_control_stream_id.reset();
+        impl_->prioritized_streams.clear();
         impl_->connection_id_hex.clear();
     }
 
@@ -959,6 +983,9 @@ TransportStatus PicoquicClient::write_stream(std::uint64_t stream_id,
         }
         trace("queue write stream=" + std::to_string(stream_id) + " bytes=" + std::to_string(bytes.size()) +
               " fin=" + std::to_string(fin ? 1 : 0));
+        if (!impl_->moqt_control_stream_id.has_value()) {
+            impl_->moqt_control_stream_id = stream_id;
+        }
         impl_->pending_writes.push_back({
             .stream_id = stream_id,
             .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),

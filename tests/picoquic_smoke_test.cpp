@@ -26,6 +26,18 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+namespace openmoq::publisher::transport::picoquic_priority_internal {
+std::uint8_t reliable_stream_priority_for_testing(
+    std::uint64_t stream_id,
+    std::uint64_t moqt_control_stream_id);
+}
+
+namespace openmoq::publisher::transport::webtransport_priority_internal {
+std::uint8_t reliable_stream_priority_for_testing(
+    std::uint64_t stream_id,
+    std::uint64_t moqt_control_stream_id);
+}
+
 namespace {
 
 using openmoq::publisher::ByteSpan;
@@ -335,7 +347,7 @@ bool start_server(SmokeServer& server, bool hold_unidirectional_data = true) {
     picoquic_set_cookie_mode(server.quic, 2);
     picoquic_tp_t tp = *picoquic_get_default_tp(server.quic);
     // Hold client-initiated unidirectional data at the sender so the
-    // transport's literal 10-byte admission budget can be exercised without
+    // transport's literal admission budget can be exercised without
     // racing the packet loop. Bidirectional control/request traffic remains
     // flow-controlled independently and must still be delivered.
     if (hold_unidirectional_data) {
@@ -413,6 +425,27 @@ void stop_server(SmokeServer& server) {
 int main() {
     bool ok = true;
 
+    ok &= expect(
+        openmoq::publisher::transport::picoquic_priority_internal::
+                reliable_stream_priority_for_testing(2, 2) == 0,
+        "expected the raw-QUIC MOQT control stream to use priority class 0");
+    ok &= expect(
+        openmoq::publisher::transport::picoquic_priority_internal::
+                reliable_stream_priority_for_testing(0, 2) == 1,
+        "expected a raw-QUIC draft-18 request stream to use priority class 1");
+    ok &= expect(
+        openmoq::publisher::transport::webtransport_priority_internal::
+                reliable_stream_priority_for_testing(2, 2) == 0,
+        "expected the WebTransport MOQT control stream to use priority class 0");
+    ok &= expect(
+        openmoq::publisher::transport::webtransport_priority_internal::
+                reliable_stream_priority_for_testing(0, 2) == 1,
+        "expected the WebTransport CONNECT stream not to be mistaken for the MOQT control stream");
+    ok &= expect(
+        openmoq::publisher::transport::webtransport_priority_internal::
+                reliable_stream_priority_for_testing(4, 2) == 1,
+        "expected a later WebTransport draft-18 request stream to use priority class 1");
+
     std::cerr << "smoke test start" << std::endl;
     std::cerr << "trace " << (trace_enabled() ? "enabled" : "disabled") << std::endl;
 
@@ -435,7 +468,8 @@ int main() {
         .insecure_skip_verify = true,
     };
 
-    PicoquicClient transport(10);
+    constexpr std::size_t kAdmissionBudget = 17;
+    PicoquicClient transport(kAdmissionBudget);
     MoqtSession session(transport, "media", true);
 
     auto status = session.connect(endpoint, tls);
@@ -456,6 +490,15 @@ int main() {
     ok &= expect(status.ok, status.ok ? "expected publish to succeed after setup negotiation"
                                       : "expected publish to succeed after setup negotiation: " + status.message);
 
+    // The draft-14 session uses streams 2 and 6 for this fixture's two
+    // timeout-free objects. Both are deliberately flow-controlled by the
+    // server; release their admitted bytes before testing the connection
+    // budget independently below.
+    ok &= expect(transport.reset_stream(2, 0).ok,
+                 "expected reset to release the session init object");
+    ok &= expect(transport.reset_stream(6, 0).ok,
+                 "expected reset to release the session media object");
+
     {
         std::unique_lock<std::mutex> lock(server.mutex);
         ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
@@ -470,9 +513,9 @@ int main() {
     status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kUnidirectional,
                                    media_stream_id);
     ok &= expect(status.ok, "expected media stream open to succeed");
-    const std::vector<std::uint8_t> first_media(8, 0xA1);
+    const std::vector<std::uint8_t> first_media(kAdmissionBudget - 2, 0xA1);
     const std::vector<std::uint8_t> second_media(3, 0xB2);
-    const std::vector<std::uint8_t> oversized_media(11, 0xD4);
+    const std::vector<std::uint8_t> oversized_media(kAdmissionBudget + 1, 0xD4);
     const auto admission_started = std::chrono::steady_clock::now();
     const auto oversized_result =
         transport.try_write_object(media_stream_id, oversized_media, false, ObjectWriteOptions{});
@@ -487,9 +530,9 @@ int main() {
                      oversized_result.message.find("budget") != std::string::npos,
                  "expected oversized media failure to explain the admission budget");
     ok &= expect(first_result.disposition == ObjectWriteDisposition::kAccepted,
-                 "expected first media write within 10-byte budget to be accepted");
+                 "expected first media write within the admission budget to be accepted");
     ok &= expect(second_result.disposition == ObjectWriteDisposition::kWouldBlock,
-                 "expected combined media writes over 10-byte budget to would-block");
+                 "expected combined media writes over the admission budget to would-block");
     ok &= expect(admission_elapsed < std::chrono::seconds(1),
                  "expected full media admission to return synchronously without the 30-second wait");
 
@@ -517,7 +560,7 @@ int main() {
     ObjectWriteOptions timer_wins_options;
     timer_wins_options.subgroup_deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-    const std::vector<std::uint8_t> timed_media(10, 0xE4);
+    const std::vector<std::uint8_t> timed_media(kAdmissionBudget, 0xE4);
     const auto timed_result = transport.try_write_object(
         timeout_stream_id, timed_media, true, timer_wins_options);
     ok &= expect(timed_result.disposition == ObjectWriteDisposition::kAccepted,
@@ -540,7 +583,7 @@ int main() {
     status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kUnidirectional,
                                    replacement_stream_id);
     ok &= expect(status.ok, "expected replacement media stream open to succeed");
-    const std::vector<std::uint8_t> exact_budget(10, 0xC3);
+    const std::vector<std::uint8_t> exact_budget(kAdmissionBudget, 0xC3);
     const auto after_reset =
         transport.try_write_object(replacement_stream_id, exact_budget, true, ObjectWriteOptions{});
     ok &= expect(after_reset.disposition == ObjectWriteDisposition::kAccepted,
