@@ -91,6 +91,32 @@ struct SubscribeMessage {
     DeliveryTimeouts delivery_timeouts;
 };
 
+// The optional values carried by REQUEST_UPDATE are deliberately distinct
+// from SubscribeMessage defaults: an omitted parameter retains the existing
+// request value.
+struct SubscriptionFilter {
+    std::uint64_t filter_type = 0;
+    std::size_t start_group_id = 0;
+    std::size_t start_object_id = 0;
+    std::size_t end_group_id = 0;
+};
+
+struct RequestUpdateMessage {
+    std::uint64_t request_id = 0;
+    // Draft 16 identifies the target in the message. Draft 18 associates the
+    // update with the retained bidirectional request stream.
+    std::optional<std::uint64_t> existing_request_id;
+    std::optional<std::uint64_t> object_delivery_timeout_ms;
+    std::optional<std::uint64_t> subgroup_delivery_timeout_ms;
+    std::optional<std::uint8_t> subscriber_priority;
+    std::optional<std::uint8_t> forward;
+    std::optional<SubscriptionFilter> subscription_filter;
+    std::optional<std::uint64_t> new_group_request;
+    bool has_authorization_token = false;
+};
+
+// Archived positional update model retained only for pre-draft-16 session
+// compatibility. Draft 16 and draft 18 use RequestUpdateMessage above.
 struct SubscribeUpdateMessage {
     std::uint64_t request_id = 0;
     std::uint64_t subscription_request_id = 0;
@@ -162,7 +188,11 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                      DraftVersion draft,
                                      SubscribeTracksMessage& message);
 bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion draft, SubscribeMessage& message);
-bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, SubscribeUpdateMessage& message);
+bool decode_request_update_message(std::span<const std::uint8_t> bytes,
+                                   DraftVersion draft,
+                                   RequestUpdateMessage& message);
+bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
+                                     SubscribeUpdateMessage& message);
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
                                                       std::uint64_t request_id,
                                                       std::uint64_t track_alias,

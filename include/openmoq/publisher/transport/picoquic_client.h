@@ -26,6 +26,10 @@ public:
     TransportStatus write_stream(std::uint64_t stream_id,
                                  std::span<const std::uint8_t> bytes,
                                  bool fin) override;
+    TransportStatus set_reliable_stream_priority(std::uint64_t stream_id,
+                                                 std::uint8_t priority) override;
+    std::optional<std::uint8_t> applied_reliable_stream_priority_for_testing(
+        std::uint64_t stream_id) const;
     ObjectWriteResult try_write_object(std::uint64_t stream_id,
                                        std::span<const std::uint8_t> bytes,
                                        bool fin,

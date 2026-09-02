@@ -922,12 +922,11 @@ bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draf
     std::size_t offset = payload_offset;
     const std::size_t payload_end = payload_offset + payload_length;
     if (draft == DraftVersion::kDraft16) {
-        std::uint64_t parameter_count = 0;
         return decode_moqint_impl(bytes, offset, draft, message.request_id) &&
                decode_moqint_impl(bytes, offset, draft, message.error_code) &&
                decode_moqint_impl(bytes, offset, draft, message.retry_interval) &&
                decode_reason_phrase(bytes.subspan(0, payload_end), offset, draft, message.reason) &&
-               decode_moqint_impl(bytes, offset, draft, parameter_count) && parameter_count == 0 && offset == payload_end;
+               offset == payload_end;
     }
 
     if (!uses_moq_vi64(draft) && !decode_moqint_impl(bytes, offset, draft, message.request_id)) {
@@ -1300,10 +1299,143 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
     return offset == payload_end;
 }
 
-bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, SubscribeUpdateMessage& message) {
+bool decode_request_update_message(std::span<const std::uint8_t> bytes,
+                                   DraftVersion draft,
+                                   RequestUpdateMessage& message) {
+    if (draft != DraftVersion::kDraft16 && draft != DraftVersion::kDraft18) {
+        return false;
+    }
+
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
-    if (!parse_uint16_length_message(bytes, DraftVersion::kDraft16, kSubscribeUpdateType, payload_offset, payload_length)) {
+    if (!parse_uint16_length_message(bytes, draft, kSubscribeUpdateType, payload_offset, payload_length)) {
+        return false;
+    }
+
+    message = {};
+    std::size_t offset = payload_offset;
+    const std::size_t payload_end = payload_offset + payload_length;
+    std::uint64_t parameter_count = 0;
+    if (!decode_moqint_impl(bytes, offset, draft, message.request_id)) {
+        return false;
+    }
+    if (draft == DraftVersion::kDraft16) {
+        std::uint64_t existing_request_id = 0;
+        if (!decode_moqint_impl(bytes, offset, draft, existing_request_id)) {
+            return false;
+        }
+        message.existing_request_id = existing_request_id;
+    }
+    if (!decode_moqint_impl(bytes, offset, draft, parameter_count)) {
+        return false;
+    }
+
+    std::uint64_t previous_parameter_type = 0;
+    for (std::uint64_t index = 0; index < parameter_count; ++index) {
+        std::uint64_t parameter_type = 0;
+        if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
+            return false;
+        }
+
+        if ((parameter_type & 0x1ULL) == 0) {
+            std::uint64_t value = 0;
+            if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
+                return false;
+            }
+            switch (parameter_type) {
+                case 0x02:
+                    if (message.object_delivery_timeout_ms.has_value() ||
+                        (draft == DraftVersion::kDraft16 && value == 0)) {
+                        return false;
+                    }
+                    message.object_delivery_timeout_ms = value;
+                    break;
+                case 0x06:
+                    if (draft != DraftVersion::kDraft18 ||
+                        message.subgroup_delivery_timeout_ms.has_value()) {
+                        return false;
+                    }
+                    message.subgroup_delivery_timeout_ms = value;
+                    break;
+                case kParamForward:
+                    if (message.forward.has_value() || value > 1) {
+                        return false;
+                    }
+                    message.forward = static_cast<std::uint8_t>(value);
+                    break;
+                case kParamSubscriberPriority:
+                    if (message.subscriber_priority.has_value() || value > 255) {
+                        return false;
+                    }
+                    message.subscriber_priority = static_cast<std::uint8_t>(value);
+                    break;
+                case kParamGroupOrder:
+                    // Draft 16 requires known parameters outside their message
+                    // scope to be ignored. Draft 18 makes the same condition a
+                    // connection-level protocol violation.
+                    if (draft == DraftVersion::kDraft18) {
+                        return false;
+                    }
+                    break;
+                case 0x32:
+                    if (message.new_group_request.has_value()) {
+                        return false;
+                    }
+                    message.new_group_request = value;
+                    break;
+                default:
+                    return false;
+            }
+            continue;
+        }
+
+        std::uint64_t parameter_length = 0;
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) ||
+            parameter_length > payload_end - offset) {
+            return false;
+        }
+        const std::size_t parameter_end = offset + static_cast<std::size_t>(parameter_length);
+        switch (parameter_type) {
+            case kParamAuthorizationToken:
+                message.has_authorization_token = true;
+                break;
+            case 0x09:  // LARGEST_OBJECT is known but outside REQUEST_UPDATE.
+                if (draft == DraftVersion::kDraft18) {
+                    return false;
+                }
+                break;
+            case 0x21: {
+                if (message.subscription_filter.has_value()) {
+                    return false;
+                }
+                SubscribeMessage decoded_filter;
+                std::size_t filter_offset = offset;
+                if (!decode_subscribe_filter(bytes, filter_offset, parameter_end, draft, decoded_filter)) {
+                    return false;
+                }
+                message.subscription_filter = SubscriptionFilter{
+                    .filter_type = decoded_filter.filter_type,
+                    .start_group_id = decoded_filter.start_group_id,
+                    .start_object_id = decoded_filter.start_object_id,
+                    .end_group_id = decoded_filter.end_group_id,
+                };
+                break;
+            }
+            default:
+                return false;
+        }
+        offset = parameter_end;
+    }
+
+    return offset == payload_end;
+}
+
+bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
+                                     SubscribeUpdateMessage& message) {
+    std::size_t payload_offset = 0;
+    std::size_t payload_length = 0;
+    if (!parse_uint16_length_message(
+            bytes, DraftVersion::kDraft16, kSubscribeUpdateType, payload_offset, payload_length)) {
         return false;
     }
 
@@ -1317,8 +1449,7 @@ bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, Subscr
         !decode_varint_impl(bytes, offset, message.subscription_request_id) ||
         !decode_varint_impl(bytes, offset, start_group_id) ||
         !decode_varint_impl(bytes, offset, start_object_id) ||
-        !decode_varint_impl(bytes, offset, end_group_plus_one) ||
-        offset + 2 > payload_end) {
+        !decode_varint_impl(bytes, offset, end_group_plus_one) || offset + 2 > payload_end) {
         return false;
     }
 
@@ -1330,8 +1461,8 @@ bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, Subscr
     if (message.forward > 1) {
         return false;
     }
-
-    return decode_varint_impl(bytes, offset, parameter_count) && parameter_count == 0 && offset == payload_end;
+    return decode_varint_impl(bytes, offset, parameter_count) && parameter_count == 0 &&
+           offset == payload_end;
 }
 
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
@@ -1406,9 +1537,6 @@ std::vector<std::uint8_t> encode_request_error_message(DraftVersion draft,
     append_moqint(payload, draft, error_code);
     append_moqint(payload, draft, retry_interval);
     append_string(payload, draft, reason);
-    if (!uses_moq_vi64(draft)) {
-        append_moqint(payload, draft, 0);
-    }
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kRequestErrorType);

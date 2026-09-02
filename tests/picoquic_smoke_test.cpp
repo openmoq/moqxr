@@ -12,6 +12,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -25,18 +26,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-namespace openmoq::publisher::transport::picoquic_priority_internal {
-std::uint8_t reliable_stream_priority_for_testing(
-    std::uint64_t stream_id,
-    std::uint64_t moqt_control_stream_id);
-}
-
-namespace openmoq::publisher::transport::webtransport_priority_internal {
-std::uint8_t reliable_stream_priority_for_testing(
-    std::uint64_t stream_id,
-    std::uint64_t moqt_control_stream_id);
-}
 
 namespace {
 
@@ -425,27 +414,6 @@ void stop_server(SmokeServer& server) {
 int main() {
     bool ok = true;
 
-    ok &= expect(
-        openmoq::publisher::transport::picoquic_priority_internal::
-                reliable_stream_priority_for_testing(2, 2) == 0,
-        "expected the raw-QUIC MOQT control stream to use priority class 0");
-    ok &= expect(
-        openmoq::publisher::transport::picoquic_priority_internal::
-                reliable_stream_priority_for_testing(0, 2) == 1,
-        "expected a raw-QUIC draft-18 request stream to use priority class 1");
-    ok &= expect(
-        openmoq::publisher::transport::webtransport_priority_internal::
-                reliable_stream_priority_for_testing(2, 2) == 0,
-        "expected the WebTransport MOQT control stream to use priority class 0");
-    ok &= expect(
-        openmoq::publisher::transport::webtransport_priority_internal::
-                reliable_stream_priority_for_testing(0, 2) == 1,
-        "expected the WebTransport CONNECT stream not to be mistaken for the MOQT control stream");
-    ok &= expect(
-        openmoq::publisher::transport::webtransport_priority_internal::
-                reliable_stream_priority_for_testing(4, 2) == 1,
-        "expected a later WebTransport draft-18 request stream to use priority class 1");
-
     std::cerr << "smoke test start" << std::endl;
     std::cerr << "trace " << (trace_enabled() ? "enabled" : "disabled") << std::endl;
 
@@ -489,6 +457,19 @@ int main() {
     }
     ok &= expect(status.ok, status.ok ? "expected publish to succeed after setup negotiation"
                                       : "expected publish to succeed after setup negotiation: " + status.message);
+
+    ok &= expect(transport.set_reliable_stream_priority(0, 0).ok,
+                 "expected raw-QUIC backend to accept an explicit control priority");
+    const auto raw_control_priority_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < raw_control_priority_deadline &&
+           transport.applied_reliable_stream_priority_for_testing(0) !=
+               std::optional<std::uint8_t>{0}) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ok &= expect(transport.applied_reliable_stream_priority_for_testing(0) ==
+                     std::optional<std::uint8_t>{0},
+                 "expected raw-QUIC packet loop to apply explicit control class 0");
 
     // The draft-14 session uses streams 2 and 6 for this fixture's two
     // timeout-free objects. Both are deliberately flow-controlled by the
@@ -540,9 +521,21 @@ int main() {
     status = transport.open_stream(openmoq::publisher::transport::StreamDirection::kBidirectional,
                                    request_stream_id);
     ok &= expect(status.ok, "expected request stream open while media is full to succeed");
+    ok &= expect(transport.set_reliable_stream_priority(request_stream_id, 1).ok,
+                 "expected raw-QUIC backend to accept an explicit request priority");
     const std::vector<std::uint8_t> request_bytes = {0x5A};
     status = transport.write_stream(request_stream_id, request_bytes, true);
     ok &= expect(status.ok, "expected reliable request write while media is full to succeed");
+    const auto raw_request_priority_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < raw_request_priority_deadline &&
+           transport.applied_reliable_stream_priority_for_testing(request_stream_id) !=
+               std::optional<std::uint8_t>{1}) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ok &= expect(transport.applied_reliable_stream_priority_for_testing(request_stream_id) ==
+                     std::optional<std::uint8_t>{1},
+                 "expected raw-QUIC packet loop to apply explicit request class 1");
     {
         std::unique_lock<std::mutex> lock(server.mutex);
         ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] {

@@ -89,6 +89,15 @@ public:
     virtual TransportStatus write_stream(std::uint64_t stream_id,
                                          std::span<const std::uint8_t> bytes,
                                          bool fin) = 0;
+    // Assigns a reliable MOQT stream to an explicit transport scheduler class.
+    // Sessions call this only for draft-specific stream roles they know; the
+    // transport must not infer a role from write order or stream identifiers.
+    virtual TransportStatus set_reliable_stream_priority(std::uint64_t stream_id,
+                                                         std::uint8_t priority) {
+        static_cast<void>(stream_id);
+        static_cast<void>(priority);
+        return TransportStatus::success();
+    }
     virtual ObjectWriteResult try_write_object(std::uint64_t stream_id,
                                                std::span<const std::uint8_t> bytes,
                                                bool fin,

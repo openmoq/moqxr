@@ -35,26 +35,6 @@
 
 namespace openmoq::publisher::transport {
 
-namespace webtransport_priority_internal {
-
-constexpr std::uint8_t kMoqtControlPriority = 0;
-constexpr std::uint8_t kMoqtRequestPriority = 1;
-
-std::uint8_t reliable_stream_priority(
-    std::uint64_t stream_id,
-    std::uint64_t moqt_control_stream_id) {
-    return stream_id == moqt_control_stream_id ? kMoqtControlPriority
-                                               : kMoqtRequestPriority;
-}
-
-std::uint8_t reliable_stream_priority_for_testing(
-    std::uint64_t stream_id,
-    std::uint64_t moqt_control_stream_id) {
-    return reliable_stream_priority(stream_id, moqt_control_stream_id);
-}
-
-}  // namespace webtransport_priority_internal
-
 namespace {
 constexpr std::size_t kMediaAdmissionCapacity = 4ULL * 1024 * 1024;
 }
@@ -100,9 +80,8 @@ struct WebTransportClient::Impl {
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> application_streams;
     std::set<std::uint64_t> accepted_streams;
-    // This is the first reliable WebTransport application stream written by
-    // MoqtSession, not the HTTP/3 CONNECT stream in control_stream_ctx.
-    std::optional<std::uint64_t> moqt_control_stream_id;
+    std::map<std::uint64_t, std::uint8_t> pending_reliable_stream_priorities;
+    std::map<std::uint64_t, std::uint8_t> applied_reliable_stream_priorities;
     bool connected = false;
     bool failed = false;
     bool disconnected = false;
@@ -128,7 +107,6 @@ struct WebTransportClient::Impl {
     sockaddr_storage server_address{};
     h3zero_callback_ctx_t* h3_ctx = nullptr;
     h3zero_stream_ctx_t* control_stream_ctx = nullptr;
-    std::set<std::uint64_t> prioritized_streams;
     int packet_loop_return_code = 0;
 #endif
 };
@@ -190,21 +168,6 @@ h3zero_stream_ctx_t* find_local_stream_context(WebTransportClient::Impl& impl,
     }
 
     return h3zero_find_stream(impl.h3_ctx, stream_id);
-}
-
-// picoquic schedules the lowest priority value first. MOQT control is class
-// 0, draft-18 request streams are class 1, and objects start at class 2.
-void prioritize_reliable_stream(WebTransportClient::Impl& impl,
-                                std::uint64_t stream_id,
-                                std::uint64_t moqt_control_stream_id) {
-    if (!impl.prioritized_streams.insert(stream_id).second) {
-        return;
-    }
-    // Packet loop thread, as picoquic requires; the stream already exists (created by picowt).
-    const std::uint8_t priority =
-        webtransport_priority_internal::reliable_stream_priority(
-            stream_id, moqt_control_stream_id);
-    static_cast<void>(picoquic_set_stream_priority(impl.cnx, stream_id, priority));
 }
 
 bool queue_delivery_timeout_locked(WebTransportClient::Impl& impl,
@@ -313,9 +276,9 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
     std::deque<WebTransportClient::Impl::PendingOpen*> opens;
     std::deque<WebTransportClient::Impl::PendingWrite> writes;
     std::deque<WebTransportClient::Impl::PendingReset> resets;
+    std::map<std::uint64_t, std::uint8_t> reliable_stream_priorities;
     std::set<std::uint64_t> media_activations;
     bool close_requested = false;
-    std::optional<std::uint64_t> moqt_control_stream_id;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         for (const DeliveryTimeoutReset& reset :
@@ -325,9 +288,9 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
         opens.swap(impl.pending_opens);
         writes.swap(impl.pending_writes);
         resets.swap(impl.pending_resets);
+        reliable_stream_priorities.swap(impl.pending_reliable_stream_priorities);
         media_activations.swap(impl.pending_media_activations);
         close_requested = impl.close_requested;
-        moqt_control_stream_id = impl.moqt_control_stream_id;
     }
 
     for (auto* open : opens) {
@@ -359,6 +322,16 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
         impl.condition.notify_all();
     }
 
+    for (const auto& [stream_id, priority] : reliable_stream_priorities) {
+        if (picoquic_set_stream_priority(impl.cnx, stream_id, priority) != 0) {
+            return fail_media_delivery(
+                impl, "failed to set webtransport reliable stream priority", -1);
+        }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.applied_reliable_stream_priorities.insert_or_assign(stream_id, priority);
+        impl.condition.notify_all();
+    }
+
     std::deque<WebTransportClient::Impl::PendingWrite> deferred_writes;
     while (!writes.empty()) {
         auto& write = writes.front();
@@ -370,11 +343,6 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
             impl.condition.notify_all();
             return -1;
         }
-        if (moqt_control_stream_id.has_value()) {
-            prioritize_reliable_stream(
-                impl, write.stream_id, *moqt_control_stream_id);
-        }
-
         if (picoquic_add_to_stream_with_ctx(
                 impl.cnx, write.stream_id, write.bytes.data(), write.bytes.size(), write.fin ? 1 : 0, stream_ctx) != 0) {
             // picoquic's per-stream send buffer is full. This is transient
@@ -724,10 +692,8 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->media_streams_with_pending.clear();
     impl_->timed_out_media_streams.clear();
     impl_->received_streams.clear();
-    impl_->moqt_control_stream_id.reset();
-#ifdef OPENMOQ_HAS_PICOQUIC
-    impl_->prioritized_streams.clear();
-#endif
+    impl_->pending_reliable_stream_priorities.clear();
+    impl_->applied_reliable_stream_priorities.clear();
     return TransportStatus::success();
 }
 
@@ -1016,9 +982,6 @@ TransportStatus WebTransportClient::write_stream(std::uint64_t stream_id,
             return TransportStatus::failure(impl_->last_error.empty() ? "webtransport connection failed"
                                                                        : impl_->last_error);
         }
-        if (!impl_->moqt_control_stream_id.has_value()) {
-            impl_->moqt_control_stream_id = stream_id;
-        }
         impl_->pending_writes.push_back({
             .stream_id = stream_id,
             .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
@@ -1030,6 +993,36 @@ TransportStatus WebTransportClient::write_stream(std::uint64_t stream_id,
     impl_->condition.notify_all();
     return TransportStatus::success();
 #endif
+}
+
+TransportStatus WebTransportClient::set_reliable_stream_priority(
+    std::uint64_t stream_id,
+    std::uint8_t priority) {
+    if (state_ != ConnectionState::kConnected) {
+        return TransportStatus::failure("transport is not connected");
+    }
+#ifndef OPENMOQ_HAS_PICOQUIC
+    static_cast<void>(stream_id);
+    static_cast<void>(priority);
+    return TransportStatus::failure("picoquic support is not enabled in this build");
+#else
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->pending_reliable_stream_priorities.insert_or_assign(stream_id, priority);
+    }
+    impl_->condition.notify_all();
+    return TransportStatus::success();
+#endif
+}
+
+std::optional<std::uint8_t>
+WebTransportClient::applied_reliable_stream_priority_for_testing(
+    std::uint64_t stream_id) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto priority = impl_->applied_reliable_stream_priorities.find(stream_id);
+    return priority == impl_->applied_reliable_stream_priorities.end()
+               ? std::nullopt
+               : std::optional<std::uint8_t>{priority->second};
 }
 
 ObjectWriteResult WebTransportClient::try_write_object(std::uint64_t stream_id,

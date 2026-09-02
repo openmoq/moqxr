@@ -18,6 +18,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -299,6 +300,33 @@ int main() {
     }
     ok &= expect(connect_status.ok, "expected webtransport CONNECT to a silent local server to succeed");
     ok &= expect(client->state() == ConnectionState::kConnected, "expected connected state after connect");
+
+    std::uint64_t priority_control_stream_id = 0;
+    std::uint64_t priority_request_stream_id = 0;
+    ok &= expect(client->open_stream(StreamDirection::kUnidirectional,
+                                     priority_control_stream_id).ok,
+                 "expected WebTransport priority control stream open to succeed");
+    ok &= expect(client->open_stream(StreamDirection::kBidirectional,
+                                     priority_request_stream_id).ok,
+                 "expected WebTransport priority request stream open to succeed");
+    ok &= expect(client->set_reliable_stream_priority(priority_control_stream_id, 0).ok &&
+                     client->set_reliable_stream_priority(priority_request_stream_id, 1).ok,
+                 "expected WebTransport backend to accept explicit reliable priorities");
+    const auto priority_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < priority_deadline &&
+           (client->applied_reliable_stream_priority_for_testing(priority_control_stream_id) !=
+                std::optional<std::uint8_t>{0} ||
+            client->applied_reliable_stream_priority_for_testing(priority_request_stream_id) !=
+                std::optional<std::uint8_t>{1})) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ok &= expect(
+        client->applied_reliable_stream_priority_for_testing(priority_control_stream_id) ==
+                std::optional<std::uint8_t>{0} &&
+            client->applied_reliable_stream_priority_for_testing(priority_request_stream_id) ==
+                std::optional<std::uint8_t>{1},
+        "expected WebTransport packet loop to apply explicit classes 0 and 1");
 
     {
         std::unique_lock<std::mutex> lock(server.mutex);
