@@ -72,6 +72,11 @@ struct SubscribeTracksMessage {
     std::uint8_t forward = 1;
 };
 
+struct DeliveryTimeouts {
+    std::uint64_t object_ms = 0;
+    std::uint64_t subgroup_ms = 0;
+};
+
 struct SubscribeMessage {
     std::uint64_t request_id = 0;
     std::vector<std::string> track_namespace;
@@ -83,10 +88,7 @@ struct SubscribeMessage {
     std::size_t start_group_id = 0;
     std::size_t start_object_id = 0;
     std::size_t end_group_id = 0;
-    // Largest delivery timeout parameter carried by the message (DELIVERY_TIMEOUT
-    // 0x02 in draft-16/17; OBJECT_DELIVERY_TIMEOUT 0x02 / SUBGROUP_DELIVERY_TIMEOUT
-    // 0x06 in draft-18), 0 when absent.
-    std::uint64_t delivery_timeout_ms = 0;
+    DeliveryTimeouts delivery_timeouts;
 };
 
 struct SubscribeUpdateMessage {
@@ -111,8 +113,7 @@ struct PublishOk {
     std::uint8_t subscriber_priority = 0;
     std::uint8_t group_order = 0;
     std::uint64_t filter_type = 0;
-    // See SubscribeMessage::delivery_timeout_ms.
-    std::uint64_t delivery_timeout_ms = 0;
+    DeliveryTimeouts delivery_timeouts;
 };
 
 struct PublishError {

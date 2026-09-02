@@ -1183,11 +1183,11 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT) — spec §9.2.2.2: value 0 is illegal on the wire.
                     if (value == 0) { return false; }
-                    message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                    message.delivery_timeouts.object_ms = value;
                     break;
                 case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
                     if (draft == DraftVersion::kDraft18) {
-                        message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                        message.delivery_timeouts.subgroup_ms = value;
                     }
                     break;
                 case kParamForward:  // FORWARD
@@ -1646,11 +1646,11 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT)
                     if (value == 0) { return false; }
-                    message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                    message.delivery_timeouts.object_ms = value;
                     break;
                 case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
                     if (draft == DraftVersion::kDraft18) {
-                        message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                        message.delivery_timeouts.subgroup_ms = value;
                     }
                     break;
                 case 0x08:  // EXPIRES
