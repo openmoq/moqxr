@@ -396,16 +396,33 @@ void append_parameter_delta(std::vector<std::uint8_t>& out,
     previous_type = type;
 }
 
-bool decode_parameter_type(std::span<const std::uint8_t> bytes,
-                           std::size_t& offset,
-                           DraftVersion draft,
-                           std::uint64_t& previous_type,
-                           bool delta_encoded,
-                           std::uint64_t& parameter_type,
-                           std::optional<std::uint64_t> repeatable_type = std::nullopt) {
+enum class ParameterTypeDecodeError {
+    kNone,
+    kEncoding,
+    kProtocolViolation,
+};
+
+bool decode_parameter_type(
+    std::span<const std::uint8_t> bytes,
+    std::size_t& offset,
+    DraftVersion draft,
+    std::uint64_t& previous_type,
+    bool delta_encoded,
+    std::uint64_t& parameter_type,
+    std::optional<std::uint64_t> repeatable_type = std::nullopt,
+    ParameterTypeDecodeError* error = nullptr) {
+    const auto fail = [error](ParameterTypeDecodeError failure) {
+        if (error != nullptr) {
+            *error = failure;
+        }
+        return false;
+    };
+    if (error != nullptr) {
+        *error = ParameterTypeDecodeError::kNone;
+    }
     std::uint64_t encoded_type = 0;
     if (!decode_moqint_impl(bytes, offset, draft, encoded_type)) {
-        return false;
+        return fail(ParameterTypeDecodeError::kEncoding);
     }
     if (!delta_encoded) {
         parameter_type = encoded_type;
@@ -414,10 +431,10 @@ bool decode_parameter_type(std::span<const std::uint8_t> bytes,
     }
     if (previous_type != 0 && encoded_type == 0 &&
         repeatable_type != previous_type) {
-        return false;
+        return fail(ParameterTypeDecodeError::kProtocolViolation);
     }
     if (encoded_type > std::numeric_limits<std::uint64_t>::max() - previous_type) {
-        return false;
+        return fail(ParameterTypeDecodeError::kProtocolViolation);
     }
     parameter_type = previous_type + encoded_type;
     previous_type = parameter_type;
@@ -1405,14 +1422,21 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
     std::uint64_t previous_parameter_type = 0;
     for (std::uint64_t index = 0; index < parameter_count; ++index) {
         std::uint64_t parameter_type = 0;
+        ParameterTypeDecodeError parameter_type_error =
+            ParameterTypeDecodeError::kNone;
         if (!decode_parameter_type(bytes,
                                    offset,
                                    draft,
                                    previous_parameter_type,
                                    true,
                                    parameter_type,
-                                   kParamAuthorizationToken)) {
-            return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+                                   kParamAuthorizationToken,
+                                   &parameter_type_error)) {
+            return fail(
+                parameter_type_error ==
+                        ParameterTypeDecodeError::kProtocolViolation
+                    ? RequestUpdateDecodeError::kSemantic
+                    : RequestUpdateDecodeError::kKeyValueFormatting);
         }
 
         if ((parameter_type & 0x1ULL) == 0) {

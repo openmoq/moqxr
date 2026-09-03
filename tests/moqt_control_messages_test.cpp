@@ -18,6 +18,7 @@ using openmoq::publisher::transport::PublishError;
 using openmoq::publisher::transport::PublishNamespaceOk;
 using openmoq::publisher::transport::PublishOk;
 using openmoq::publisher::transport::RequestError;
+using openmoq::publisher::transport::RequestUpdateDecodeError;
 using openmoq::publisher::transport::RequestUpdateMessage;
 using openmoq::publisher::transport::ServerSetupMessage;
 using openmoq::publisher::transport::SetupMessage;
@@ -610,6 +611,54 @@ std::vector<std::uint8_t> build_request_update_parameter_edge_case(
     return bytes;
 }
 
+std::vector<std::uint8_t> build_request_update_duplicate_parameter(
+    DraftVersion draft) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 101);
+    if (draft == DraftVersion::kDraft16) {
+        append_moqint(payload, draft, 77);
+    }
+    append_moqint(payload, draft, 2);
+    append_moqint(payload, draft, 0x10);
+    if (draft == DraftVersion::kDraft18) {
+        payload.push_back(1);
+    } else {
+        append_moqint(payload, draft, 1);
+    }
+    append_moqint(payload, draft, 0);
+    if (draft == DraftVersion::kDraft18) {
+        payload.push_back(1);
+    } else {
+        append_moqint(payload, draft, 1);
+    }
+
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x02);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> build_draft18_request_update_delta_overflow() {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, DraftVersion::kDraft18, 101);
+    append_moqint(payload, DraftVersion::kDraft18, 2);
+    append_moqint(payload, DraftVersion::kDraft18, 0x32);
+    append_moqint(payload, DraftVersion::kDraft18, 1);
+    // The nine-byte VI64 form below is UINT64_MAX. Adding it to the
+    // preceding parameter type would overflow instead of advancing the
+    // required monotonically ordered type sequence.
+    payload.insert(payload.end(), 9, 0xff);
+
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, DraftVersion::kDraft18, 0x02);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
 std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     std::vector<std::uint8_t> payload;
     if (draft != DraftVersion::kDraft18) {
@@ -1060,6 +1109,29 @@ bool test_request_update_decoding() {
                          DraftVersion::kDraft18,
                          repeated_authorization),
                  "REQUEST_UPDATE rejects malformed AUTHORIZATION_TOKEN structures");
+
+    for (const DraftVersion draft :
+         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+        RequestUpdateDecodeError decode_error =
+            RequestUpdateDecodeError::kNone;
+        ok &= expect(!decode_request_update_message(
+                          build_request_update_duplicate_parameter(draft),
+                          draft,
+                          ignored_scope,
+                          &decode_error) &&
+                         decode_error == RequestUpdateDecodeError::kSemantic,
+                     "REQUEST_UPDATE classifies a repeated non-repeatable parameter as a protocol violation");
+    }
+
+    RequestUpdateDecodeError overflow_error =
+        RequestUpdateDecodeError::kNone;
+    ok &= expect(!decode_request_update_message(
+                      build_draft18_request_update_delta_overflow(),
+                      DraftVersion::kDraft18,
+                      ignored_scope,
+                      &overflow_error) &&
+                     overflow_error == RequestUpdateDecodeError::kSemantic,
+                 "draft-18 REQUEST_UPDATE classifies parameter-type delta overflow as a protocol violation");
     ok &= expect(!decode_request_update_message(
                       build_request_update_message(DraftVersion::kDraft16),
                       DraftVersion::kDraft14,
