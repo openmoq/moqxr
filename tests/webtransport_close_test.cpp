@@ -339,6 +339,38 @@ int main() {
             client->applied_reliable_stream_priority_for_testing(priority_request_stream_id) ==
                 std::optional<std::uint8_t>{1},
         "expected WebTransport packet loop to apply explicit classes 0 and 1");
+    constexpr std::size_t kReliablePriorityHistoryCapacity = 256;
+    constexpr std::size_t kReliablePriorityChurnCount = 272;
+    const auto reliable_priority_churn_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (std::size_t index = 0; index < kReliablePriorityChurnCount; ++index) {
+        const std::uint8_t priority =
+            static_cast<std::uint8_t>(index + 2);
+        ok &= expect(client->set_reliable_stream_priority(
+                         priority_request_stream_id, priority).ok,
+                     "expected WebTransport reliable-priority churn update to queue");
+        while (std::chrono::steady_clock::now() <
+                   reliable_priority_churn_deadline &&
+               client->applied_reliable_stream_priority_for_testing(
+                   priority_request_stream_id) !=
+                   std::optional<std::uint8_t>{priority}) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    const auto reliable_priority_history =
+        client->applied_reliable_stream_priorities_for_testing(
+            priority_request_stream_id);
+    ok &= expect(
+        reliable_priority_history.size() ==
+                kReliablePriorityHistoryCapacity &&
+            reliable_priority_history.front() ==
+                static_cast<std::uint8_t>(
+                    kReliablePriorityChurnCount -
+                    kReliablePriorityHistoryCapacity + 2) &&
+            reliable_priority_history.back() ==
+                static_cast<std::uint8_t>(
+                    kReliablePriorityChurnCount - 1 + 2),
+        "expected WebTransport reliable-priority history to retain only the latest 256 FIFO values");
 
     {
         std::unique_lock<std::mutex> lock(server.mutex);
@@ -559,6 +591,43 @@ int main() {
         ok &= expect(acknowledged_peer_stops == peer_stop_stress_streams.size() &&
                          drain_client->peer_stopped_media_stream_count_for_testing() == 0,
                      "expected concurrent WebTransport consumption to bound retained peer-stop state");
+        constexpr std::size_t kExpiryStressCount = 24;
+        for (std::size_t index = 0; index < kExpiryStressCount; ++index) {
+            std::uint64_t stress_stream_id = 0;
+            ok &= expect(drain_client->open_stream(
+                             StreamDirection::kUnidirectional,
+                             stress_stream_id).ok,
+                         "expected WebTransport stress-expiry stream open to succeed");
+            ObjectWriteOptions stress_options;
+            stress_options.object_deadline =
+                std::chrono::steady_clock::now() -
+                std::chrono::milliseconds(1);
+            const std::array<std::uint8_t, 1> payload = {
+                static_cast<std::uint8_t>(index)};
+            ok &= expect(drain_client->try_write_object(
+                             stress_stream_id, payload, false,
+                             stress_options).disposition ==
+                             ObjectWriteDisposition::kAccepted,
+                         "expected WebTransport stress-expiry object admission");
+            const auto expiry_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(1);
+            while (std::chrono::steady_clock::now() < expiry_deadline &&
+                   !drain_client->media_stream_expired(stress_stream_id)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            const auto expiry_events =
+                drain_client->media_stream_expiry_events();
+            ok &= expect(std::find(expiry_events.begin(),
+                                   expiry_events.end(),
+                                   stress_stream_id) != expiry_events.end(),
+                         "expected WebTransport stress expiry to remain losslessly observable");
+            drain_client->acknowledge_media_stream_expired(
+                stress_stream_id);
+        }
+        ok &= expect(
+            drain_client->timed_out_media_stream_count_for_testing() == 0,
+            "expected repeated WebTransport expiry acknowledgement to keep retained state bounded");
         {
             std::lock_guard<std::mutex> lock(server.mutex);
             bytes_before_drain = server.stream_bytes_received;
@@ -659,6 +728,16 @@ int main() {
         }
         ok &= expect(deadline_client.media_stream_expired(timeout_stream_id),
                      "expected webtransport timer expiry to remain queryable by stream ID");
+        const auto timeout_snapshot =
+            deadline_client.media_stream_expiry_events();
+        ok &= expect(std::find(timeout_snapshot.begin(),
+                               timeout_snapshot.end(),
+                               timeout_stream_id) != timeout_snapshot.end(),
+                     "expected WebTransport timer expiry in the stable event snapshot");
+        deadline_client.acknowledge_media_stream_expired(timeout_stream_id);
+        ok &= expect(!deadline_client.media_stream_expired(timeout_stream_id) &&
+                         deadline_client.timed_out_media_stream_count_for_testing() == 0,
+                     "expected WebTransport expiry acknowledgement to release retained stream state");
         std::uint64_t replacement_stream_id = 0;
         ok &= expect(deadline_client.open_stream(StreamDirection::kUnidirectional,
                                                  replacement_stream_id).ok,

@@ -321,6 +321,15 @@ struct MockTransport final : PublisherTransport {
         return expired_media_streams.contains(stream_id);
     }
 
+    std::vector<std::uint64_t> media_stream_expiry_events() const override {
+        return {expired_media_streams.begin(), expired_media_streams.end()};
+    }
+
+    void acknowledge_media_stream_expired(std::uint64_t stream_id) override {
+        acknowledged_expired_media_streams.push_back(stream_id);
+        expired_media_streams.erase(stream_id);
+    }
+
     bool media_stream_peer_stopped(std::uint64_t stream_id) const override {
         return peer_stopped_media_streams.contains(stream_id);
     }
@@ -364,6 +373,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<std::chrono::milliseconds> read_timeouts;
     std::vector<std::chrono::milliseconds> delivery_timeouts;
     std::set<std::uint64_t> expired_media_streams;
+    std::vector<std::uint64_t> acknowledged_expired_media_streams;
     std::set<std::uint64_t> peer_stopped_media_streams;
     std::vector<std::uint64_t> acknowledged_peer_stopped_media_streams;
     std::set<std::uint64_t> failing_reset_streams;
@@ -5108,6 +5118,9 @@ int main() {
                      "expected kFailed paired with stable stream expiry to retire only that subgroup");
         ok &= expect(transport.object_write_attempts.size() == 3,
                      "expected one raced failure, one continuing subgroup write, and no expired-key reopen");
+        ok &= expect(transport.acknowledged_expired_media_streams.size() == 1 &&
+                         transport.expired_media_streams.empty(),
+                     "expected the session to acknowledge active expiry only after retiring its owning subgroup");
         if (transport.object_write_attempts.size() == 3) {
             ok &= expect(transport.object_write_attempts[0].stream_id ==
                              transport.object_write_attempts[1].stream_id &&
@@ -5279,6 +5292,69 @@ int main() {
                     kLatePeerStopCount &&
                 transport.peer_stopped_media_streams.empty(),
             "expected repeated STOP_SENDING after FIN retirement to be consumed without retained growth");
+    }
+
+    {
+        // Expiry can race after the application has already accepted FIN and
+        // erased its stream-to-subgroup key.  The session-wide snapshot must
+        // still drain each ownerless event while publishing, plus the final
+        // event during close, rather than retaining stream IDs indefinitely.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1,
+            kTestTrackNamespace,
+            "events",
+            1,
+            DraftVersion::kDraft16,
+            1000));
+        std::vector<SchedulingObjectSpec> objects;
+        constexpr std::size_t kLateExpiryCount = 24;
+        objects.reserve(kLateExpiryCount);
+        for (std::size_t index = 0; index < kLateExpiryCount; ++index) {
+            objects.push_back({
+                .track_name = "events",
+                .group_id = 11,
+                .subgroup_id = index,
+                .object_id = 0,
+                .marker = static_cast<std::uint8_t>(index + 1),
+            });
+        }
+        std::optional<std::uint64_t> previous_finished_stream;
+        transport.on_try_write_object =
+            [&previous_finished_stream](
+                MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                if (previous_finished_stream.has_value()) {
+                    current.expired_media_streams.insert(
+                        *previous_finished_stream);
+                }
+                previous_finished_stream = event.stream_id;
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok,
+                     "expected late-expiry session connect to succeed");
+        status = session.publish(make_scheduling_plan(std::move(objects)));
+        ok &= expect(status.ok,
+                     "expected FIN-retired expiry fixture to publish successfully");
+        ok &= expect(
+            transport.acknowledged_expired_media_streams.size() ==
+                    kLateExpiryCount - 1 &&
+                transport.expired_media_streams.empty(),
+            "expected the running session to drain repeated expiry events after FIN retirement");
+        if (previous_finished_stream.has_value()) {
+            transport.expired_media_streams.insert(*previous_finished_stream);
+        }
+        status = session.close();
+        ok &= expect(status.ok &&
+                         transport.acknowledged_expired_media_streams.size() ==
+                             kLateExpiryCount &&
+                         transport.expired_media_streams.empty(),
+                     "expected close to drain the final ownerless expiry event without retained growth");
     }
 
     {

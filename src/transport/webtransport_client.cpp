@@ -85,7 +85,8 @@ struct WebTransportClient::Impl {
     std::set<std::uint64_t> application_streams;
     std::set<std::uint64_t> accepted_streams;
     std::map<std::uint64_t, std::uint8_t> pending_reliable_stream_priorities;
-    std::map<std::uint64_t, std::uint8_t> applied_reliable_stream_priorities;
+    std::deque<std::pair<std::uint64_t, std::uint8_t>>
+        applied_reliable_stream_priorities;
     std::deque<std::pair<std::uint64_t, std::uint8_t>>
         applied_media_stream_priorities;
     bool connected = false;
@@ -199,6 +200,16 @@ void record_media_priority_locked(WebTransportClient::Impl& impl,
         impl.applied_media_stream_priorities.pop_front();
     }
     impl.applied_media_stream_priorities.emplace_back(stream_id, priority);
+}
+
+void record_reliable_priority_locked(WebTransportClient::Impl& impl,
+                                     std::uint64_t stream_id,
+                                     std::uint8_t priority) {
+    if (impl.applied_reliable_stream_priorities.size() >=
+        kAppliedMediaPriorityHistoryCapacity) {
+        impl.applied_reliable_stream_priorities.pop_front();
+    }
+    impl.applied_reliable_stream_priorities.emplace_back(stream_id, priority);
 }
 
 int fail_media_delivery(WebTransportClient::Impl& impl, std::string message, int error_code) {
@@ -374,7 +385,7 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
                 impl, "failed to set webtransport reliable stream priority", -1);
         }
         std::lock_guard<std::mutex> lock(impl.mutex);
-        impl.applied_reliable_stream_priorities.insert_or_assign(stream_id, priority);
+        record_reliable_priority_locked(impl, stream_id, priority);
         impl.condition.notify_all();
     }
 
@@ -1126,10 +1137,27 @@ std::optional<std::uint8_t>
 WebTransportClient::applied_reliable_stream_priority_for_testing(
     std::uint64_t stream_id) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto priority = impl_->applied_reliable_stream_priorities.find(stream_id);
-    return priority == impl_->applied_reliable_stream_priorities.end()
+    const auto priority = std::find_if(
+        impl_->applied_reliable_stream_priorities.rbegin(),
+        impl_->applied_reliable_stream_priorities.rend(),
+        [stream_id](const auto& entry) { return entry.first == stream_id; });
+    return priority == impl_->applied_reliable_stream_priorities.rend()
                ? std::nullopt
                : std::optional<std::uint8_t>{priority->second};
+}
+
+std::vector<std::uint8_t>
+WebTransportClient::applied_reliable_stream_priorities_for_testing(
+    std::uint64_t stream_id) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::vector<std::uint8_t> priorities;
+    for (const auto& [applied_stream_id, priority] :
+         impl_->applied_reliable_stream_priorities) {
+        if (applied_stream_id == stream_id) {
+            priorities.push_back(priority);
+        }
+    }
+    return priorities;
 }
 
 std::vector<std::uint8_t>
@@ -1397,6 +1425,42 @@ bool WebTransportClient::media_stream_expired(std::uint64_t stream_id) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->timed_out_media_streams.contains(stream_id);
 #endif
+}
+
+std::vector<std::uint64_t> WebTransportClient::media_stream_expiry_events()
+    const {
+#ifndef OPENMOQ_HAS_PICOQUIC
+    return {};
+#else
+    if (impl_ == nullptr) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return {impl_->timed_out_media_streams.begin(),
+            impl_->timed_out_media_streams.end()};
+#endif
+}
+
+void WebTransportClient::acknowledge_media_stream_expired(
+    std::uint64_t stream_id) {
+#ifdef OPENMOQ_HAS_PICOQUIC
+    if (impl_ != nullptr) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->timed_out_media_streams.erase(stream_id);
+        impl_->condition.notify_all();
+    }
+#else
+    static_cast<void>(stream_id);
+#endif
+}
+
+std::size_t WebTransportClient::timed_out_media_stream_count_for_testing()
+    const {
+    if (impl_ == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->timed_out_media_streams.size();
 }
 
 bool WebTransportClient::media_stream_peer_stopped(

@@ -132,6 +132,17 @@ public:
         static_cast<void>(stream_id);
         return false;
     }
+    // Returns a stable, non-destructive snapshot of all unacknowledged media
+    // stream expiry notifications. This mirrors peer-stop ownership: a
+    // session checks every independent sender before releasing an event.
+    virtual std::vector<std::uint64_t> media_stream_expiry_events() const {
+        return {};
+    }
+    // Releases a previously observed expiry notification after the owning
+    // session has permanently retired that subgroup.
+    virtual void acknowledge_media_stream_expired(std::uint64_t stream_id) {
+        static_cast<void>(stream_id);
+    }
     // Stable, non-destructive notification that the peer sent STOP_SENDING
     // for this media stream.  Sessions use it to retire the owning subgroup
     // without allowing later admissions to recreate that exact stream.

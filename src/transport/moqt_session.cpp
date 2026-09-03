@@ -2358,6 +2358,16 @@ public:
             transport.media_stream_expired(stream_id));
     }
 
+    // Mirrors peer-stop retirement, but expiry is permanently terminal for
+    // the subgroup and therefore never enters the draft-18 renewable set.
+    bool retire_expired_stream(PublisherTransport& transport,
+                               std::uint64_t stream_id) {
+        if (!transport.media_stream_expired(stream_id)) {
+            return false;
+        }
+        return retire_transport_stream(stream_id, false, true);
+    }
+
     void renew_peer_stopped_subgroups(PublisherTransport& transport) {
         observe_transport_stream_state(transport);
         for (const Key& key : peer_stopped_subgroups_) {
@@ -2525,6 +2535,9 @@ private:
             const bool peer_stopped =
                 transport.media_stream_peer_stopped(stream_id);
             retire_transport_stream(stream_id, peer_stopped, expired);
+            if (expired) {
+                transport.acknowledge_media_stream_expired(stream_id);
+            }
             if (peer_stopped) {
                 transport.acknowledge_media_stream_peer_stopped(stream_id);
             }
@@ -2542,6 +2555,18 @@ private:
 template <typename VisitSenders>
 void dispatch_peer_stopped_media_streams(PublisherTransport& transport,
                                          VisitSenders&& visit_senders) {
+    for (const std::uint64_t stream_id :
+         transport.media_stream_expiry_events()) {
+        bool owned = false;
+        visit_senders([&](SubgroupSenderState& sender) {
+            if (!owned) {
+                owned = sender.retire_expired_stream(transport, stream_id);
+            }
+        });
+        // Expiry is permanently terminal. An ownerless entry raced after FIN
+        // and is still safe to release after every sender saw the snapshot.
+        transport.acknowledge_media_stream_expired(stream_id);
+    }
     for (const std::uint64_t stream_id :
          transport.media_stream_peer_stop_events()) {
         bool owned = false;
