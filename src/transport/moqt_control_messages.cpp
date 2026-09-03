@@ -401,7 +401,8 @@ bool decode_parameter_type(std::span<const std::uint8_t> bytes,
                            DraftVersion draft,
                            std::uint64_t& previous_type,
                            bool delta_encoded,
-                           std::uint64_t& parameter_type) {
+                           std::uint64_t& parameter_type,
+                           std::optional<std::uint64_t> repeatable_type = std::nullopt) {
     std::uint64_t encoded_type = 0;
     if (!decode_moqint_impl(bytes, offset, draft, encoded_type)) {
         return false;
@@ -411,7 +412,8 @@ bool decode_parameter_type(std::span<const std::uint8_t> bytes,
         previous_type = parameter_type;
         return true;
     }
-    if (previous_type != 0 && encoded_type == 0) {
+    if (previous_type != 0 && encoded_type == 0 &&
+        repeatable_type != previous_type) {
         return false;
     }
     if (encoded_type > std::numeric_limits<std::uint64_t>::max() - previous_type) {
@@ -420,6 +422,32 @@ bool decode_parameter_type(std::span<const std::uint8_t> bytes,
     parameter_type = previous_type + encoded_type;
     previous_type = parameter_type;
     return true;
+}
+
+bool valid_authorization_token(std::span<const std::uint8_t> bytes,
+                               std::size_t offset,
+                               std::size_t parameter_end,
+                               DraftVersion draft) {
+    const auto parameter_bytes = bytes.first(parameter_end);
+    std::uint64_t alias_type = 0;
+    if (!decode_moqint_impl(parameter_bytes, offset, draft, alias_type)) {
+        return false;
+    }
+
+    std::uint64_t ignored = 0;
+    switch (alias_type) {
+        case 0x00:  // DELETE: alias only.
+        case 0x02:  // USE_ALIAS: alias only.
+            return decode_moqint_impl(parameter_bytes, offset, draft, ignored) &&
+                   offset == parameter_end;
+        case 0x01:  // REGISTER: alias, token type, then token value.
+            return decode_moqint_impl(parameter_bytes, offset, draft, ignored) &&
+                   decode_moqint_impl(parameter_bytes, offset, draft, ignored);
+        case 0x03:  // USE_VALUE: token type, then token value.
+            return decode_moqint_impl(parameter_bytes, offset, draft, ignored);
+        default:
+            return false;
+    }
 }
 
 std::uint64_t draft_version_number(DraftVersion draft) {
@@ -855,6 +883,34 @@ std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uin
     return message_bytes;
 }
 
+std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
+                                                    std::uint64_t request_id,
+                                                    std::size_t largest_group_id,
+                                                    std::size_t largest_object_id) {
+    std::vector<std::uint8_t> payload;
+    if (!uses_moq_vi64(draft)) {
+        append_moqint(payload, draft, request_id);
+    }
+    append_moqint(payload, draft, 1);
+    std::vector<std::uint8_t> largest_object;
+    append_location(largest_object,
+                    draft,
+                    largest_group_id,
+                    largest_object_id);
+    std::uint64_t previous_parameter_type = 0;
+    append_parameter_delta(payload,
+                           draft,
+                           previous_parameter_type,
+                           0x09,
+                           largest_object);
+
+    std::vector<std::uint8_t> message_bytes;
+    append_moqint(message_bytes, draft, kRequestOkType);
+    append_uint16(message_bytes, static_cast<std::uint16_t>(payload.size()));
+    message_bytes.insert(message_bytes.end(), payload.begin(), payload.end());
+    return message_bytes;
+}
+
 bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishNamespaceOk& message) {
     if (draft == DraftVersion::kDraft14) {
         return decode_publish_namespace_ok(bytes, message);
@@ -1272,7 +1328,13 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
     std::uint64_t previous_parameter_type = 0;
     for (std::uint64_t index = 0; index < parameter_count; ++index) {
         std::uint64_t parameter_type = 0;
-        if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
+        if (!decode_parameter_type(bytes,
+                                   offset,
+                                   draft,
+                                   previous_parameter_type,
+                                   true,
+                                   parameter_type,
+                                   kParamAuthorizationToken)) {
             return false;
         }
         if ((parameter_type & 0x1ULL) == 0) {
@@ -1333,7 +1395,13 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
     std::uint64_t previous_parameter_type = 0;
     for (std::uint64_t index = 0; index < parameter_count; ++index) {
         std::uint64_t parameter_type = 0;
-        if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
+        if (!decode_parameter_type(bytes,
+                                   offset,
+                                   draft,
+                                   previous_parameter_type,
+                                   true,
+                                   parameter_type,
+                                   kParamAuthorizationToken)) {
             return false;
         }
 
@@ -1356,6 +1424,11 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                         return false;
                     }
                     message.subgroup_delivery_timeout_ms = value;
+                    break;
+                case 0x08:  // EXPIRES is known but outside REQUEST_UPDATE.
+                    if (draft == DraftVersion::kDraft18) {
+                        return false;
+                    }
                     break;
                 case kParamForward:
                     if (message.forward.has_value() || value > 1) {
@@ -1397,6 +1470,12 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
         const std::size_t parameter_end = offset + static_cast<std::size_t>(parameter_length);
         switch (parameter_type) {
             case kParamAuthorizationToken:
+                if (!valid_authorization_token(bytes,
+                                               offset,
+                                               parameter_end,
+                                               draft)) {
+                    return false;
+                }
                 message.has_authorization_token = true;
                 break;
             case 0x09:  // LARGEST_OBJECT is known but outside REQUEST_UPDATE.

@@ -17,6 +17,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -38,9 +39,13 @@ namespace openmoq::publisher::transport {
 
 namespace priority_scheduler_internal {
 
+thread_local bool count_priority_comparisons = false;
+thread_local std::uint64_t priority_comparison_count = 0;
+
 struct CandidatePriority {
     std::uint8_t subscriber_priority = 128;
     std::uint8_t publisher_priority = 128;
+    std::uint64_t request_fairness_round = 0;
     std::uint8_t group_order = 1;
     std::uint64_t group_id = 0;
     std::uint64_t subgroup_id = 0;
@@ -50,11 +55,25 @@ struct CandidatePriority {
 };
 
 bool precedes(const CandidatePriority& first, const CandidatePriority& second) {
+    if (count_priority_comparisons) {
+        ++priority_comparison_count;
+    }
     if (first.subscriber_priority != second.subscriber_priority) {
         return first.subscriber_priority < second.subscriber_priority;
     }
     if (first.publisher_priority != second.publisher_priority) {
         return first.publisher_priority < second.publisher_priority;
+    }
+
+    // Request fairness precedes the request-local object ordering. Entries in
+    // one request's frontier set use round zero; the one entry exported to the
+    // session heap receives the request's current scheduling round. Keeping a
+    // single unconditional tuple order makes this a strict weak ordering even
+    // while stale heap entries await generation-based removal.
+    if (std::tie(first.request_fairness_round, first.request_id) !=
+        std::tie(second.request_fairness_round, second.request_id)) {
+        return std::tie(first.request_fairness_round, first.request_id) <
+               std::tie(second.request_fairness_round, second.request_id);
     }
 
     const std::uint8_t first_group_order = first.group_order == 2 ? 2 : 1;
@@ -74,6 +93,23 @@ bool precedes(const CandidatePriority& first, const CandidatePriority& second) {
     }
     return std::tie(first.request_id, first.plan_index) <
            std::tie(second.request_id, second.plan_index);
+}
+
+struct CandidatePriorityLess {
+    bool operator()(const CandidatePriority& first,
+                    const CandidatePriority& second) const {
+        return precedes(first, second);
+    }
+};
+
+void begin_priority_comparison_count_for_testing() {
+    priority_comparison_count = 0;
+    count_priority_comparisons = true;
+}
+
+std::uint64_t end_priority_comparison_count_for_testing() {
+    count_priority_comparisons = false;
+    return priority_comparison_count;
 }
 
 std::mutex& publisher_priority_mutex() {
@@ -140,6 +176,71 @@ void note_delivery_timeouts(openmoq::publisher::transport::PublisherTransport& t
 
 constexpr std::uint64_t kProtocolViolationErrorCode = 0x3;
 constexpr std::uint64_t kDeliveryTimeoutErrorCode = 0x02;
+constexpr std::uint64_t kInvalidRequestIdErrorCode = 0x04;
+constexpr std::uint64_t kTooManyRequestsErrorCode = 0x07;
+
+std::uint64_t advertised_max_request_id(TransportKind transport) {
+    return transport == TransportKind::kWebTransport ? 128 : 100;
+}
+
+TransportStatus close_session(PublisherTransport& transport,
+                              std::uint64_t error_code,
+                              std::string_view message) {
+    const TransportStatus close_status = transport.close(error_code);
+    static_cast<void>(close_status);
+    return TransportStatus::failure(message);
+}
+
+class PeerRequestIdValidator {
+public:
+    PeerRequestIdValidator(openmoq::publisher::DraftVersion draft,
+                           std::uint64_t advertised_max_request_id)
+        : draft_(draft),
+          advertised_max_request_id_(advertised_max_request_id) {}
+
+    TransportStatus validate(PublisherTransport& transport,
+                             std::uint64_t request_id) {
+        if (draft_ != openmoq::publisher::DraftVersion::kDraft16 &&
+            draft_ != openmoq::publisher::DraftVersion::kDraft18) {
+            return TransportStatus::success();
+        }
+
+        if (draft_ == openmoq::publisher::DraftVersion::kDraft16 &&
+            request_id >= advertised_max_request_id_) {
+            return close_session(transport,
+                                 kTooManyRequestsErrorCode,
+                                 "peer request id exceeds advertised maximum");
+        }
+        if ((request_id & 0x1ULL) == 0) {
+            return close_session(transport,
+                                 kInvalidRequestIdErrorCode,
+                                 "peer request id has invalid parity");
+        }
+
+        if (draft_ == openmoq::publisher::DraftVersion::kDraft16) {
+            if (request_id != next_draft16_request_id_) {
+                return close_session(transport,
+                                     kInvalidRequestIdErrorCode,
+                                     "peer request id is not next in sequence");
+            }
+            next_draft16_request_id_ += 2;
+            return TransportStatus::success();
+        }
+
+        if (!draft18_request_ids_.insert(request_id).second) {
+            return close_session(transport,
+                                 kInvalidRequestIdErrorCode,
+                                 "peer request id is duplicated");
+        }
+        return TransportStatus::success();
+    }
+
+private:
+    openmoq::publisher::DraftVersion draft_;
+    std::uint64_t advertised_max_request_id_ = 0;
+    std::uint64_t next_draft16_request_id_ = 1;
+    std::set<std::uint64_t> draft18_request_ids_;
+};
 
 const NowFunction& steady_now_function() {
     static const NowFunction now = std::chrono::steady_clock::now;
@@ -810,9 +911,15 @@ struct ActiveSubscription {
     std::map<std::size_t, std::uint64_t> send_sequence_by_object_index;
     std::map<std::pair<std::uint64_t, std::uint64_t>, SubgroupFrontier>
         subgroup_frontiers;
+    std::set<priority_scheduler_internal::CandidatePriority,
+             priority_scheduler_internal::CandidatePriorityLess>
+        scheduler_frontiers;
     std::map<std::size_t, ObjectWriteOptions> availability_by_object_index;
     std::vector<std::uint8_t> pending_request_bytes;
     std::uint8_t publisher_priority = 128;
+    std::uint64_t scheduling_round = 0;
+    std::uint64_t scheduler_generation = 0;
+    bool forward_paused_by_update = false;
     bool completed = false;
 };
 
@@ -1381,6 +1488,17 @@ bool apply_request_update(SubscribeMessage& subscribe,
     return true;
 }
 
+bool request_update_extends_end(const SubscribeMessage& subscribe,
+                                const RequestUpdateMessage& update) {
+    if (!update.subscription_filter.has_value() ||
+        subscribe.filter_type != 0x04) {
+        return false;
+    }
+    const SubscriptionFilter& updated = *update.subscription_filter;
+    return updated.filter_type != 0x04 ||
+           updated.end_group_id > subscribe.end_group_id;
+}
+
 bool apply_subscribe_update(SubscribeMessage& subscribe, const SubscribeUpdateMessage& update) {
     const bool start_increases = update.start_group_id > subscribe.start_group_id ||
                                  (update.start_group_id == subscribe.start_group_id &&
@@ -1515,9 +1633,16 @@ bool find_next_matching_object_index(const openmoq::publisher::PublishPlan& plan
     return false;
 }
 
+bool is_final_object_in_subgroup(const openmoq::publisher::PublishPlan& plan,
+                                 std::size_t object_index);
+
 void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
-                                ActiveSubscription& active) {
+                                ActiveSubscription& active,
+                                openmoq::publisher::DraftVersion draft,
+                                const NowFunction& now_function) {
+    ++active.scheduler_generation;
     active.subgroup_frontiers.clear();
+    active.scheduler_frontiers.clear();
     for (std::size_t index = 0; index < plan.objects.size(); ++index) {
         const auto& object = plan.objects[index];
         if (active.admitted_object_indices.contains(index) ||
@@ -1538,6 +1663,21 @@ void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
                       return std::tie(plan.objects[first].object_id, first) <
                              std::tie(plan.objects[second].object_id, second);
                   });
+        if (!frontier.object_indices.empty()) {
+            const std::size_t plan_index = frontier.object_indices.front();
+            const auto& object = plan.objects[plan_index];
+            active.scheduler_frontiers.insert({
+                .subscriber_priority = active.subscribe.subscriber_priority,
+                .publisher_priority = active.publisher_priority,
+                .request_fairness_round = 0,
+                .group_order = active.subscribe.group_order,
+                .group_id = static_cast<std::uint64_t>(object.group_id),
+                .subgroup_id = object.subgroup_id,
+                .object_id = static_cast<std::uint64_t>(object.object_id),
+                .request_id = active.subscribe.request_id,
+                .plan_index = plan_index,
+            });
+        }
     }
 
     for (auto availability_it = active.availability_by_object_index.begin();
@@ -1553,12 +1693,35 @@ void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
             ++availability_it;
         }
     }
-    active.completed = active.subgroup_frontiers.empty();
+
+    const auto first_available_at = read_now(now_function);
+    const DeliveryTimeouts timeouts =
+        timeouts_for_draft(draft, active.subscribe.delivery_timeouts);
+    for (const auto& [key, frontier] : active.subgroup_frontiers) {
+        static_cast<void>(key);
+        for (const std::size_t plan_index : frontier.object_indices) {
+            active.availability_by_object_index.try_emplace(
+                plan_index,
+                ObjectWriteOptions{
+                    .transport_priority = 255,
+                    .object_deadline = deadline_after(
+                        first_available_at, timeouts.object_ms),
+                    .subgroup_deadline =
+                        is_final_object_in_subgroup(plan, plan_index)
+                            ? deadline_after(first_available_at,
+                                             timeouts.subgroup_ms)
+                            : std::nullopt,
+                });
+        }
+    }
+    active.completed = active.scheduler_frontiers.empty();
 }
 
 bool advance_subscription_to_next_loop_object(const openmoq::publisher::PublishPlan& plan,
                                               const LoopState& loop_state,
-                                              ActiveSubscription& active) {
+                                              ActiveSubscription& active,
+                                              openmoq::publisher::DraftVersion draft,
+                                              const NowFunction& now_function) {
     if (!loop_state.enabled || !track_can_loop(loop_state, active.track.name)) {
         return false;
     }
@@ -1578,7 +1741,7 @@ bool advance_subscription_to_next_loop_object(const openmoq::publisher::PublishP
     active.admitted_object_indices.clear();
     active.send_sequence_by_object_index.clear();
     active.availability_by_object_index.clear();
-    rebuild_priority_frontiers(plan, active);
+    rebuild_priority_frontiers(plan, active, draft, now_function);
     active.completed = false;
     return true;
 }
@@ -1718,6 +1881,15 @@ public:
                                             delivery_timeouts.subgroup_ms)
                            : std::nullopt);
             if (deadline_reached(read_now(now_function), object_deadline, subgroup_deadline)) {
+                const auto expired_stream_it = streams_.find(key);
+                if (expired_stream_it != streams_.end()) {
+                    const std::uint64_t expired_stream_id =
+                        expired_stream_it->second.stream_id;
+                    close_subgroup(key);
+                    const TransportStatus reset_status = transport.reset_stream(
+                        expired_stream_id, kDeliveryTimeoutErrorCode);
+                    return {reset_status, ServeDisposition::kSkipped};
+                }
                 closed_subgroups_.insert(key);
                 return {TransportStatus::success(), ServeDisposition::kSkipped};
             }
@@ -1878,6 +2050,23 @@ public:
         }
     }
 
+    TransportStatus cancel_subgroup(PublisherTransport& transport,
+                                    std::uint64_t group_id,
+                                    std::uint64_t subgroup_id,
+                                    std::uint64_t error_code) {
+        const Key key{group_id, subgroup_id};
+        observe_transport_expiries(transport);
+        const auto stream_it = streams_.find(key);
+        if (stream_it == streams_.end()) {
+            pending_objects_.erase(key);
+            closed_subgroups_.insert(key);
+            return TransportStatus::success();
+        }
+        const std::uint64_t stream_id = stream_it->second.stream_id;
+        close_subgroup(key);
+        return transport.reset_stream(stream_id, error_code);
+    }
+
     // FIN all currently open streams (used when transitioning to a new group).
     TransportStatus finish_group(PublisherTransport& transport) {
         return finish_group(transport,
@@ -2003,9 +2192,14 @@ TransportStatus finalize_subscription(PublisherTransport& transport,
                                       std::uint64_t response_stream_id,
                                       std::uint64_t request_id,
                                       std::uint64_t stream_count,
-                                      std::set<std::uint64_t>& completed_request_ids) {
+                                      std::set<std::uint64_t>& completed_request_ids,
+                                      std::uint64_t status_code = 0x2,
+                                      std::string_view reason = {}) {
     const TransportStatus write_status = transport.write_stream(
-        response_stream_id, encode_publish_done_message(draft, request_id, stream_count), false);
+        response_stream_id,
+        encode_publish_done_message(
+            draft, request_id, stream_count, status_code, reason),
+        false);
     if (!write_status.ok) {
         return write_status;
     }
@@ -2069,7 +2263,8 @@ TransportStatus read_request_stream_message(PublisherTransport& transport,
                                             std::uint64_t request_stream_id,
                                             openmoq::publisher::DraftVersion draft,
                                             std::chrono::milliseconds timeout,
-                                            std::vector<std::uint8_t>& message_bytes) {
+                                            std::vector<std::uint8_t>& message_bytes,
+                                            std::vector<std::uint8_t>* trailing_bytes = nullptr) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     message_bytes.clear();
 
@@ -2089,6 +2284,13 @@ TransportStatus read_request_stream_message(PublisherTransport& transport,
 
         std::size_t message_size = 0;
         if (next_control_message(message_bytes, draft, message_size)) {
+            if (trailing_bytes != nullptr) {
+                trailing_bytes->assign(
+                    message_bytes.begin() +
+                        static_cast<std::ptrdiff_t>(message_size),
+                    message_bytes.end());
+            }
+            message_bytes.resize(message_size);
             return TransportStatus::success();
         }
         if (fin) {
@@ -2114,6 +2316,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     std::map<std::uint64_t, DormantPublishedTrack>* dormant_published_tracks = nullptr,
                                     const std::map<std::uint64_t, std::uint64_t>* request_id_by_track_alias = nullptr,
                                     std::uint64_t peer_max_request_id = 0,
+                                    std::uint64_t local_max_request_id = 100,
                                     std::uint64_t subscribe_tracks_next_request_id = 2,
                                     const std::optional<std::vector<std::uint8_t>>& authorization_token = std::nullopt,
                                     const NowFunction& now_function = steady_now_function()) {
@@ -2123,13 +2326,44 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     std::map<std::uint64_t, SubscribeMessage> pending_subscriptions;
     std::deque<std::uint64_t> pending_subscription_order;
     std::map<std::uint64_t, ActiveSubscription> active_subscriptions;
-    std::set<std::uint64_t> received_request_ids;
-    if (dormant_published_tracks != nullptr) {
-        for (const auto& [request_id, track] : *dormant_published_tracks) {
-            static_cast<void>(track);
-            received_request_ids.insert(request_id);
+    struct EligibleCandidate {
+        std::uint64_t request_id = 0;
+        std::uint64_t scheduler_generation = 0;
+        std::size_t loop_cycle = 0;
+        std::size_t plan_index = 0;
+        priority_scheduler_internal::CandidatePriority priority;
+    };
+    struct LaterCandidate {
+        bool operator()(const EligibleCandidate& first,
+                        const EligibleCandidate& second) const {
+            return priority_scheduler_internal::precedes(
+                second.priority, first.priority);
         }
-    }
+    };
+    std::priority_queue<EligibleCandidate,
+                        std::vector<EligibleCandidate>,
+                        LaterCandidate>
+        eligible_candidates;
+    std::optional<std::chrono::steady_clock::time_point>
+        priority_stall_started_at;
+    const auto enqueue_active_candidate =
+        [&](std::uint64_t request_id, const ActiveSubscription& active) {
+            if (active.completed || active.forward_paused_by_update ||
+                active.scheduler_frontiers.empty()) {
+                return;
+            }
+            auto priority = *active.scheduler_frontiers.begin();
+            priority.request_fairness_round = active.scheduling_round;
+            priority.request_id = request_id;
+            eligible_candidates.push({
+                .request_id = request_id,
+                .scheduler_generation = active.scheduler_generation,
+                .loop_cycle = active.loop_cycle,
+                .plan_index = priority.plan_index,
+                .priority = priority,
+            });
+        };
+    PeerRequestIdValidator peer_request_ids(draft, local_max_request_id);
     bool fin = false;
     bool served_any_subscription = false;
     std::optional<std::chrono::steady_clock::time_point> catalog_last_served_at;
@@ -2148,6 +2382,9 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
 
     const auto apply_update_to_active = [&](ActiveSubscription& active,
                                             const RequestUpdateMessage& update) {
+        if (update.forward.has_value()) {
+            active.forward_paused_by_update = *update.forward == 0;
+        }
         apply_request_update(active.subscribe, update);
         note_delivery_timeouts(transport, active.subscribe.delivery_timeouts);
 
@@ -2167,11 +2404,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         }
 
         if (uses_priority_scheduler(draft)) {
-            rebuild_priority_frontiers(plan, active);
+            rebuild_priority_frontiers(plan, active, draft, now_function);
             if (active.subgroup_frontiers.empty()) {
                 active.completed =
                     !advance_subscription_to_next_loop_object(
-                        plan, loop_state, active);
+                        plan, loop_state, active, draft, now_function);
             }
             return;
         }
@@ -2184,7 +2421,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         } else {
             active.next_object_index = plan.objects.size();
             active.completed =
-                !advance_subscription_to_next_loop_object(plan, loop_state, active);
+                !advance_subscription_to_next_loop_object(
+                    plan, loop_state, active, draft, now_function);
         }
     };
 
@@ -2192,8 +2430,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         [&](const RequestUpdateMessage& update,
             std::uint64_t existing_request_id,
             std::uint64_t response_stream_id) -> TransportStatus {
-        if (update.new_group_request.has_value() ||
-            update.has_authorization_token) {
+        if (update.new_group_request.has_value()) {
             const bool has_pending =
                 pending_subscriptions.contains(existing_request_id);
             const bool has_active =
@@ -2253,6 +2490,41 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             return response_status;
         }
 
+        std::optional<std::pair<std::size_t, std::size_t>>
+            largest_object_for_response;
+        const auto note_end_extension =
+            [&](const SubscribeMessage& subscribe,
+                const PublishedTrack& track) {
+                if (track.content_exists &&
+                    request_update_extends_end(subscribe, update)) {
+                    largest_object_for_response =
+                        {track.largest_group_id, track.largest_object_id};
+                }
+            };
+        const auto pending_before =
+            pending_subscriptions.find(existing_request_id);
+        if (pending_before != pending_subscriptions.end()) {
+            const auto track_it =
+                tracks_by_name.find(pending_before->second.track_name);
+            if (track_it != tracks_by_name.end()) {
+                note_end_extension(pending_before->second, track_it->second);
+            }
+        } else {
+            const auto active_before =
+                active_subscriptions.find(existing_request_id);
+            if (active_before != active_subscriptions.end()) {
+                note_end_extension(active_before->second.subscribe,
+                                   active_before->second.track);
+            } else if (dormant_published_tracks != nullptr) {
+                const auto dormant_before =
+                    dormant_published_tracks->find(existing_request_id);
+                if (dormant_before != dormant_published_tracks->end()) {
+                    note_end_extension(dormant_before->second.subscribe,
+                                       dormant_before->second.track);
+                }
+            }
+        }
+
         auto pending_it = pending_subscriptions.find(existing_request_id);
         if (pending_it != pending_subscriptions.end()) {
             apply_request_update(pending_it->second, update);
@@ -2261,6 +2533,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             auto active_it = active_subscriptions.find(existing_request_id);
             if (active_it != active_subscriptions.end()) {
                 apply_update_to_active(active_it->second, update);
+                enqueue_active_candidate(existing_request_id,
+                                         active_it->second);
             } else if (dormant_published_tracks != nullptr) {
                 auto dormant_it =
                     dormant_published_tracks->find(existing_request_id);
@@ -2279,16 +2553,21 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     .admitted_object_indices = {},
                     .send_sequence_by_object_index = {},
                     .subgroup_frontiers = {},
+                    .scheduler_frontiers = {},
                     .availability_by_object_index = {},
                     .pending_request_bytes = {},
                     .publisher_priority =
                         priority_scheduler_internal::publisher_priority_for_request(
                             existing_request_id),
+                    .scheduling_round = 0,
                 };
                 apply_update_to_active(active, update);
                 if (!active.completed) {
                     active_subscriptions.insert_or_assign(
                         existing_request_id, std::move(active));
+                    enqueue_active_candidate(
+                        existing_request_id,
+                        active_subscriptions.at(existing_request_id));
                 }
                 dormant_published_tracks->erase(dormant_it);
             } else {
@@ -2297,10 +2576,15 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             }
         }
 
-        return transport.write_stream(
-            response_stream_id,
-            encode_request_ok_message(draft, update.request_id),
-            false);
+        const std::vector<std::uint8_t> response =
+            largest_object_for_response.has_value()
+                ? encode_request_ok_message(
+                      draft,
+                      update.request_id,
+                      largest_object_for_response->first,
+                      largest_object_for_response->second)
+                : encode_request_ok_message(draft, update.request_id);
+        return transport.write_stream(response_stream_id, response, false);
     };
 
     while (true) {
@@ -2324,9 +2608,15 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 }
 
                 std::vector<std::uint8_t> message_bytes;
+                std::vector<std::uint8_t> trailing_request_bytes;
                 const TransportStatus read_status =
                     read_request_stream_message(
-                        transport, request_stream_id, draft, subscriber_timeout, message_bytes);
+                        transport,
+                        request_stream_id,
+                        draft,
+                        subscriber_timeout,
+                        message_bytes,
+                        &trailing_request_bytes);
                 if (!read_status.ok) {
                     return read_status;
                 }
@@ -2350,8 +2640,10 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         return write_status.ok ? protocol_violation(transport, "received invalid SUBSCRIBE")
                                                : write_status;
                     }
-                    if (!received_request_ids.insert(subscribe.request_id).second) {
-                        return protocol_violation(transport, "received duplicate request id");
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(transport, subscribe.request_id);
+                    if (!request_id_status.ok) {
+                        return request_id_status;
                     }
                     note_delivery_timeouts(transport, subscribe.delivery_timeouts);
                     if (!namespace_matches(subscribe.track_namespace, track_namespace)) {
@@ -2397,20 +2689,27 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         .admitted_object_indices = {},
                         .send_sequence_by_object_index = {},
                         .subgroup_frontiers = {},
+                        .scheduler_frontiers = {},
                         .availability_by_object_index = {},
-                        .pending_request_bytes = {},
+                        .pending_request_bytes =
+                            std::move(trailing_request_bytes),
                         .publisher_priority =
                             priority_scheduler_internal::publisher_priority_for_request(
                                 subscribe.request_id),
+                        .scheduling_round = 0,
                         .completed = false,
                     };
                     std::size_t next_object_index = 0;
                     if (find_next_matching_object_index(plan, active.subscribe, 0, next_object_index)) {
                         active.next_object_index = next_object_index;
                         if (uses_priority_scheduler(draft)) {
-                            rebuild_priority_frontiers(plan, active);
+                            rebuild_priority_frontiers(
+                                plan, active, draft, now_function);
                         }
                         active_subscriptions.insert_or_assign(subscribe.request_id, std::move(active));
+                        enqueue_active_candidate(
+                            subscribe.request_id,
+                            active_subscriptions.at(subscribe.request_id));
                     } else {
                         const TransportStatus finalize_status =
                             finalize_subscription(transport, draft, request_stream_id, subscribe.request_id, 0, completed_request_ids);
@@ -2433,8 +2732,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         return write_status.ok ? protocol_violation(transport, "received invalid SUBSCRIBE_NAMESPACE")
                                                : write_status;
                     }
-                    if (!received_request_ids.insert(subscribe_namespace.request_id).second) {
-                        return protocol_violation(transport, "received duplicate request id");
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(
+                            transport, subscribe_namespace.request_id);
+                    if (!request_id_status.ok) {
+                        return request_id_status;
                     }
                     if (!namespace_prefix_matches(subscribe_namespace.track_namespace_prefix, track_namespace)) {
                         const TransportStatus write_status =
@@ -2464,8 +2766,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     return write_status.ok ? protocol_violation(transport, "received unsupported request stream")
                                            : write_status;
                 }
-                if (!received_request_ids.insert(subscribe_tracks.request_id).second) {
-                    return protocol_violation(transport, "received duplicate request id");
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(transport,
+                                              subscribe_tracks.request_id);
+                if (!request_id_status.ok) {
+                    return request_id_status;
                 }
                 if (!namespace_prefix_matches(subscribe_tracks.track_namespace_prefix, track_namespace)) {
                     const TransportStatus write_status =
@@ -2539,10 +2844,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                 transport,
                                 "received invalid REQUEST_UPDATE on retained SUBSCRIBE stream");
                         }
-                        if ((update.request_id & 0x1ULL) == 0 ||
-                            !received_request_ids.insert(update.request_id).second) {
-                            return protocol_violation(
-                                transport, "received duplicate request id");
+                        const TransportStatus request_id_status =
+                            peer_request_ids.validate(transport,
+                                                      update.request_id);
+                        if (!request_id_status.ok) {
+                            return request_id_status;
                         }
                         const TransportStatus update_status =
                             process_subscription_request_update(
@@ -2673,10 +2979,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         return protocol_violation(
                             transport, "received invalid REQUEST_UPDATE");
                     }
-                    if ((request_update.request_id & 0x1ULL) == 0 ||
-                        !received_request_ids.insert(request_update.request_id).second) {
-                        return protocol_violation(
-                            transport, "received duplicate request id");
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(
+                            transport, request_update.request_id);
+                    if (!request_id_status.ok) {
+                        return request_id_status;
                     }
                     const TransportStatus update_status =
                         process_subscription_request_update(
@@ -2771,7 +3078,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     } else {
                         active_it->second.next_object_index = plan.objects.size();
                         active_it->second.completed =
-                            !advance_subscription_to_next_loop_object(plan, loop_state, active_it->second);
+                            !advance_subscription_to_next_loop_object(
+                                plan,
+                                loop_state,
+                                active_it->second,
+                                draft,
+                                now_function);
                     }
                     buffer.erase(buffer.begin(), buffer.begin() + message_size);
                     continue;
@@ -2790,11 +3102,13 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             .admitted_object_indices = {},
                             .send_sequence_by_object_index = {},
                             .subgroup_frontiers = {},
+                            .scheduler_frontiers = {},
                             .availability_by_object_index = {},
                             .pending_request_bytes = {},
                             .publisher_priority =
                                 priority_scheduler_internal::publisher_priority_for_request(
                                     remapped_request_id),
+                            .scheduling_round = 0,
                             .completed = false,
                         };
                         if (!apply_subscribe_update(active.subscribe, subscribe_update)) {
@@ -2815,7 +3129,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             active.next_object_index = next_object_index;
                             active_subscriptions.insert_or_assign(remapped_request_id, std::move(active));
                         } else {
-                            if (advance_subscription_to_next_loop_object(plan, loop_state, active)) {
+                            if (advance_subscription_to_next_loop_object(
+                                    plan,
+                                    loop_state,
+                                    active,
+                                    draft,
+                                    now_function)) {
                                 active_subscriptions.insert_or_assign(remapped_request_id, std::move(active));
                             } else {
                                 const TransportStatus finalize_status = finalize_subscription(
@@ -2849,6 +3168,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (!decode_subscribe_namespace_message(message_bytes, draft, subscribe_namespace)) {
                     return protocol_violation(transport, "received invalid SUBSCRIBE_NAMESPACE");
                 }
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(
+                        transport, subscribe_namespace.request_id);
+                if (!request_id_status.ok) {
+                    return request_id_status;
+                }
                 if (!namespace_prefix_matches(subscribe_namespace.track_namespace_prefix, track_namespace)) {
                     return TransportStatus::failure("peer requested unsupported namespace prefix");
                 }
@@ -2868,8 +3193,10 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (!decode_subscribe_message(message_bytes, draft, subscribe)) {
                     return protocol_violation(transport, "received invalid SUBSCRIBE");
                 }
-                if (!received_request_ids.insert(subscribe.request_id).second) {
-                    return protocol_violation(transport, "received duplicate request id");
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(transport, subscribe.request_id);
+                if (!request_id_status.ok) {
+                    return request_id_status;
                 }
                 note_delivery_timeouts(transport, subscribe.delivery_timeouts);
                 if (!namespace_matches(subscribe.track_namespace, track_namespace)) {
@@ -2888,6 +3215,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             const TransportStatus read_status =
                 transport.read_stream(control_read_stream_id, chunk, immediate_fin, std::chrono::milliseconds(0));
             if (read_status.ok) {
+                priority_stall_started_at.reset();
                 if (trace_enabled()) {
                     std::cerr << "[moqt-session] control chunk now_ms="
                               << trace_elapsed_ms(std::chrono::steady_clock::now())
@@ -2951,10 +3279,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 .admitted_object_indices = {},
                 .send_sequence_by_object_index = {},
                 .subgroup_frontiers = {},
+                .scheduler_frontiers = {},
                 .availability_by_object_index = {},
                 .pending_request_bytes = {},
                 .publisher_priority =
                     priority_scheduler_internal::publisher_priority_for_request(request_id),
+                .scheduling_round = 0,
                 .completed = false,
             };
 
@@ -2962,9 +3292,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             if (find_next_matching_object_index(plan, active.subscribe, 0, next_object_index)) {
                 active.next_object_index = next_object_index;
                 if (uses_priority_scheduler(draft)) {
-                    rebuild_priority_frontiers(plan, active);
+                    rebuild_priority_frontiers(
+                        plan, active, draft, now_function);
                 }
                 active_subscriptions.insert_or_assign(request_id, std::move(active));
+                enqueue_active_candidate(request_id,
+                                         active_subscriptions.at(request_id));
                 continue;
             }
 
@@ -3027,86 +3360,36 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             }
 
             if (uses_priority_scheduler(draft)) {
-                struct EligibleCandidate {
-                    std::uint64_t request_id = 0;
-                    std::size_t loop_cycle = 0;
-                    std::size_t plan_index = 0;
-                    priority_scheduler_internal::CandidatePriority priority;
-                };
-
-                struct LaterCandidate {
-                    bool operator()(const EligibleCandidate& first,
-                                    const EligibleCandidate& second) const {
-                        return priority_scheduler_internal::precedes(
-                            second.priority, first.priority);
-                    }
-                };
-
-                std::priority_queue<EligibleCandidate,
-                                    std::vector<EligibleCandidate>,
-                                    LaterCandidate>
-                    eligible_candidates;
-                for (auto& [request_id, active] : active_subscriptions) {
-                    if (active.completed) {
-                        continue;
-                    }
-                    for (auto& [key, frontier] : active.subgroup_frontiers) {
-                        static_cast<void>(key);
-                        if (frontier.next >= frontier.object_indices.size()) {
-                            continue;
-                        }
-                        const std::size_t plan_index =
-                            frontier.object_indices[frontier.next];
-                        const auto& object = plan.objects[plan_index];
-                        if (!active.availability_by_object_index.contains(plan_index)) {
-                            const auto first_available_at = read_now(now_function);
-                            const DeliveryTimeouts timeouts = timeouts_for_draft(
-                                draft, active.subscribe.delivery_timeouts);
-                            active.availability_by_object_index.emplace(
-                                plan_index,
-                                ObjectWriteOptions{
-                                    .transport_priority = 255,
-                                    .object_deadline = deadline_after(
-                                        first_available_at, timeouts.object_ms),
-                                    .subgroup_deadline =
-                                        is_final_object_in_subgroup(plan, plan_index)
-                                            ? deadline_after(
-                                                  first_available_at,
-                                                  timeouts.subgroup_ms)
-                                            : std::nullopt,
-                                });
-                        }
-                        eligible_candidates.push(EligibleCandidate{
-                            .request_id = request_id,
-                            .loop_cycle = active.loop_cycle,
-                            .plan_index = plan_index,
-                            .priority = {
-                                .subscriber_priority =
-                                    active.subscribe.subscriber_priority,
-                                .publisher_priority = active.publisher_priority,
-                                .group_order = active.subscribe.group_order,
-                                .group_id =
-                                    static_cast<std::uint64_t>(object.group_id),
-                                .subgroup_id = object.subgroup_id,
-                                .object_id =
-                                    static_cast<std::uint64_t>(object.object_id),
-                                .request_id = request_id,
-                                .plan_index = plan_index,
-                            },
-                        });
-                    }
-                }
-
                 bool made_progress = false;
+                bool attempted_eligible_candidate = false;
+                std::vector<EligibleCandidate> blocked_candidates;
                 while (!eligible_candidates.empty()) {
                     const EligibleCandidate selected = eligible_candidates.top();
                     eligible_candidates.pop();
                     auto active_it = active_subscriptions.find(selected.request_id);
                     if (active_it == active_subscriptions.end()) {
-                        return TransportStatus::failure(
-                            "priority scheduler lost its active subscription");
+                        continue;
                     }
                     ActiveSubscription& active = active_it->second;
+                    if (active.completed || active.forward_paused_by_update ||
+                        selected.scheduler_generation !=
+                            active.scheduler_generation ||
+                        selected.loop_cycle != active.loop_cycle ||
+                        selected.priority.request_fairness_round !=
+                            active.scheduling_round ||
+                        active.scheduler_frontiers.empty()) {
+                        continue;
+                    }
+                    auto selected_frontier_key = selected.priority;
+                    selected_frontier_key.request_fairness_round = 0;
+                    const auto scheduler_frontier_it =
+                        active.scheduler_frontiers.find(
+                            selected_frontier_key);
+                    if (scheduler_frontier_it ==
+                        active.scheduler_frontiers.end()) {
+                        continue;
+                    }
+                    attempted_eligible_candidate = true;
                     const auto& source_object = plan.objects[selected.plan_index];
                     const openmoq::publisher::CmsfObject object =
                         make_looped_object(source_object,
@@ -3168,12 +3451,31 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     }
                     if (serve_result.disposition ==
                         SubgroupSenderState::ServeDisposition::kWouldBlock) {
+                        blocked_candidates.push_back(selected);
+                        const auto next_frontier_it =
+                            std::next(scheduler_frontier_it);
+                        if (next_frontier_it !=
+                            active.scheduler_frontiers.end()) {
+                            auto next_priority = *next_frontier_it;
+                            next_priority.request_fairness_round =
+                                active.scheduling_round;
+                            eligible_candidates.push({
+                                .request_id = selected.request_id,
+                                .scheduler_generation =
+                                    active.scheduler_generation,
+                                .loop_cycle = active.loop_cycle,
+                                .plan_index = next_priority.plan_index,
+                                .priority = next_priority,
+                            });
+                        }
                         continue;
                     }
 
                     active.admitted_object_indices.insert(selected.plan_index);
                     active.send_sequence_by_object_index.erase(selected.plan_index);
                     active.availability_by_object_index.erase(selected.plan_index);
+                    active.scheduler_frontiers.erase(
+                        scheduler_frontier_it);
                     const auto frontier_it = active.subgroup_frontiers.find(
                         {static_cast<std::uint64_t>(source_object.group_id),
                          source_object.subgroup_id});
@@ -3186,6 +3488,28 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             "priority scheduler lost its subgroup frontier");
                     }
                     ++frontier_it->second.next;
+                    ++active.scheduling_round;
+                    if (frontier_it->second.next <
+                        frontier_it->second.object_indices.size()) {
+                        const std::size_t successor_index =
+                            frontier_it->second
+                                .object_indices[frontier_it->second.next];
+                        const auto& successor = plan.objects[successor_index];
+                        active.scheduler_frontiers.insert({
+                            .subscriber_priority =
+                                active.subscribe.subscriber_priority,
+                            .publisher_priority = active.publisher_priority,
+                            .request_fairness_round = 0,
+                            .group_order = active.subscribe.group_order,
+                            .group_id = static_cast<std::uint64_t>(
+                                successor.group_id),
+                            .subgroup_id = successor.subgroup_id,
+                            .object_id = static_cast<std::uint64_t>(
+                                successor.object_id),
+                            .request_id = selected.request_id,
+                            .plan_index = successor_index,
+                        });
+                    }
                     const bool object_published =
                         serve_result.disposition ==
                         SubgroupSenderState::ServeDisposition::kAccepted;
@@ -3213,24 +3537,85 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             object);
                     }
 
-                    const bool has_remaining = std::any_of(
-                        active.subgroup_frontiers.begin(),
-                        active.subgroup_frontiers.end(),
-                        [](const auto& entry) {
-                            return entry.second.next <
-                                   entry.second.object_indices.size();
-                        });
-                    if (!has_remaining) {
+                    if (active.scheduler_frontiers.empty()) {
                         active.next_object_index = plan.objects.size();
                         active.completed =
                             !advance_subscription_to_next_loop_object(
-                                plan, loop_state, active);
+                                plan,
+                                loop_state,
+                                active,
+                                draft,
+                                now_function);
                     }
+                    enqueue_active_candidate(selected.request_id, active);
+                    for (const auto& blocked : blocked_candidates) {
+                        eligible_candidates.push(blocked);
+                    }
+                    priority_stall_started_at.reset();
                     made_progress = true;
                     break;
                 }
 
                 if (!made_progress) {
+                    for (const auto& blocked : blocked_candidates) {
+                        eligible_candidates.push(blocked);
+                    }
+                    if (attempted_eligible_candidate &&
+                        !blocked_candidates.empty()) {
+                        const auto now = read_now(now_function);
+                        if (!priority_stall_started_at.has_value()) {
+                            priority_stall_started_at = now;
+                        } else if (now - *priority_stall_started_at >=
+                                   subscriber_timeout) {
+                            const EligibleCandidate& victim =
+                                blocked_candidates.back();
+                            auto victim_it =
+                                active_subscriptions.find(victim.request_id);
+                            if (victim_it != active_subscriptions.end()) {
+                                const auto& victim_object =
+                                    plan.objects[victim.plan_index];
+                                const std::uint64_t reset_code =
+                                    draft == openmoq::publisher::DraftVersion::kDraft16
+                                        ? 0x01
+                                        : 0x05;
+                                const TransportStatus reset_status =
+                                    victim_it->second.sender->cancel_subgroup(
+                                        transport,
+                                        static_cast<std::uint64_t>(
+                                            victim_object.group_id),
+                                        victim_object.subgroup_id,
+                                        reset_code);
+                                if (!reset_status.ok) {
+                                    return reset_status;
+                                }
+                                const std::uint64_t too_far_behind =
+                                    draft == openmoq::publisher::DraftVersion::kDraft16
+                                        ? 0x06
+                                        : 0x05;
+                                const TransportStatus finalize_status =
+                                    finalize_subscription(
+                                        transport,
+                                        draft,
+                                        uses_request_streams(draft)
+                                            ? victim_it->second.request_stream_id
+                                            : control_stream_id,
+                                        victim.request_id,
+                                        victim_it->second.sender->stream_count(),
+                                        completed_request_ids,
+                                        too_far_behind,
+                                        "subscriber exceeded publisher resource limit");
+                                if (!finalize_status.ok) {
+                                    return finalize_status;
+                                }
+                                active_subscriptions.erase(victim_it);
+                                served_any_subscription = true;
+                            }
+                            priority_stall_started_at.reset();
+                            continue;
+                        }
+                    } else {
+                        priority_stall_started_at.reset();
+                    }
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
                 continue;
@@ -3341,7 +3726,13 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     } else {
                         static_cast<void>(request_id);
                         active.next_object_index = plan.objects.size();
-                        active.completed = !advance_subscription_to_next_loop_object(plan, loop_state, active);
+                        active.completed =
+                            !advance_subscription_to_next_loop_object(
+                                plan,
+                                loop_state,
+                                active,
+                                draft,
+                                now_function);
                     }
                 }
 
@@ -3426,6 +3817,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                          const LoopState& loop_state,
                                          std::span<const PublishedTrack> tracks,
                                          std::uint64_t peer_max_request_id,
+                                         std::uint64_t local_max_request_id,
                                          std::string_view track_namespace,
                                          const std::optional<std::vector<std::uint8_t>>& authorization_token,
                                          bool paced,
@@ -3626,6 +4018,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                      nullptr,
                                      nullptr,
                                      0,
+                                     local_max_request_id,
                                      2,
                                      authorization_token,
                                      now_function);
@@ -4167,6 +4560,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
             loop_state,
             tracks,
             peer_max_request_id_,
+            advertised_max_request_id(endpoint_->transport),
             track_namespace_,
             action_token,
             paced_,
@@ -4225,6 +4619,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                        &dormant_published_tracks,
                                        &request_id_by_track_alias,
                                        peer_max_request_id_,
+                                       advertised_max_request_id(endpoint_->transport),
                                        2 + (selected_tracks.size() * 2),
                                        action_token,
                                        now_function_);
@@ -4254,6 +4649,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                nullptr,
                                nullptr,
                                peer_max_request_id_,
+                               advertised_max_request_id(endpoint_->transport),
                                2,
                                action_token,
                                now_function_);
@@ -4288,6 +4684,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     }
     std::cout << "connection_id=" << transport_.connection_id() << '\n' << std::flush;
     const auto action_token = action_authorization_token();
+    PeerRequestIdValidator peer_request_ids(
+        draft_version, advertised_max_request_id(endpoint_->transport));
 
     // MoqtSession is not otherwise reused across broadcasts in this project
     // (publisher_api.cpp constructs a fresh session per publish), but nothing
@@ -4588,10 +4986,27 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 return {TransportStatus::failure("failed to parse control request type"), 0};
             }
 
+            if ((draft_version == DraftVersion::kDraft18 &&
+                 message_type == 0x02) ||
+                (uses_request_streams(draft_version) &&
+                 (message_type == 0x03 || message_type == 0x06 ||
+                  message_type == 0x50 || message_type == 0x16 ||
+                  message_type == 0x1d || message_type == 0x51))) {
+                return {protocol_violation(
+                            transport_,
+                            "draft-18 request message received on control stream"),
+                        0};
+            }
+
             if (message_type == 0x03) {
                 SubscribeMessage subscribe;
                 if (!decode_subscribe_message(message_bytes, draft_version, subscribe)) {
                     return {TransportStatus::failure("received invalid SUBSCRIBE"), 0};
+                }
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(transport_, subscribe.request_id);
+                if (!request_id_status.ok) {
+                    return {request_id_status, 0};
                 }
                 note_delivery_timeouts(transport_, subscribe.delivery_timeouts);
 
@@ -4642,6 +5057,12 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             } else if (message_type == 0x11) {
                 SubscribeNamespaceMessage subscribe_namespace;
                 if (decode_subscribe_namespace_message(message_bytes, draft_version, subscribe_namespace)) {
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(
+                            transport_, subscribe_namespace.request_id);
+                    if (!request_id_status.ok) {
+                        return {request_id_status, 0};
+                    }
                     auto ws = transport_.write_stream(control_stream_id_,
                         encode_subscribe_namespace_ok_message(draft_version, subscribe_namespace.request_id), false);
                     if (!ws.ok) {
@@ -4804,6 +5225,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     }
     std::cout << "connection_id=" << transport_.connection_id() << '\n' << std::flush;
     const auto action_token = action_authorization_token();
+    PeerRequestIdValidator peer_request_ids(
+        draft_version, advertised_max_request_id(endpoint_->transport));
 
     // MoqtSession is not otherwise reused across broadcasts in this project
     // (publisher_api.cpp constructs a fresh session per publish), but nothing
@@ -5398,6 +5821,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                 : write_status,
                                 0};
                     }
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(transport_, subscribe.request_id);
+                    if (!request_id_status.ok) {
+                        return {request_id_status, 0};
+                    }
                     note_delivery_timeouts(transport_, subscribe.delivery_timeouts);
 
                     const auto track_it = alias_by_track.find(subscribe.track_name);
@@ -5475,6 +5903,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                 : write_status,
                                 0};
                     }
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(
+                            transport_, subscribe_namespace.request_id);
+                    if (!request_id_status.ok) {
+                        return {request_id_status, 0};
+                    }
                     TransportStatus write_status =
                         transport_.write_stream(request_stream_id,
                                                 encode_request_ok_message(draft_version, subscribe_namespace.request_id),
@@ -5496,6 +5930,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     return {write_status.ok ? protocol_violation(transport_, "received unsupported request stream")
                                             : write_status,
                             0};
+                }
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(transport_,
+                                              subscribe_tracks.request_id);
+                if (!request_id_status.ok) {
+                    return {request_id_status, 0};
                 }
                 if (!namespace_prefix_matches(subscribe_tracks.track_namespace_prefix, track_namespace_)) {
                     TransportStatus write_status =
@@ -5565,9 +6005,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             trace_control_message(message_bytes, draft_version);
 
-            if (uses_request_streams(draft_version) &&
-                (message_type == 0x03 || message_type == 0x06 || message_type == 0x50 ||
-                 message_type == 0x16 || message_type == 0x1d || message_type == 0x51)) {
+            if ((draft_version == DraftVersion::kDraft18 &&
+                 message_type == 0x02) ||
+                (uses_request_streams(draft_version) &&
+                 (message_type == 0x03 || message_type == 0x06 ||
+                  message_type == 0x50 || message_type == 0x16 ||
+                  message_type == 0x1d || message_type == 0x51))) {
                 return {protocol_violation(transport_, "draft-18 request message received on control stream"), 0};
             }
 
@@ -5575,6 +6018,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 SubscribeMessage subscribe;
                 if (!decode_subscribe_message(message_bytes, draft_version, subscribe)) {
                     return {protocol_violation(transport_, "received invalid SUBSCRIBE"), 0};
+                }
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(transport_, subscribe.request_id);
+                if (!request_id_status.ok) {
+                    return {request_id_status, 0};
                 }
                 note_delivery_timeouts(transport_, subscribe.delivery_timeouts);
 
@@ -5639,6 +6087,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             } else if (message_type == 0x11) {  // SUBSCRIBE_NAMESPACE
                 SubscribeNamespaceMessage subscribe_namespace;
                 if (decode_subscribe_namespace_message(message_bytes, draft_version, subscribe_namespace)) {
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(
+                            transport_, subscribe_namespace.request_id);
+                    if (!request_id_status.ok) {
+                        return {request_id_status, 0};
+                    }
                     auto ws = transport_.write_stream(control_stream_id_,
                         encode_subscribe_namespace_ok_message(draft_version, subscribe_namespace.request_id), false);
                     if (!ws.ok) {
@@ -5975,6 +6429,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     }
     std::cout << "connection_id=" << transport_.connection_id() << '\n' << std::flush;
     const auto action_token = action_authorization_token();
+    PeerRequestIdValidator peer_request_ids(
+        draft_version, advertised_max_request_id(endpoint_->transport));
 
     NamespaceMessage namespace_message{
         .draft = draft_version,
@@ -6057,7 +6513,6 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     std::map<std::string, SubscribeMessage> published_track_settings;
     std::map<std::uint64_t, std::vector<std::uint8_t>> pending_publish_request_bytes;
     std::set<std::uint64_t> terminated_publish_request_ids;
-    std::set<std::uint64_t> used_request_ids{0};
     std::uint64_t next_publish_request_id = 2;
 
     auto publish_tracks = [&]() -> TransportStatus {
@@ -6102,7 +6557,6 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             published_track_settings.insert_or_assign(track_name, settings);
             published_track_request_ids.insert_or_assign(track_name, next_publish_request_id);
             publish_stream_id_by_request_id_.insert_or_assign(next_publish_request_id, stream_id);
-            used_request_ids.insert(next_publish_request_id);
             if (publish_ok.forward != 0) {
                 subscribed_tracks.insert(track_name);
             }
@@ -6131,8 +6585,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
     auto accept_subscribe = [&](const SubscribeMessage& subscribe,
                                 std::uint64_t response_stream_id) -> TransportStatus {
-        if (!used_request_ids.insert(subscribe.request_id).second) {
-            return protocol_violation(transport_, "duplicate peer request id");
+        const TransportStatus request_id_status =
+            peer_request_ids.validate(transport_, subscribe.request_id);
+        if (!request_id_status.ok) {
+            return request_id_status;
         }
         note_delivery_timeouts(transport_, subscribe.delivery_timeouts);
         const auto track_it = alias_by_track.find(subscribe.track_name);
@@ -6187,10 +6643,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                         pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(message_size));
                     RequestUpdateMessage update;
                     if (!decode_request_update_message(message_bytes, draft_version, update) ||
-                        update.existing_request_id.has_value() ||
-                        (update.request_id & 0x1ULL) == 0 ||
-                        !used_request_ids.insert(update.request_id).second) {
+                        update.existing_request_id.has_value()) {
                         return protocol_violation(transport_, "invalid REQUEST_UPDATE on PUBLISH stream");
+                    }
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(transport_, update.request_id);
+                    if (!request_id_status.ok) {
+                        return request_id_status;
                     }
                     if (update.new_group_request.has_value() ||
                         update.has_authorization_token) {
@@ -6355,6 +6814,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                         return write_status.ok ? protocol_violation(transport_, "received invalid SUBSCRIBE_NAMESPACE")
                                                : write_status;
                     }
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(
+                            transport_, subscribe_namespace.request_id);
+                    if (!request_id_status.ok) {
+                        return request_id_status;
+                    }
                     if (!namespace_prefix_matches(subscribe_namespace.track_namespace_prefix, track_namespace_)) {
                         TransportStatus write_status =
                             transport_.write_stream(request_stream_id,
@@ -6385,6 +6850,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                 true);
                     return write_status.ok ? protocol_violation(transport_, "received unsupported request stream")
                                            : write_status;
+                }
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(transport_,
+                                              subscribe_tracks.request_id);
+                if (!request_id_status.ok) {
+                    return request_id_status;
                 }
                 if (!namespace_prefix_matches(subscribe_tracks.track_namespace_prefix, track_namespace_)) {
                     TransportStatus write_status =
@@ -6424,9 +6895,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             trace_control_message(message_bytes, draft_version);
 
-            if (uses_request_streams(draft_version) &&
-                (message_type == 0x03 || message_type == 0x06 || message_type == 0x50 ||
-                 message_type == 0x16 || message_type == 0x1d || message_type == 0x51)) {
+            if ((draft_version == DraftVersion::kDraft18 &&
+                 message_type == 0x02) ||
+                (uses_request_streams(draft_version) &&
+                 (message_type == 0x03 || message_type == 0x06 ||
+                  message_type == 0x50 || message_type == 0x16 ||
+                  message_type == 0x1d || message_type == 0x51))) {
                 return protocol_violation(transport_, "draft-18 request message received on control stream");
             }
             if (message_type == 0x03) {
@@ -6444,6 +6918,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             } else if (message_type == 0x11) {
                 SubscribeNamespaceMessage subscribe_namespace;
                 if (decode_subscribe_namespace_message(message_bytes, draft_version, subscribe_namespace)) {
+                    const TransportStatus request_id_status =
+                        peer_request_ids.validate(
+                            transport_, subscribe_namespace.request_id);
+                    if (!request_id_status.ok) {
+                        return request_id_status;
+                    }
                     if (!namespace_prefix_matches(subscribe_namespace.track_namespace_prefix, track_namespace_)) {
                         return TransportStatus::failure("peer requested unsupported namespace prefix");
                     }

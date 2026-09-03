@@ -569,6 +569,47 @@ std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
     return bytes;
 }
 
+std::vector<std::uint8_t> build_request_update_parameter_edge_case(
+    DraftVersion draft,
+    std::size_t authorization_token_count,
+    bool include_expires,
+    bool malformed_authorization_token = false) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 101);
+    if (draft == DraftVersion::kDraft16) {
+        append_moqint(payload, draft, 77);
+    }
+    append_moqint(payload,
+                  draft,
+                  authorization_token_count + (include_expires ? 1 : 0));
+
+    std::uint64_t previous_type = 0;
+    for (std::size_t index = 0; index < authorization_token_count; ++index) {
+        append_moqint(payload, draft, 0x03 - previous_type);
+        std::vector<std::uint8_t> token;
+        // USE_VALUE carries a token type followed by the token value.
+        append_moqint(token, draft, malformed_authorization_token ? 0x01 : 0x03);
+        if (!malformed_authorization_token) {
+            append_moqint(token, draft, 0);
+            token.push_back(static_cast<std::uint8_t>('a' + index));
+        }
+        append_moqint(payload, draft, token.size());
+        payload.insert(payload.end(), token.begin(), token.end());
+        previous_type = 0x03;
+    }
+    if (include_expires) {
+        append_moqint(payload, draft, 0x08 - previous_type);
+        append_moqint(payload, draft, 500);
+    }
+
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x02);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
 std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     std::vector<std::uint8_t> payload;
     if (draft != DraftVersion::kDraft18) {
@@ -987,6 +1028,38 @@ bool test_request_update_decoding() {
                       DraftVersion::kDraft16,
                       ignored_scope),
                  "draft-16 rejects a zero DELIVERY_TIMEOUT in REQUEST_UPDATE");
+    RequestUpdateMessage repeated_authorization;
+    ok &= expect(decode_request_update_message(
+                     build_request_update_parameter_edge_case(
+                         DraftVersion::kDraft16, 2, true),
+                     DraftVersion::kDraft16,
+                     repeated_authorization) &&
+                     repeated_authorization.has_authorization_token,
+                 "draft-16 accepts repeated well-formed AUTHORIZATION_TOKEN and ignores EXPIRES");
+    ok &= expect(decode_request_update_message(
+                     build_request_update_parameter_edge_case(
+                         DraftVersion::kDraft18, 2, false),
+                     DraftVersion::kDraft18,
+                     repeated_authorization) &&
+                     repeated_authorization.has_authorization_token,
+                 "draft-18 accepts repeated well-formed AUTHORIZATION_TOKEN parameters");
+    ok &= expect(!decode_request_update_message(
+                      build_request_update_parameter_edge_case(
+                          DraftVersion::kDraft18, 0, true),
+                      DraftVersion::kDraft18,
+                      repeated_authorization),
+                 "draft-18 rejects EXPIRES outside REQUEST_UPDATE_OK");
+    ok &= expect(!decode_request_update_message(
+                      build_request_update_parameter_edge_case(
+                          DraftVersion::kDraft16, 1, false, true),
+                      DraftVersion::kDraft16,
+                      repeated_authorization) &&
+                     !decode_request_update_message(
+                         build_request_update_parameter_edge_case(
+                             DraftVersion::kDraft18, 1, false, true),
+                         DraftVersion::kDraft18,
+                         repeated_authorization),
+                 "REQUEST_UPDATE rejects malformed AUTHORIZATION_TOKEN structures");
     ok &= expect(!decode_request_update_message(
                       build_request_update_message(DraftVersion::kDraft16),
                       DraftVersion::kDraft14,
@@ -1010,6 +1083,22 @@ bool test_request_update_response_wire_shapes() {
     const std::vector<std::uint8_t> draft18_ok = {0x07, 0x00, 0x01, 0x00};
     ok &= expect(encode_request_ok_message(DraftVersion::kDraft18, 101) == draft18_ok,
                  "draft-18 REQUEST_UPDATE_OK omits a request id on the retained stream");
+
+    const std::vector<std::uint8_t> draft16_extended_ok = {
+        0x07, 0x00, 0x07, 0x40, 0x65, 0x01, 0x09, 0x02, 0x0c, 0x05,
+    };
+    ok &= expect(encode_request_ok_message(
+                     DraftVersion::kDraft16, 101, 12, 5) ==
+                     draft16_extended_ok,
+                 "draft-16 end-extension REQUEST_OK carries request id and LARGEST_OBJECT");
+
+    const std::vector<std::uint8_t> draft18_extended_ok = {
+        0x07, 0x00, 0x05, 0x01, 0x09, 0x02, 0x0c, 0x05,
+    };
+    ok &= expect(encode_request_ok_message(
+                     DraftVersion::kDraft18, 101, 12, 5) ==
+                     draft18_extended_ok,
+                 "draft-18 end-extension REQUEST_OK carries LARGEST_OBJECT without request id");
 
     std::vector<std::uint8_t> draft16_error = {
         0x05, 0x00, 0x12, 0x40, 0x65, 0x02, 0x00, 0x0d,

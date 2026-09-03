@@ -178,6 +178,10 @@ bool decode_max_request_id_message(std::span<const std::uint8_t> bytes, MaxReque
 bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draft, std::size_t& message_size);
 std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& message);
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uint64_t request_id);
+std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
+                                                    std::uint64_t request_id,
+                                                    std::size_t largest_group_id,
+                                                    std::size_t largest_object_id);
 bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishNamespaceOk& message);
 bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draft, RequestError& message);
 bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,

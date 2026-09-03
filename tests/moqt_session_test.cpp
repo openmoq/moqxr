@@ -29,6 +29,8 @@ void clear_publisher_priorities_for_testing();
 std::uint8_t object_transport_priority_for_testing(
     std::uint8_t subscriber_priority,
     std::uint8_t publisher_priority);
+void begin_priority_comparison_count_for_testing();
+std::uint64_t end_priority_comparison_count_for_testing();
 
 }  // namespace openmoq::publisher::transport::priority_scheduler_internal
 
@@ -552,7 +554,9 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::uint8_t subscriber_priority = 128,
                                                    std::uint8_t group_order = 0,
                                                    std::size_t start_group_id = 0,
-                                                   std::size_t start_object_id = 0) {
+                                                   std::size_t start_object_id = 0,
+                                                   std::uint64_t filter_type_value = 0x03,
+                                                   std::size_t end_group_id = 0) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     const std::vector<std::uint8_t> tuple_len = encode_moqint(draft, 1);
     const std::vector<std::uint8_t> component_len = encode_moqint(draft, track_namespace.size());
@@ -567,13 +571,19 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         payload.push_back(subscriber_priority);
         payload.push_back(group_order == 0 ? 0x01 : group_order);
         payload.push_back(forward);  // forward
-        const std::vector<std::uint8_t> filter_type = encode_varint(0x03);  // AbsoluteStart
+        const std::vector<std::uint8_t> filter_type =
+            encode_varint(filter_type_value);
         const std::vector<std::uint8_t> start_group = encode_varint(start_group_id);
         const std::vector<std::uint8_t> start_object = encode_varint(start_object_id);
         const std::vector<std::uint8_t> parameter_count = encode_varint(0);
         payload.insert(payload.end(), filter_type.begin(), filter_type.end());
         payload.insert(payload.end(), start_group.begin(), start_group.end());
         payload.insert(payload.end(), start_object.begin(), start_object.end());
+        if (filter_type_value == 0x04) {
+            const std::vector<std::uint8_t> end_group =
+                encode_varint(end_group_id);
+            payload.insert(payload.end(), end_group.begin(), end_group.end());
+        }
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     } else {
         // Draft-16/18: parameters as delta-encoded KVPs. Draft 16 has the
@@ -618,15 +628,19 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         payload.insert(payload.end(), priority_delta.begin(), priority_delta.end());
         payload.insert(payload.end(), priority_value.begin(), priority_value.end());
         // SUBSCRIPTION_FILTER (0x21, odd) delta=0x01
-        // Value: FilterType(0x03=AbsoluteStart) + StartGroup(0) + StartObject(0)
+        // Value: filter type followed by its applicable locations.
         const std::vector<std::uint8_t> filter_delta = encode_moqint(draft, 0x21 - 0x20);
         std::vector<std::uint8_t> filter_value;
-        const std::vector<std::uint8_t> ft = encode_moqint(draft, 0x03);
+        const std::vector<std::uint8_t> ft =
+            encode_moqint(draft, filter_type_value);
         const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
         const std::vector<std::uint8_t> so = encode_moqint(draft, start_object_id);
         filter_value.insert(filter_value.end(), ft.begin(), ft.end());
         filter_value.insert(filter_value.end(), sg.begin(), sg.end());
         filter_value.insert(filter_value.end(), so.begin(), so.end());
+        if (filter_type_value == 0x04) {
+            append_bytes(filter_value, encode_moqint(draft, end_group_id));
+        }
         const std::vector<std::uint8_t> filter_len = encode_moqint(draft, filter_value.size());
         payload.insert(payload.end(), filter_delta.begin(), filter_delta.end());
         payload.insert(payload.end(), filter_len.begin(), filter_len.end());
@@ -757,6 +771,33 @@ std::vector<std::uint8_t> encode_request_update_filter_message(
     }
     append_bytes(payload, encode_moqint(draft, filter.size()));
     payload.insert(payload.end(), filter.begin(), filter.end());
+
+    std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
+    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    message.insert(message.end(), payload.begin(), payload.end());
+    return message;
+}
+
+std::vector<std::uint8_t> encode_request_update_authorization_message(
+    DraftVersion draft,
+    std::uint64_t request_id,
+    std::optional<std::uint64_t> existing_request_id) {
+    std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
+    if (draft == DraftVersion::kDraft16) {
+        append_bytes(payload,
+                     encode_moqint(draft, existing_request_id.value_or(0)));
+    }
+    append_bytes(payload, encode_moqint(draft, 2));
+    std::uint64_t previous_type = 0;
+    for (const std::uint8_t value : {'a', 'b'}) {
+        append_bytes(payload, encode_moqint(draft, 0x03 - previous_type));
+        std::vector<std::uint8_t> token = encode_moqint(draft, 0x03);
+        append_bytes(token, encode_moqint(draft, 0));
+        token.push_back(value);
+        append_bytes(payload, encode_moqint(draft, token.size()));
+        payload.insert(payload.end(), token.begin(), token.end());
+        previous_type = 0x03;
+    }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
     append_be16(message, static_cast<std::uint16_t>(payload.size()));
@@ -1577,6 +1618,46 @@ int main() {
         MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "ascending", 0, DraftVersion::kDraft16,
+            0, 0, 20, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "descending", 0, DraftVersion::kDraft16,
+            0, 0, 20, 2));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "ascending", .group_id = 9, .subgroup_id = 0,
+             .object_id = 0, .marker = 'B'},
+            {.track_name = "ascending", .group_id = 2, .subgroup_id = 0,
+             .object_id = 0, .marker = 'A'},
+            {.track_name = "descending", .group_id = 2, .subgroup_id = 0,
+             .object_id = 0, .marker = 'C'},
+            {.track_name = "descending", .group_id = 9, .subgroup_id = 0,
+             .object_id = 0, .marker = 'D'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected opposite-order fairness session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected opposite-order fairness publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'A', {1, 2, 0, 0}},
+            {'B', {1, 9, 0, 0}},
+            {'C', {3, 2, 0, 0}},
+            {'D', {3, 9, 0, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.object_write_attempts, identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 2, 0, 0},
+                                                      {3, 9, 0, 0},
+                                                      {1, 9, 0, 0},
+                                                      {3, 2, 0, 0}}),
+            "expected fair request tie without comparing opposite group directions");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
             0, 0, 20, 1));
         const PublishPlan plan = make_scheduling_plan({
@@ -1703,6 +1784,52 @@ int main() {
         MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
+            1000, 0, 1, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'H'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 1,
+             .object_id = 0, .marker = 'L'},
+        });
+        bool blocked_high_once = false;
+        transport.on_try_write_object =
+            [&](MockTransport&,
+                const MockTransport::ObjectWriteEvent& event) {
+                if (!blocked_high_once && !event.bytes.empty() &&
+                    event.bytes.back() == 'H') {
+                    blocked_high_once = true;
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kWouldBlock,
+                        "same-request high-priority subgroup blocked"};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected same-request blocked scheduler session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected same-request blocked scheduler publish to succeed");
+        const std::map<std::uint8_t, ScheduledObjectIdentity> identities{
+            {'H', {1, 1, 0, 0}},
+            {'L', {1, 1, 1, 0}},
+        };
+        ok &= expect(
+            scheduled_identities(transport.object_write_attempts,
+                                 identities) ==
+                std::vector<ScheduledObjectIdentity>({{1, 1, 0, 0},
+                                                      {1, 1, 1, 0},
+                                                      {1, 1, 0, 0}}),
+            "expected a blocked subgroup frontier not to hide a lower-priority eligible subgroup in the same request");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "blocked-high", 0, DraftVersion::kDraft16,
             0, 0, 1, 1));
         transport.reads[0].push_back(encode_subscribe_message(
@@ -1758,6 +1885,138 @@ int main() {
                      "expected all-blocked retries not to reset either subgroup");
     }
 
+    for (const DraftVersion draft :
+         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        if (draft == DraftVersion::kDraft16) {
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "stalled-high", 0, draft,
+                0, 0, 1, 1));
+            transport.reads[0].push_back(encode_subscribe_message(
+                3, kTestTrackNamespace, "stalled-low", 0, draft,
+                0, 0, 100, 1));
+        } else {
+            transport.keep_open_streams.insert(1);
+            transport.keep_open_streams.insert(5);
+            transport.reads[3].push_back(encode_draft18_setup_response());
+            transport.reads[0].push_back(
+                encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[1].push_back(encode_subscribe_message(
+                91, kTestTrackNamespace, "stalled-high", 0, draft,
+                0, 0, 1, 1));
+            transport.reads[5].push_back(encode_subscribe_message(
+                93, kTestTrackNamespace, "stalled-low", 0, draft,
+                0, 0, 100, 1));
+        }
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "stalled-high", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'H'},
+            {.track_name = "stalled-low", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'L'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(draft);
+        std::optional<std::uint64_t> low_stream_id;
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                now += std::chrono::milliseconds(600);
+                if (!event.bytes.empty() && event.bytes.back() == 'L') {
+                    low_stream_id = event.stream_id;
+                }
+                if (!current.reset_calls.empty() && !event.bytes.empty() &&
+                    event.bytes.back() == 'H') {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kAccepted, {}};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kWouldBlock,
+                    "permanently blocked until resource eviction"};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected resource-stall session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected persistent all-block resource stall to terminate the lowest-priority subscription");
+        const std::uint64_t expected_reset_code =
+            draft == DraftVersion::kDraft16 ? 0x01 : 0x05;
+        ok &= expect(low_stream_id.has_value() &&
+                         std::find(transport.reset_calls.begin(),
+                                   transport.reset_calls.end(),
+                                   std::pair{*low_stream_id,
+                                             expected_reset_code}) !=
+                             transport.reset_calls.end(),
+                     "expected the lowest-priority blocked subgroup to receive the draft-specific resource reset");
+        const std::uint64_t low_request_id =
+            draft == DraftVersion::kDraft16 ? 3 : 93;
+        const std::uint64_t response_stream_id =
+            draft == DraftVersion::kDraft16 ? 0 : 5;
+        const std::uint64_t too_far_behind =
+            draft == DraftVersion::kDraft16 ? 0x06 : 0x05;
+        const auto expected_done =
+            openmoq::publisher::transport::encode_publish_done_message(
+                draft,
+                low_request_id,
+                1,
+                too_far_behind,
+                "subscriber exceeded publisher resource limit");
+        ok &= expect(std::count_if(
+                         transport.writes.begin(),
+                         transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == response_stream_id &&
+                                    write.bytes == expected_done;
+                         }) == 1,
+                     "expected draft-specific TOO_FAR_BEHIND PUBLISH_DONE on the subscription response stream");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "scale", 0, DraftVersion::kDraft16,
+            0, 0, 10, 1));
+        std::vector<SchedulingObjectSpec> objects;
+        constexpr std::size_t kScaleObjectCount = 128;
+        objects.reserve(kScaleObjectCount);
+        for (std::size_t index = 0; index < kScaleObjectCount; ++index) {
+            objects.push_back({.track_name = "scale",
+                               .group_id = 1,
+                               .subgroup_id = index,
+                               .object_id = 0,
+                               .media_time_us = index,
+                               .marker = static_cast<std::uint8_t>(index)});
+        }
+        const PublishPlan plan = make_scheduling_plan(objects);
+        openmoq::publisher::transport::priority_scheduler_internal::
+            begin_priority_comparison_count_for_testing();
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected retained-heap scale session connect to succeed");
+        status = session.publish(plan);
+        const std::uint64_t comparison_count =
+            openmoq::publisher::transport::priority_scheduler_internal::
+                end_priority_comparison_count_for_testing();
+        ok &= expect(status.ok &&
+                         transport.object_write_attempts.size() ==
+                             kScaleObjectCount,
+                     "expected retained scheduler heap to admit every scale object once");
+        ok &= expect(comparison_count < 5000,
+                     "expected retained scheduler heap to avoid rebuilding all eligible candidates after each admission");
+    }
+
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
@@ -1805,6 +2064,107 @@ int main() {
             scheduled_identities(transport.object_write_attempts, identities) ==
                 std::vector<ScheduledObjectIdentity>({{1, 1, 0, 0}}),
             "expected lower-priority object deadline to age from availability before scheduler selection");
+    }
+
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            5, 0, 1, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 1, .marker = 'B'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 2, .marker = 'C'},
+        });
+        transport.on_try_write_object =
+            [&now](MockTransport&,
+                   const MockTransport::ObjectWriteEvent& event) {
+                if (!event.bytes.empty() && event.bytes.back() == 'A') {
+                    now += std::chrono::milliseconds(10);
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected predecessor-wait object deadline session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected predecessor-wait object deadline publish to succeed");
+        ok &= expect(transport.object_write_attempts.size() == 1 &&
+                         transport.object_write_attempts.front().bytes.back() == 'A',
+                     "expected every provided object deadline to age while its subgroup predecessor runs");
+        ok &= expect(std::any_of(transport.reset_calls.begin(),
+                                 transport.reset_calls.end(),
+                                 [](const auto& reset) {
+                                     return reset.second == 0x02;
+                                 }),
+                     "expected predecessor-aged object expiry to reset its open subgroup");
+    }
+
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 0, DraftVersion::kDraft18,
+            0, 5, 1, 1));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 1, .marker = 'B'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+        transport.on_try_write_object =
+            [&now](MockTransport&,
+                   const MockTransport::ObjectWriteEvent& event) {
+                if (!event.bytes.empty() && event.bytes.back() == 'A') {
+                    now += std::chrono::milliseconds(10);
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected predecessor-wait subgroup deadline session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected predecessor-wait subgroup deadline publish to succeed");
+        ok &= expect(transport.object_write_attempts.size() == 1 &&
+                         transport.object_write_attempts.front().bytes.back() == 'A',
+                     "expected provided subgroup completion deadline to age while its predecessor runs");
+        ok &= expect(std::any_of(transport.reset_calls.begin(),
+                                 transport.reset_calls.end(),
+                                 [](const auto& reset) {
+                                     return reset.second == 0x02;
+                                 }),
+                     "expected predecessor-aged subgroup completion expiry to reset its stream");
     }
 
     {
@@ -1920,7 +2280,13 @@ int main() {
              .object_id = 0, .marker = 'U'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected draft-16 rejected-update session connect to succeed");
         status = session.publish(plan);
@@ -1953,12 +2319,80 @@ int main() {
                      "expected rejected update not to admit subscription objects");
     }
 
+    for (const DraftVersion draft :
+         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+        MockTransport transport;
+        const std::uint64_t subscription_request_id =
+            draft == DraftVersion::kDraft16 ? 1 : 91;
+        const std::uint64_t update_request_id =
+            draft == DraftVersion::kDraft16 ? 3 : 93;
+        const std::uint64_t response_stream_id =
+            draft == DraftVersion::kDraft16 ? 0 : 1;
+        if (draft == DraftVersion::kDraft16) {
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                subscription_request_id,
+                kTestTrackNamespace,
+                "events",
+                1,
+                draft,
+                1000,
+                0,
+                1,
+                1));
+            transport.reads[0].push_back(
+                encode_request_update_authorization_message(
+                    draft, update_request_id, subscription_request_id));
+        } else {
+            transport.reads[3].push_back(encode_draft18_setup_response());
+            transport.reads[0].push_back(
+                encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[1].push_back(encode_subscribe_message(
+                subscription_request_id,
+                kTestTrackNamespace,
+                "events",
+                1,
+                draft,
+                1000,
+                0,
+                1,
+                1));
+            transport.reads[1].push_back(
+                encode_request_update_authorization_message(
+                    draft, update_request_id, std::nullopt));
+        }
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'A'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(draft);
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected repeated-authorization update session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok &&
+                         transport.object_write_attempts.size() == 1,
+                     "expected repeated valid AUTHORIZATION_TOKEN parameters to preserve the subscription");
+        const auto expected_ok =
+            openmoq::publisher::transport::encode_request_ok_message(
+                draft, update_request_id);
+        ok &= expect(std::count_if(
+                         transport.writes.begin(),
+                         transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == response_stream_id &&
+                                    write.bytes == expected_ok;
+                         }) == 1,
+                     "expected repeated valid AUTHORIZATION_TOKEN parameters to receive REQUEST_OK");
+    }
+
     {
         MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
-            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
             1000, 0, 1, 1));
         const PublishPlan plan = make_scheduling_plan({
             {.track_name = "events", .group_id = 1, .subgroup_id = 0,
@@ -2006,7 +2440,7 @@ int main() {
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
         transport.reads[1].push_back(encode_subscribe_message(
-            91, kTestTrackNamespace, "events", 0, DraftVersion::kDraft18,
+            91, kTestTrackNamespace, "events", 1, DraftVersion::kDraft18,
             1000, 0, 1, 1));
         PublishPlan plan = make_scheduling_plan({
             {.track_name = "events", .group_id = 1, .subgroup_id = 0,
@@ -2061,6 +2495,356 @@ int main() {
                          transport.object_write_attempts[0].options.transport_priority <
                              transport.object_write_attempts[1].options.transport_priority,
                      "expected retained draft-18 update to reprioritize the same session-owned object");
+    }
+
+    {
+        MockTransport transport;
+        transport.keep_open_streams.insert(0);
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
+            1000, 0, 1, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'F'},
+        });
+        std::size_t attempts = 0;
+        bool pause_queued = false;
+        std::size_t reads_after_pause = 0;
+        std::size_t attempts_when_resume_queued = 0;
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent&) {
+                ++attempts;
+                if (!pause_queued) {
+                    current.reads[0].push_back(encode_request_update_message(
+                        DraftVersion::kDraft16, 3, 0, 0x10, 1));
+                    pause_queued = true;
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kWouldBlock,
+                        "pause retained candidate"};
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (!pause_queued || stream_id != 0 || ++reads_after_pause != 3) {
+                return;
+            }
+            attempts_when_resume_queued = attempts;
+            current.reads[0].push_back(encode_request_update_message(
+                DraftVersion::kDraft16, 5, 1, 0x10, 1));
+        };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-16 Forward park/resume session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected draft-16 Forward park/resume update sequence to succeed");
+        ok &= expect(attempts_when_resume_queued == 1 && attempts == 2,
+                     "expected draft-16 Forward 1-to-0 to park and 0-to-1 to resume the retained candidate");
+    }
+
+    {
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, DraftVersion::kDraft18,
+            1000, 0, 1, 1));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'F'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+        std::size_t attempts = 0;
+        bool pause_queued = false;
+        std::size_t reads_after_pause = 0;
+        std::size_t attempts_when_resume_queued = 0;
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent&) {
+                ++attempts;
+                if (!pause_queued) {
+                    current.reads[1].push_back(encode_request_update_message(
+                        DraftVersion::kDraft18, 93, 0, 0x10));
+                    pause_queued = true;
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kWouldBlock,
+                        "pause retained candidate"};
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (!pause_queued || stream_id != 1 || ++reads_after_pause != 3) {
+                return;
+            }
+            attempts_when_resume_queued = attempts;
+            current.reads[1].push_back(encode_request_update_message(
+                DraftVersion::kDraft18, 95, 1, 0x10));
+        };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-18 Forward park/resume session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected draft-18 Forward park/resume update sequence to succeed");
+        ok &= expect(attempts_when_resume_queued == 1 && attempts == 2,
+                     "expected draft-18 Forward 1-to-0 to park and 0-to-1 to resume the retained candidate");
+    }
+
+    {
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 0, DraftVersion::kDraft18,
+            1000, 0, 100, 1);
+        append_bytes(coalesced,
+                     encode_request_update_message(
+                         DraftVersion::kDraft18, 93, 7, 0x20));
+        transport.reads[1].push_back(std::move(coalesced));
+
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'C'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected coalesced draft-18 request session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected coalesced SUBSCRIBE and REQUEST_UPDATE frames to succeed");
+        ok &= expect(transport.object_write_attempts.size() == 1 &&
+                         transport.object_write_attempts.front()
+                                 .options.transport_priority ==
+                             openmoq::publisher::transport::
+                                 priority_scheduler_internal::
+                                     object_transport_priority_for_testing(7, 128),
+                     "expected retained coalesced REQUEST_UPDATE to affect first object admission");
+        const auto update_ok =
+            openmoq::publisher::transport::encode_request_ok_message(
+                DraftVersion::kDraft18, 93);
+        ok &= expect(std::count_if(
+                         transport.writes.begin(),
+                         transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == 1 &&
+                                    write.bytes == update_ok;
+                         }) == 1,
+                     "expected exactly one response to the coalesced REQUEST_UPDATE frame");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            2, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'P'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-16 parity session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(!status.ok && transport.last_close_code == 0x04,
+                     "expected draft-16 peer request parity failure to close with INVALID_REQUEST_ID");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
+            0, 0, 20, 1, 0, 0, 0x04, 1));
+        transport.reads[0].push_back(encode_request_update_filter_message(
+            DraftVersion::kDraft16, 3, 1, 0x04, 0, 0, 4));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0,
+             .object_id = 7, .marker = 'E'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-16 end-extension session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected draft-16 subscription end extension to succeed");
+        const auto expected_ok =
+            openmoq::publisher::transport::encode_request_ok_message(
+                DraftVersion::kDraft16, 3, 3, 7);
+        ok &= expect(std::count_if(
+                         transport.writes.begin(),
+                         transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == 0 &&
+                                    write.bytes == expected_ok;
+                         }) == 1,
+                     "expected draft-16 end-extension REQUEST_OK to include current LARGEST_OBJECT");
+    }
+
+    {
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 0, DraftVersion::kDraft18,
+            0, 0, 20, 1, 0, 0, 0x04, 1);
+        append_bytes(coalesced, encode_request_update_filter_message(
+                                    DraftVersion::kDraft18,
+                                    93,
+                                    std::nullopt,
+                                    0x04,
+                                    0,
+                                    0,
+                                    4));
+        transport.reads[1].push_back(std::move(coalesced));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0,
+             .object_id = 7, .marker = 'E'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-18 end-extension session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok,
+                     "expected draft-18 subscription end extension to succeed");
+        const auto expected_ok =
+            openmoq::publisher::transport::encode_request_ok_message(
+                DraftVersion::kDraft18, 93, 3, 7);
+        ok &= expect(std::count_if(
+                         transport.writes.begin(),
+                         transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == 1 &&
+                                    write.bytes == expected_ok;
+                         }) == 1,
+                     "expected draft-18 end-extension REQUEST_OK to include current LARGEST_OBJECT without an id");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'S'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-16 sequence session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(!status.ok && transport.last_close_code == 0x04,
+                     "expected draft-16 skipped peer request id to close with INVALID_REQUEST_ID");
+    }
+
+    {
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            101, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'L'},
+        });
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-16 request-limit session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(!status.ok && transport.last_close_code == 0x07,
+                     "expected draft-16 advertised request limit failure to close with TOO_MANY_REQUESTS");
+    }
+
+    {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            92, kTestTrackNamespace, "events", 0, DraftVersion::kDraft18));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'P'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-18 parity session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(!status.ok && transport.last_close_code == 0x04,
+                     "expected draft-18 peer request parity failure to close with INVALID_REQUEST_ID");
+    }
+
+    {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 0, DraftVersion::kDraft18));
+        transport.reads[5].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 0, DraftVersion::kDraft18));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'D'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected draft-18 duplicate-id session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(!status.ok && transport.last_close_code == 0x04,
+                     "expected duplicate draft-18 peer request id to close with INVALID_REQUEST_ID");
     }
 
     {
@@ -2909,24 +3693,14 @@ int main() {
         ok &= expect(status.ok, "expected draft-18 subgroup-deadline session connect to succeed");
         status = session.publish(make_delivery_deadline_plan(DraftVersion::kDraft18));
         ok &= expect(status.ok, "expected draft-18 final subgroup publication to succeed");
-        ok &= expect(transport.object_write_attempts.size() == 2,
-                     "expected both draft-18 subgroup objects to be admitted");
-        if (transport.object_write_attempts.size() == 2) {
-            const auto& first = transport.object_write_attempts[0];
-            const auto& final = transport.object_write_attempts[1];
-            ok &= expect(!first.options.subgroup_deadline.has_value(),
-                         "expected no subgroup timer before final publication");
-            ok &= expect(final.options.object_deadline ==
-                             Clock::time_point{} + std::chrono::milliseconds(601),
-                         "expected the final object's independent 500 ms deadline");
-            ok &= expect(final.options.subgroup_deadline ==
-                             Clock::time_point{} + std::chrono::milliseconds(201),
-                         "expected subgroup timeout to start at the 101 ms final-publication time");
-        }
-        ok &= expect(std::none_of(transport.reset_calls.begin(),
-                                  transport.reset_calls.end(),
-                                  [](const auto& reset) { return reset.second == 0x02; }),
-                     "expected the session not to substitute close drain for transport ACK monitoring");
+        ok &= expect(transport.object_write_attempts.size() == 1,
+                     "expected final subgroup object to expire while waiting for its predecessor");
+        ok &= expect(std::any_of(transport.reset_calls.begin(),
+                                 transport.reset_calls.end(),
+                                 [](const auto& reset) {
+                                     return reset.second == 0x02;
+                                 }),
+                     "expected the aged subgroup-completion deadline to reset the open stream");
     }
 
     {
@@ -4860,6 +5634,38 @@ int main() {
     }
 
     {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[3].push_back(encode_request_update_message(
+            DraftVersion::kDraft18, 91, 0, 0x10));
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = []() -> std::optional<LiveObject> {
+                return std::nullopt;
+            },
+        };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok,
+                     "expected misplaced live REQUEST_UPDATE session connect to succeed");
+        status = session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(!status.ok &&
+                         status.message ==
+                             "draft-18 request message received on control stream",
+                     "expected live dispatcher to reject draft-18 REQUEST_UPDATE on the control stream");
+        ok &= expect(transport.last_close_code == 0x3,
+                     "expected misplaced live REQUEST_UPDATE to close with PROTOCOL_VIOLATION");
+    }
+
+    {
         MockTransport draft18_forward_update_transport;
         draft18_forward_update_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_forward_update_transport.reads[0].push_back(
@@ -5098,10 +5904,10 @@ int main() {
         status = session.publish_live_objects(source, DraftVersion::kDraft18);
         ok &= expect(!status.ok &&
                          status.message ==
-                             "invalid REQUEST_UPDATE on PUBLISH stream",
-                     "expected REQUEST_UPDATE to require a fresh request id");
-        ok &= expect(transport.last_close_code == 0x3,
-                     "expected reused REQUEST_UPDATE id to close with PROTOCOL_VIOLATION");
+                             "peer request id has invalid parity",
+                     "expected REQUEST_UPDATE to use the peer request-id space");
+        ok &= expect(transport.last_close_code == 0x4,
+                     "expected wrong-parity REQUEST_UPDATE id to close with INVALID_REQUEST_ID");
     }
 
     {
