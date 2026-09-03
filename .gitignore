@@ -49,3 +49,4 @@ openmoq-publisher-trace.csv
 # Stray dtrace-generated probe header (build artifact)
 .tmp.dprobes.h
 .superpowers/
+docs/superpowers
