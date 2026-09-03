@@ -34,7 +34,8 @@ MediaFragment make_fragment(std::string track_name,
                             std::uint64_t start_time_us,
                             std::uint64_t duration_us,
                             std::size_t payload_bytes,
-                            bool keyframe = false) {
+                            bool keyframe = false,
+                            std::optional<std::uint8_t> sap_type = std::nullopt) {
     MediaFragment fragment;
     fragment.group_id = group_id;
     fragment.object_id = object_id;
@@ -42,9 +43,9 @@ MediaFragment make_fragment(std::string track_name,
     fragment.start_time_us = start_time_us;
     fragment.duration_us = duration_us;
     fragment.is_video_keyframe = keyframe;
-    if (fragment.track_name.starts_with("video")) {
+    if (sap_type.has_value() || keyframe) {
         fragment.has_sap_type = true;
-        fragment.sap_type = keyframe ? 2 : 0;
+        fragment.sap_type = sap_type.value_or(2);
     }
     fragment.payload.owned_bytes.assign(payload_bytes,
                                         static_cast<std::uint8_t>(group_id + object_id + 1));
@@ -206,7 +207,8 @@ int main() {
                          LiveMediaAdmission::kShedToKeyframe,
                      "expected persistent video-b classification to suppress deltas until its keyframe");
         ok &= expect(queue.push(make_fragment(
-                         "video-new", 0, 0, 1'000'000, 500'000, 10)) ==
+                         "camera-c", 0, 0, 1'000'000, 500'000, 10,
+                         false, std::uint8_t{0})) ==
                          LiveMediaAdmission::kShedToKeyframe,
                      "expected a video track first seen as a delta during recovery to be suppressed");
         ok &= expect(queue.push(make_fragment(
@@ -218,7 +220,7 @@ int main() {
                          LiveMediaAdmission::kAccepted,
                      "expected video-b admission to resume at its own keyframe");
         ok &= expect(queue.push(make_fragment(
-                         "video-new", 0, 1, 1'200'000, 500'000, 20, true)) ==
+                         "camera-c", 0, 1, 1'200'000, 500'000, 20, true)) ==
                          LiveMediaAdmission::kAccepted,
                      "expected the newly classified video track to resume at its keyframe");
         ok &= expect(queue.queued_bytes() == 90 &&
@@ -238,13 +240,38 @@ int main() {
             ok &= expect(fragments[2].track_name == "video-b" &&
                              fragments[2].is_video_keyframe,
                          "expected video-b's first retained object to be its keyframe");
-            ok &= expect(fragments[3].track_name == "video-new" &&
+            ok &= expect(fragments[3].track_name == "camera-c" &&
                              fragments[3].is_video_keyframe,
                          "expected a newly discovered video's first retained object to be its keyframe");
         }
         ok &= expect(queue.queued_bytes() == 0 &&
                          queue.queued_media_duration() == std::chrono::microseconds(0),
                      "expected exact accounting after draining multi-video recovery");
+    }
+
+    {
+        LiveMediaQueue queue(100, std::chrono::seconds(2));
+        ok &= expect(queue.push(make_fragment(
+                         "camera", 0, 0, 0, 500'000, 60, true)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected delayed-media fixture's old video keyframe");
+        ok &= expect(queue.push(make_fragment(
+                         "camera", 1, 0, 1'000'000, 500'000, 60, true)) ==
+                         LiveMediaAdmission::kShedToKeyframe,
+                     "expected delayed-media fixture to establish a recovery timestamp");
+        ok &= expect(queue.push(make_fragment(
+                         "audio", 0, 0, 500'000, 100'000, 10)) ==
+                         LiveMediaAdmission::kShedToKeyframe,
+                     "expected under-limit delayed audio before the recovery timestamp to be discarded");
+        ok &= expect(queue.push(make_fragment(
+                         "video-looking-audio", 1, 0, 1'000'000,
+                         500'000, 10, false, std::uint8_t{1})) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected SAP-1 audio to remain audio despite a video-looking track name");
+        ok &= expect(queue.queued_bytes() == 70 &&
+                         queue.queued_media_duration() ==
+                             std::chrono::microseconds(500'000),
+                     "expected delayed audio rejection to preserve exact recovered bounds");
     }
 
     {

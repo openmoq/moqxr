@@ -52,15 +52,24 @@ public:
         if (resource_limit_exceeded_) {
             return LiveMediaAdmission::kNoDecodableBoundary;
         }
-        if (role == LiveMediaFragmentRole::kMedia &&
-            (video_tracks_.contains(fragment.track_name) ||
-             is_video_fragment(fragment))) {
-            const auto [track_it, inserted] =
-                video_tracks_.insert(fragment.track_name);
-            if (recovery_started_ && inserted) {
-                awaiting_recovery_keyframe_.insert(*track_it);
+        if (role == LiveMediaFragmentRole::kMedia) {
+            const bool is_video =
+                video_tracks_.contains(fragment.track_name) ||
+                is_video_fragment(fragment);
+            if (is_video) {
+                const auto [track_it, inserted] =
+                    video_tracks_.insert(fragment.track_name);
+                if (recovery_started_ && inserted) {
+                    awaiting_recovery_keyframe_.insert(*track_it);
+                }
             }
-            if (awaiting_recovery_keyframe_.contains(fragment.track_name)) {
+            if (active_recovery_boundary_.has_value() &&
+                fragment.start_time_us <
+                    active_recovery_boundary_->start_time_us) {
+                return LiveMediaAdmission::kShedToKeyframe;
+            }
+            if (is_video &&
+                awaiting_recovery_keyframe_.contains(fragment.track_name)) {
                 if (!fragment.is_video_keyframe) {
                     return LiveMediaAdmission::kShedToKeyframe;
                 }
@@ -108,6 +117,7 @@ public:
         }
         entries_ = std::move(retained);
         recovery_started_ = true;
+        active_recovery_boundary_ = recovery;
         awaiting_recovery_keyframe_ = video_tracks_;
         for (const auto& [track_name, started] : video_started) {
             if (started) {
@@ -278,6 +288,7 @@ private:
     std::deque<Entry> entries_;
     std::set<std::string> video_tracks_;
     std::set<std::string> awaiting_recovery_keyframe_;
+    std::optional<RecoveryBoundary> active_recovery_boundary_;
     std::size_t queued_bytes_ = 0;
     std::chrono::microseconds queued_media_duration_{0};
     bool eof_ = false;
