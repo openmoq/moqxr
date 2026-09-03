@@ -53,7 +53,8 @@ public:
             return LiveMediaAdmission::kNoDecodableBoundary;
         }
         if (role == LiveMediaFragmentRole::kMedia &&
-            is_video_fragment(fragment)) {
+            (video_tracks_.contains(fragment.track_name) ||
+             is_video_fragment(fragment))) {
             const auto [track_it, inserted] =
                 video_tracks_.insert(fragment.track_name);
             if (recovery_started_ && inserted) {

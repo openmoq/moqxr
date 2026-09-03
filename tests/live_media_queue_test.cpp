@@ -199,10 +199,12 @@ int main() {
                          LiveMediaAdmission::kShedToKeyframe,
                      "expected overflow to recover at video-a's next keyframe");
 
-        ok &= expect(queue.push(make_fragment(
-                         "video-b", 1, 0, 1'000'000, 500'000, 10)) ==
+        MediaFragment known_video_delta = make_fragment(
+            "video-b", 1, 0, 1'000'000, 500'000, 10);
+        known_video_delta.has_sap_type = false;
+        ok &= expect(queue.push(std::move(known_video_delta)) ==
                          LiveMediaAdmission::kShedToKeyframe,
-                     "expected video-b deltas to remain suppressed until its keyframe");
+                     "expected persistent video-b classification to suppress deltas until its keyframe");
         ok &= expect(queue.push(make_fragment(
                          "video-new", 0, 0, 1'000'000, 500'000, 10)) ==
                          LiveMediaAdmission::kShedToKeyframe,
