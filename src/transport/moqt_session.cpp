@@ -3669,11 +3669,34 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             if (active.completed || active.forward_paused_by_update ||
                 active.generation_lead_parked ||
                 active.scheduler_frontiers.empty()) {
+                if (trace_enabled()) {
+                    std::cerr << "[moqt-session] enqueue-candidate-skipped track=" << active.track.name
+                              << " request_id=" << request_id
+                              << " completed=" << (active.completed ? 1 : 0)
+                              << " forward_paused=" << (active.forward_paused_by_update ? 1 : 0)
+                              << " generation_lead_parked=" << (active.generation_lead_parked ? 1 : 0)
+                              << " scheduler_frontiers_empty=" << (active.scheduler_frontiers.empty() ? 1 : 0)
+                              << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                              << std::endl;
+                }
                 return;
             }
             auto priority = *active.scheduler_frontiers.begin();
             priority.request_fairness_round = active.scheduling_round;
             priority.request_id = request_id;
+            if (trace_enabled()) {
+                std::cerr << "[moqt-session] enqueue-candidate track=" << active.track.name
+                          << " request_id=" << request_id
+                          << " group=" << priority.group_id
+                          << " object=" << priority.object_id
+                          << " plan_index=" << priority.plan_index
+                          << " media_time_us=" << priority.media_time_us
+                          << " round=" << priority.request_fairness_round
+                          << " generation=" << active.scheduler_generation
+                          << " loop_cycle=" << active.loop_cycle
+                          << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                          << std::endl;
+            }
             eligible_candidates.push({
                 .request_id = request_id,
                 .scheduler_generation = active.scheduler_generation,
@@ -4931,7 +4954,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             frontier_it->second
                                 .object_indices[frontier_it->second.next];
                         const auto& successor = plan.objects[successor_index];
-                        active.scheduler_frontiers.insert({
+                        const auto insert_result = active.scheduler_frontiers.insert({
                             .subscriber_priority =
                                 active.subscribe.subscriber_priority,
                             .publisher_priority = active.publisher_priority,
@@ -4949,6 +4972,16 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             .request_id = selected.request_id,
                             .plan_index = successor_index,
                         });
+                        if (trace_enabled()) {
+                            std::cerr << "[moqt-session] successor-inserted track=" << successor.track_name
+                                      << " group=" << successor.group_id
+                                      << " object=" << successor.object_id
+                                      << " plan_index=" << successor_index
+                                      << " inserted=" << (insert_result.second ? 1 : 0)
+                                      << " scheduler_frontiers_size_after=" << active.scheduler_frontiers.size()
+                                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                                      << std::endl;
+                        }
                     }
                     const bool object_published =
                         serve_result.disposition ==
