@@ -192,9 +192,15 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                      DraftVersion draft,
                                      SubscribeTracksMessage& message);
 bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion draft, SubscribeMessage& message);
+enum class RequestUpdateDecodeError {
+    kNone,
+    kKeyValueFormatting,
+    kSemantic,
+};
 bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                                    DraftVersion draft,
-                                   RequestUpdateMessage& message);
+                                   RequestUpdateMessage& message,
+                                   RequestUpdateDecodeError* error = nullptr);
 bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
                                      SubscribeUpdateMessage& message);
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
