@@ -4787,8 +4787,27 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 while (!eligible_candidates.empty()) {
                     const EligibleCandidate selected = eligible_candidates.top();
                     eligible_candidates.pop();
+                    if (trace_enabled() && selected.priority.group_id >= 60) {
+                        std::cerr << "[moqt-session] candidate-popped request_id=" << selected.request_id
+                                  << " group=" << selected.priority.group_id
+                                  << " object=" << selected.priority.object_id
+                                  << " media_time_us=" << selected.priority.media_time_us
+                                  << " round=" << selected.priority.request_fairness_round
+                                  << " generation=" << selected.scheduler_generation
+                                  << " loop_cycle=" << selected.loop_cycle
+                                  << " eligible_candidates_size_after_pop=" << eligible_candidates.size()
+                                  << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                                  << std::endl;
+                    }
                     auto active_it = active_subscriptions.find(selected.request_id);
                     if (active_it == active_subscriptions.end()) {
+                        if (trace_enabled()) {
+                            std::cerr << "[moqt-session] candidate-no-active-subscription request_id=" << selected.request_id
+                                      << " group=" << selected.priority.group_id
+                                      << " object=" << selected.priority.object_id
+                                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                                      << std::endl;
+                        }
                         continue;
                     }
                     ActiveSubscription& active = active_it->second;
