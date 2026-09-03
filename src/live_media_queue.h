@@ -53,8 +53,18 @@ public:
             return LiveMediaAdmission::kNoDecodableBoundary;
         }
         if (role == LiveMediaFragmentRole::kMedia &&
-            fragment.is_video_keyframe) {
-            video_tracks_.insert(fragment.track_name);
+            is_video_fragment(fragment)) {
+            const auto [track_it, inserted] =
+                video_tracks_.insert(fragment.track_name);
+            if (recovery_started_ && inserted) {
+                awaiting_recovery_keyframe_.insert(*track_it);
+            }
+            if (awaiting_recovery_keyframe_.contains(fragment.track_name)) {
+                if (!fragment.is_video_keyframe) {
+                    return LiveMediaAdmission::kShedToKeyframe;
+                }
+                awaiting_recovery_keyframe_.erase(fragment.track_name);
+            }
         }
 
         entries_.push_back(Entry{std::move(fragment), role});
@@ -96,6 +106,13 @@ public:
             }
         }
         entries_ = std::move(retained);
+        recovery_started_ = true;
+        awaiting_recovery_keyframe_ = video_tracks_;
+        for (const auto& [track_name, started] : video_started) {
+            if (started) {
+                awaiting_recovery_keyframe_.erase(track_name);
+            }
+        }
         apply_bounds(measure(entries_, std::nullopt));
         return LiveMediaAdmission::kShedToKeyframe;
     }
@@ -162,6 +179,12 @@ private:
         return fragment.payload.owned_bytes.empty()
                    ? fragment.payload.span.size
                    : fragment.payload.owned_bytes.size();
+    }
+
+    static bool is_video_fragment(const MediaFragment& fragment) {
+        return fragment.is_video_keyframe ||
+               (fragment.has_sap_type &&
+                (fragment.sap_type == 0 || fragment.sap_type == 2));
     }
 
     bool should_retain(const Entry& entry,
@@ -253,10 +276,12 @@ private:
     mutable std::mutex mutex_;
     std::deque<Entry> entries_;
     std::set<std::string> video_tracks_;
+    std::set<std::string> awaiting_recovery_keyframe_;
     std::size_t queued_bytes_ = 0;
     std::chrono::microseconds queued_media_duration_{0};
     bool eof_ = false;
     bool resource_limit_exceeded_ = false;
+    bool recovery_started_ = false;
 };
 
 namespace transport {

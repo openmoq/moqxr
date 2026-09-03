@@ -42,6 +42,10 @@ MediaFragment make_fragment(std::string track_name,
     fragment.start_time_us = start_time_us;
     fragment.duration_us = duration_us;
     fragment.is_video_keyframe = keyframe;
+    if (fragment.track_name.starts_with("video")) {
+        fragment.has_sap_type = true;
+        fragment.sap_type = keyframe ? 2 : 0;
+    }
     fragment.payload.owned_bytes.assign(payload_bytes,
                                         static_cast<std::uint8_t>(group_id + object_id + 1));
     return fragment;
@@ -174,6 +178,71 @@ int main() {
                          fragments[2].track_name == "audio" &&
                          fragments[2].group_id == 1,
                      "expected delayed older audio to be shed while aligned recovery media remains");
+    }
+
+    {
+        LiveMediaQueue queue(100, std::chrono::seconds(2));
+        ok &= expect(queue.push(
+                         make_fragment("video-a", 0, 0, 0, 500'000, 40, true)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected the first video track's old keyframe to be admitted");
+        ok &= expect(queue.push(
+                         make_fragment("video-b", 0, 0, 0, 500'000, 30, true)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected the second video track's old keyframe to be admitted");
+        ok &= expect(queue.push(
+                         make_fragment("audio", 0, 0, 0, 500'000, 10)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected old aligned audio to be admitted");
+        ok &= expect(queue.push(make_fragment(
+                         "video-a", 1, 0, 1'000'000, 500'000, 40, true)) ==
+                         LiveMediaAdmission::kShedToKeyframe,
+                     "expected overflow to recover at video-a's next keyframe");
+
+        ok &= expect(queue.push(make_fragment(
+                         "video-b", 1, 0, 1'000'000, 500'000, 10)) ==
+                         LiveMediaAdmission::kShedToKeyframe,
+                     "expected video-b deltas to remain suppressed until its keyframe");
+        ok &= expect(queue.push(make_fragment(
+                         "video-new", 0, 0, 1'000'000, 500'000, 10)) ==
+                         LiveMediaAdmission::kShedToKeyframe,
+                     "expected a video track first seen as a delta during recovery to be suppressed");
+        ok &= expect(queue.push(make_fragment(
+                         "audio", 1, 0, 1'000'000, 500'000, 10)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected audio aligned to the recovery boundary to remain admitted");
+        ok &= expect(queue.push(make_fragment(
+                         "video-b", 1, 1, 1'100'000, 500'000, 20, true)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected video-b admission to resume at its own keyframe");
+        ok &= expect(queue.push(make_fragment(
+                         "video-new", 0, 1, 1'200'000, 500'000, 20, true)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected the newly classified video track to resume at its keyframe");
+        ok &= expect(queue.queued_bytes() == 90 &&
+                         queue.queued_media_duration() ==
+                             std::chrono::microseconds(700'000),
+                     "expected suppressed video deltas not to affect recovered queue accounting");
+
+        const std::vector<MediaFragment> fragments = drain(queue);
+        ok &= expect(fragments.size() == 4,
+                     "expected only decodable post-recovery media to remain queued");
+        if (fragments.size() == 4) {
+            ok &= expect(fragments[0].track_name == "video-a" &&
+                             fragments[0].is_video_keyframe,
+                         "expected recovery to begin with video-a's keyframe");
+            ok &= expect(fragments[1].track_name == "audio",
+                         "expected aligned audio to remain in queue order");
+            ok &= expect(fragments[2].track_name == "video-b" &&
+                             fragments[2].is_video_keyframe,
+                         "expected video-b's first retained object to be its keyframe");
+            ok &= expect(fragments[3].track_name == "video-new" &&
+                             fragments[3].is_video_keyframe,
+                         "expected a newly discovered video's first retained object to be its keyframe");
+        }
+        ok &= expect(queue.queued_bytes() == 0 &&
+                         queue.queued_media_duration() == std::chrono::microseconds(0),
+                     "expected exact accounting after draining multi-video recovery");
     }
 
     {
