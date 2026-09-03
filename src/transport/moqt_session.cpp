@@ -3360,6 +3360,15 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             enqueue_active_candidate(request_id, active);
         }
     };
+    const auto erase_active_subscription =
+        [&](std::uint64_t request_id) {
+            const auto active_it = active_subscriptions.find(request_id);
+            if (active_it == active_subscriptions.end()) {
+                return;
+            }
+            active_subscriptions.erase(active_it);
+            resume_generation_leaders();
+        };
 
     const auto process_subscription_request_update =
         [&](const RequestUpdateMessage& update,
@@ -3793,7 +3802,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             }
             for (const std::uint64_t completed_request_id :
                  completed_request_ids) {
-                active_subscriptions.erase(completed_request_id);
+                erase_active_subscription(completed_request_id);
             }
         }
 
@@ -3843,7 +3852,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     if (!finalize_status.ok) {
                         return finalize_status;
                     }
-                    active_subscriptions.erase(active_it);
+                    erase_active_subscription(unsubscribe_request_id);
                     served_any_subscription = true;
                 }
                 buffer.erase(buffer.begin(), buffer.begin() + message_size);
@@ -3898,7 +3907,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     }
                     if (completed_request_ids.contains(
                             *request_update.existing_request_id)) {
-                        active_subscriptions.erase(
+                        erase_active_subscription(
                             *request_update.existing_request_id);
                     }
                     buffer.erase(buffer.begin(), buffer.begin() + message_size);
@@ -4243,7 +4252,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (!finalize_status.ok) {
                     return finalize_status;
                 }
-                active_subscriptions.erase(active_it);
+                erase_active_subscription(request_id);
             }
             if (!completed_request_ids_to_finalize.empty()) {
                 served_any_subscription = true;
@@ -4515,7 +4524,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                 if (!finalize_status.ok) {
                                     return finalize_status;
                                 }
-                                active_subscriptions.erase(victim_it);
+                                erase_active_subscription(victim.request_id);
                                 served_any_subscription = true;
                             }
                             priority_stall_started_at.reset();

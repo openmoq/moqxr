@@ -2635,6 +2635,105 @@ int main() {
             "expected cycles 1 through 3 to retain cycle 2's exact availability origin");
     }
 
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.keep_open_streams.insert(0);
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "leader", 1,
+            DraftVersion::kDraft16, 50, 0, 0, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "lagger", 1,
+            DraftVersion::kDraft16, 50, 0, 255, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "leader", .group_id = 1,
+             .subgroup_id = 0, .object_id = 0, .marker = 'H'},
+            {.track_name = "lagger", .group_id = 1,
+             .subgroup_id = 0, .object_id = 0, .marker = 'L'},
+        });
+        bool lagger_unsubscribe_queued = false;
+        std::size_t empty_reads_after_unsubscribe = 0;
+        transport.on_read =
+            [&](MockTransport& current, std::uint64_t stream_id) {
+                if (stream_id != 0 || !lagger_unsubscribe_queued ||
+                    current.reads.contains(stream_id)) {
+                    return;
+                }
+                ++empty_reads_after_unsubscribe;
+                if (empty_reads_after_unsubscribe == 3) {
+                    current.missing_read_error =
+                        "parked leader was not resumed after lagger removal";
+                }
+            };
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                if (event.bytes.empty() || event.bytes.back() != 'H') {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "lagger advanced before cap-bound removal"};
+                }
+                std::size_t offset = 0;
+                std::uint64_t stream_type = 0;
+                std::uint64_t track_alias = 0;
+                std::uint64_t group_id = 0;
+                if (!decode_varint(event.bytes, offset, stream_type) ||
+                    !decode_varint(event.bytes, offset, track_alias) ||
+                    !decode_varint(event.bytes, offset, group_id)) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "invalid cap-bound leader object header"};
+                }
+                if (group_id < 129) {
+                    now = Clock::time_point{} +
+                          std::chrono::milliseconds((group_id + 1) / 2);
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kAccepted, {}};
+                }
+                if (group_id == 129) {
+                    now = Clock::time_point{} +
+                          std::chrono::milliseconds(1000);
+                    current.reads[0].push_back(encode_unsubscribe_message(
+                        DraftVersion::kDraft16, 3));
+                    lagger_unsubscribe_queued = true;
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kAccepted, {}};
+                }
+                if (group_id == 131 &&
+                    event.options.object_deadline ==
+                        Clock::time_point{} +
+                            std::chrono::milliseconds(1050)) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "cap-bound generation leader resumed"};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kFailed,
+                    "cap-bound leader lost its next generation origin"};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            true,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected cap-bound generation session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(
+            !status.ok &&
+                status.message == "cap-bound generation leader resumed",
+            "expected removing the minimum-cycle request to resume the parked generation leader");
+        ok &= expect(lagger_unsubscribe_queued,
+                     "expected cap-bound test to remove the lagging request");
+    }
+
     for (const DraftVersion draft :
          {DraftVersion::kDraft14, DraftVersion::kDraft17}) {
         MockTransport transport;
