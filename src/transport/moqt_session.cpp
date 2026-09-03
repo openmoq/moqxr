@@ -2343,8 +2343,22 @@ public:
             std::vector<std::uint8_t> wire_bytes;
             const bool opened_stream = stream_it == streams_.end();
             if (opened_stream) {
+                const auto open_started_ms =
+                    trace_enabled() ? trace_elapsed_ms(std::chrono::steady_clock::now()) : 0;
                 TransportStatus status =
                     transport.open_stream(StreamDirection::kUnidirectional, stream_id);
+                if (trace_enabled()) {
+                    const auto open_finished_ms = trace_elapsed_ms(std::chrono::steady_clock::now());
+                    std::cerr << "[moqt-session] open_stream send_seq=" << send_seq
+                              << " track=" << object.track_name
+                              << " group=" << object.group_id
+                              << " subgroup=" << object.subgroup_id
+                              << " started_ms=" << open_started_ms
+                              << " finished_ms=" << open_finished_ms
+                              << " blocked_ms=" << (open_finished_ms - open_started_ms)
+                              << " ok=" << (status.ok ? 1 : 0)
+                              << std::endl;
+                }
                 if (!status.ok) {
                     return {status, ServeDisposition::kSkipped};
                 }
@@ -2445,6 +2459,17 @@ public:
             pending_it->second.fin,
             options);
         if (result.disposition == ObjectWriteDisposition::kWouldBlock) {
+            if (trace_enabled()) {
+                std::cerr << "[moqt-session] wouldblock stream=" << stream_id
+                          << " send_seq=" << send_seq
+                          << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                          << " track=" << object.track_name
+                          << " group=" << object.group_id
+                          << " subgroup=" << object.subgroup_id
+                          << " object=" << object.object_id
+                          << " wire_bytes=" << pending_it->second.wire_bytes.size()
+                          << std::endl;
+            }
             return {TransportStatus::success(), ServeDisposition::kWouldBlock};
         }
         if (result.disposition == ObjectWriteDisposition::kFailed) {
