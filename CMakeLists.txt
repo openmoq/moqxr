@@ -585,6 +585,16 @@ if(OPENMOQ_BUILD_TESTS)
     add_test(NAME openmoq-publisher-pending-media-queue-tests
         COMMAND openmoq-publisher-pending-media-queue-tests)
 
+    add_executable(openmoq-publisher-live-media-queue-tests
+        tests/live_media_queue_test.cpp
+    )
+    target_include_directories(openmoq-publisher-live-media-queue-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(NAME openmoq-publisher-live-media-queue-tests
+        COMMAND openmoq-publisher-live-media-queue-tests)
+
     add_executable(openmoq-publisher-packaging-tests
         tests/cmaf_segmenter_test.cpp
     )

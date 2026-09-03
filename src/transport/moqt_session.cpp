@@ -4,6 +4,7 @@
 #include "openmoq/publisher/live_srt_ingest.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
+#include "../live_media_queue.h"
 
 #include <algorithm>
 #include <array>
@@ -5142,12 +5143,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     remember_catalog_delivery_timeouts({});
     last_catalog_published_at_ = std::chrono::steady_clock::time_point{};
 
-    struct LiveMediaQueue {
-        std::mutex mutex;
-        std::deque<openmoq::publisher::MediaFragment> fragments;
-        bool eof = false;
-    };
-    auto queue = std::make_shared<LiveMediaQueue>();
+    auto queue = std::make_shared<openmoq::publisher::LiveMediaQueue>();
     std::atomic<bool> stop_requested = false;
 
     std::vector<openmoq::publisher::LiveSrtCallerRuntimeConfig> srt_callers;
@@ -5174,9 +5170,11 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     openmoq::publisher::LiveSrtIngestManager srt_manager(
         std::move(srt_callers),
-        [queue](openmoq::publisher::MediaFragment&& fragment) {
-            std::lock_guard<std::mutex> lock(queue->mutex);
-            queue->fragments.push_back(std::move(fragment));
+        [queue, &stop_requested](openmoq::publisher::MediaFragment&& fragment) {
+            if (queue->push(std::move(fragment)) ==
+                openmoq::publisher::LiveMediaAdmission::kNoDecodableBoundary) {
+                stop_requested.store(true, std::memory_order_release);
+            }
         },
         stop_requested);
 
@@ -5200,8 +5198,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     std::thread srt_join_thread([&srt_manager, queue]() {
         srt_manager.join();
-        std::lock_guard<std::mutex> lock(queue->mutex);
-        queue->eof = true;
+        queue->mark_eof();
     });
 
     NamespaceMessage namespace_message{
@@ -5346,15 +5343,21 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     std::set<std::string> subscribed_tracks;
     LargestObjectByTrack largest_object_by_track;
 
+    const auto live_srt_resource_limit_status = []() {
+        return TransportStatus::failure(
+            "live SRT resource limit exceeded: source is too far behind and "
+            "no decodable keyframe boundary exists within 16 MiB/2 s");
+    };
     auto drain_queue = [&]() -> TransportStatus {
         while (true) {
-            openmoq::publisher::MediaFragment fragment;
-            {
-                std::lock_guard<std::mutex> lock(queue->mutex);
-                if (queue->fragments.empty()) break;
-                fragment = std::move(queue->fragments.front());
-                queue->fragments.pop_front();
+            if (queue->resource_limit_exceeded()) {
+                return live_srt_resource_limit_status();
             }
+            std::optional<openmoq::publisher::MediaFragment> queued_fragment =
+                queue->try_pop();
+            if (!queued_fragment.has_value()) break;
+            openmoq::publisher::MediaFragment fragment =
+                std::move(*queued_fragment);
 
             note_largest_live_object(largest_object_by_track,
                                      fragment.track_name,
@@ -5799,11 +5802,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     bool fin = false;
     while (true) {
-        bool is_eof;
-        {
-            std::lock_guard<std::mutex> lock(queue->mutex);
-            is_eof = queue->eof && queue->fragments.empty();
-        }
+        const bool is_eof = queue->done();
 
         status = drain_queue();
         if (!status.ok) {
@@ -5839,6 +5838,9 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     stop_requested = true;
     if (srt_join_thread.joinable()) {
         srt_join_thread.join();
+    }
+    if (status.ok && queue->resource_limit_exceeded()) {
+        status = live_srt_resource_limit_status();
     }
 
     for (auto& [track_name, sender] : sender_by_track) {
