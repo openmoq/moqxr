@@ -1481,6 +1481,53 @@ bool object_matches_filter(const openmoq::publisher::CmsfObject& object, const S
     }
 }
 
+using LargestObjectByTrack =
+    std::map<std::string, std::pair<std::size_t, std::size_t>>;
+
+void note_largest_live_object(LargestObjectByTrack& largest_by_track,
+                              std::string_view track_name,
+                              std::size_t group_id,
+                              std::size_t object_id) {
+    auto [it, inserted] = largest_by_track.try_emplace(
+        std::string(track_name), group_id, object_id);
+    if (!inserted) {
+        it->second = std::max(it->second,
+                              std::pair{group_id, object_id});
+    }
+}
+
+bool live_object_matches_request_union(
+    const openmoq::publisher::CmsfObject& object,
+    openmoq::publisher::DraftVersion draft,
+    const std::map<std::uint64_t, SubscribeMessage>& active_subscriptions,
+    const SubscribeMessage* published_request = nullptr) {
+    if (!uses_priority_scheduler(draft)) {
+        return true;
+    }
+
+    bool has_matching_request = false;
+    for (const auto& [request_id, subscribe] : active_subscriptions) {
+        static_cast<void>(request_id);
+        if (subscribe.track_name != object.track_name) {
+            continue;
+        }
+        has_matching_request = true;
+        if (subscribe.forward != 0 &&
+            object_matches_filter(object, subscribe)) {
+            return true;
+        }
+    }
+    if (published_request != nullptr &&
+        published_request->track_name == object.track_name) {
+        has_matching_request = true;
+        if (published_request->forward != 0 &&
+            object_matches_filter(object, *published_request)) {
+            return true;
+        }
+    }
+    return !has_matching_request;
+}
+
 bool apply_request_update(SubscribeMessage& subscribe,
                           const RequestUpdateMessage& update) {
     if (update.object_delivery_timeout_ms.has_value()) {
@@ -2185,6 +2232,24 @@ public:
         }
     }
 
+    void refresh_unadmitted_deadlines(
+        std::uint64_t group_id,
+        std::uint64_t subgroup_id,
+        std::uint64_t object_id,
+        const std::optional<std::chrono::steady_clock::time_point>&
+            object_deadline,
+        const std::optional<std::chrono::steady_clock::time_point>&
+            subgroup_deadline) {
+        const Key key{group_id, subgroup_id};
+        const auto pending_it = pending_objects_.find(key);
+        if (pending_it == pending_objects_.end() ||
+            pending_it->second.object_id != object_id) {
+            return;
+        }
+        pending_it->second.options.object_deadline = object_deadline;
+        pending_it->second.options.subgroup_deadline = subgroup_deadline;
+    }
+
     TransportStatus cancel_all_open_subgroups(PublisherTransport& transport,
                                               std::uint64_t error_code) {
         observe_transport_expiries(transport);
@@ -2455,6 +2520,7 @@ TransportStatus poll_retained_subscribe_request_updates(
                 "missing draft-18 subscriber request stream");
         }
         auto& pending = pending_bytes[existing_request_id];
+        bool stream_fin = false;
         while (true) {
             std::size_t message_size = 0;
             if (next_control_message(pending, draft, message_size)) {
@@ -2494,6 +2560,15 @@ TransportStatus poll_retained_subscribe_request_updates(
                 continue;
             }
 
+            if (stream_fin) {
+                if (pending.empty()) {
+                    break;
+                }
+                return protocol_violation(
+                    transport,
+                    "truncated REQUEST_UPDATE on retained SUBSCRIBE stream");
+            }
+
             std::vector<std::uint8_t> chunk;
             bool fin = false;
             const TransportStatus read_status = transport.read_stream(
@@ -2510,13 +2585,107 @@ TransportStatus poll_retained_subscribe_request_updates(
                 return read_status;
             }
             pending.insert(pending.end(), chunk.begin(), chunk.end());
-            if (fin && !pending.empty() &&
-                !next_control_message(pending, draft, message_size)) {
-                return protocol_violation(
-                    transport,
-                    "truncated REQUEST_UPDATE on retained SUBSCRIBE stream");
+            stream_fin = fin;
+            if (chunk.empty() && !stream_fin) {
+                break;
             }
-            if (fin || chunk.empty()) {
+        }
+    }
+    return TransportStatus::success();
+}
+
+template <typename ApplyUpdate, typename OnFin>
+TransportStatus poll_retained_publish_request_updates(
+    PublisherTransport& transport,
+    openmoq::publisher::DraftVersion draft,
+    const std::map<std::string, std::uint64_t>& request_ids_by_track,
+    const std::map<std::uint64_t, std::uint64_t>& request_stream_ids,
+    std::map<std::uint64_t, std::vector<std::uint8_t>>& pending_bytes,
+    std::set<std::uint64_t>& terminated_request_ids,
+    PeerRequestIdValidator& peer_request_ids,
+    ApplyUpdate&& apply_update,
+    OnFin&& on_fin) {
+    if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+        return TransportStatus::success();
+    }
+    for (const auto& [track_name, request_id] : request_ids_by_track) {
+        if (terminated_request_ids.contains(request_id)) {
+            continue;
+        }
+        const auto stream_it = request_stream_ids.find(request_id);
+        if (stream_it == request_stream_ids.end()) {
+            return TransportStatus::failure(
+                "missing draft-18 publish request stream");
+        }
+        auto& pending = pending_bytes[request_id];
+        bool stream_fin = false;
+        while (true) {
+            std::size_t message_size = 0;
+            if (next_control_message(pending, draft, message_size)) {
+                const std::vector<std::uint8_t> message_bytes(
+                    pending.begin(),
+                    pending.begin() +
+                        static_cast<std::ptrdiff_t>(message_size));
+                RequestUpdateMessage update;
+                RequestUpdateDecodeError decode_error =
+                    RequestUpdateDecodeError::kNone;
+                if (!decode_request_update_message(
+                        message_bytes, draft, update, &decode_error)) {
+                    return request_update_decode_failure(
+                        transport,
+                        decode_error,
+                        "invalid REQUEST_UPDATE on PUBLISH stream");
+                }
+                if (update.existing_request_id.has_value()) {
+                    return protocol_violation(
+                        transport,
+                        "draft-18 REQUEST_UPDATE carried an existing request id");
+                }
+                const TransportStatus request_id_status =
+                    peer_request_ids.validate(transport, update.request_id);
+                if (!request_id_status.ok) {
+                    return request_id_status;
+                }
+                const TransportStatus update_status = apply_update(
+                    track_name, request_id, stream_it->second, update);
+                if (!update_status.ok) {
+                    return update_status;
+                }
+                pending.erase(
+                    pending.begin(),
+                    pending.begin() +
+                        static_cast<std::ptrdiff_t>(message_size));
+                continue;
+            }
+            if (stream_fin) {
+                if (!pending.empty()) {
+                    return protocol_violation(
+                        transport,
+                        "truncated REQUEST_UPDATE on PUBLISH stream");
+                }
+                terminated_request_ids.insert(request_id);
+                on_fin(track_name, request_id);
+                break;
+            }
+
+            std::vector<std::uint8_t> chunk;
+            bool fin = false;
+            const TransportStatus read_status = transport.read_stream(
+                stream_it->second,
+                chunk,
+                fin,
+                std::chrono::milliseconds(0));
+            if (!read_status.ok) {
+                if (read_status.message ==
+                        "timed out waiting for stream data" ||
+                    read_status.message == "no queued read for stream") {
+                    break;
+                }
+                return read_status;
+            }
+            pending.insert(pending.end(), chunk.begin(), chunk.end());
+            stream_fin = fin;
+            if (chunk.empty() && !stream_fin) {
                 break;
             }
         }
@@ -2641,11 +2810,38 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
 
     const auto apply_update_to_active = [&](ActiveSubscription& active,
                                             const RequestUpdateMessage& update) {
+        const bool deadlines_changed =
+            update.object_delivery_timeout_ms.has_value() ||
+            update.subgroup_delivery_timeout_ms.has_value();
         if (update.forward.has_value()) {
             active.forward_paused_by_update = *update.forward == 0;
         }
         apply_request_update(active.subscribe, update);
         note_delivery_timeouts(transport, active.subscribe.delivery_timeouts);
+
+        if (deadlines_changed) {
+            const DeliveryTimeouts timeouts = timeouts_for_draft(
+                draft, active.subscribe.delivery_timeouts);
+            for (auto& [plan_index, options] :
+                 active.availability_by_object_index) {
+                options.object_deadline = deadline_after(
+                    generation_availability.object_available_at(
+                        active.loop_cycle, plan_index),
+                    timeouts.object_ms);
+                options.subgroup_deadline = deadline_after(
+                    generation_availability.subgroup_completed_at(
+                        active.loop_cycle, plan_index),
+                    timeouts.subgroup_ms);
+                const auto object = make_looped_object(
+                    plan.objects[plan_index], loop_state, active.loop_cycle);
+                active.sender->refresh_unadmitted_deadlines(
+                    object.group_id,
+                    object.subgroup_id,
+                    object.object_id,
+                    options.object_deadline,
+                    options.subgroup_deadline);
+            }
+        }
 
         for (auto sequence_it = active.send_sequence_by_object_index.begin();
              sequence_it != active.send_sequence_by_object_index.end();) {
@@ -5133,6 +5329,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     std::map<std::uint64_t, std::vector<std::uint8_t>>
         pending_subscription_request_bytes;
     std::set<std::string> subscribed_tracks;
+    LargestObjectByTrack largest_object_by_track;
 
     auto drain_queue = [&]() -> TransportStatus {
         while (true) {
@@ -5143,6 +5340,11 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 fragment = std::move(queue->fragments.front());
                 queue->fragments.pop_front();
             }
+
+            note_largest_live_object(largest_object_by_track,
+                                     fragment.track_name,
+                                     fragment.group_id,
+                                     fragment.object_id);
 
             if (!auto_forward_ && !subscribed_tracks.count(fragment.track_name)) {
                 continue;
@@ -5164,6 +5366,12 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 .payload = {},
                 .owned_payload = fragment.payload.owned_bytes,
             };
+            if (!live_object_matches_request_union(
+                    object,
+                    draft_version,
+                    active_subscriptions)) {
+                continue;
+            }
 
             auto& sender = sender_by_track[fragment.track_name];
             const DeliveryTimeouts delivery_timeouts =
@@ -5224,6 +5432,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     transport_,
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
+            const bool end_extended = request_update_extends_end(
+                active_it->second, update);
             const std::string track_name = active_it->second.track_name;
             apply_request_update(active_it->second, update);
             note_delivery_timeouts(
@@ -5255,11 +5465,19 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             } else {
                 subscribed_tracks.erase(track_name);
             }
+            const auto largest_it =
+                largest_object_by_track.find(track_name);
+            const std::vector<std::uint8_t> response =
+                end_extended && largest_it != largest_object_by_track.end()
+                    ? encode_request_ok_message(
+                          draft_version,
+                          update.request_id,
+                          largest_it->second.first,
+                          largest_it->second.second)
+                    : encode_request_ok_message(
+                          draft_version, update.request_id);
             return transport_.write_stream(
-                response_stream_id,
-                encode_request_ok_message(
-                    draft_version, update.request_id),
-                false);
+                response_stream_id, response, false);
         };
 
     auto process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
@@ -5435,6 +5653,18 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 } else if (subscription_forwards_objects(
                                draft_version, subscribe.forward)) {
                     subscribed_tracks.insert(subscribe.track_name);
+                }
+                const TransportStatus retained_update_status =
+                    poll_retained_subscribe_request_updates(
+                        transport_,
+                        draft_version,
+                        active_subscriptions,
+                        active_subscription_stream_ids,
+                        pending_subscription_request_bytes,
+                        peer_request_ids,
+                        apply_subscriber_request_update);
+                if (!retained_update_status.ok) {
+                    return {retained_update_status, 0};
                 }
             }
         }
@@ -6101,6 +6331,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     std::set<std::string> subscribed_tracks;
     std::map<std::string, std::uint64_t> subscribe_tracks_publish_request_ids;
     std::map<std::string, DeliveryTimeouts> published_track_delivery_timeouts;
+    std::map<std::string, SubscribeMessage> published_track_settings;
+    std::map<std::uint64_t, std::vector<std::uint8_t>>
+        pending_publish_request_bytes;
+    std::set<std::uint64_t> terminated_publish_request_ids;
+    LargestObjectByTrack largest_object_by_track;
     std::uint64_t next_subscribe_tracks_publish_request_id = 2;
 
     auto drain_queue = [&]() -> TransportStatus {
@@ -6117,6 +6352,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 fragment = std::move(queue->fragments.front());
                 queue->fragments.pop_front();
             }
+
+            note_largest_live_object(largest_object_by_track,
+                                     fragment.track_name,
+                                     fragment.group_id,
+                                     fragment.object_id);
 
             // In auto-forward mode, publish media immediately even before a downstream
             // SUBSCRIBE arrives. Keep subscription gating for await-subscribe mode.
@@ -6140,6 +6380,17 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 .payload = {},
                 .owned_payload = fragment.payload.owned_bytes,
             };
+            const auto published_settings_it =
+                published_track_settings.find(fragment.track_name);
+            if (!live_object_matches_request_union(
+                    object,
+                    draft_version,
+                    active_subscriptions,
+                    published_settings_it != published_track_settings.end()
+                        ? &published_settings_it->second
+                        : nullptr)) {
+                continue;
+            }
 
             auto& sender = sender_by_track[fragment.track_name];
             const auto publisher_timeout_it =
@@ -6167,7 +6418,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 object, true, stream_per_object, payload, delivery_timeouts,
                 now_function_, &object_published,
                 {.subscriber = subscriber_priority_for_track(
-                     active_subscriptions, fragment.track_name),
+                     active_subscriptions,
+                     fragment.track_name,
+                     published_settings_it != published_track_settings.end()
+                         ? published_settings_it->second.subscriber_priority
+                         : 128),
                  .publisher = 128});
             if (!write_status.ok) {
                 return write_status;
@@ -6219,29 +6474,44 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             };
             PublishOk publish_ok;
             std::uint64_t track_stream_id = 0;
+            const std::uint64_t publish_request_id =
+                next_subscribe_tracks_publish_request_id;
             TransportStatus publish_status =
                 send_request_stream_and_wait(transport_,
                                              draft_version,
                                              encode_track_message(track_message),
                                              true,
                                              &publish_ok,
-                                             &track_stream_id);
+                                             &track_stream_id,
+                                             &pending_publish_request_bytes[
+                                                 publish_request_id]);
             if (!publish_status.ok) {
                 return publish_status;
             }
             published_track_delivery_timeouts.insert_or_assign(
                 track_name, publish_ok.delivery_timeouts);
+            SubscribeMessage settings;
+            settings.request_id = publish_request_id;
+            settings.track_name = track_name;
+            settings.subscriber_priority = publish_ok.subscriber_priority;
+            settings.group_order = publish_ok.group_order;
+            settings.forward = publish_ok.forward;
+            settings.filter_type = publish_ok.filter_type;
+            settings.delivery_timeouts = publish_ok.delivery_timeouts;
+            published_track_settings.insert_or_assign(
+                track_name, settings);
             if (track_name == "catalog") {
                 catalog_delivery_timeouts = merge_delivery_timeouts(
                     catalog_delivery_timeouts, publish_ok.delivery_timeouts);
                 remember_catalog_delivery_timeouts(catalog_delivery_timeouts);
             }
-            subscribe_tracks_publish_request_ids.insert_or_assign(track_name,
-                                                                  next_subscribe_tracks_publish_request_id);
-            publish_stream_id_by_request_id_.insert_or_assign(next_subscribe_tracks_publish_request_id,
-                                                              track_stream_id);
+            subscribe_tracks_publish_request_ids.insert_or_assign(
+                track_name, publish_request_id);
+            publish_stream_id_by_request_id_.insert_or_assign(
+                publish_request_id, track_stream_id);
             std::cerr << "[moqt-session] live: PUBLISH track=" << track_name
-                      << " request_id=" << next_subscribe_tracks_publish_request_id << " (request stream)\n";
+                      << " request_id=" << publish_request_id
+                      << " (request stream)\n";
             next_subscribe_tracks_publish_request_id += 2;
         }
         return TransportStatus::success();
@@ -6271,6 +6541,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     transport_,
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
+            const bool end_extended = request_update_extends_end(
+                active_it->second, update);
             const std::string track_name = active_it->second.track_name;
             apply_request_update(active_it->second, update);
             note_delivery_timeouts(
@@ -6305,18 +6577,88 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             } else {
                 subscribed_tracks.erase(track_name);
             }
+            const auto largest_it =
+                largest_object_by_track.find(track_name);
+            const std::vector<std::uint8_t> response =
+                end_extended && largest_it != largest_object_by_track.end()
+                    ? encode_request_ok_message(
+                          draft_version,
+                          update.request_id,
+                          largest_it->second.first,
+                          largest_it->second.second)
+                    : encode_request_ok_message(
+                          draft_version, update.request_id);
             return transport_.write_stream(
-                response_stream_id,
-                encode_request_ok_message(
-                    draft_version, update.request_id),
-                false);
+                response_stream_id, response, false);
         };
+
+    const auto process_publish_request_updates = [&]() -> TransportStatus {
+        return poll_retained_publish_request_updates(
+            transport_,
+            draft_version,
+            subscribe_tracks_publish_request_ids,
+            publish_stream_id_by_request_id_,
+            pending_publish_request_bytes,
+            terminated_publish_request_ids,
+            peer_request_ids,
+            [&](const std::string& track_name,
+                std::uint64_t request_id,
+                std::uint64_t response_stream_id,
+                const RequestUpdateMessage& update) -> TransportStatus {
+                static_cast<void>(request_id);
+                if (update.new_group_request.has_value()) {
+                    return protocol_violation(
+                        transport_,
+                        "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
+                }
+                const auto settings_it =
+                    published_track_settings.find(track_name);
+                if (settings_it == published_track_settings.end()) {
+                    return TransportStatus::failure(
+                        "missing settings for draft-18 PUBLISH request");
+                }
+                const bool end_extended = request_update_extends_end(
+                    settings_it->second, update);
+                apply_request_update(settings_it->second, update);
+                published_track_delivery_timeouts.insert_or_assign(
+                    track_name, settings_it->second.delivery_timeouts);
+                note_delivery_timeouts(
+                    transport_, settings_it->second.delivery_timeouts);
+                if (settings_it->second.forward != 0) {
+                    subscribed_tracks.insert(track_name);
+                } else {
+                    subscribed_tracks.erase(track_name);
+                }
+                const auto largest_it =
+                    largest_object_by_track.find(track_name);
+                const std::vector<std::uint8_t> response =
+                    end_extended &&
+                            largest_it != largest_object_by_track.end()
+                        ? encode_request_ok_message(
+                              draft_version,
+                              update.request_id,
+                              largest_it->second.first,
+                              largest_it->second.second)
+                        : encode_request_ok_message(
+                              draft_version, update.request_id);
+                return transport_.write_stream(
+                    response_stream_id, response, false);
+            },
+            [&](const std::string& track_name, std::uint64_t request_id) {
+                static_cast<void>(track_name);
+                static_cast<void>(request_id);
+            });
+    };
 
     // Helper: process pending SUBSCRIBE/SUBSCRIBE_NAMESPACE messages
     // from the control stream. Returns the number of new subscriptions accepted.
     auto process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
         std::size_t new_subs = 0;
-        TransportStatus update_status =
+        TransportStatus update_status = process_publish_request_updates();
+        if (!update_status.ok) {
+            return {update_status, 0};
+        }
+        update_status =
             poll_retained_subscribe_request_updates(
                 transport_,
                 draft_version,
@@ -6451,6 +6793,18 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                    draft_version, subscribe.forward)) {
                         subscribed_tracks.insert(subscribe.track_name);
                     }
+                    const TransportStatus retained_update_status =
+                        poll_retained_subscribe_request_updates(
+                            transport_,
+                            draft_version,
+                            active_subscriptions,
+                            active_subscription_stream_ids,
+                            pending_subscription_request_bytes,
+                            peer_request_ids,
+                            apply_subscriber_request_update);
+                    if (!retained_update_status.ok) {
+                        return {retained_update_status, 0};
+                    }
                     continue;
                 }
 
@@ -6523,6 +6877,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 }
 
                 TransportStatus publish_status = publish_live_tracks_for_subscribe_tracks();
+                if (!publish_status.ok) {
+                    return {publish_status, 0};
+                }
+                publish_status = process_publish_request_updates();
                 if (!publish_status.ok) {
                     return {publish_status, 0};
                 }
@@ -6728,6 +7086,13 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!preannounce_status.ok) {
                 std::cerr << "[moqt-session] live: forward-mode PUBLISH preannounce failed ("
                           << preannounce_status.message << "); continuing without it\n";
+            } else {
+                const TransportStatus update_status =
+                    process_publish_request_updates();
+                if (!update_status.ok) {
+                    join_stdin_thread();
+                    return update_status;
+                }
             }
         }
         std::optional<std::chrono::steady_clock::time_point> eof_deadline;
@@ -7094,6 +7459,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     std::map<std::string, SubscribeMessage> published_track_settings;
     std::map<std::uint64_t, std::vector<std::uint8_t>> pending_publish_request_bytes;
     std::set<std::uint64_t> terminated_publish_request_ids;
+    LargestObjectByTrack largest_object_by_track;
     std::uint64_t next_publish_request_id = 2;
 
     auto publish_tracks = [&]() -> TransportStatus {
@@ -7245,15 +7611,26 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
 
+            const bool end_extended = request_update_extends_end(
+                active_it->second, update);
             const std::string track_name = active_it->second.track_name;
             apply_request_update(active_it->second, update);
             note_delivery_timeouts(
                 transport_, active_it->second.delivery_timeouts);
             refresh_subscriber_forward_permission(track_name);
+            const auto largest_it =
+                largest_object_by_track.find(track_name);
+            const std::vector<std::uint8_t> response =
+                end_extended && largest_it != largest_object_by_track.end()
+                    ? encode_request_ok_message(
+                          draft_version,
+                          update.request_id,
+                          largest_it->second.first,
+                          largest_it->second.second)
+                    : encode_request_ok_message(
+                          draft_version, update.request_id);
             return transport_.write_stream(
-                response_stream_id,
-                encode_request_ok_message(draft_version, update.request_id),
-                false);
+                response_stream_id, response, false);
         };
 
     const auto process_subscriber_request_updates = [&]() -> TransportStatus {
@@ -7268,97 +7645,57 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     };
 
     auto process_publish_request_updates = [&]() -> TransportStatus {
-        if (draft_version != openmoq::publisher::DraftVersion::kDraft18) {
-            return TransportStatus::success();
-        }
-        for (const auto& [track_name, request_id] : published_track_request_ids) {
-            if (terminated_publish_request_ids.contains(request_id)) {
-                continue;
-            }
-            const auto stream_it = publish_stream_id_by_request_id_.find(request_id);
-            if (stream_it == publish_stream_id_by_request_id_.end()) {
-                return TransportStatus::failure("missing draft-18 publish request stream");
-            }
-            auto& pending = pending_publish_request_bytes[request_id];
-            while (true) {
-                std::size_t message_size = 0;
-                if (next_control_message(pending, draft_version, message_size)) {
-                    const std::vector<std::uint8_t> message_bytes(
-                        pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(message_size));
-                    RequestUpdateMessage update;
-                    RequestUpdateDecodeError decode_error =
-                        RequestUpdateDecodeError::kNone;
-                    if (!decode_request_update_message(
-                            message_bytes, draft_version, update,
-                            &decode_error)) {
-                        return request_update_decode_failure(
-                            transport_, decode_error,
-                            "invalid REQUEST_UPDATE on PUBLISH stream");
-                    }
-                    if (update.existing_request_id.has_value()) {
-                        return protocol_violation(
-                            transport_,
-                            "draft-18 REQUEST_UPDATE carried an existing request id");
-                    }
-                    const TransportStatus request_id_status =
-                        peer_request_ids.validate(transport_, update.request_id);
-                    if (!request_id_status.ok) {
-                        return request_id_status;
-                    }
-                    if (update.new_group_request.has_value()) {
-                        return protocol_violation(
-                            transport_,
-                            "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
-                    }
-                    const auto settings_it = published_track_settings.find(track_name);
-                    if (settings_it == published_track_settings.end()) {
-                        return TransportStatus::failure(
-                            "missing settings for draft-18 PUBLISH request");
-                    }
-                    apply_request_update(settings_it->second, update);
-                    published_track_delivery_timeouts.insert_or_assign(
-                        track_name, settings_it->second.delivery_timeouts);
-                    note_delivery_timeouts(
-                        transport_, settings_it->second.delivery_timeouts);
-                    if (settings_it->second.forward == 0) {
-                            subscribed_tracks.erase(track_name);
-                    } else {
-                        subscribed_tracks.insert(track_name);
-                    }
-                    const TransportStatus response_status =
-                        transport_.write_stream(stream_it->second,
-                                                encode_request_ok_message(
-                                                    draft_version, update.request_id),
-                                                false);
-                    if (!response_status.ok) {
-                        return response_status;
-                    }
-                    pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(message_size));
-                    continue;
+        return poll_retained_publish_request_updates(
+            transport_,
+            draft_version,
+            published_track_request_ids,
+            publish_stream_id_by_request_id_,
+            pending_publish_request_bytes,
+            terminated_publish_request_ids,
+            peer_request_ids,
+            [&](const std::string& track_name,
+                std::uint64_t request_id,
+                std::uint64_t response_stream_id,
+                const RequestUpdateMessage& update) -> TransportStatus {
+                static_cast<void>(request_id);
+                if (update.new_group_request.has_value()) {
+                    return protocol_violation(
+                        transport_,
+                        "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
                 }
-
-                std::vector<std::uint8_t> chunk;
-                bool fin = false;
-                const TransportStatus read_status =
-                    transport_.read_stream(stream_it->second, chunk, fin, std::chrono::milliseconds(0));
-                if (!read_status.ok) {
-                    if (read_status.message == "timed out waiting for stream data" ||
-                        read_status.message == "no queued read for stream") {
-                        break;
-                    }
-                    return read_status;
+                const auto settings_it =
+                    published_track_settings.find(track_name);
+                if (settings_it == published_track_settings.end()) {
+                    return TransportStatus::failure(
+                        "missing settings for draft-18 PUBLISH request");
                 }
-                pending.insert(pending.end(), chunk.begin(), chunk.end());
-                if (fin && pending.empty()) {
-                    subscribed_tracks.erase(track_name);
-                    break;
-                }
-                if (fin && !next_control_message(pending, draft_version, message_size)) {
-                    return protocol_violation(transport_, "truncated REQUEST_UPDATE on PUBLISH stream");
-                }
-            }
-        }
-        return TransportStatus::success();
+                const bool end_extended = request_update_extends_end(
+                    settings_it->second, update);
+                apply_request_update(settings_it->second, update);
+                published_track_delivery_timeouts.insert_or_assign(
+                    track_name, settings_it->second.delivery_timeouts);
+                note_delivery_timeouts(
+                    transport_, settings_it->second.delivery_timeouts);
+                refresh_subscriber_forward_permission(track_name);
+                const auto largest_it =
+                    largest_object_by_track.find(track_name);
+                const std::vector<std::uint8_t> response =
+                    end_extended &&
+                            largest_it != largest_object_by_track.end()
+                        ? encode_request_ok_message(
+                              draft_version,
+                              update.request_id,
+                              largest_it->second.first,
+                              largest_it->second.second)
+                        : encode_request_ok_message(
+                              draft_version, update.request_id);
+                return transport_.write_stream(
+                    response_stream_id, response, false);
+            },
+            [&](const std::string& track_name, std::uint64_t request_id) {
+                static_cast<void>(track_name);
+                static_cast<void>(request_id);
+            });
     };
 
     auto process_control_messages = [&]() -> TransportStatus {
@@ -7433,6 +7770,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     pending_subscription_request_bytes.insert_or_assign(
                         subscribe.request_id,
                         std::move(trailing_request_bytes));
+                    const TransportStatus retained_update_status =
+                        process_subscriber_request_updates();
+                    if (!retained_update_status.ok) {
+                        return retained_update_status;
+                    }
                     continue;
                 }
                 if (request_type == 0x50) {
@@ -7778,6 +8120,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         if (alias_it == alias_by_track.end()) {
             return TransportStatus::failure("live object references unknown track: " + next->track_name);
         }
+        note_largest_live_object(largest_object_by_track,
+                                 next->track_name,
+                                 next->group_id,
+                                 next->object_id);
         if (next->track_name == "catalog") {
             retained_source_catalog = std::move(*next);
             status = send_retained_catalog();
@@ -7816,8 +8162,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         };
         const auto published_settings_it =
             published_track_settings.find(next->track_name);
-        if (published_settings_it != published_track_settings.end() &&
-            !object_matches_filter(object, published_settings_it->second)) {
+        if (!live_object_matches_request_union(
+                object,
+                draft_version,
+                active_subscriptions,
+                published_settings_it != published_track_settings.end()
+                    ? &published_settings_it->second
+                    : nullptr)) {
             continue;
         }
         const std::uint64_t send_seq = next_send_seq();
