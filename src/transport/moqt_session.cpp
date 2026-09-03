@@ -1957,6 +1957,14 @@ void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
                                 ActiveSubscription& active,
                                 openmoq::publisher::DraftVersion draft,
                                 GenerationAvailability& availability) {
+    if (trace_enabled()) {
+        std::cerr << "[moqt-session] rebuild-frontiers track=" << active.track.name
+                  << " old_generation=" << active.scheduler_generation
+                  << " new_generation=" << (active.scheduler_generation + 1)
+                  << " admitted_count=" << active.admitted_object_indices.size()
+                  << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                  << std::endl;
+    }
     ++active.scheduler_generation;
     active.subgroup_frontiers.clear();
     active.scheduler_frontiers.clear();
@@ -4768,6 +4776,22 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         selected.priority.request_fairness_round !=
                             active.scheduling_round ||
                         active.scheduler_frontiers.empty()) {
+                        if (trace_enabled()) {
+                            std::cerr << "[moqt-session] candidate-discarded track=" << active.track.name
+                                      << " request_id=" << selected.request_id
+                                      << " plan_index=" << selected.plan_index
+                                      << " completed=" << (active.completed ? 1 : 0)
+                                      << " forward_paused=" << (active.forward_paused_by_update ? 1 : 0)
+                                      << " selected_gen=" << selected.scheduler_generation
+                                      << " active_gen=" << active.scheduler_generation
+                                      << " selected_loop_cycle=" << selected.loop_cycle
+                                      << " active_loop_cycle=" << active.loop_cycle
+                                      << " selected_round=" << selected.priority.request_fairness_round
+                                      << " active_round=" << active.scheduling_round
+                                      << " scheduler_frontiers_empty=" << (active.scheduler_frontiers.empty() ? 1 : 0)
+                                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                                      << std::endl;
+                        }
                         continue;
                     }
                     auto selected_frontier_key = selected.priority;
@@ -4777,6 +4801,16 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             selected_frontier_key);
                     if (scheduler_frontier_it ==
                         active.scheduler_frontiers.end()) {
+                        if (trace_enabled()) {
+                            std::cerr << "[moqt-session] candidate-frontier-missing track=" << active.track.name
+                                      << " request_id=" << selected.request_id
+                                      << " plan_index=" << selected.plan_index
+                                      << " group=" << selected.priority.group_id
+                                      << " object=" << selected.priority.object_id
+                                      << " scheduler_frontiers_size=" << active.scheduler_frontiers.size()
+                                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                                      << std::endl;
+                        }
                         continue;
                     }
                     attempted_eligible_candidate = true;
