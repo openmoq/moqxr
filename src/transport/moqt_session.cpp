@@ -2048,16 +2048,38 @@ bool advance_subscription_to_next_loop_object(const openmoq::publisher::PublishP
         *generation_lead_parked = false;
     }
     if (!loop_state.enabled || !track_can_loop(loop_state, active.track.name)) {
+        if (trace_enabled()) {
+            std::cerr << "[moqt-session] loop-advance track=" << active.track.name
+                      << " outcome=cannot-loop"
+                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                      << std::endl;
+        }
         return false;
     }
 
     const TrackLoopInfo* info = find_track_loop_info(loop_state, active.track.name);
     if (info == nullptr || !info->has_loopable_objects) {
+        if (trace_enabled()) {
+            std::cerr << "[moqt-session] loop-advance track=" << active.track.name
+                      << " outcome=no-loop-info"
+                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                      << std::endl;
+        }
         return false;
     }
 
     std::size_t next_object_index = 0;
     if (!find_next_matching_object_index(plan, active.subscribe, info->first_loop_object_index, next_object_index)) {
+        if (trace_enabled()) {
+            std::cerr << "[moqt-session] loop-advance track=" << active.track.name
+                      << " outcome=no-matching-object"
+                      << " first_loop_object_index=" << info->first_loop_object_index
+                      << " subscribe_start_group=" << active.subscribe.start_group_id
+                      << " subscribe_start_object=" << active.subscribe.start_object_id
+                      << " subscribe_filter_type=" << static_cast<int>(active.subscribe.filter_type)
+                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                      << std::endl;
+        }
         return false;
     }
 
@@ -2066,8 +2088,26 @@ bool advance_subscription_to_next_loop_object(const openmoq::publisher::PublishP
         if (generation_lead_parked != nullptr) {
             *generation_lead_parked = true;
         }
+        if (trace_enabled()) {
+            std::cerr << "[moqt-session] loop-advance track=" << active.track.name
+                      << " outcome=lead-parked"
+                      << " active_loop_cycle=" << active.loop_cycle
+                      << " maximum_loop_cycle=" << *maximum_loop_cycle
+                      << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                      << std::endl;
+        }
         active.completed = false;
         return true;
+    }
+
+    if (trace_enabled()) {
+        std::cerr << "[moqt-session] loop-advance track=" << active.track.name
+                  << " outcome=advanced"
+                  << " from_loop_cycle=" << active.loop_cycle
+                  << " to_loop_cycle=" << (active.loop_cycle + 1)
+                  << " next_object_index=" << next_object_index
+                  << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                  << std::endl;
     }
 
     ++active.loop_cycle;
