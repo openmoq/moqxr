@@ -5143,8 +5143,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     remember_catalog_delivery_timeouts({});
     last_catalog_published_at_ = std::chrono::steady_clock::time_point{};
 
-    auto queue = std::make_shared<openmoq::publisher::LiveMediaQueue>();
     std::atomic<bool> stop_requested = false;
+    auto queue = std::make_shared<LiveSrtQueueAdapter>(stop_requested);
 
     std::vector<openmoq::publisher::LiveSrtCallerRuntimeConfig> srt_callers;
     srt_callers.reserve(ingest.srt_callers.size());
@@ -5170,11 +5170,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     openmoq::publisher::LiveSrtIngestManager srt_manager(
         std::move(srt_callers),
-        [queue, &stop_requested](openmoq::publisher::MediaFragment&& fragment) {
-            if (queue->push(std::move(fragment)) ==
-                openmoq::publisher::LiveMediaAdmission::kNoDecodableBoundary) {
-                stop_requested.store(true, std::memory_order_release);
-            }
+        [queue](openmoq::publisher::MediaFragment&& fragment) {
+            queue->admit(std::move(fragment));
         },
         stop_requested);
 
@@ -5343,15 +5340,12 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     std::set<std::string> subscribed_tracks;
     LargestObjectByTrack largest_object_by_track;
 
-    const auto live_srt_resource_limit_status = []() {
-        return TransportStatus::failure(
-            "live SRT resource limit exceeded: source is too far behind and "
-            "no decodable keyframe boundary exists within 16 MiB/2 s");
-    };
     auto drain_queue = [&]() -> TransportStatus {
         while (true) {
-            if (queue->resource_limit_exceeded()) {
-                return live_srt_resource_limit_status();
+            const TransportStatus queue_status =
+                queue->publishing_status(TransportStatus::success());
+            if (!queue_status.ok) {
+                return queue_status;
             }
             std::optional<openmoq::publisher::MediaFragment> queued_fragment =
                 queue->try_pop();
@@ -5839,9 +5833,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     if (srt_join_thread.joinable()) {
         srt_join_thread.join();
     }
-    if (status.ok && queue->resource_limit_exceeded()) {
-        status = live_srt_resource_limit_status();
-    }
+    status = queue->publishing_status(std::move(status));
 
     for (auto& [track_name, sender] : sender_by_track) {
         const DeliveryTimeouts delivery_timeouts =

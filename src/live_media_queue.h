@@ -1,8 +1,10 @@
 #pragma once
 
 #include "openmoq/publisher/cmaf_segmenter.h"
+#include "openmoq/publisher/transport/publisher_transport.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace openmoq::publisher {
@@ -61,25 +64,21 @@ public:
             return LiveMediaAdmission::kAccepted;
         }
 
-        bool has_discardable_media_before = false;
         std::optional<RecoveryBoundary> recovery;
-        for (std::size_t index = 0; index < entries_.size(); ++index) {
-            const Entry& entry = entries_[index];
-            if (entry.role != LiveMediaFragmentRole::kMedia) {
-                continue;
+        std::set<std::uint64_t> recovery_timestamps;
+        for (const Entry& entry : entries_) {
+            if (entry.role == LiveMediaFragmentRole::kMedia &&
+                entry.fragment.is_video_keyframe) {
+                recovery_timestamps.insert(entry.fragment.start_time_us);
             }
-            if (entry.fragment.is_video_keyframe &&
-                has_discardable_media_before) {
-                const RecoveryBoundary candidate{
-                    .start_time_us = entry.fragment.start_time_us,
-                };
-                const QueueBounds candidate_bounds = measure(entries_, candidate);
-                if (within_limits(candidate_bounds)) {
-                    recovery = candidate;
-                    break;
-                }
+        }
+        for (const std::uint64_t timestamp : recovery_timestamps) {
+            const RecoveryBoundary candidate{.start_time_us = timestamp};
+            const QueueBounds candidate_bounds = measure(entries_, candidate);
+            if (within_limits(candidate_bounds)) {
+                recovery = candidate;
+                break;
             }
-            has_discardable_media_before = true;
         }
 
         if (!recovery.has_value()) {
@@ -156,6 +155,7 @@ private:
         std::size_t bytes = 0;
         std::chrono::microseconds media_duration{0};
         bool bytes_overflow = false;
+        bool media_time_overflow = false;
     };
 
     static std::size_t fragment_payload_size(const MediaFragment& fragment) {
@@ -214,12 +214,15 @@ private:
                                                 entry.fragment.start_time_us)
                                    : std::optional<std::uint64_t>(
                                          entry.fragment.start_time_us);
-            const std::uint64_t media_end =
+            const bool media_end_overflow =
                 entry.fragment.duration_us >
-                        (std::numeric_limits<std::uint64_t>::max)() -
-                            entry.fragment.start_time_us
-                    ? (std::numeric_limits<std::uint64_t>::max)()
-                    : entry.fragment.start_time_us + entry.fragment.duration_us;
+                (std::numeric_limits<std::uint64_t>::max)() -
+                    entry.fragment.start_time_us;
+            bounds.media_time_overflow |= media_end_overflow;
+            const std::uint64_t media_end = media_end_overflow
+                                                ? (std::numeric_limits<std::uint64_t>::max)()
+                                                : entry.fragment.start_time_us +
+                                                      entry.fragment.duration_us;
             last_media_end = (std::max)(last_media_end, media_end);
         }
 
@@ -235,7 +238,8 @@ private:
     }
 
     bool within_limits(const QueueBounds& bounds) const {
-        return !bounds.bytes_overflow && bounds.bytes <= max_bytes_ &&
+        return !bounds.bytes_overflow && !bounds.media_time_overflow &&
+               bounds.bytes <= max_bytes_ &&
                bounds.media_duration <= max_media_duration_;
     }
 
@@ -254,5 +258,53 @@ private:
     bool eof_ = false;
     bool resource_limit_exceeded_ = false;
 };
+
+namespace transport {
+
+inline constexpr std::string_view kLiveSrtResourceLimitDiagnostic =
+    "live SRT resource limit exceeded: source is too far behind and "
+    "no decodable keyframe boundary exists within 16 MiB/2 s";
+
+class LiveSrtQueueAdapter {
+public:
+    explicit LiveSrtQueueAdapter(std::atomic<bool>& stop_requested)
+        : stop_requested_(stop_requested) {}
+
+    LiveMediaAdmission admit(MediaFragment fragment) {
+        const LiveMediaAdmission admission = queue_.push(std::move(fragment));
+        if (admission == LiveMediaAdmission::kNoDecodableBoundary) {
+            stop_requested_.store(true, std::memory_order_release);
+        }
+        return admission;
+    }
+
+    std::optional<MediaFragment> try_pop() {
+        return queue_.try_pop();
+    }
+
+    void mark_eof() {
+        queue_.mark_eof();
+    }
+
+    bool done() const {
+        return queue_.done();
+    }
+
+    TransportStatus publishing_status(TransportStatus current_status) const {
+        if (!current_status.ok || !queue_.resource_limit_exceeded()) {
+            return current_status;
+        }
+        return TransportStatus{
+            .ok = false,
+            .message = std::string(kLiveSrtResourceLimitDiagnostic),
+        };
+    }
+
+private:
+    std::atomic<bool>& stop_requested_;
+    LiveMediaQueue queue_;
+};
+
+}  // namespace transport
 
 }  // namespace openmoq::publisher

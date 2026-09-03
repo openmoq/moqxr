@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -16,6 +17,8 @@ using openmoq::publisher::LiveMediaAdmission;
 using openmoq::publisher::LiveMediaFragmentRole;
 using openmoq::publisher::LiveMediaQueue;
 using openmoq::publisher::MediaFragment;
+using openmoq::publisher::transport::LiveSrtQueueAdapter;
+using openmoq::publisher::transport::TransportStatus;
 
 bool expect(bool condition, const std::string& message) {
     if (!condition) {
@@ -146,6 +149,34 @@ int main() {
     }
 
     {
+        LiveMediaQueue queue(100, std::chrono::seconds(2));
+        ok &= expect(queue.push(make_fragment("init", 0, 0, 0, 0, 10),
+                                LiveMediaFragmentRole::kInitialization) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected delayed-audio fixture initialization to be admitted");
+        ok &= expect(queue.push(
+                         make_fragment("video", 1, 0, 2'000'000, 500'000, 40, true)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected the recovery keyframe to arrive before delayed old audio");
+        ok &= expect(queue.push(
+                         make_fragment("audio", 1, 0, 2'000'000, 500'000, 20)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected aligned audio at the recovery timestamp to be admitted");
+        ok &= expect(queue.push(
+                         make_fragment("audio", 0, 0, 0, 500'000, 40)) ==
+                         LiveMediaAdmission::kShedToKeyframe,
+                     "expected a prior keyframe to remain a valid timestamp recovery boundary");
+
+        const std::vector<MediaFragment> fragments = drain(queue);
+        ok &= expect(fragments.size() == 3 && fragments[0].track_name == "init" &&
+                         fragments[1].track_name == "video" &&
+                         fragments[1].is_video_keyframe &&
+                         fragments[2].track_name == "audio" &&
+                         fragments[2].group_id == 1,
+                     "expected delayed older audio to be shed while aligned recovery media remains");
+    }
+
+    {
         LiveMediaQueue bytes_only(100, std::chrono::seconds(2));
         ok &= expect(bytes_only.push(
                          make_fragment("video", 0, 0, 0, 500'000, 80, true)) ==
@@ -165,6 +196,18 @@ int main() {
                          make_fragment("audio", 0, 0, 2'000'000, 1, 10)) ==
                          LiveMediaAdmission::kNoDecodableBoundary,
                      "expected duration overflow alone to enforce the literal 2-second bound");
+    }
+
+    {
+        LiveMediaQueue queue(100, std::chrono::seconds(2));
+        ok &= expect(queue.push(make_fragment(
+                         "video", 0, 0,
+                         (std::numeric_limits<std::uint64_t>::max)() - 100,
+                         2'000'001, 10, true)) ==
+                         LiveMediaAdmission::kNoDecodableBoundary,
+                     "expected timestamp addition overflow never to understate media span");
+        ok &= expect(queue.queued_bytes() == 0 && queue.resource_limit_exceeded(),
+                     "expected overflowing media time to leave the valid queue unchanged");
     }
 
     {
@@ -227,6 +270,33 @@ int main() {
         ok &= expect(producer_ok.load(std::memory_order_acquire) &&
                          consumed == kFragmentCount && queue.queued_bytes() == 0,
                      "expected concurrent producer/consumer accounting to remain exact");
+    }
+
+    {
+        std::atomic<bool> stop_requested = false;
+        LiveSrtQueueAdapter adapter(stop_requested);
+        ok &= expect(adapter.admit(
+                         make_fragment("video", 0, 0, 0, 2'000'000, 1, true)) ==
+                         LiveMediaAdmission::kAccepted,
+                     "expected the built-in SRT adapter to use its exact production duration limit");
+        ok &= expect(adapter.admit(
+                         make_fragment("audio", 0, 0, 2'000'000, 1, 1)) ==
+                         LiveMediaAdmission::kNoDecodableBoundary &&
+                         stop_requested.load(std::memory_order_acquire),
+                     "expected adapter overflow to stop built-in SRT ingest");
+
+        const TransportStatus resource_failure =
+            adapter.publishing_status(TransportStatus{.ok = true});
+        ok &= expect(!resource_failure.ok &&
+                         resource_failure.message.find("resource limit") != std::string::npos &&
+                         resource_failure.message.find("too far behind") != std::string::npos,
+                     "expected the production adapter's resource-limit/too-far-behind diagnostic");
+
+        const TransportStatus earlier_failure = adapter.publishing_status(
+            TransportStatus{.ok = false, .message = "earlier transport failure"});
+        ok &= expect(!earlier_failure.ok &&
+                         earlier_failure.message == "earlier transport failure",
+                     "expected an earlier transport failure to take precedence");
     }
 
     return ok ? 0 : 1;
