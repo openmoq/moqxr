@@ -6254,7 +6254,7 @@ int main() {
                                      return write.stream_id == response_stream_id &&
                                             write.bytes == forward_ok;
                                  }),
-                         "expected draft-16 live REQUEST_UPDATE acknowledgements to carry each fresh request id");
+                         "expected draft-16 live REQUEST_UPDATE acknowledgements before publication to use each fresh request id and the short wire shape");
         } else {
             const auto request_ok =
                 openmoq::publisher::transport::encode_request_ok_message(
@@ -6266,7 +6266,7 @@ int main() {
                                  return write.stream_id == response_stream_id &&
                                         write.bytes == request_ok;
                              }) == 2,
-                         "expected two ID-less REQUEST_OK frames on the retained draft-18 subscriber stream");
+                         "expected two short ID-less REQUEST_OK frames before publication on the retained draft-18 subscriber stream");
         }
     }
 
@@ -6337,7 +6337,7 @@ int main() {
             queue_draft16_scheduling_prefix(transport);
             transport.reads[0].push_back(encode_subscribe_message(
                 1, kTestTrackNamespace, "events", 1, draft,
-                0, 0, 100, 1, 0, 0, 0x04, 1));
+                0, 0, 100, 1, 0, 0, 0x04, 4));
         } else {
             transport.keep_open_streams.insert(1);
             transport.reads[3].push_back(encode_draft18_setup_response());
@@ -6345,8 +6345,24 @@ int main() {
                 encode_publish_namespace_ok_message(draft, 0));
             transport.reads[1].push_back(encode_subscribe_message(
                 91, kTestTrackNamespace, "events", 1, draft,
-                0, 0, 100, 1, 0, 0, 0x04, 1));
+                0, 0, 100, 1, 0, 0, 0x04, 4));
         }
+
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent&) {
+                if (draft == DraftVersion::kDraft16) {
+                    current.reads[0].push_back(
+                        encode_request_update_message(
+                            draft, 3, 7, 0x20, 1));
+                } else {
+                    current.reads[1].push_back(
+                        encode_request_update_message(
+                            draft, 93, 7, 0x20));
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
 
         std::size_t object_index = 0;
         LiveObjectSource source{
@@ -6354,15 +6370,6 @@ int main() {
             .next_object = [&]() -> std::optional<LiveObject> {
                 if (object_index++ != 0) {
                     return std::nullopt;
-                }
-                if (draft == DraftVersion::kDraft16) {
-                    transport.reads[0].push_back(
-                        encode_request_update_filter_message(
-                            draft, 3, 1, 0x04, 0, 0, 4));
-                } else {
-                    transport.reads[1].push_back(
-                        encode_request_update_filter_message(
-                            draft, 93, std::nullopt, 0x04, 0, 0, 4));
                 }
                 return LiveObject{
                     .track_name = "events",
@@ -6383,21 +6390,23 @@ int main() {
                             false,
                             std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
-                     "expected live end-extension session connect to succeed");
+                     "expected live post-publication priority-update session connect to succeed");
         status = session.publish_live_objects(source, draft);
         const std::uint64_t update_request_id =
             draft == DraftVersion::kDraft16 ? 3 : 93;
         const auto expected_ok =
             openmoq::publisher::transport::encode_request_ok_message(
                 draft, update_request_id, 3, 7);
-        ok &= expect(status.ok && std::count_if(
-                         transport.writes.begin(),
-                         transport.writes.end(),
-                         [&](const MockTransport::WriteEvent& write) {
-                             return write.stream_id == response_stream_id &&
-                                    write.bytes == expected_ok;
-                         }) == 1,
-                     "expected live end-extension REQUEST_OK to carry the current largest known object in the draft-specific shape");
+        ok &= expect(status.ok &&
+                         session.publish_stats().objects_published == 1 &&
+                         std::count_if(
+                             transport.writes.begin(),
+                             transport.writes.end(),
+                             [&](const MockTransport::WriteEvent& write) {
+                                 return write.stream_id == response_stream_id &&
+                                        write.bytes == expected_ok;
+                             }) == 1,
+                     "expected a post-publication priority REQUEST_OK to carry the current largest known object in the draft-specific shape");
     }
 
     for (const bool coalesced : {false, true}) {

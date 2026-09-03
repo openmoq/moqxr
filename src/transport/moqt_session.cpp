@@ -1496,6 +1496,21 @@ void note_largest_live_object(LargestObjectByTrack& largest_by_track,
     }
 }
 
+std::vector<std::uint8_t> encode_live_request_ok_message(
+    DraftVersion draft,
+    std::uint64_t request_id,
+    const std::string& track_name,
+    const LargestObjectByTrack& largest_by_track) {
+    const auto largest_it = largest_by_track.find(track_name);
+    if (largest_it == largest_by_track.end()) {
+        return encode_request_ok_message(draft, request_id);
+    }
+    return encode_request_ok_message(draft,
+                                     request_id,
+                                     largest_it->second.first,
+                                     largest_it->second.second);
+}
+
 bool live_object_matches_request_union(
     const openmoq::publisher::CmsfObject& object,
     openmoq::publisher::DraftVersion draft,
@@ -5432,8 +5447,6 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     transport_,
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
-            const bool end_extended = request_update_extends_end(
-                active_it->second, update);
             const std::string track_name = active_it->second.track_name;
             apply_request_update(active_it->second, update);
             note_delivery_timeouts(
@@ -5465,17 +5478,11 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             } else {
                 subscribed_tracks.erase(track_name);
             }
-            const auto largest_it =
-                largest_object_by_track.find(track_name);
             const std::vector<std::uint8_t> response =
-                end_extended && largest_it != largest_object_by_track.end()
-                    ? encode_request_ok_message(
-                          draft_version,
-                          update.request_id,
-                          largest_it->second.first,
-                          largest_it->second.second)
-                    : encode_request_ok_message(
-                          draft_version, update.request_id);
+                encode_live_request_ok_message(draft_version,
+                                               update.request_id,
+                                               track_name,
+                                               largest_object_by_track);
             return transport_.write_stream(
                 response_stream_id, response, false);
         };
@@ -6541,8 +6548,6 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     transport_,
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
-            const bool end_extended = request_update_extends_end(
-                active_it->second, update);
             const std::string track_name = active_it->second.track_name;
             apply_request_update(active_it->second, update);
             note_delivery_timeouts(
@@ -6577,17 +6582,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             } else {
                 subscribed_tracks.erase(track_name);
             }
-            const auto largest_it =
-                largest_object_by_track.find(track_name);
             const std::vector<std::uint8_t> response =
-                end_extended && largest_it != largest_object_by_track.end()
-                    ? encode_request_ok_message(
-                          draft_version,
-                          update.request_id,
-                          largest_it->second.first,
-                          largest_it->second.second)
-                    : encode_request_ok_message(
-                          draft_version, update.request_id);
+                encode_live_request_ok_message(draft_version,
+                                               update.request_id,
+                                               track_name,
+                                               largest_object_by_track);
             return transport_.write_stream(
                 response_stream_id, response, false);
         };
@@ -6617,8 +6616,6 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     return TransportStatus::failure(
                         "missing settings for draft-18 PUBLISH request");
                 }
-                const bool end_extended = request_update_extends_end(
-                    settings_it->second, update);
                 apply_request_update(settings_it->second, update);
                 published_track_delivery_timeouts.insert_or_assign(
                     track_name, settings_it->second.delivery_timeouts);
@@ -6629,18 +6626,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 } else {
                     subscribed_tracks.erase(track_name);
                 }
-                const auto largest_it =
-                    largest_object_by_track.find(track_name);
                 const std::vector<std::uint8_t> response =
-                    end_extended &&
-                            largest_it != largest_object_by_track.end()
-                        ? encode_request_ok_message(
-                              draft_version,
-                              update.request_id,
-                              largest_it->second.first,
-                              largest_it->second.second)
-                        : encode_request_ok_message(
-                              draft_version, update.request_id);
+                    encode_live_request_ok_message(draft_version,
+                                                   update.request_id,
+                                                   track_name,
+                                                   largest_object_by_track);
                 return transport_.write_stream(
                     response_stream_id, response, false);
             },
@@ -7611,24 +7601,16 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
 
-            const bool end_extended = request_update_extends_end(
-                active_it->second, update);
             const std::string track_name = active_it->second.track_name;
             apply_request_update(active_it->second, update);
             note_delivery_timeouts(
                 transport_, active_it->second.delivery_timeouts);
             refresh_subscriber_forward_permission(track_name);
-            const auto largest_it =
-                largest_object_by_track.find(track_name);
             const std::vector<std::uint8_t> response =
-                end_extended && largest_it != largest_object_by_track.end()
-                    ? encode_request_ok_message(
-                          draft_version,
-                          update.request_id,
-                          largest_it->second.first,
-                          largest_it->second.second)
-                    : encode_request_ok_message(
-                          draft_version, update.request_id);
+                encode_live_request_ok_message(draft_version,
+                                               update.request_id,
+                                               track_name,
+                                               largest_object_by_track);
             return transport_.write_stream(
                 response_stream_id, response, false);
         };
@@ -7669,26 +7651,17 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     return TransportStatus::failure(
                         "missing settings for draft-18 PUBLISH request");
                 }
-                const bool end_extended = request_update_extends_end(
-                    settings_it->second, update);
                 apply_request_update(settings_it->second, update);
                 published_track_delivery_timeouts.insert_or_assign(
                     track_name, settings_it->second.delivery_timeouts);
                 note_delivery_timeouts(
                     transport_, settings_it->second.delivery_timeouts);
                 refresh_subscriber_forward_permission(track_name);
-                const auto largest_it =
-                    largest_object_by_track.find(track_name);
                 const std::vector<std::uint8_t> response =
-                    end_extended &&
-                            largest_it != largest_object_by_track.end()
-                        ? encode_request_ok_message(
-                              draft_version,
-                              update.request_id,
-                              largest_it->second.first,
-                              largest_it->second.second)
-                        : encode_request_ok_message(
-                              draft_version, update.request_id);
+                    encode_live_request_ok_message(draft_version,
+                                                   update.request_id,
+                                                   track_name,
+                                                   largest_object_by_track);
                 return transport_.write_stream(
                     response_stream_id, response, false);
             },
