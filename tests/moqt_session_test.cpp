@@ -41,7 +41,11 @@ namespace openmoq::publisher::transport::live_srt_internal {
 TransportStatus exercise_stalled_admission_for_testing(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
-    std::size_t* control_poll_count);
+    std::size_t* control_poll_count,
+    bool trigger_resource_limit,
+    std::uint64_t initial_object_timeout_ms,
+    std::uint8_t initial_subscriber_priority,
+    const NowFunction& now_function);
 
 }  // namespace openmoq::publisher::transport::live_srt_internal
 
@@ -1567,7 +1571,13 @@ int main() {
         transport.state_ = ConnectionState::kConnected;
         transport.on_try_write_object =
             [](MockTransport&,
-               const MockTransport::ObjectWriteEvent&) {
+               const MockTransport::ObjectWriteEvent& event) {
+                if (!event.bytes.empty() &&
+                    (event.bytes.back() == 'A' ||
+                     event.bytes.back() == 'B')) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kAccepted, {}};
+                }
                 return ObjectWriteResult{
                     ObjectWriteDisposition::kWouldBlock,
                     "stalled live SRT transport"};
@@ -1576,7 +1586,13 @@ int main() {
         const TransportStatus stalled_status =
             openmoq::publisher::transport::live_srt_internal::
                 exercise_stalled_admission_for_testing(
-                    transport, draft, &control_poll_count);
+                    transport,
+                    draft,
+                    &control_poll_count,
+                    true,
+                    0,
+                    128,
+                    std::chrono::steady_clock::now);
         const std::uint64_t expected_reset_code =
             draft == DraftVersion::kDraft16 ? 0x01 : 0x05;
         ok &= expect(!stalled_status.ok &&
@@ -1584,13 +1600,141 @@ int main() {
                              "live SRT resource limit exceeded: source is too far behind and no decodable keyframe boundary exists within 16 MiB/2 s",
                      "expected stalled built-in SRT admission to surface its stable resource diagnostic");
         ok &= expect(control_poll_count == 1 &&
-                         transport.object_write_attempts.size() == 1,
-                     "expected stalled built-in SRT admission to poll controls before retrying transport");
+                         transport.object_write_attempts.size() == 3 &&
+                         std::count_if(
+                             transport.object_write_attempts.begin(),
+                             transport.object_write_attempts.end(),
+                             [](const MockTransport::ObjectWriteEvent& event) {
+                                 return event.fin;
+                             }) == 1,
+                     "expected terminal SRT overflow to stop after one nonblocking subgroup FIN attempt");
         ok &= expect(transport.reset_calls ==
                          std::vector<std::pair<std::uint64_t,
                                                std::uint64_t>>{
-                             {2, expected_reset_code}},
-                     "expected stalled built-in SRT admission to cancel only its affected subgroup");
+                             {2, expected_reset_code},
+                             {6, expected_reset_code}},
+                     "expected terminal SRT overflow to cancel every affected open subgroup");
+        const auto expected_done =
+            openmoq::publisher::transport::encode_publish_done_message(
+                draft,
+                1,
+                2,
+                draft == DraftVersion::kDraft16 ? 0x06 : 0x05,
+                "subscriber exceeded publisher resource limit");
+        const std::uint64_t response_stream_id =
+            draft == DraftVersion::kDraft16 ? 0 : 5;
+        ok &= expect(std::count_if(
+                         transport.writes.begin(),
+                         transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == response_stream_id &&
+                                    write.bytes == expected_done &&
+                                    write.fin ==
+                                        (draft == DraftVersion::kDraft18) &&
+                                    write.reset_count_before_write == 2;
+                         }) == 1,
+                     "expected draft-specific TOO_FAR_BEHIND PUBLISH_DONE after every SRT subgroup reset");
+    }
+
+    for (const auto& update :
+         {encode_request_update_message(
+              DraftVersion::kDraft16, 3, 0, 0x10, 1),
+          encode_request_update_filter_message(
+              DraftVersion::kDraft16, 3, 1, 0x03, 2, 0)}) {
+        MockTransport transport;
+        transport.state_ = ConnectionState::kConnected;
+        transport.keep_open_streams.insert(0);
+        transport.reads[0].push_back(update);
+        transport.on_try_write_object =
+            [](MockTransport& current,
+               const MockTransport::ObjectWriteEvent&) {
+                if (current.object_write_attempts.size() > 1) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "bounded stalled SRT update-release test"};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kWouldBlock,
+                    "release retained SRT object by update"};
+            };
+        std::size_t control_poll_count = 0;
+        status = openmoq::publisher::transport::live_srt_internal::
+            exercise_stalled_admission_for_testing(
+                transport,
+                DraftVersion::kDraft16,
+                &control_poll_count,
+                false,
+                100,
+                1,
+                std::chrono::steady_clock::now);
+        const auto request_ok =
+            openmoq::publisher::transport::encode_request_ok_message(
+                DraftVersion::kDraft16, 3);
+        ok &= expect(status.ok && control_poll_count == 1 &&
+                         transport.object_write_attempts.size() == 1,
+                     "expected stalled draft-16 SRT object to be released by Forward/filter update");
+        ok &= expect(std::count_if(
+                         transport.writes.begin(),
+                         transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == 0 &&
+                                    write.bytes == request_ok;
+                         }) == 1,
+                     "expected stalled draft-16 polling to nonblocking-read and acknowledge REQUEST_UPDATE");
+    }
+
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.state_ = ConnectionState::kConnected;
+        transport.keep_open_streams.insert(0);
+        std::vector<std::uint8_t> updates = encode_request_update_message(
+            DraftVersion::kDraft16, 3, 100, 0x02, 1);
+        append_bytes(
+            updates,
+            encode_request_update_message(
+                DraftVersion::kDraft16, 5, 200, 0x20, 1));
+        transport.reads[0].push_back(std::move(updates));
+        transport.on_try_write_object =
+            [&now](MockTransport& current,
+                   const MockTransport::ObjectWriteEvent&) {
+                if (current.object_write_attempts.size() == 1) {
+                    now += std::chrono::milliseconds(10);
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kWouldBlock,
+                        "refresh retained SRT scheduling options"};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::size_t control_poll_count = 0;
+        status = openmoq::publisher::transport::live_srt_internal::
+            exercise_stalled_admission_for_testing(
+                transport,
+                DraftVersion::kDraft16,
+                &control_poll_count,
+                false,
+                5,
+                1,
+                [&now]() { return now; });
+        ok &= expect(status.ok && control_poll_count == 1 &&
+                         transport.object_write_attempts.size() == 2,
+                     "expected stalled SRT admission to retry after timeout/priority REQUEST_UPDATE");
+        if (transport.object_write_attempts.size() == 2) {
+            const auto& first = transport.object_write_attempts[0];
+            const auto& second = transport.object_write_attempts[1];
+            ok &= expect(
+                first.stream_id == second.stream_id &&
+                    first.bytes == second.bytes &&
+                    first.options.object_deadline ==
+                        Clock::time_point{} + std::chrono::milliseconds(5) &&
+                    second.options.object_deadline ==
+                        Clock::time_point{} + std::chrono::milliseconds(100) &&
+                    first.options.transport_priority <
+                        second.options.transport_priority,
+                "expected stalled SRT update to refresh only deadline/priority while preserving bytes and stream");
+        }
     }
 
     {
@@ -2190,6 +2334,76 @@ int main() {
                      "expected loop-storage test to stop after the configured cycle count");
         ok &= expect(peak_entries <= 4,
                      "expected loop generation availability storage to remain bounded across many cycles");
+    }
+
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.keep_open_streams.insert(0);
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "anchor", 1,
+            DraftVersion::kDraft16, 0, 0, 1, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "anchor", .group_id = 1,
+             .subgroup_id = 0, .object_id = 0, .marker = 'A'},
+            {.track_name = "historical", .group_id = 1,
+             .subgroup_id = 0, .object_id = 0, .marker = 'H'},
+        });
+        bool late_subscription_queued = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                const std::uint8_t marker = event.bytes.empty()
+                                                ? 0
+                                                : event.bytes.back();
+                if (marker == 'H') {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "late subscription used a refreshed historical generation origin"};
+                }
+                if (late_subscription_queued) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "bounded late-subscription origin test complete"};
+                }
+                if (current.object_write_attempts.size() == 8) {
+                    now += std::chrono::milliseconds(10);
+                    current.reads[0].push_back(encode_subscribe_message(
+                        3, kTestTrackNamespace, "historical", 1,
+                        DraftVersion::kDraft16, 5, 0, 1, 1));
+                    late_subscription_queued = true;
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            true,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected late-subscription origin session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(
+            !status.ok &&
+                status.message ==
+                    "bounded late-subscription origin test complete",
+            "expected late subscription to reuse expired immutable origins instead of refreshing an evicted generation");
+        ok &= expect(std::none_of(
+                         transport.object_write_attempts.begin(),
+                         transport.object_write_attempts.end(),
+                         [](const MockTransport::ObjectWriteEvent& event) {
+                             return !event.bytes.empty() &&
+                                    event.bytes.back() == 'H';
+                         }),
+                     "expected no historical late-subscription object to reach transport admission");
     }
 
     for (const DraftVersion draft :

@@ -1754,7 +1754,8 @@ public:
         if (!enabled_) {
             return;
         }
-        first_generation_at_ = read_now(now_function_);
+        first_generation_at_ = read_now(now_function);
+        priority_scheduler_internal::note_generation_availability_storage(1);
         for (const auto& object : plan.objects) {
             if (object.kind !=
                 openmoq::publisher::CmsfObjectKind::kMedia) {
@@ -1820,20 +1821,24 @@ public:
 
     void retain_generations(
         const std::set<std::size_t>& needed_cycles) {
-        if (!enabled_ ||
-            (paced_ && loop_state_.cycle_duration_us != 0)) {
+        if (!enabled_ || paced_) {
             return;
         }
         for (auto origin_it = generation_origins_.begin();
              origin_it != generation_origins_.end();) {
             if (needed_cycles.contains(origin_it->first)) {
                 ++origin_it;
-            } else {
-                origin_it = generation_origins_.erase(origin_it);
+                continue;
             }
+            retired_through_cycle_ =
+                retired_through_cycle_.has_value()
+                    ? (std::max)(*retired_through_cycle_,
+                                 origin_it->first)
+                    : origin_it->first;
+            origin_it = generation_origins_.erase(origin_it);
         }
         priority_scheduler_internal::note_generation_availability_storage(
-            generation_origins_.size());
+            generation_origins_.size() + 1);
     }
 
 private:
@@ -1847,6 +1852,15 @@ private:
                 std::chrono::microseconds(
                     loop_cycle * loop_state_.cycle_duration_us);
         }
+
+        // Exact origins are retained only while some request is at that
+        // cycle. A late request that revisits a retired cycle uses the
+        // conservative immutable first-generation anchor; it must never
+        // recreate old availability at the current wall-clock time.
+        if (retired_through_cycle_.has_value() &&
+            loop_cycle <= *retired_through_cycle_) {
+            return first_generation_at_;
+        }
         const auto existing_it = generation_origins_.find(loop_cycle);
         if (existing_it != generation_origins_.end()) {
             return existing_it->second;
@@ -1854,7 +1868,7 @@ private:
         const auto origin_it = generation_origins_.emplace(
             loop_cycle, read_now(now_function_)).first;
         priority_scheduler_internal::note_generation_availability_storage(
-            generation_origins_.size());
+            generation_origins_.size() + 1);
         return origin_it->second;
     }
 
@@ -1868,6 +1882,7 @@ private:
     std::vector<std::chrono::microseconds> subgroup_completion_offsets_;
     std::map<std::size_t, std::chrono::steady_clock::time_point>
         generation_origins_;
+    std::optional<std::size_t> retired_through_cycle_;
 };
 
 void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
@@ -2321,21 +2336,6 @@ public:
         return first_failure;
     }
 
-    TransportStatus cancel_subgroup(PublisherTransport& transport,
-                                    std::uint64_t group_id,
-                                    std::uint64_t subgroup_id,
-                                    std::uint64_t error_code) {
-        observe_transport_expiries(transport);
-        const Key key{group_id, subgroup_id};
-        const auto stream_it = streams_.find(key);
-        if (stream_it == streams_.end()) {
-            return TransportStatus::success();
-        }
-        const std::uint64_t stream_id = stream_it->second.stream_id;
-        close_subgroup(key);
-        return transport.reset_stream(stream_id, error_code);
-    }
-
     // FIN all currently open streams (used when transitioning to a new group).
     TransportStatus finish_group(PublisherTransport& transport) {
         return finish_group(transport,
@@ -2347,7 +2347,9 @@ public:
     TransportStatus finish_group(PublisherTransport& transport,
                                  openmoq::publisher::DraftVersion draft,
                                  DeliveryTimeouts delivery_timeouts,
-                                 const NowFunction& now_function) {
+                                 const NowFunction& now_function,
+                                 const std::function<TransportStatus()>&
+                                     resource_status = {}) {
         delivery_timeouts = timeouts_for_draft(draft, delivery_timeouts);
         const auto subgroup_deadline =
             deadline_after(read_now(now_function), delivery_timeouts.subgroup_ms);
@@ -2360,6 +2362,12 @@ public:
             pending_objects_.erase(key);
 
             while (true) {
+                if (resource_status) {
+                    const TransportStatus status = resource_status();
+                    if (!status.ok) {
+                        return status;
+                    }
+                }
                 if (deadline_reached(read_now(now_function), std::nullopt, subgroup_deadline)) {
                     const std::uint64_t stream_id = stream.stream_id;
                     close_subgroup(key);
@@ -2461,6 +2469,97 @@ std::uint64_t live_srt_resource_reset_code(
     return uses_request_streams(draft) ? 0x05 : 0x01;
 }
 
+struct LiveSrtSchedulingOptions {
+    DeliveryTimeouts delivery_timeouts;
+    SubgroupSenderState::SchedulingPriority priority;
+};
+
+TransportStatus append_control_stream_bytes_nonblocking(
+    PublisherTransport& transport,
+    std::uint64_t control_stream_id,
+    std::vector<std::uint8_t>& pending_bytes,
+    bool* stream_fin = nullptr) {
+    std::vector<std::uint8_t> chunk;
+    bool fin = false;
+    const TransportStatus status = transport.read_stream(
+        control_stream_id, chunk, fin, std::chrono::milliseconds(0));
+    if (!status.ok) {
+        if (status.message == "timed out waiting for stream data") {
+            return TransportStatus::success();
+        }
+        return status;
+    }
+    pending_bytes.insert(
+        pending_bytes.end(), chunk.begin(), chunk.end());
+    if (stream_fin != nullptr) {
+        *stream_fin = fin;
+    }
+    return TransportStatus::success();
+}
+
+bool is_live_srt_resource_limit(const TransportStatus& status) {
+    return !status.ok &&
+           status.message == kLiveSrtResourceLimitDiagnostic;
+}
+
+TransportStatus terminate_live_srt_resource_limit(
+    PublisherTransport& transport,
+    openmoq::publisher::DraftVersion draft,
+    std::uint64_t control_stream_id,
+    const std::map<std::uint64_t, SubscribeMessage>& active_subscriptions,
+    const std::map<std::uint64_t, std::uint64_t>& subscription_stream_ids,
+    std::map<std::string, SubgroupSenderState>& sender_by_track,
+    TransportStatus resource_status) {
+    const std::uint64_t reset_code = live_srt_resource_reset_code(draft);
+    for (auto& [track_name, sender] : sender_by_track) {
+        static_cast<void>(track_name);
+        const TransportStatus reset_status =
+            sender.cancel_all_open_subgroups(transport, reset_code);
+        if (!reset_status.ok) {
+            std::cerr << "[moqt-session] warning: failed to reset live SRT "
+                         "subgroup after resource overflow: "
+                      << reset_status.message << '\n';
+        }
+    }
+
+    const std::uint64_t too_far_behind =
+        draft == openmoq::publisher::DraftVersion::kDraft18 ? 0x05 : 0x06;
+    for (const auto& [request_id, subscribe] : active_subscriptions) {
+        if (subscribe.track_name == "catalog") {
+            continue;
+        }
+        const auto sender_it = sender_by_track.find(subscribe.track_name);
+        if (sender_it == sender_by_track.end()) {
+            continue;
+        }
+        std::uint64_t response_stream_id = control_stream_id;
+        if (uses_request_streams(draft)) {
+            const auto stream_it = subscription_stream_ids.find(request_id);
+            if (stream_it == subscription_stream_ids.end()) {
+                std::cerr << "[moqt-session] warning: missing retained "
+                             "SUBSCRIBE stream for resource PUBLISH_DONE\n";
+                continue;
+            }
+            response_stream_id = stream_it->second;
+        }
+        const TransportStatus done_status = transport.write_stream(
+            response_stream_id,
+            encode_publish_done_message(
+                draft,
+                request_id,
+                sender_it->second.stream_count(),
+                too_far_behind,
+                "subscriber exceeded publisher resource limit"),
+            uses_request_streams(draft));
+        if (!done_status.ok) {
+            std::cerr << "[moqt-session] warning: failed to send live SRT "
+                         "resource PUBLISH_DONE: "
+                      << done_status.message << '\n';
+        }
+    }
+    return resource_status;
+}
+
 TransportStatus serve_live_srt_object_until_admitted(
     PublisherTransport& transport,
     LiveSrtQueueAdapter& queue,
@@ -2470,9 +2569,8 @@ TransportStatus serve_live_srt_object_until_admitted(
     std::uint64_t send_seq,
     const openmoq::publisher::CmsfObject& object,
     std::span<const std::uint8_t> payload,
-    DeliveryTimeouts delivery_timeouts,
     const NowFunction& now_function,
-    SubgroupSenderState::SchedulingPriority priority,
+    const std::function<LiveSrtSchedulingOptions()>& scheduling_options,
     const std::function<TransportStatus()>& poll_control,
     const std::function<bool()>& remains_eligible,
     bool* published) {
@@ -2482,17 +2580,24 @@ TransportStatus serve_live_srt_object_until_admitted(
     const auto resource_status = [&]() {
         return queue.publishing_status(TransportStatus::success());
     };
-    const auto cancel_for_resource_limit =
-        [&](TransportStatus status) -> TransportStatus {
-            const TransportStatus reset_status = sender.cancel_subgroup(
-                transport,
-                object.group_id,
-                object.subgroup_id,
-                live_srt_resource_reset_code(draft));
-            return reset_status.ok ? status : reset_status;
-        };
+    const auto object_available_at = read_now(now_function);
 
     while (true) {
+        const LiveSrtSchedulingOptions current = scheduling_options();
+        const DeliveryTimeouts effective_timeouts =
+            timeouts_for_draft(draft, current.delivery_timeouts);
+        const ObjectWriteOptions prepared_options{
+            .transport_priority = 255,
+            .object_deadline = deadline_after(
+                object_available_at, effective_timeouts.object_ms),
+            .subgroup_deadline = std::nullopt,
+        };
+        sender.refresh_unadmitted_deadlines(
+            object.group_id,
+            object.subgroup_id,
+            object.object_id,
+            prepared_options.object_deadline,
+            prepared_options.subgroup_deadline);
         const SubgroupSenderState::ServeResult result = sender.try_serve(
             transport,
             draft,
@@ -2502,9 +2607,10 @@ TransportStatus serve_live_srt_object_until_admitted(
             true,
             false,
             payload,
-            delivery_timeouts,
+            current.delivery_timeouts,
             now_function,
-            priority);
+            current.priority,
+            prepared_options);
         if (!result.status.ok) {
             return result.status;
         }
@@ -2514,12 +2620,16 @@ TransportStatus serve_live_srt_object_until_admitted(
                 *published = result.disposition ==
                              SubgroupSenderState::ServeDisposition::kAccepted;
             }
+            const TransportStatus status = resource_status();
+            if (!status.ok) {
+                return status;
+            }
             return result.status;
         }
 
         TransportStatus status = resource_status();
         if (!status.ok) {
-            return cancel_for_resource_limit(std::move(status));
+            return status;
         }
         status = poll_control();
         if (!status.ok) {
@@ -2527,7 +2637,7 @@ TransportStatus serve_live_srt_object_until_admitted(
         }
         status = resource_status();
         if (!status.ok) {
-            return cancel_for_resource_limit(std::move(status));
+            return status;
         }
         if (!remains_eligible()) {
             sender.discard_unadmitted(
@@ -4921,7 +5031,11 @@ namespace live_srt_internal {
 TransportStatus exercise_stalled_admission_for_testing(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
-    std::size_t* control_poll_count) {
+    std::size_t* control_poll_count,
+    bool trigger_resource_limit,
+    std::uint64_t initial_object_timeout_ms,
+    std::uint8_t initial_subscriber_priority,
+    const NowFunction& now_function) {
     std::atomic<bool> stop_requested = false;
     LiveSrtQueueAdapter queue(stop_requested);
     openmoq::publisher::MediaFragment retained_fragment;
@@ -4935,18 +5049,119 @@ TransportStatus exercise_stalled_admission_for_testing(
             "failed to prepare live SRT stalled-admission test");
     }
 
-    SubgroupSenderState sender;
+    std::map<std::string, SubgroupSenderState> sender_by_track;
+    SubgroupSenderState& sender = sender_by_track["video"];
+    std::map<std::uint64_t, SubscribeMessage> active_subscriptions;
+    active_subscriptions.emplace(
+        1,
+        SubscribeMessage{
+            .request_id = 1,
+            .track_namespace = {},
+            .track_name = "video",
+            .subscriber_priority = initial_subscriber_priority,
+            .group_order = 1,
+            .forward = 1,
+            .filter_type = 0x01,
+            .delivery_timeouts =
+                {.object_ms = initial_object_timeout_ms,
+                 .subgroup_ms = 0},
+        });
+    const std::map<std::uint64_t, std::uint64_t>
+        active_subscription_stream_ids{{1, 5}};
+
+    if (trigger_resource_limit) {
+        for (std::uint64_t subgroup_id = 0; subgroup_id < 2;
+             ++subgroup_id) {
+            const std::uint8_t marker =
+                subgroup_id == 0 ? 'A' : 'B';
+            const openmoq::publisher::CmsfObject prefix_object{
+                .kind = openmoq::publisher::CmsfObjectKind::kMedia,
+                .track_name = "video",
+                .group_id = 1,
+                .subgroup_id = subgroup_id,
+                .object_id = 0,
+                .payload = {},
+                .owned_payload = {marker},
+            };
+            const auto prefix_result = sender.try_serve(
+                transport,
+                draft,
+                1,
+                subgroup_id + 1,
+                prefix_object,
+                true,
+                false,
+                prefix_object.owned_payload,
+                {},
+                now_function,
+                {.subscriber = initial_subscriber_priority,
+                 .publisher = 128});
+            if (!prefix_result.status.ok ||
+                prefix_result.disposition !=
+                    SubgroupSenderState::ServeDisposition::kAccepted) {
+                return prefix_result.status.ok
+                           ? TransportStatus::failure(
+                                 "failed to prepare open SRT subgroup")
+                           : prefix_result.status;
+            }
+        }
+
+        std::size_t finalization_polls = 0;
+        const TransportStatus finalization_status = sender.finish_group(
+            transport,
+            draft,
+            {},
+            now_function,
+            [&]() {
+                ++finalization_polls;
+                if (finalization_polls == 1) {
+                    return TransportStatus::success();
+                }
+                if (control_poll_count != nullptr) {
+                    ++*control_poll_count;
+                }
+                openmoq::publisher::MediaFragment overflow;
+                overflow.track_name = "audio";
+                overflow.start_time_us = 2'000'000;
+                overflow.duration_us = 1;
+                overflow.payload.owned_bytes = {'R'};
+                if (queue.admit(std::move(overflow)) !=
+                    openmoq::publisher::
+                        LiveMediaAdmission::kNoDecodableBoundary) {
+                    return TransportStatus::failure(
+                        "failed to trigger live SRT resource limit");
+                }
+                return queue.publishing_status(
+                    TransportStatus::success());
+            });
+        return terminate_live_srt_resource_limit(
+            transport,
+            draft,
+            0,
+            active_subscriptions,
+            active_subscription_stream_ids,
+            sender_by_track,
+            finalization_status);
+    }
+
     const openmoq::publisher::CmsfObject object{
         .kind = openmoq::publisher::CmsfObjectKind::kMedia,
         .track_name = "video",
         .group_id = 1,
-        .subgroup_id = 0,
+        .subgroup_id = trigger_resource_limit ? 2U : 0U,
         .object_id = 0,
         .payload = {},
         .owned_payload = {'X'},
     };
+    std::vector<std::uint8_t> pending_control_bytes;
+    PeerRequestIdValidator peer_request_ids(draft, 100);
+    const TransportStatus initial_request_id_status =
+        peer_request_ids.validate(transport, 1);
+    if (!initial_request_id_status.ok) {
+        return initial_request_id_status;
+    }
     bool published = false;
-    return serve_live_srt_object_until_admitted(
+    const TransportStatus status = serve_live_srt_object_until_admitted(
         transport,
         queue,
         sender,
@@ -4955,28 +5170,86 @@ TransportStatus exercise_stalled_admission_for_testing(
         1,
         object,
         object.owned_payload,
-        {},
-        steady_now_function(),
-        {.subscriber = 128, .publisher = 128},
+        now_function,
+        [&]() {
+            return LiveSrtSchedulingOptions{
+                .delivery_timeouts = delivery_timeouts_for_track(
+                    active_subscriptions, "video"),
+                .priority =
+                    {.subscriber = subscriber_priority_for_track(
+                         active_subscriptions, "video"),
+                     .publisher = 128},
+            };
+        },
         [&]() {
             if (control_poll_count != nullptr) {
                 ++*control_poll_count;
             }
-            openmoq::publisher::MediaFragment overflow;
-            overflow.track_name = "audio";
-            overflow.start_time_us = 2'000'000;
-            overflow.duration_us = 1;
-            overflow.payload.owned_bytes = {'A'};
-            if (queue.admit(std::move(overflow)) !=
-                openmoq::publisher::
-                    LiveMediaAdmission::kNoDecodableBoundary) {
-                return TransportStatus::failure(
-                    "failed to trigger live SRT resource limit");
+            const TransportStatus read_status =
+                append_control_stream_bytes_nonblocking(
+                    transport, 0, pending_control_bytes);
+            if (!read_status.ok) {
+                return read_status;
+            }
+            std::size_t message_size = 0;
+            while (next_control_message(
+                pending_control_bytes, draft, message_size)) {
+                const std::vector<std::uint8_t> message(
+                    pending_control_bytes.begin(),
+                    pending_control_bytes.begin() +
+                        static_cast<std::ptrdiff_t>(message_size));
+                const TransportStatus update_status =
+                    process_draft16_control_request_update(
+                        transport,
+                        message,
+                        0,
+                        peer_request_ids,
+                        [&](std::uint64_t existing_request_id,
+                            std::uint64_t response_stream_id,
+                            const RequestUpdateMessage& update) {
+                            const auto active_it =
+                                active_subscriptions.find(
+                                    existing_request_id);
+                            if (active_it ==
+                                active_subscriptions.end()) {
+                                return protocol_violation(
+                                    transport,
+                                    "REQUEST_UPDATE specified an invalid existing subscription");
+                            }
+                            apply_request_update(
+                                active_it->second, update);
+                            return transport.write_stream(
+                                response_stream_id,
+                                encode_request_ok_message(
+                                    draft, update.request_id),
+                                false);
+                        });
+                if (!update_status.ok) {
+                    return update_status;
+                }
+                pending_control_bytes.erase(
+                    pending_control_bytes.begin(),
+                    pending_control_bytes.begin() +
+                        static_cast<std::ptrdiff_t>(message_size));
             }
             return TransportStatus::success();
         },
-        []() { return true; },
+        [&]() {
+            return live_object_matches_request_union(
+                object, draft, active_subscriptions);
+        },
         &published);
+    if (!is_live_srt_resource_limit(status)) {
+        return status;
+    }
+    return terminate_live_srt_resource_limit(
+        transport,
+        draft,
+        0,
+        active_subscriptions,
+        active_subscription_stream_ids,
+        sender_by_track,
+        status);
 }
 
 }  // namespace live_srt_internal
@@ -5553,6 +5826,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     LargestObjectByTrack largest_object_by_track;
     std::function<std::pair<TransportStatus, std::size_t>()>
         process_control_messages;
+    bool control_fin = false;
 
     auto drain_queue = [&]() -> TransportStatus {
         while (true) {
@@ -5605,7 +5879,14 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             const auto group_it = last_group_id_by_track.find(fragment.track_name);
             if (group_it != last_group_id_by_track.end() && group_it->second != static_cast<std::uint64_t>(fragment.group_id)) {
                 TransportStatus finish_status = sender.finish_group(
-                    transport_, draft_version, delivery_timeouts, now_function_);
+                    transport_,
+                    draft_version,
+                    delivery_timeouts,
+                    now_function_,
+                    [&]() {
+                        return queue->publishing_status(
+                            TransportStatus::success());
+                    });
                 if (!finish_status.ok) {
                     return finish_status;
                 }
@@ -5618,14 +5899,34 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 serve_live_srt_object_until_admitted(
                     transport_, *queue, sender, draft_version,
                     alias_it->second, send_seq, object, payload,
-                    delivery_timeouts, now_function_,
-                    {.subscriber = subscriber_priority_for_track(
-                         active_subscriptions, fragment.track_name),
-                     .publisher = 128},
+                    now_function_,
+                    [&]() {
+                        return LiveSrtSchedulingOptions{
+                            .delivery_timeouts = delivery_timeouts_for_track(
+                                active_subscriptions,
+                                fragment.track_name),
+                            .priority =
+                                {.subscriber = subscriber_priority_for_track(
+                                     active_subscriptions,
+                                     fragment.track_name),
+                                 .publisher = 128},
+                        };
+                    },
                     [&]() {
                         if (!process_control_messages) {
                             return TransportStatus::failure(
                                 "live SRT control poll unavailable");
+                        }
+                        if (draft_version == DraftVersion::kDraft16) {
+                            const TransportStatus read_status =
+                                append_control_stream_bytes_nonblocking(
+                                    transport_,
+                                    control_stream_id_,
+                                    pending_control_bytes_,
+                                    &control_fin);
+                            if (!read_status.ok) {
+                                return read_status;
+                            }
                         }
                         auto [control_status, new_subscriptions] =
                             process_control_messages();
@@ -6029,7 +6330,6 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return {TransportStatus::success(), new_subs};
     };
 
-    bool fin = false;
     while (true) {
         const bool is_eof = queue->done();
 
@@ -6055,10 +6355,10 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             transport_.read_stream(control_stream_id_, chunk, immediate_fin, std::chrono::milliseconds(0));
         if (read_status.ok) {
             pending_control_bytes_.insert(pending_control_bytes_.end(), chunk.begin(), chunk.end());
-            fin = immediate_fin;
+            control_fin = immediate_fin;
         }
 
-        if (fin || is_eof) {
+        if (control_fin || is_eof) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -6070,14 +6370,43 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     }
     status = queue->publishing_status(std::move(status));
 
+    if (is_live_srt_resource_limit(status)) {
+        return terminate_live_srt_resource_limit(
+            transport_,
+            draft_version,
+            control_stream_id_,
+            active_subscriptions,
+            active_subscription_stream_ids,
+            sender_by_track,
+            std::move(status));
+    }
+
     for (auto& [track_name, sender] : sender_by_track) {
         const DeliveryTimeouts delivery_timeouts =
             delivery_timeouts_for_track(active_subscriptions, track_name);
         TransportStatus finish_status = sender.finish_group(
-            transport_, draft_version, delivery_timeouts, now_function_);
+            transport_,
+            draft_version,
+            delivery_timeouts,
+            now_function_,
+            [&]() {
+                return queue->publishing_status(
+                    TransportStatus::success());
+            });
         if (!finish_status.ok && status.ok) {
             status = finish_status;
         }
+    }
+
+    if (is_live_srt_resource_limit(status)) {
+        return terminate_live_srt_resource_limit(
+            transport_,
+            draft_version,
+            control_stream_id_,
+            active_subscriptions,
+            active_subscription_stream_ids,
+            sender_by_track,
+            std::move(status));
     }
 
     if (!status.ok) {
