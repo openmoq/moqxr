@@ -73,6 +73,8 @@ struct SilentServer {
     bool stream_fin_received = false;
     std::set<std::uint64_t> stream_fins;
     std::map<std::uint64_t, std::uint64_t> stream_reset_errors;
+    std::optional<std::uint64_t> stop_sending_stream_id;
+    bool stop_sending_sent = false;
     picohttp_server_path_item_t path_item{};
     picohttp_server_parameters_t params{};
 };
@@ -110,6 +112,14 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         // everything written before close() actually arrived.
         std::lock_guard<std::mutex> lock(server->mutex);
         server->stream_bytes_received += length;
+        if (stream_ctx != nullptr && length != 0 &&
+            server->stop_sending_stream_id == stream_ctx->stream_id &&
+            !server->stop_sending_sent) {
+            server->stop_sending_sent = true;
+            if (picoquic_stop_sending(cnx, stream_ctx->stream_id, 0x01) != 0) {
+                return -1;
+            }
+        }
         if (stream_ctx != nullptr && stream_ctx->stream_id != 0 &&
             (stream_ctx->stream_id & 0x2) == 0) {
             server->request_stream_bytes_received += length;
@@ -375,14 +385,24 @@ int main() {
         ok &= expect(drain_client->open_stream(StreamDirection::kUnidirectional,
                                                ack_stream_id).ok,
                      "expected ACK-wins webtransport stream open to succeed");
+        ObjectWriteOptions first_priority_options;
+        first_priority_options.transport_priority = 220;
+        const std::vector<std::uint8_t> first_priority_payload = {0x79};
+        const auto first_priority_result = drain_client->try_write_object(
+            ack_stream_id, first_priority_payload, false,
+            first_priority_options);
         ObjectWriteOptions ack_wins_options;
+        ack_wins_options.transport_priority = 7;
         ack_wins_options.subgroup_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         const std::vector<std::uint8_t> ack_payload = {0x7A};
         const auto ack_result = drain_client->try_write_object(
             ack_stream_id, ack_payload, true, ack_wins_options);
-        ok &= expect(ack_result.disposition == ObjectWriteDisposition::kAccepted,
-                     "expected deadline-bearing webtransport FIN to be admitted");
+        ok &= expect(first_priority_result.disposition ==
+                             ObjectWriteDisposition::kAccepted &&
+                         ack_result.disposition ==
+                             ObjectWriteDisposition::kAccepted,
+                     "expected both same-stream webtransport priority objects to be admitted");
         {
             std::unique_lock<std::mutex> lock(server.mutex);
             ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
@@ -391,6 +411,13 @@ int main() {
                          "expected the webtransport peer to receive the ACK-wins FIN");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        const auto media_priorities =
+            drain_client->applied_media_stream_priorities_for_testing(
+                ack_stream_id);
+        ok &= expect(media_priorities.size() >= 2 &&
+                         media_priorities.front() == 220 &&
+                         media_priorities.back() == 7,
+                     "expected the WebTransport callback to apply the next queued object's current priority");
         ok &= expect(!drain_client->media_stream_expired(ack_stream_id),
                      "expected h3zero stream free after ACK to cancel the subgroup timer");
         std::size_t bytes_before_drain = 0;
@@ -398,6 +425,67 @@ int main() {
             std::lock_guard<std::mutex> lock(server.mutex);
             ok &= expect(!server.stream_reset_errors.contains(ack_stream_id),
                          "expected no webtransport timeout reset after the acknowledged deadline-bearing FIN");
+            bytes_before_drain = server.stream_bytes_received;
+        }
+
+        std::uint64_t peer_stopped_stream_id = 0;
+        ok &= expect(drain_client->open_stream(StreamDirection::kUnidirectional,
+                                               peer_stopped_stream_id).ok,
+                     "expected peer-stop WebTransport stream open to succeed");
+        std::size_t bytes_before_stop = 0;
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            bytes_before_stop = server.stream_bytes_received;
+            server.stream_reset_errors.erase(peer_stopped_stream_id);
+            server.stop_sending_stream_id = peer_stopped_stream_id;
+            server.stop_sending_sent = false;
+        }
+        const std::vector<std::uint8_t> peer_stopped_first(
+            2 * 1024 * 1024, 0x61);
+        const std::vector<std::uint8_t> peer_stopped_second(
+            2 * 1024 * 1024, 0x62);
+        ok &= expect(drain_client->try_write_object(peer_stopped_stream_id,
+                                                    peer_stopped_first,
+                                                    false,
+                                                    {}).disposition ==
+                         ObjectWriteDisposition::kAccepted &&
+                         drain_client->try_write_object(peer_stopped_stream_id,
+                                                       peer_stopped_second,
+                                                       false,
+                                                       {}).disposition ==
+                             ObjectWriteDisposition::kAccepted,
+                     "expected queued WebTransport media before peer STOP_SENDING");
+        {
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                             return server.stream_reset_errors.contains(
+                                 peer_stopped_stream_id);
+                         }),
+                         "expected WebTransport publisher to answer STOP_SENDING with a reset");
+            const auto reset =
+                server.stream_reset_errors.find(peer_stopped_stream_id);
+            if (reset != server.stream_reset_errors.end()) {
+                ok &= expect(reset->second == 0x01,
+                             "expected WebTransport peer-stop reset error CANCELLED 0x01");
+            }
+            ok &= expect(server.stream_bytes_received - bytes_before_stop <
+                             peer_stopped_first.size() +
+                                 peer_stopped_second.size(),
+                         "expected WebTransport STOP_SENDING to discard queued media");
+        }
+        ok &= expect(drain_client->media_stream_peer_stopped(
+                         peer_stopped_stream_id),
+                     "expected WebTransport peer-stop state to remain queryable");
+        const std::vector<std::uint8_t> after_stop_payload = {0x63};
+        const auto after_peer_stop = drain_client->try_write_object(
+            peer_stopped_stream_id, after_stop_payload, true, {});
+        ok &= expect(after_peer_stop.disposition ==
+                             ObjectWriteDisposition::kFailed &&
+                         after_peer_stop.message.find("stopped by peer") !=
+                             std::string::npos,
+                     "expected WebTransport to reject later admission on a peer-stopped stream");
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
             bytes_before_drain = server.stream_bytes_received;
         }
 
@@ -501,14 +589,71 @@ int main() {
                                                  replacement_stream_id).ok,
                      "expected replacement webtransport timer stream open to succeed");
         const std::vector<std::uint8_t> exact_budget(10, 0xE3);
+        std::size_t bytes_before_replacement = 0;
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            bytes_before_replacement = server.stream_bytes_received;
+        }
         ok &= expect(deadline_client.try_write_object(replacement_stream_id,
                                                       exact_budget,
                                                       true,
                                                       {}).disposition == ObjectWriteDisposition::kAccepted,
                      "expected webtransport timeout reset to release the full admission budget");
+        {
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return server.stream_bytes_received >=
+                                    bytes_before_replacement + exact_budget.size();
+                         }),
+                         "expected replacement WebTransport object to drain before close-order test");
+        }
+
+        std::uint64_t close_expired_stream_id = 0;
+        ok &= expect(deadline_client.open_stream(StreamDirection::kUnidirectional,
+                                                 close_expired_stream_id).ok,
+                     "expected activation-expiry WebTransport stream open to succeed");
+        std::size_t bytes_before_close_expiry = 0;
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            bytes_before_close_expiry = server.stream_bytes_received;
+            server.stream_reset_errors.erase(close_expired_stream_id);
+        }
+        const std::vector<std::uint8_t> close_prefix = {0xE4};
+        ok &= expect(deadline_client.try_write_object(close_expired_stream_id,
+                                                      close_prefix,
+                                                      false,
+                                                      {}).disposition ==
+                         ObjectWriteDisposition::kAccepted,
+                     "expected WebTransport prefix before activation expiry");
+        {
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return server.stream_bytes_received >=
+                                    bytes_before_close_expiry + close_prefix.size();
+                         }),
+                         "expected WebTransport activation-expiry stream context");
+        }
+        ObjectWriteOptions close_expired_options;
+        close_expired_options.object_deadline =
+            std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+        const std::vector<std::uint8_t> close_expired_payload(9, 0xE5);
+        ok &= expect(deadline_client.try_write_object(close_expired_stream_id,
+                                                      close_expired_payload,
+                                                      false,
+                                                      close_expired_options).disposition ==
+                         ObjectWriteDisposition::kAccepted,
+                     "expected already-expired WebTransport object to enter activation");
         deadline_client.note_delivery_timeout(std::chrono::milliseconds(1));
         ok &= expect(deadline_client.close(0).ok,
                      "expected timer-wins webtransport client close to succeed");
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            const auto reset =
+                server.stream_reset_errors.find(close_expired_stream_id);
+            ok &= expect(reset != server.stream_reset_errors.end() &&
+                             reset->second == 0x02,
+                         "expected activation-time WebTransport expiry reset before connection close");
+        }
     }
 
     stop_server(server);

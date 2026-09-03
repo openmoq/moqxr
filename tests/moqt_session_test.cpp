@@ -321,6 +321,10 @@ struct MockTransport final : PublisherTransport {
         return expired_media_streams.contains(stream_id);
     }
 
+    bool media_stream_peer_stopped(std::uint64_t stream_id) const override {
+        return peer_stopped_media_streams.contains(stream_id);
+    }
+
     TransportStatus reset_stream(std::uint64_t stream_id, std::uint64_t error_code) override {
         reset_calls.emplace_back(stream_id, error_code);
         if (failing_reset_streams.contains(stream_id)) {
@@ -349,6 +353,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<std::chrono::milliseconds> read_timeouts;
     std::vector<std::chrono::milliseconds> delivery_timeouts;
     std::set<std::uint64_t> expired_media_streams;
+    std::set<std::uint64_t> peer_stopped_media_streams;
     std::set<std::uint64_t> failing_reset_streams;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> keep_open_streams;
@@ -5098,6 +5103,96 @@ int main() {
                                  transport.object_write_attempts[0].stream_id,
                          "expected the race on the original stream followed by progress on an independent stream");
         }
+    }
+
+    {
+        // STOP_SENDING retires only the affected subgroup and must remain
+        // visible after the backend discards its queued bytes.  Later objects
+        // in that subgroup are suppressed, while another subgroup continues.
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        transport.reads[0].push_back(
+            encode_subscribe_message(1,
+                                     kTestTrackNamespace,
+                                     "events",
+                                     1,
+                                     DraftVersion::kDraft16,
+                                     1000));
+        transport.on_try_write_object =
+            [](MockTransport& current,
+               const MockTransport::ObjectWriteEvent& event) {
+                if (current.object_write_attempts.size() == 1) {
+                    current.peer_stopped_media_streams.insert(event.stream_id);
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected peer-stop session connect to succeed");
+        status = session.publish(make_transport_expiry_plan(DraftVersion::kDraft16));
+        ok &= expect(status.ok, "expected peer STOP_SENDING to retire only its subgroup");
+        ok &= expect(transport.object_write_attempts.size() == 2,
+                     "expected later stopped-subgroup objects suppressed while an independent subgroup publishes");
+        if (transport.object_write_attempts.size() == 2) {
+            ok &= expect(transport.object_write_attempts[0].stream_id !=
+                             transport.object_write_attempts[1].stream_id,
+                         "expected peer stop to prevent reopening the original subgroup stream");
+        }
+    }
+
+    {
+        // Draft-18 explicitly permits renewed delivery after a Forward 0->1
+        // REQUEST_UPDATE.  The stopped QUIC stream remains retired; the next
+        // object in that subgroup is admitted on a fresh stream.
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, DraftVersion::kDraft18,
+            1000, 0, 1, 1));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 7, .subgroup_id = 3,
+             .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 7, .subgroup_id = 3,
+             .object_id = 1, .marker = 'B'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+        transport.on_try_write_object =
+            [](MockTransport& current,
+               const MockTransport::ObjectWriteEvent& event) {
+                if (current.object_write_attempts.size() == 1) {
+                    current.peer_stopped_media_streams.insert(event.stream_id);
+                    current.reads[1].push_back(encode_request_update_message(
+                        DraftVersion::kDraft18, 93, 0, 0x10));
+                    current.reads[1].push_back(encode_request_update_message(
+                        DraftVersion::kDraft18, 95, 1, 0x10));
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 peer-stop renewal connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected draft-18 Forward renewal after STOP_SENDING to succeed");
+        ok &= expect(transport.object_write_attempts.size() == 2 &&
+                         transport.object_write_attempts[0].stream_id !=
+                             transport.object_write_attempts[1].stream_id,
+                     "expected Forward 0-to-1 renewal to use a fresh subgroup stream");
     }
 
     {

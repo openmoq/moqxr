@@ -132,6 +132,13 @@ public:
         static_cast<void>(stream_id);
         return false;
     }
+    // Stable, non-destructive notification that the peer sent STOP_SENDING
+    // for this media stream.  Sessions use it to retire the owning subgroup
+    // without allowing later admissions to recreate that exact stream.
+    virtual bool media_stream_peer_stopped(std::uint64_t stream_id) const {
+        static_cast<void>(stream_id);
+        return false;
+    }
     virtual TransportStatus close(std::uint64_t application_error_code) = 0;
 };
 

@@ -63,6 +63,8 @@ struct SmokeServer {
     bool media_stream_fin_received = false;
     std::set<std::uint64_t> media_stream_fins;
     std::map<std::uint64_t, std::uint64_t> media_stream_reset_errors;
+    std::optional<std::uint64_t> stop_sending_stream_id;
+    bool stop_sending_sent = false;
     std::vector<std::uint8_t> control_bytes;
     std::size_t publish_response_count = 0;
     bool loop_ready = false;
@@ -172,6 +174,13 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
             if ((stream_id & 0x3) == 0x2) {
                 if (bytes != nullptr && length != 0) {
                     server->media_stream_bytes.insert(server->media_stream_bytes.end(), bytes, bytes + length);
+                    if (server->stop_sending_stream_id == stream_id &&
+                        !server->stop_sending_sent) {
+                        server->stop_sending_sent = true;
+                        if (picoquic_stop_sending(cnx, stream_id, 0x01) != 0) {
+                            return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+                        }
+                    }
                 }
                 if (event == picoquic_callback_stream_fin) {
                     server->media_stream_fin_received = true;
@@ -628,12 +637,15 @@ int main() {
     for (std::size_t index = 0; index < delivery_bytes.size(); ++index) {
         delivery_bytes[index] = static_cast<std::uint8_t>(index % 251);
     }
+    ObjectWriteOptions first_priority_options;
+    first_priority_options.transport_priority = 220;
     const auto delivery_first = delivery_client.try_write_object(
         delivery_stream_id,
         std::span<const std::uint8_t>(delivery_bytes.data(), 3000),
         false,
-        ObjectWriteOptions{});
+        first_priority_options);
     ObjectWriteOptions ack_wins_options;
+    ack_wins_options.transport_priority = 7;
     ack_wins_options.subgroup_deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     const auto delivery_second = delivery_client.try_write_object(
@@ -653,6 +665,13 @@ int main() {
         ok &= expect(delivery_server.media_stream_bytes == delivery_bytes,
                      "expected partial provide callbacks to deliver every media byte in order");
     }
+    const auto media_priorities =
+        delivery_client.applied_media_stream_priorities_for_testing(
+            delivery_stream_id);
+    ok &= expect(media_priorities.size() >= 2 &&
+                     media_priorities.front() == 220 &&
+                     media_priorities.back() == 7,
+                 "expected the raw-QUIC callback to apply the next queued object's current priority");
     std::this_thread::sleep_for(std::chrono::milliseconds(700));
     ok &= expect(!delivery_client.media_stream_expired(delivery_stream_id),
                  "expected raw-QUIC stream release after ACK to cancel the subgroup timer");
@@ -661,6 +680,59 @@ int main() {
         ok &= expect(!delivery_server.media_stream_reset_errors.contains(delivery_stream_id),
                      "expected no raw-QUIC timeout reset after the acknowledged deadline-bearing FIN");
     }
+
+    std::uint64_t peer_stopped_stream_id = 0;
+    status = delivery_client.open_stream(
+        openmoq::publisher::transport::StreamDirection::kUnidirectional,
+        peer_stopped_stream_id);
+    ok &= expect(status.ok, "expected peer-stop raw-QUIC stream open to succeed");
+    std::size_t media_bytes_before_stop = 0;
+    {
+        std::lock_guard<std::mutex> lock(delivery_server.mutex);
+        media_bytes_before_stop = delivery_server.media_stream_bytes.size();
+        delivery_server.stop_sending_stream_id = peer_stopped_stream_id;
+        delivery_server.stop_sending_sent = false;
+    }
+    const std::vector<std::uint8_t> peer_stopped_first(2 * 1024 * 1024, 0x51);
+    const std::vector<std::uint8_t> peer_stopped_second(2 * 1024 * 1024, 0x52);
+    ok &= expect(delivery_client.try_write_object(peer_stopped_stream_id,
+                                                  peer_stopped_first,
+                                                  false,
+                                                  {}).disposition ==
+                     ObjectWriteDisposition::kAccepted &&
+                     delivery_client.try_write_object(peer_stopped_stream_id,
+                                                      peer_stopped_second,
+                                                      false,
+                                                      {}).disposition ==
+                         ObjectWriteDisposition::kAccepted,
+                 "expected queued raw-QUIC media before peer STOP_SENDING");
+    {
+        std::unique_lock<std::mutex> lock(delivery_server.mutex);
+        ok &= expect(delivery_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                         return delivery_server.media_stream_reset_errors.contains(
+                             peer_stopped_stream_id);
+                     }),
+                     "expected raw-QUIC publisher to answer STOP_SENDING with RESET_STREAM");
+        const auto reset = delivery_server.media_stream_reset_errors.find(
+            peer_stopped_stream_id);
+        if (reset != delivery_server.media_stream_reset_errors.end()) {
+            ok &= expect(reset->second == 0x01,
+                         "expected raw-QUIC peer-stop reset error CANCELLED 0x01");
+        }
+        ok &= expect(delivery_server.media_stream_bytes.size() -
+                             media_bytes_before_stop <
+                         peer_stopped_first.size() + peer_stopped_second.size(),
+                     "expected raw-QUIC STOP_SENDING to discard queued media");
+    }
+    ok &= expect(delivery_client.media_stream_peer_stopped(
+                     peer_stopped_stream_id),
+                 "expected raw-QUIC peer-stop state to remain queryable");
+    const auto after_peer_stop = delivery_client.try_write_object(
+        peer_stopped_stream_id, std::vector<std::uint8_t>{0x53}, true, {});
+    ok &= expect(after_peer_stop.disposition == ObjectWriteDisposition::kFailed &&
+                     after_peer_stop.message.find("stopped by peer") !=
+                         std::string::npos,
+                 "expected raw-QUIC to reject later admission on a peer-stopped stream");
     std::uint64_t empty_fin_stream_id = 0;
     status = delivery_client.open_stream(
         openmoq::publisher::transport::StreamDirection::kUnidirectional,
@@ -693,6 +765,11 @@ int main() {
         std::lock_guard<std::mutex> lock(delivery_server.mutex);
         ok &= expect(delivery_server.media_stream_fins.contains(empty_fin_stream_id),
                      "expected close drain to deliver the zero-byte stream FIN");
+        const auto reset =
+            delivery_server.media_stream_reset_errors.find(expired_stream_id);
+        ok &= expect(reset != delivery_server.media_stream_reset_errors.end() &&
+                         reset->second == 0x02,
+                     "expected activation-time raw-QUIC expiry reset before connection close");
     }
     stop_server(delivery_server);
     return ok ? 0 : 1;

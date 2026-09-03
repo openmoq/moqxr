@@ -30,6 +30,8 @@ public:
                                                  std::uint8_t priority) override;
     std::optional<std::uint8_t> applied_reliable_stream_priority_for_testing(
         std::uint64_t stream_id) const;
+    std::vector<std::uint8_t> applied_media_stream_priorities_for_testing(
+        std::uint64_t stream_id) const;
     ObjectWriteResult try_write_object(std::uint64_t stream_id,
                                        std::span<const std::uint8_t> bytes,
                                        bool fin,
@@ -43,6 +45,7 @@ public:
     std::string connection_id() const override;
     void note_delivery_timeout(std::chrono::milliseconds timeout) override;
     bool media_stream_expired(std::uint64_t stream_id) const override;
+    bool media_stream_peer_stopped(std::uint64_t stream_id) const override;
     TransportStatus close(std::uint64_t application_error_code) override;
 
 private:

@@ -1588,6 +1588,15 @@ bool apply_request_update(SubscribeMessage& subscribe,
     return true;
 }
 
+bool request_update_renews_peer_stopped_subgroups(
+    openmoq::publisher::DraftVersion draft,
+    const SubscribeMessage& subscribe,
+    const RequestUpdateMessage& update) {
+    return draft == openmoq::publisher::DraftVersion::kDraft18 &&
+           subscribe.forward == 0 &&
+           update.forward == std::optional<std::uint8_t>{1};
+}
+
 bool request_update_extends_end(const SubscribeMessage& subscribe,
                                 const RequestUpdateMessage& update) {
     if (!update.subscription_filter.has_value() ||
@@ -2121,7 +2130,7 @@ public:
                           std::optional<ObjectWriteOptions> prepared_options =
                               std::nullopt) {
         const Key key{static_cast<std::uint64_t>(object.group_id), object.subgroup_id};
-        observe_transport_expiries(transport);
+        observe_transport_stream_state(transport);
         if (closed_subgroups_.contains(key)) {
             return {TransportStatus::success(), ServeDisposition::kSkipped};
         }
@@ -2265,7 +2274,7 @@ public:
             return {TransportStatus::success(), ServeDisposition::kWouldBlock};
         }
         if (result.disposition == ObjectWriteDisposition::kFailed) {
-            observe_transport_expiries(transport);
+            observe_transport_stream_state(transport);
             if (closed_subgroups_.contains(key)) {
                 return {TransportStatus::success(), ServeDisposition::kSkipped};
             }
@@ -2335,9 +2344,17 @@ public:
         pending_it->second.options.subgroup_deadline = subgroup_deadline;
     }
 
+    void renew_peer_stopped_subgroups(PublisherTransport& transport) {
+        observe_transport_stream_state(transport);
+        for (const Key& key : peer_stopped_subgroups_) {
+            closed_subgroups_.erase(key);
+        }
+        peer_stopped_subgroups_.clear();
+    }
+
     TransportStatus cancel_all_open_subgroups(PublisherTransport& transport,
                                               std::uint64_t error_code) {
-        observe_transport_expiries(transport);
+        observe_transport_stream_state(transport);
         const std::vector<std::pair<Key, OpenStream>> open_streams(
             streams_.begin(), streams_.end());
         TransportStatus first_failure = TransportStatus::success();
@@ -2369,7 +2386,7 @@ public:
         delivery_timeouts = timeouts_for_draft(draft, delivery_timeouts);
         const auto subgroup_deadline =
             deadline_after(read_now(now_function), delivery_timeouts.subgroup_ms);
-        observe_transport_expiries(transport);
+        observe_transport_stream_state(transport);
         const std::vector<std::pair<Key, OpenStream>> open_streams(streams_.begin(), streams_.end());
         for (const auto& [key, stream] : open_streams) {
             if (closed_subgroups_.contains(key)) {
@@ -2404,7 +2421,7 @@ public:
                         .subgroup_deadline = subgroup_deadline,
                     });
                 if (result.disposition == ObjectWriteDisposition::kFailed) {
-                    observe_transport_expiries(transport);
+                    observe_transport_stream_state(transport);
                     if (closed_subgroups_.contains(key)) {
                         break;
                     }
@@ -2455,9 +2472,12 @@ private:
         closed_subgroups_.insert(key);
     }
 
-    void observe_transport_expiries(PublisherTransport& transport) {
+    void observe_transport_stream_state(PublisherTransport& transport) {
         for (auto it = stream_keys_.begin(); it != stream_keys_.end();) {
-            if (!transport.media_stream_expired(it->first)) {
+            const bool expired = transport.media_stream_expired(it->first);
+            const bool peer_stopped =
+                !expired && transport.media_stream_peer_stopped(it->first);
+            if (!expired && !peer_stopped) {
                 ++it;
                 continue;
             }
@@ -2469,6 +2489,9 @@ private:
             }
             pending_objects_.erase(key);
             closed_subgroups_.insert(key);
+            if (peer_stopped) {
+                peer_stopped_subgroups_.insert(key);
+            }
             it = stream_keys_.erase(it);
         }
     }
@@ -2477,6 +2500,7 @@ private:
     std::map<Key, PendingObject> pending_objects_;
     std::map<std::uint64_t, Key> stream_keys_;
     std::set<Key> closed_subgroups_;
+    std::set<Key> peer_stopped_subgroups_;
     std::uint64_t stream_count_ = 0;
 };
 
@@ -3282,10 +3306,16 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         const bool deadlines_changed =
             update.object_delivery_timeout_ms.has_value() ||
             update.subgroup_delivery_timeout_ms.has_value();
+        const bool renew_peer_stopped_subgroups =
+            request_update_renews_peer_stopped_subgroups(
+                draft, active.subscribe, update);
         if (update.forward.has_value()) {
             active.forward_paused_by_update = *update.forward == 0;
         }
         apply_request_update(active.subscribe, update);
+        if (renew_peer_stopped_subgroups) {
+            active.sender->renew_peer_stopped_subgroups(transport);
+        }
         note_delivery_timeouts(transport, active.subscribe.delivery_timeouts);
 
         if (deadlines_changed) {
@@ -6218,7 +6248,14 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
             const std::string track_name = active_it->second.track_name;
+            const bool renew_peer_stopped_subgroups =
+                request_update_renews_peer_stopped_subgroups(
+                    draft_version, active_it->second, update);
             apply_request_update(active_it->second, update);
+            if (renew_peer_stopped_subgroups) {
+                sender_by_track[track_name].renew_peer_stopped_subgroups(
+                    transport_);
+            }
             note_delivery_timeouts(
                 transport_, active_it->second.delivery_timeouts);
             const bool forward = std::any_of(
@@ -7323,7 +7360,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
             }
             const std::string track_name = active_it->second.track_name;
+            const bool renew_peer_stopped_subgroups =
+                request_update_renews_peer_stopped_subgroups(
+                    draft_version, active_it->second, update);
             apply_request_update(active_it->second, update);
+            if (renew_peer_stopped_subgroups) {
+                sender_by_track[track_name].renew_peer_stopped_subgroups(
+                    transport_);
+            }
             note_delivery_timeouts(
                 transport_, active_it->second.delivery_timeouts);
 
@@ -7390,7 +7434,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     return TransportStatus::failure(
                         "missing settings for draft-18 PUBLISH request");
                 }
+                const bool renew_peer_stopped_subgroups =
+                    request_update_renews_peer_stopped_subgroups(
+                        draft_version, settings_it->second, update);
                 apply_request_update(settings_it->second, update);
+                if (renew_peer_stopped_subgroups) {
+                    sender_by_track[track_name]
+                        .renew_peer_stopped_subgroups(transport_);
+                }
                 published_track_delivery_timeouts.insert_or_assign(
                     track_name, settings_it->second.delivery_timeouts);
                 note_delivery_timeouts(
@@ -8376,7 +8427,14 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
 
             const std::string track_name = active_it->second.track_name;
+            const bool renew_peer_stopped_subgroups =
+                request_update_renews_peer_stopped_subgroups(
+                    draft_version, active_it->second, update);
             apply_request_update(active_it->second, update);
+            if (renew_peer_stopped_subgroups) {
+                sender_by_track[track_name].renew_peer_stopped_subgroups(
+                    transport_);
+            }
             note_delivery_timeouts(
                 transport_, active_it->second.delivery_timeouts);
             refresh_subscriber_forward_permission(track_name);
@@ -8425,7 +8483,14 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     return TransportStatus::failure(
                         "missing settings for draft-18 PUBLISH request");
                 }
+                const bool renew_peer_stopped_subgroups =
+                    request_update_renews_peer_stopped_subgroups(
+                        draft_version, settings_it->second, update);
                 apply_request_update(settings_it->second, update);
+                if (renew_peer_stopped_subgroups) {
+                    sender_by_track[track_name]
+                        .renew_peer_stopped_subgroups(transport_);
+                }
                 published_track_delivery_timeouts.insert_or_assign(
                     track_name, settings_it->second.delivery_timeouts);
                 note_delivery_timeouts(
