@@ -957,6 +957,7 @@ struct ActiveSubscription {
     std::uint64_t scheduling_round = 0;
     std::uint64_t scheduler_generation = 0;
     bool forward_paused_by_update = false;
+    bool generation_lead_parked = false;
     bool completed = false;
 };
 
@@ -1740,6 +1741,8 @@ bool is_final_object_in_subgroup(const openmoq::publisher::PublishPlan& plan,
 // subscriber or a filter rebuild cannot restart a delivery timer.  In paced
 // mode the application availability point is the object's media pacing point;
 // an unpaced plan is wholly available when the generation is exposed.
+constexpr std::size_t kMaximumGenerationLeadCycles = 64;
+
 class GenerationAvailability {
 public:
     GenerationAvailability(const openmoq::publisher::PublishPlan& plan,
@@ -1830,9 +1833,11 @@ public:
         }
         oldest_retained_cycle_ =
             (std::max)(oldest_retained_cycle_, *needed_cycles.begin());
+        const std::size_t newest_retained_cycle = *needed_cycles.rbegin();
         for (auto origin_it = generation_origins_.begin();
              origin_it != generation_origins_.end();) {
-            if (needed_cycles.contains(origin_it->first)) {
+            if (origin_it->first >= oldest_retained_cycle_ &&
+                origin_it->first <= newest_retained_cycle) {
                 ++origin_it;
                 continue;
             }
@@ -1967,7 +1972,12 @@ bool advance_subscription_to_next_loop_object(const openmoq::publisher::PublishP
                                               const LoopState& loop_state,
                                               ActiveSubscription& active,
                                               openmoq::publisher::DraftVersion draft,
-                                              GenerationAvailability& availability) {
+                                              GenerationAvailability& availability,
+                                              std::optional<std::size_t> maximum_loop_cycle = std::nullopt,
+                                              bool* generation_lead_parked = nullptr) {
+    if (generation_lead_parked != nullptr) {
+        *generation_lead_parked = false;
+    }
     if (!loop_state.enabled || !track_can_loop(loop_state, active.track.name)) {
         return false;
     }
@@ -1980,6 +1990,15 @@ bool advance_subscription_to_next_loop_object(const openmoq::publisher::PublishP
     std::size_t next_object_index = 0;
     if (!find_next_matching_object_index(plan, active.subscribe, info->first_loop_object_index, next_object_index)) {
         return false;
+    }
+
+    if (maximum_loop_cycle.has_value() &&
+        active.loop_cycle >= *maximum_loop_cycle) {
+        if (generation_lead_parked != nullptr) {
+            *generation_lead_parked = true;
+        }
+        active.completed = false;
+        return true;
     }
 
     ++active.loop_cycle;
@@ -3189,6 +3208,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     const auto enqueue_active_candidate =
         [&](std::uint64_t request_id, const ActiveSubscription& active) {
             if (active.completed || active.forward_paused_by_update ||
+                active.generation_lead_parked ||
                 active.scheduler_frontiers.empty()) {
                 return;
             }
@@ -3216,6 +3236,37 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         paced,
         now_function,
         uses_priority_scheduler(draft));
+    const auto minimum_active_loop_cycle = [&]() {
+        std::optional<std::size_t> minimum;
+        for (const auto& [request_id, active] : active_subscriptions) {
+            static_cast<void>(request_id);
+            if (active.completed) {
+                continue;
+            }
+            minimum = minimum.has_value()
+                          ? (std::min)(*minimum, active.loop_cycle)
+                          : active.loop_cycle;
+        }
+        return minimum;
+    };
+    const auto advance_active_subscription =
+        [&](ActiveSubscription& active) {
+            std::optional<std::size_t> maximum_loop_cycle;
+            if (uses_priority_scheduler(draft)) {
+                const auto minimum = minimum_active_loop_cycle();
+                if (minimum.has_value()) {
+                    maximum_loop_cycle =
+                        *minimum <=
+                                (std::numeric_limits<std::size_t>::max)() -
+                                    kMaximumGenerationLeadCycles
+                            ? *minimum + kMaximumGenerationLeadCycles
+                            : (std::numeric_limits<std::size_t>::max)();
+                }
+            }
+            return advance_subscription_to_next_loop_object(
+                plan, loop_state, active, draft, generation_availability,
+                maximum_loop_cycle, &active.generation_lead_parked);
+        };
     const auto await_subscribe_deadline = pacing_start + subscriber_timeout;
     NamespaceMessage namespace_message{
         .draft = draft,
@@ -3277,13 +3328,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         }
 
         if (uses_priority_scheduler(draft)) {
+            active.generation_lead_parked = false;
             rebuild_priority_frontiers(
                 plan, active, draft, generation_availability);
             if (active.subgroup_frontiers.empty()) {
-                active.completed =
-                    !advance_subscription_to_next_loop_object(
-                        plan, loop_state, active, draft,
-                        generation_availability);
+                active.completed = !advance_active_subscription(active);
             }
             return;
         }
@@ -3299,6 +3348,16 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 !advance_subscription_to_next_loop_object(
                     plan, loop_state, active, draft,
                     generation_availability);
+        }
+    };
+
+    const auto resume_generation_leaders = [&]() {
+        for (auto& [request_id, active] : active_subscriptions) {
+            if (!active.generation_lead_parked) {
+                continue;
+            }
+            active.completed = !advance_active_subscription(active);
+            enqueue_active_candidate(request_id, active);
         }
     };
 
@@ -4398,14 +4457,9 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
 
                     if (active.scheduler_frontiers.empty()) {
                         active.next_object_index = plan.objects.size();
-                        active.completed =
-                            !advance_subscription_to_next_loop_object(
-                                plan,
-                                loop_state,
-                                active,
-                                draft,
-                                generation_availability);
+                        active.completed = !advance_active_subscription(active);
                     }
+                    resume_generation_leaders();
                     enqueue_active_candidate(selected.request_id, active);
                     for (const auto& blocked : blocked_candidates) {
                         eligible_candidates.push(blocked);

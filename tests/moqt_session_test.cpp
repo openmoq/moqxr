@@ -2518,6 +2518,123 @@ int main() {
             "expected late subscription to start at the oldest retained generation with its exact origin");
     }
 
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point now{};
+        MockTransport transport;
+        transport.keep_open_streams.insert(0);
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "fast", 1,
+            DraftVersion::kDraft16, 50, 0, 128, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "slow", 1,
+            DraftVersion::kDraft16, 50, 0, 128, 1));
+        const PublishPlan plan = make_scheduling_plan({
+            {.track_name = "fast", .group_id = 1,
+             .subgroup_id = 0, .object_id = 0, .marker = 'F'},
+            {.track_name = "slow", .group_id = 1,
+             .subgroup_id = 0, .object_id = 0, .marker = 'S'},
+        });
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                if (event.bytes.empty()) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "missing object bytes in two-speed generation test"};
+                }
+                std::size_t offset = 0;
+                std::uint64_t stream_type = 0;
+                std::uint64_t track_alias = 0;
+                std::uint64_t group_id = 0;
+                if (!decode_varint(event.bytes, offset, stream_type) ||
+                    !decode_varint(event.bytes, offset, track_alias) ||
+                    !decode_varint(event.bytes, offset, group_id)) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "invalid object header in two-speed generation test"};
+                }
+
+                const std::uint8_t marker = event.bytes.back();
+                if (marker == 'F') {
+                    if (group_id == 1) {
+                        now = Clock::time_point{} +
+                              std::chrono::milliseconds(10);
+                    } else if (group_id == 3) {
+                        now = Clock::time_point{} +
+                              std::chrono::milliseconds(20);
+                    } else if (group_id == 5) {
+                        now = Clock::time_point{} +
+                              std::chrono::milliseconds(30);
+                        current.reads[0].push_back(
+                            encode_request_update_message(
+                                DraftVersion::kDraft16,
+                                7,
+                                0,
+                                0x10,
+                                1));
+                    } else {
+                        return ObjectWriteResult{
+                            ObjectWriteDisposition::kFailed,
+                            "fast request outran two-speed generation test"};
+                    }
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kAccepted, {}};
+                }
+
+                if (marker != 'S') {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "unexpected marker in two-speed generation test"};
+                }
+                if (group_id == 1) {
+                    current.reads[0].push_back(
+                        encode_request_update_message(
+                            DraftVersion::kDraft16,
+                            5,
+                            0,
+                            0x20,
+                            1));
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kAccepted, {}};
+                }
+                if (group_id == 3) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kAccepted, {}};
+                }
+                if (group_id == 5 &&
+                    event.options.object_deadline ==
+                        Clock::time_point{} +
+                            std::chrono::milliseconds(70)) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "bounded two-speed generation test complete"};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kFailed,
+                    "two-speed request recreated compacted cycle origin"};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            true,
+                            std::chrono::seconds(1),
+                            {},
+                            [&now]() { return now; });
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected two-speed generation session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(
+            !status.ok &&
+                status.message ==
+                    "bounded two-speed generation test complete",
+            "expected cycles 1 through 3 to retain cycle 2's exact availability origin");
+    }
+
     for (const DraftVersion draft :
          {DraftVersion::kDraft14, DraftVersion::kDraft17}) {
         MockTransport transport;
