@@ -18,12 +18,13 @@ using openmoq::publisher::transport::PublishError;
 using openmoq::publisher::transport::PublishNamespaceOk;
 using openmoq::publisher::transport::PublishOk;
 using openmoq::publisher::transport::RequestError;
+using openmoq::publisher::transport::RequestUpdateDecodeError;
+using openmoq::publisher::transport::RequestUpdateMessage;
 using openmoq::publisher::transport::ServerSetupMessage;
 using openmoq::publisher::transport::SetupMessage;
 using openmoq::publisher::transport::SubscribeMessage;
 using openmoq::publisher::transport::SubscribeNamespaceMessage;
 using openmoq::publisher::transport::SubscribeTracksMessage;
-using openmoq::publisher::transport::SubscribeUpdateMessage;
 using openmoq::publisher::transport::TrackMessage;
 using openmoq::publisher::transport::TransportKind;
 using openmoq::publisher::transport::decode_max_request_id_message;
@@ -31,12 +32,12 @@ using openmoq::publisher::transport::decode_publish_error;
 using openmoq::publisher::transport::decode_publish_ok;
 using openmoq::publisher::transport::decode_request_error;
 using openmoq::publisher::transport::decode_request_ok;
+using openmoq::publisher::transport::decode_request_update_message;
 using openmoq::publisher::transport::decode_server_setup_message;
 using openmoq::publisher::transport::decode_setup_response_message;
 using openmoq::publisher::transport::decode_subscribe_message;
 using openmoq::publisher::transport::decode_subscribe_namespace_message;
 using openmoq::publisher::transport::decode_subscribe_tracks_message;
-using openmoq::publisher::transport::decode_subscribe_update_message;
 using openmoq::publisher::transport::decode_varint;
 using openmoq::publisher::transport::encode_namespace_message;
 using openmoq::publisher::transport::encode_publish_done_message;
@@ -380,18 +381,28 @@ std::vector<std::uint8_t> build_subscribe_message(DraftVersion draft, SubscribeP
     return bytes;
 }
 
-// SUBSCRIBE (draft-16+) carrying DELIVERY_TIMEOUT (0x02) ahead of the usual
-// FORWARD / SUBSCRIBER_PRIORITY / SUBSCRIPTION_FILTER / GROUP_ORDER set.
-std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeout(DraftVersion draft,
-                                                                        std::uint64_t delivery_timeout_ms) {
+// SUBSCRIBE (draft-16+) carrying DELIVERY_TIMEOUT (0x02) and, when requested,
+// draft-18 SUBGROUP_DELIVERY_TIMEOUT (0x06), ahead of the usual FORWARD /
+// SUBSCRIBER_PRIORITY / SUBSCRIPTION_FILTER / GROUP_ORDER set.
+std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeouts(DraftVersion draft,
+                                                                         std::uint64_t object_timeout_ms,
+                                                                         std::uint64_t subgroup_timeout_ms,
+                                                                         bool include_subgroup_timeout = false) {
     std::vector<std::uint8_t> payload;
     append_moqint(payload, draft, 77);
     append_track_namespace(payload, draft, {"live", "alpha"});
     append_string(payload, draft, "catalog");
-    append_moqint(payload, draft, 5);     // parameter count
-    append_moqint(payload, draft, 0x02);  // DELIVERY_TIMEOUT, delta from 0x00
-    append_moqint(payload, draft, delivery_timeout_ms);
-    append_moqint(payload, draft, 0x10 - 0x02);  // FORWARD
+    const bool with_subgroup = include_subgroup_timeout || subgroup_timeout_ms != 0;
+    append_moqint(payload, draft, with_subgroup ? 6 : 5);  // parameter count
+    append_moqint(payload, draft, 0x02);                   // DELIVERY_TIMEOUT, delta from 0x00
+    append_moqint(payload, draft, object_timeout_ms);
+    std::uint64_t previous = 0x02;
+    if (with_subgroup) {
+        append_moqint(payload, draft, 0x06 - previous);    // SUBGROUP_DELIVERY_TIMEOUT
+        append_moqint(payload, draft, subgroup_timeout_ms);
+        previous = 0x06;
+    }
+    append_moqint(payload, draft, 0x10 - previous);  // FORWARD
     append_message_uint8(payload, draft, 1);
     append_moqint(payload, draft, 0x20 - 0x10);  // SUBSCRIBER_PRIORITY
     append_message_uint8(payload, draft, 200);
@@ -411,15 +422,16 @@ std::vector<std::uint8_t> build_subscribe_message_with_delivery_timeout(DraftVer
 }
 
 // PUBLISH_OK (draft-16+) carrying OBJECT_DELIVERY_TIMEOUT (0x02) and, when
-// non-zero, SUBGROUP_DELIVERY_TIMEOUT (0x06, draft-18).
+// requested, SUBGROUP_DELIVERY_TIMEOUT (0x06, draft-18).
 std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftVersion draft,
                                                                           std::uint64_t object_timeout_ms,
-                                                                          std::uint64_t subgroup_timeout_ms) {
+                                                                          std::uint64_t subgroup_timeout_ms,
+                                                                          bool include_subgroup_timeout = false) {
     std::vector<std::uint8_t> payload;
     if (draft != DraftVersion::kDraft18) {
         append_moqint(payload, draft, 55);
     }
-    const bool with_subgroup = subgroup_timeout_ms != 0;
+    const bool with_subgroup = include_subgroup_timeout || subgroup_timeout_ms != 0;
     append_moqint(payload, draft, with_subgroup ? 6 : 5);  // parameter count
     append_moqint(payload, draft, 0x02);                   // OBJECT_DELIVERY_TIMEOUT
     append_moqint(payload, draft, object_timeout_ms);
@@ -505,19 +517,145 @@ std::vector<std::uint8_t> build_subscribe_tracks_message(ForwardEncoding forward
     return bytes;
 }
 
-std::vector<std::uint8_t> build_subscribe_update_message() {
+std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
+                                                       bool include_group_order = false,
+                                                       bool zero_draft16_timeout = false) {
     std::vector<std::uint8_t> payload;
-    append_varint(payload, 101);
-    append_varint(payload, 77);
-    append_varint(payload, 12);
-    append_varint(payload, 5);
-    append_varint(payload, 20);
-    payload.push_back(200);
-    payload.push_back(1);
-    append_varint(payload, 0);
+    append_moqint(payload, draft, 101);
+    if (draft == DraftVersion::kDraft16) {
+        append_moqint(payload, draft, 77);
+    }
+
+    const std::uint64_t parameter_count =
+        (draft == DraftVersion::kDraft18 ? 6 : 5) + (include_group_order ? 1 : 0);
+    append_moqint(payload, draft, parameter_count);
+    std::uint64_t previous_type = 0;
+    auto append_numeric = [&](std::uint64_t type, std::uint64_t value) {
+        append_moqint(payload, draft, type - previous_type);
+        if (draft == DraftVersion::kDraft18 &&
+            (type == 0x10 || type == 0x20 || type == 0x22)) {
+            payload.push_back(static_cast<std::uint8_t>(value));
+        } else {
+            append_moqint(payload, draft, value);
+        }
+        previous_type = type;
+    };
+
+    append_numeric(0x02, zero_draft16_timeout ? 0 : 900);
+    if (draft == DraftVersion::kDraft18) {
+        append_numeric(0x06, 250);
+    }
+    append_numeric(0x10, 1);
+    append_numeric(0x20, 200);
+
+    append_moqint(payload, draft, 0x21 - previous_type);
+    std::vector<std::uint8_t> filter;
+    append_moqint(filter, draft, 0x04);
+    append_moqint(filter, draft, 12);
+    append_moqint(filter, draft, 5);
+    append_moqint(filter, draft, 20);
+    append_moqint(payload, draft, filter.size());
+    payload.insert(payload.end(), filter.begin(), filter.end());
+    previous_type = 0x21;
+    if (include_group_order) {
+        append_numeric(0x22, 1);
+    }
+    append_numeric(0x32, 21);
 
     std::vector<std::uint8_t> bytes;
-    append_uint16_length_message(bytes, 0x02, payload);
+    append_moqint(bytes, draft, 0x02);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> build_request_update_parameter_edge_case(
+    DraftVersion draft,
+    std::size_t authorization_token_count,
+    bool include_expires,
+    bool malformed_authorization_token = false) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 101);
+    if (draft == DraftVersion::kDraft16) {
+        append_moqint(payload, draft, 77);
+    }
+    append_moqint(payload,
+                  draft,
+                  authorization_token_count + (include_expires ? 1 : 0));
+
+    std::uint64_t previous_type = 0;
+    for (std::size_t index = 0; index < authorization_token_count; ++index) {
+        append_moqint(payload, draft, 0x03 - previous_type);
+        std::vector<std::uint8_t> token;
+        // USE_VALUE carries a token type followed by the token value.
+        append_moqint(token, draft, malformed_authorization_token ? 0x01 : 0x03);
+        if (!malformed_authorization_token) {
+            append_moqint(token, draft, 0);
+            token.push_back(static_cast<std::uint8_t>('a' + index));
+        }
+        append_moqint(payload, draft, token.size());
+        payload.insert(payload.end(), token.begin(), token.end());
+        previous_type = 0x03;
+    }
+    if (include_expires) {
+        append_moqint(payload, draft, 0x08 - previous_type);
+        append_moqint(payload, draft, 500);
+    }
+
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x02);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> build_request_update_duplicate_parameter(
+    DraftVersion draft) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 101);
+    if (draft == DraftVersion::kDraft16) {
+        append_moqint(payload, draft, 77);
+    }
+    append_moqint(payload, draft, 2);
+    append_moqint(payload, draft, 0x10);
+    if (draft == DraftVersion::kDraft18) {
+        payload.push_back(1);
+    } else {
+        append_moqint(payload, draft, 1);
+    }
+    append_moqint(payload, draft, 0);
+    if (draft == DraftVersion::kDraft18) {
+        payload.push_back(1);
+    } else {
+        append_moqint(payload, draft, 1);
+    }
+
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x02);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> build_draft18_request_update_delta_overflow() {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, DraftVersion::kDraft18, 101);
+    append_moqint(payload, DraftVersion::kDraft18, 2);
+    append_moqint(payload, DraftVersion::kDraft18, 0x32);
+    append_moqint(payload, DraftVersion::kDraft18, 1);
+    // The nine-byte VI64 form below is UINT64_MAX. Adding it to the
+    // preceding parameter type would overflow instead of advancing the
+    // required monotonically ordered type sequence.
+    payload.insert(payload.end(), 9, 0xff);
+
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, DraftVersion::kDraft18, 0x02);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
     return bytes;
 }
 
@@ -859,13 +997,6 @@ bool test_peer_control_message_decoders_for_all_drafts() {
                          label + " subscribe tracks rejected outside draft-18");
         }
 
-        SubscribeUpdateMessage update;
-        ok &= expect(decode_subscribe_update_message(build_subscribe_update_message(), update),
-                     label + " subscribe update decode");
-        ok &= expect(update.request_id == 101 && update.subscription_request_id == 77 && update.start_group_id == 12 &&
-                         update.start_object_id == 5 && update.end_group_plus_one == 20,
-                     label + " subscribe update fields");
-
         PublishOk publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message(draft), draft, publish_ok), label + " publish ok decode");
         ok &= expect(publish_ok.request_id == (draft == DraftVersion::kDraft18 ? 0 : 55) &&
@@ -887,6 +1018,173 @@ bool test_peer_control_message_decoders_for_all_drafts() {
         ok &= expect(decode_max_request_id_message(max_bytes, max_request_id), label + " max request id decode");
         ok &= expect(max_request_id.max_request_id == 900, label + " max request id field");
     }
+    return ok;
+}
+
+bool test_request_update_decoding() {
+    bool ok = true;
+
+    RequestUpdateMessage draft16_update;
+    ok &= expect(decode_request_update_message(
+                     build_request_update_message(DraftVersion::kDraft16),
+                     DraftVersion::kDraft16,
+                     draft16_update),
+                 "draft-16 REQUEST_UPDATE decodes its control-stream wire shape");
+    ok &= expect(draft16_update.request_id == 101 && draft16_update.existing_request_id == 77,
+                 "draft-16 REQUEST_UPDATE carries fresh and existing request ids");
+    ok &= expect(draft16_update.object_delivery_timeout_ms == 900 &&
+                     !draft16_update.subgroup_delivery_timeout_ms.has_value() &&
+                     draft16_update.subscriber_priority == 200 && draft16_update.forward == 1,
+                 "draft-16 REQUEST_UPDATE decodes optional numeric parameters");
+    ok &= expect(draft16_update.subscription_filter.has_value() &&
+                     draft16_update.subscription_filter->filter_type == 4 &&
+                     draft16_update.subscription_filter->start_group_id == 12 &&
+                     draft16_update.subscription_filter->start_object_id == 5 &&
+                     draft16_update.subscription_filter->end_group_id == 20 &&
+                     draft16_update.new_group_request == 21,
+                 "draft-16 REQUEST_UPDATE decodes filter and new-group parameters");
+
+    RequestUpdateMessage draft18_update;
+    ok &= expect(decode_request_update_message(
+                     build_request_update_message(DraftVersion::kDraft18),
+                     DraftVersion::kDraft18,
+                     draft18_update),
+                 "draft-18 REQUEST_UPDATE decodes its retained-stream wire shape");
+    ok &= expect(draft18_update.request_id == 101 && !draft18_update.existing_request_id.has_value(),
+                 "draft-18 REQUEST_UPDATE uses stream association instead of an existing request id");
+    ok &= expect(draft18_update.object_delivery_timeout_ms == 900 &&
+                     draft18_update.subgroup_delivery_timeout_ms == 250 &&
+                     draft18_update.subscriber_priority == 200 && draft18_update.forward == 1,
+                 "draft-18 REQUEST_UPDATE decodes varint and uint8 parameters");
+    ok &= expect(draft18_update.subscription_filter.has_value() &&
+                     draft18_update.subscription_filter->filter_type == 4 &&
+                     draft18_update.subscription_filter->end_group_id == 20,
+                 "draft-18 REQUEST_UPDATE decodes its subscription filter");
+
+    RequestUpdateMessage ignored_scope;
+    ok &= expect(decode_request_update_message(
+                     build_request_update_message(DraftVersion::kDraft16, true),
+                     DraftVersion::kDraft16,
+                     ignored_scope),
+                 "draft-16 ignores GROUP_ORDER outside its parameter scope");
+    ok &= expect(!decode_request_update_message(
+                      build_request_update_message(DraftVersion::kDraft18, true),
+                      DraftVersion::kDraft18,
+                      ignored_scope),
+                 "draft-18 rejects GROUP_ORDER outside its parameter scope");
+    ok &= expect(!decode_request_update_message(
+                      build_request_update_message(DraftVersion::kDraft16, false, true),
+                      DraftVersion::kDraft16,
+                      ignored_scope),
+                 "draft-16 rejects a zero DELIVERY_TIMEOUT in REQUEST_UPDATE");
+    RequestUpdateMessage repeated_authorization;
+    ok &= expect(decode_request_update_message(
+                     build_request_update_parameter_edge_case(
+                         DraftVersion::kDraft16, 2, true),
+                     DraftVersion::kDraft16,
+                     repeated_authorization) &&
+                     repeated_authorization.has_authorization_token,
+                 "draft-16 accepts repeated well-formed AUTHORIZATION_TOKEN and ignores EXPIRES");
+    ok &= expect(decode_request_update_message(
+                     build_request_update_parameter_edge_case(
+                         DraftVersion::kDraft18, 2, false),
+                     DraftVersion::kDraft18,
+                     repeated_authorization) &&
+                     repeated_authorization.has_authorization_token,
+                 "draft-18 accepts repeated well-formed AUTHORIZATION_TOKEN parameters");
+    ok &= expect(!decode_request_update_message(
+                      build_request_update_parameter_edge_case(
+                          DraftVersion::kDraft18, 0, true),
+                      DraftVersion::kDraft18,
+                      repeated_authorization),
+                 "draft-18 rejects EXPIRES outside REQUEST_UPDATE_OK");
+    ok &= expect(!decode_request_update_message(
+                      build_request_update_parameter_edge_case(
+                          DraftVersion::kDraft16, 1, false, true),
+                      DraftVersion::kDraft16,
+                      repeated_authorization) &&
+                     !decode_request_update_message(
+                         build_request_update_parameter_edge_case(
+                             DraftVersion::kDraft18, 1, false, true),
+                         DraftVersion::kDraft18,
+                         repeated_authorization),
+                 "REQUEST_UPDATE rejects malformed AUTHORIZATION_TOKEN structures");
+
+    for (const DraftVersion draft :
+         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+        RequestUpdateDecodeError decode_error =
+            RequestUpdateDecodeError::kNone;
+        ok &= expect(!decode_request_update_message(
+                          build_request_update_duplicate_parameter(draft),
+                          draft,
+                          ignored_scope,
+                          &decode_error) &&
+                         decode_error == RequestUpdateDecodeError::kSemantic,
+                     "REQUEST_UPDATE classifies a repeated non-repeatable parameter as a protocol violation");
+    }
+
+    RequestUpdateDecodeError overflow_error =
+        RequestUpdateDecodeError::kNone;
+    ok &= expect(!decode_request_update_message(
+                      build_draft18_request_update_delta_overflow(),
+                      DraftVersion::kDraft18,
+                      ignored_scope,
+                      &overflow_error) &&
+                     overflow_error == RequestUpdateDecodeError::kSemantic,
+                 "draft-18 REQUEST_UPDATE classifies parameter-type delta overflow as a protocol violation");
+    ok &= expect(!decode_request_update_message(
+                      build_request_update_message(DraftVersion::kDraft16),
+                      DraftVersion::kDraft14,
+                      ignored_scope) &&
+                     !decode_request_update_message(
+                         build_request_update_message(DraftVersion::kDraft18),
+                         DraftVersion::kDraft17,
+                         ignored_scope),
+                 "REQUEST_UPDATE decoder is limited to draft 16 and draft 18");
+
+    return ok;
+}
+
+bool test_request_update_response_wire_shapes() {
+    bool ok = true;
+
+    const std::vector<std::uint8_t> draft16_ok = {0x07, 0x00, 0x03, 0x40, 0x65, 0x00};
+    ok &= expect(encode_request_ok_message(DraftVersion::kDraft16, 101) == draft16_ok,
+                 "draft-16 REQUEST_UPDATE_OK carries the update request id");
+
+    const std::vector<std::uint8_t> draft18_ok = {0x07, 0x00, 0x01, 0x00};
+    ok &= expect(encode_request_ok_message(DraftVersion::kDraft18, 101) == draft18_ok,
+                 "draft-18 REQUEST_UPDATE_OK omits a request id on the retained stream");
+
+    const std::vector<std::uint8_t> draft16_extended_ok = {
+        0x07, 0x00, 0x07, 0x40, 0x65, 0x01, 0x09, 0x02, 0x0c, 0x05,
+    };
+    ok &= expect(encode_request_ok_message(
+                     DraftVersion::kDraft16, 101, 12, 5) ==
+                     draft16_extended_ok,
+                 "draft-16 end-extension REQUEST_OK carries request id and LARGEST_OBJECT");
+
+    const std::vector<std::uint8_t> draft18_extended_ok = {
+        0x07, 0x00, 0x05, 0x01, 0x09, 0x02, 0x0c, 0x05,
+    };
+    ok &= expect(encode_request_ok_message(
+                     DraftVersion::kDraft18, 101, 12, 5) ==
+                     draft18_extended_ok,
+                 "draft-18 end-extension REQUEST_OK carries LARGEST_OBJECT without request id");
+
+    std::vector<std::uint8_t> draft16_error = {
+        0x05, 0x00, 0x12, 0x40, 0x65, 0x02, 0x00, 0x0d,
+    };
+    constexpr std::string_view reason = "update failed";
+    draft16_error.insert(draft16_error.end(), reason.begin(), reason.end());
+    ok &= expect(encode_request_error_message(DraftVersion::kDraft16, 101, 2, 0, reason) == draft16_error,
+                 "draft-16 REQUEST_UPDATE_ERROR carries only the update request id and error fields");
+
+    std::vector<std::uint8_t> draft18_error = {0x05, 0x00, 0x10, 0x02, 0x00, 0x0d};
+    draft18_error.insert(draft18_error.end(), reason.begin(), reason.end());
+    ok &= expect(encode_request_error_message(DraftVersion::kDraft18, 101, 2, 0, reason) == draft18_error,
+                 "draft-18 REQUEST_UPDATE_ERROR omits a request id on the retained stream");
+
     return ok;
 }
 
@@ -994,30 +1292,105 @@ bool test_control_message_framing_and_parameter_regressions() {
     // (draft -16 9.15 / -18 10.11: wait the larger of the delivery timeouts).
     {
         SubscribeMessage timed_subscribe;
-        ok &= expect(decode_subscribe_message(build_subscribe_message_with_delivery_timeout(DraftVersion::kDraft16, 1500),
+        ok &= expect(decode_subscribe_message(build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft16, 1500, 0),
                                               DraftVersion::kDraft16, timed_subscribe),
                      "draft-16 SUBSCRIBE with DELIVERY_TIMEOUT decodes");
-        ok &= expect(timed_subscribe.delivery_timeout_ms == 1500 && timed_subscribe.forward == 1,
-                     "draft-16 SUBSCRIBE retains DELIVERY_TIMEOUT value");
+        ok &= expect(timed_subscribe.delivery_timeouts.object_ms == 1500,
+                     "draft-16 object delivery timeout remains independent");
+        ok &= expect(timed_subscribe.delivery_timeouts.subgroup_ms == 0,
+                     "draft-16 subgroup delivery timeout remains absent");
+        ok &= expect(timed_subscribe.forward == 1, "draft-16 SUBSCRIBE retains DELIVERY_TIMEOUT fields");
 
         SubscribeMessage untimed_subscribe;
         ok &= expect(decode_subscribe_message(build_subscribe_message(DraftVersion::kDraft16), DraftVersion::kDraft16,
                                               untimed_subscribe),
                      "draft-16 SUBSCRIBE without DELIVERY_TIMEOUT decodes");
-        ok &= expect(untimed_subscribe.delivery_timeout_ms == 0, "absent DELIVERY_TIMEOUT decodes as 0");
+        ok &= expect(untimed_subscribe.delivery_timeouts.object_ms == 0 &&
+                         untimed_subscribe.delivery_timeouts.subgroup_ms == 0,
+                     "absent DELIVERY_TIMEOUT decodes as zero timeouts");
 
         PublishOk timed_publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft16, 900, 0),
                                        DraftVersion::kDraft16, timed_publish_ok),
                      "draft-16 PUBLISH_OK with DELIVERY_TIMEOUT decodes");
-        ok &= expect(timed_publish_ok.delivery_timeout_ms == 900, "draft-16 PUBLISH_OK retains DELIVERY_TIMEOUT value");
+        ok &= expect(timed_publish_ok.delivery_timeouts.object_ms == 900,
+                     "draft-16 PUBLISH_OK retains DELIVERY_TIMEOUT value");
+        ok &= expect(timed_publish_ok.delivery_timeouts.subgroup_ms == 0,
+                     "draft-16 PUBLISH_OK has no subgroup delivery timeout");
+
+        SubscribeMessage draft18_subscribe;
+        ok &= expect(decode_subscribe_message(
+                         build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft18, 700, 2500),
+                         DraftVersion::kDraft18,
+                         draft18_subscribe),
+                     "draft-18 SUBSCRIBE with both delivery timeouts decodes");
+        ok &= expect(draft18_subscribe.delivery_timeouts.object_ms == 700,
+                     "draft-18 object delivery timeout remains independent");
+        ok &= expect(draft18_subscribe.delivery_timeouts.subgroup_ms == 2500,
+                     "draft-18 subgroup delivery timeout remains independent");
 
         PublishOk draft18_publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft18, 700, 2500),
                                        DraftVersion::kDraft18, draft18_publish_ok),
                      "draft-18 PUBLISH_OK with both delivery timeouts decodes");
-        ok &= expect(draft18_publish_ok.delivery_timeout_ms == 2500,
-                     "draft-18 PUBLISH_OK keeps the larger of OBJECT/SUBGROUP_DELIVERY_TIMEOUT");
+        ok &= expect(draft18_publish_ok.delivery_timeouts.object_ms == 700,
+                     "draft-18 PUBLISH_OK object delivery timeout remains independent");
+        ok &= expect(draft18_publish_ok.delivery_timeouts.subgroup_ms == 2500,
+                     "draft-18 PUBLISH_OK subgroup delivery timeout remains independent");
+
+        SubscribeMessage draft18_object_zero_subscribe;
+        ok &= expect(decode_subscribe_message(
+                         build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft18, 0, 2500, true),
+                         DraftVersion::kDraft18,
+                         draft18_object_zero_subscribe),
+                     "draft-18 SUBSCRIBE accepts explicit zero object delivery timeout");
+        ok &= expect(draft18_object_zero_subscribe.delivery_timeouts.object_ms == 0 &&
+                         draft18_object_zero_subscribe.delivery_timeouts.subgroup_ms == 2500,
+                     "draft-18 SUBSCRIBE retains zero object and non-zero subgroup timeouts");
+
+        SubscribeMessage draft18_subgroup_zero_subscribe;
+        ok &= expect(decode_subscribe_message(
+                         build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft18, 700, 0, true),
+                         DraftVersion::kDraft18,
+                         draft18_subgroup_zero_subscribe),
+                     "draft-18 SUBSCRIBE accepts explicit zero subgroup delivery timeout");
+        ok &= expect(draft18_subgroup_zero_subscribe.delivery_timeouts.object_ms == 700 &&
+                         draft18_subgroup_zero_subscribe.delivery_timeouts.subgroup_ms == 0,
+                     "draft-18 SUBSCRIBE retains non-zero object and zero subgroup timeouts");
+
+        PublishOk draft18_object_zero_publish_ok;
+        ok &= expect(decode_publish_ok(
+                         build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft18, 0, 2500, true),
+                         DraftVersion::kDraft18,
+                         draft18_object_zero_publish_ok),
+                     "draft-18 PUBLISH_OK accepts explicit zero object delivery timeout");
+        ok &= expect(draft18_object_zero_publish_ok.delivery_timeouts.object_ms == 0 &&
+                         draft18_object_zero_publish_ok.delivery_timeouts.subgroup_ms == 2500,
+                     "draft-18 PUBLISH_OK retains zero object and non-zero subgroup timeouts");
+
+        PublishOk draft18_subgroup_zero_publish_ok;
+        ok &= expect(decode_publish_ok(
+                         build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft18, 700, 0, true),
+                         DraftVersion::kDraft18,
+                         draft18_subgroup_zero_publish_ok),
+                     "draft-18 PUBLISH_OK accepts explicit zero subgroup delivery timeout");
+        ok &= expect(draft18_subgroup_zero_publish_ok.delivery_timeouts.object_ms == 700 &&
+                         draft18_subgroup_zero_publish_ok.delivery_timeouts.subgroup_ms == 0,
+                     "draft-18 PUBLISH_OK retains non-zero object and zero subgroup timeouts");
+
+        SubscribeMessage draft16_subgroup_timeout_subscribe;
+        ok &= expect(!decode_subscribe_message(
+                         build_subscribe_message_with_delivery_timeouts(DraftVersion::kDraft16, 1500, 2500, true),
+                         DraftVersion::kDraft16,
+                         draft16_subgroup_timeout_subscribe),
+                     "draft-16 SUBSCRIBE rejects unknown subgroup delivery timeout parameter");
+
+        PublishOk draft16_subgroup_timeout_publish_ok;
+        ok &= expect(!decode_publish_ok(
+                         build_publish_ok_message_with_delivery_timeouts(DraftVersion::kDraft16, 1500, 2500, true),
+                         DraftVersion::kDraft16,
+                         draft16_subgroup_timeout_publish_ok),
+                     "draft-16 PUBLISH_OK rejects unknown subgroup delivery timeout parameter");
     }
 
     std::vector<std::uint8_t> request_ok_payload;
@@ -1163,6 +1536,8 @@ int main() {
     ok &= test_uint8_message_parameter_decoding();
     ok &= test_publisher_control_message_encoders_for_all_drafts();
     ok &= test_peer_control_message_decoders_for_all_drafts();
+    ok &= test_request_update_decoding();
+    ok &= test_request_update_response_wire_shapes();
     ok &= test_subgroup_header_and_object_serdes_for_all_drafts();
     ok &= test_control_message_framing_and_parameter_regressions();
     return ok ? 0 : 1;

@@ -4,9 +4,11 @@
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/msf_catalog.h"
+#include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
 #include <atomic>
+#include <functional>
 #include <iosfwd>
 #include <optional>
 #include <chrono>
@@ -14,10 +16,13 @@
 #include <string>
 #include <string_view>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 namespace openmoq::publisher::transport {
+
+using NowFunction = std::function<std::chrono::steady_clock::time_point()>;
 
 struct LiveSrtCallerOptions {
     std::string id;
@@ -53,7 +58,8 @@ public:
                          bool publish_catalog,
                          bool paced,
                          std::chrono::seconds subscriber_timeout,
-                         openmoq::publisher::cat4moq::AuthorizationConfig authorization = {});
+                         openmoq::publisher::cat4moq::AuthorizationConfig authorization = {},
+                         NowFunction now_function = std::chrono::steady_clock::now);
 
     explicit MoqtSession(PublisherTransport& transport,
                          std::string track_namespace = "media",
@@ -62,7 +68,8 @@ public:
                          bool paced = false,
                          bool loop = false,
                          std::chrono::seconds subscriber_timeout = std::chrono::seconds(30),
-                         openmoq::publisher::cat4moq::AuthorizationConfig authorization = {});
+                         openmoq::publisher::cat4moq::AuthorizationConfig authorization = {},
+                         NowFunction now_function = std::chrono::steady_clock::now);
 
     TransportStatus connect(const EndpointConfig& endpoint, const TlsConfig& tls);
     TransportStatus publish(const openmoq::publisher::PublishPlan& plan);
@@ -136,7 +143,11 @@ private:
     // send/republish path and by end_broadcast's final catalog write.
     TransportStatus send_catalog_objects(openmoq::publisher::DraftVersion draft_version,
                                          std::uint64_t track_alias,
-                                         const std::vector<openmoq::publisher::CatalogObject>& objects);
+                                         const std::vector<openmoq::publisher::CatalogObject>& objects,
+                                         DeliveryTimeouts delivery_timeouts = {},
+                                         std::size_t* streams_opened = nullptr);
+    void remember_catalog_delivery_timeouts(DeliveryTimeouts delivery_timeouts);
+    DeliveryTimeouts catalog_delivery_timeouts_snapshot() const;
 
     PublisherTransport& transport_;
     std::string track_namespace_;
@@ -147,6 +158,7 @@ private:
     bool loop_ = false;
     std::chrono::seconds subscriber_timeout_ = std::chrono::seconds(30);
     openmoq::publisher::cat4moq::AuthorizationConfig authorization_;
+    NowFunction now_function_ = std::chrono::steady_clock::now;
     std::optional<EndpointConfig> endpoint_;
     std::uint64_t control_stream_id_ = 0;
     std::uint64_t peer_control_stream_id_ = 0;
@@ -186,6 +198,8 @@ private:
     std::chrono::steady_clock::time_point last_catalog_published_at_{};
     std::uint64_t catalog_track_alias_ = 0;
     bool catalog_track_alias_known_ = false;
+    mutable std::mutex catalog_delivery_timeouts_mutex_;
+    DeliveryTimeouts catalog_delivery_timeouts_;
 };
 
 }  // namespace openmoq::publisher::transport

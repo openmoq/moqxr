@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -10,6 +12,7 @@ namespace openmoq::publisher::transport {
 class WebTransportClient final : public PublisherTransport {
 public:
     WebTransportClient();
+    explicit WebTransportClient(std::size_t media_capacity_for_testing);
     ~WebTransportClient() override;
 
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override;
@@ -22,6 +25,18 @@ public:
     TransportStatus write_stream(std::uint64_t stream_id,
                                  std::span<const std::uint8_t> bytes,
                                  bool fin) override;
+    TransportStatus set_reliable_stream_priority(std::uint64_t stream_id,
+                                                 std::uint8_t priority) override;
+    std::optional<std::uint8_t> applied_reliable_stream_priority_for_testing(
+        std::uint64_t stream_id) const;
+    std::vector<std::uint8_t> applied_reliable_stream_priorities_for_testing(
+        std::uint64_t stream_id) const;
+    std::vector<std::uint8_t> applied_media_stream_priorities_for_testing(
+        std::uint64_t stream_id) const;
+    ObjectWriteResult try_write_object(std::uint64_t stream_id,
+                                       std::span<const std::uint8_t> bytes,
+                                       bool fin,
+                                       ObjectWriteOptions options) override;
     TransportStatus read_stream(std::uint64_t stream_id,
                                 std::vector<std::uint8_t>& bytes,
                                 bool& fin,
@@ -30,6 +45,16 @@ public:
                                  std::uint64_t error_code) override;
     std::string connection_id() const override;
     void note_delivery_timeout(std::chrono::milliseconds timeout) override;
+    bool media_stream_expired(std::uint64_t stream_id) const override;
+    std::vector<std::uint64_t> media_stream_expiry_events() const override;
+    void acknowledge_media_stream_expired(std::uint64_t stream_id) override;
+    std::size_t timed_out_media_stream_count_for_testing() const;
+    bool media_stream_peer_stopped(std::uint64_t stream_id) const override;
+    std::vector<std::uint64_t> media_stream_peer_stop_events() const override;
+    void acknowledge_media_stream_peer_stopped(
+        std::uint64_t stream_id) override;
+    std::size_t peer_stopped_media_stream_count_for_testing() const;
+    bool connection_close_sent_for_testing() const;
     TransportStatus close(std::uint64_t application_error_code) override;
 
 private:

@@ -72,6 +72,11 @@ struct SubscribeTracksMessage {
     std::uint8_t forward = 1;
 };
 
+struct DeliveryTimeouts {
+    std::uint64_t object_ms = 0;
+    std::uint64_t subgroup_ms = 0;
+};
+
 struct SubscribeMessage {
     std::uint64_t request_id = 0;
     std::vector<std::string> track_namespace;
@@ -83,12 +88,35 @@ struct SubscribeMessage {
     std::size_t start_group_id = 0;
     std::size_t start_object_id = 0;
     std::size_t end_group_id = 0;
-    // Largest delivery timeout parameter carried by the message (DELIVERY_TIMEOUT
-    // 0x02 in draft-16/17; OBJECT_DELIVERY_TIMEOUT 0x02 / SUBGROUP_DELIVERY_TIMEOUT
-    // 0x06 in draft-18), 0 when absent.
-    std::uint64_t delivery_timeout_ms = 0;
+    DeliveryTimeouts delivery_timeouts;
 };
 
+// The optional values carried by REQUEST_UPDATE are deliberately distinct
+// from SubscribeMessage defaults: an omitted parameter retains the existing
+// request value.
+struct SubscriptionFilter {
+    std::uint64_t filter_type = 0;
+    std::size_t start_group_id = 0;
+    std::size_t start_object_id = 0;
+    std::size_t end_group_id = 0;
+};
+
+struct RequestUpdateMessage {
+    std::uint64_t request_id = 0;
+    // Draft 16 identifies the target in the message. Draft 18 associates the
+    // update with the retained bidirectional request stream.
+    std::optional<std::uint64_t> existing_request_id;
+    std::optional<std::uint64_t> object_delivery_timeout_ms;
+    std::optional<std::uint64_t> subgroup_delivery_timeout_ms;
+    std::optional<std::uint8_t> subscriber_priority;
+    std::optional<std::uint8_t> forward;
+    std::optional<SubscriptionFilter> subscription_filter;
+    std::optional<std::uint64_t> new_group_request;
+    bool has_authorization_token = false;
+};
+
+// Archived positional update model retained only for pre-draft-16 session
+// compatibility. Draft 16 and draft 18 use RequestUpdateMessage above.
 struct SubscribeUpdateMessage {
     std::uint64_t request_id = 0;
     std::uint64_t subscription_request_id = 0;
@@ -111,8 +139,7 @@ struct PublishOk {
     std::uint8_t subscriber_priority = 0;
     std::uint8_t group_order = 0;
     std::uint64_t filter_type = 0;
-    // See SubscribeMessage::delivery_timeout_ms.
-    std::uint64_t delivery_timeout_ms = 0;
+    DeliveryTimeouts delivery_timeouts;
 };
 
 struct PublishError {
@@ -151,6 +178,10 @@ bool decode_max_request_id_message(std::span<const std::uint8_t> bytes, MaxReque
 bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draft, std::size_t& message_size);
 std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& message);
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uint64_t request_id);
+std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
+                                                    std::uint64_t request_id,
+                                                    std::size_t largest_group_id,
+                                                    std::size_t largest_object_id);
 bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishNamespaceOk& message);
 bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draft, RequestError& message);
 bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
@@ -161,7 +192,17 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                      DraftVersion draft,
                                      SubscribeTracksMessage& message);
 bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion draft, SubscribeMessage& message);
-bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, SubscribeUpdateMessage& message);
+enum class RequestUpdateDecodeError {
+    kNone,
+    kKeyValueFormatting,
+    kSemantic,
+};
+bool decode_request_update_message(std::span<const std::uint8_t> bytes,
+                                   DraftVersion draft,
+                                   RequestUpdateMessage& message,
+                                   RequestUpdateDecodeError* error = nullptr);
+bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
+                                     SubscribeUpdateMessage& message);
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
                                                       std::uint64_t request_id,
                                                       std::uint64_t track_alias,

@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace openmoq::publisher::transport {
@@ -60,6 +62,19 @@ struct TransportStatus {
     static TransportStatus failure(std::string_view error_message);
 };
 
+struct ObjectWriteOptions {
+    std::uint8_t transport_priority = 255;
+    std::optional<std::chrono::steady_clock::time_point> object_deadline;
+    std::optional<std::chrono::steady_clock::time_point> subgroup_deadline;
+};
+
+enum class ObjectWriteDisposition { kAccepted, kWouldBlock, kFailed };
+
+struct ObjectWriteResult {
+    ObjectWriteDisposition disposition = ObjectWriteDisposition::kFailed;
+    std::string message;
+};
+
 class PublisherTransport {
 public:
     virtual ~PublisherTransport() = default;
@@ -74,6 +89,27 @@ public:
     virtual TransportStatus write_stream(std::uint64_t stream_id,
                                          std::span<const std::uint8_t> bytes,
                                          bool fin) = 0;
+    // Assigns a reliable MOQT stream to an explicit transport scheduler class.
+    // Sessions call this only for draft-specific stream roles they know; the
+    // transport must not infer a role from write order or stream identifiers.
+    virtual TransportStatus set_reliable_stream_priority(std::uint64_t stream_id,
+                                                         std::uint8_t priority) {
+        static_cast<void>(stream_id);
+        static_cast<void>(priority);
+        return TransportStatus::success();
+    }
+    virtual ObjectWriteResult try_write_object(std::uint64_t stream_id,
+                                               std::span<const std::uint8_t> bytes,
+                                               bool fin,
+                                               ObjectWriteOptions options) {
+        static_cast<void>(options);
+        TransportStatus status = write_stream(stream_id, bytes, fin);
+        return {
+            .disposition = status.ok ? ObjectWriteDisposition::kAccepted
+                                     : ObjectWriteDisposition::kFailed,
+            .message = std::move(status.message),
+        };
+    }
     virtual TransportStatus read_stream(std::uint64_t stream_id,
                                         std::vector<std::uint8_t>& bytes,
                                         bool& fin,
@@ -88,6 +124,46 @@ public:
     // connection is torn down (draft -16 9.15 / -18 10.11). Optional: the
     // default ignores it and transports fall back to a built-in bound.
     virtual void note_delivery_timeout(std::chrono::milliseconds timeout) { static_cast<void>(timeout); }
+    // Stable, non-destructive notification that the transport has already
+    // reset this media stream because a delivery deadline won. Sessions use
+    // it to retire the owning subgroup without conflating timeout with the
+    // three admission outcomes. Optional transports never report expiry.
+    virtual bool media_stream_expired(std::uint64_t stream_id) const {
+        static_cast<void>(stream_id);
+        return false;
+    }
+    // Returns a stable, non-destructive snapshot of all unacknowledged media
+    // stream expiry notifications. This mirrors peer-stop ownership: a
+    // session checks every independent sender before releasing an event.
+    virtual std::vector<std::uint64_t> media_stream_expiry_events() const {
+        return {};
+    }
+    // Releases a previously observed expiry notification after the owning
+    // session has permanently retired that subgroup.
+    virtual void acknowledge_media_stream_expired(std::uint64_t stream_id) {
+        static_cast<void>(stream_id);
+    }
+    // Stable, non-destructive notification that the peer sent STOP_SENDING
+    // for this media stream.  Sessions use it to retire the owning subgroup
+    // without allowing later admissions to recreate that exact stream.
+    virtual bool media_stream_peer_stopped(std::uint64_t stream_id) const {
+        static_cast<void>(stream_id);
+        return false;
+    }
+    // Returns a stable, non-destructive snapshot of all unacknowledged media
+    // stream peer-stop notifications. A session can inspect every sender for
+    // ownership before acknowledging an entry, so one independent sender
+    // cannot consume another sender's event.
+    virtual std::vector<std::uint64_t> media_stream_peer_stop_events() const {
+        return {};
+    }
+    // Releases a previously observed peer-stop notification after the owning
+    // session has retired the subgroup. Optional transports have no retained
+    // notification state to release.
+    virtual void acknowledge_media_stream_peer_stopped(
+        std::uint64_t stream_id) {
+        static_cast<void>(stream_id);
+    }
     virtual TransportStatus close(std::uint64_t application_error_code) = 0;
 };
 

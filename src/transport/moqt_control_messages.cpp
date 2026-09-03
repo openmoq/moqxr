@@ -396,30 +396,75 @@ void append_parameter_delta(std::vector<std::uint8_t>& out,
     previous_type = type;
 }
 
-bool decode_parameter_type(std::span<const std::uint8_t> bytes,
-                           std::size_t& offset,
-                           DraftVersion draft,
-                           std::uint64_t& previous_type,
-                           bool delta_encoded,
-                           std::uint64_t& parameter_type) {
+enum class ParameterTypeDecodeError {
+    kNone,
+    kEncoding,
+    kProtocolViolation,
+};
+
+bool decode_parameter_type(
+    std::span<const std::uint8_t> bytes,
+    std::size_t& offset,
+    DraftVersion draft,
+    std::uint64_t& previous_type,
+    bool delta_encoded,
+    std::uint64_t& parameter_type,
+    std::optional<std::uint64_t> repeatable_type = std::nullopt,
+    ParameterTypeDecodeError* error = nullptr) {
+    const auto fail = [error](ParameterTypeDecodeError failure) {
+        if (error != nullptr) {
+            *error = failure;
+        }
+        return false;
+    };
+    if (error != nullptr) {
+        *error = ParameterTypeDecodeError::kNone;
+    }
     std::uint64_t encoded_type = 0;
     if (!decode_moqint_impl(bytes, offset, draft, encoded_type)) {
-        return false;
+        return fail(ParameterTypeDecodeError::kEncoding);
     }
     if (!delta_encoded) {
         parameter_type = encoded_type;
         previous_type = parameter_type;
         return true;
     }
-    if (previous_type != 0 && encoded_type == 0) {
-        return false;
+    if (previous_type != 0 && encoded_type == 0 &&
+        repeatable_type != previous_type) {
+        return fail(ParameterTypeDecodeError::kProtocolViolation);
     }
     if (encoded_type > std::numeric_limits<std::uint64_t>::max() - previous_type) {
-        return false;
+        return fail(ParameterTypeDecodeError::kProtocolViolation);
     }
     parameter_type = previous_type + encoded_type;
     previous_type = parameter_type;
     return true;
+}
+
+bool valid_authorization_token(std::span<const std::uint8_t> bytes,
+                               std::size_t offset,
+                               std::size_t parameter_end,
+                               DraftVersion draft) {
+    const auto parameter_bytes = bytes.first(parameter_end);
+    std::uint64_t alias_type = 0;
+    if (!decode_moqint_impl(parameter_bytes, offset, draft, alias_type)) {
+        return false;
+    }
+
+    std::uint64_t ignored = 0;
+    switch (alias_type) {
+        case 0x00:  // DELETE: alias only.
+        case 0x02:  // USE_ALIAS: alias only.
+            return decode_moqint_impl(parameter_bytes, offset, draft, ignored) &&
+                   offset == parameter_end;
+        case 0x01:  // REGISTER: alias, token type, then token value.
+            return decode_moqint_impl(parameter_bytes, offset, draft, ignored) &&
+                   decode_moqint_impl(parameter_bytes, offset, draft, ignored);
+        case 0x03:  // USE_VALUE: token type, then token value.
+            return decode_moqint_impl(parameter_bytes, offset, draft, ignored);
+        default:
+            return false;
+    }
 }
 
 std::uint64_t draft_version_number(DraftVersion draft) {
@@ -855,6 +900,34 @@ std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uin
     return message_bytes;
 }
 
+std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
+                                                    std::uint64_t request_id,
+                                                    std::size_t largest_group_id,
+                                                    std::size_t largest_object_id) {
+    std::vector<std::uint8_t> payload;
+    if (!uses_moq_vi64(draft)) {
+        append_moqint(payload, draft, request_id);
+    }
+    append_moqint(payload, draft, 1);
+    std::vector<std::uint8_t> largest_object;
+    append_location(largest_object,
+                    draft,
+                    largest_group_id,
+                    largest_object_id);
+    std::uint64_t previous_parameter_type = 0;
+    append_parameter_delta(payload,
+                           draft,
+                           previous_parameter_type,
+                           0x09,
+                           largest_object);
+
+    std::vector<std::uint8_t> message_bytes;
+    append_moqint(message_bytes, draft, kRequestOkType);
+    append_uint16(message_bytes, static_cast<std::uint16_t>(payload.size()));
+    message_bytes.insert(message_bytes.end(), payload.begin(), payload.end());
+    return message_bytes;
+}
+
 bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishNamespaceOk& message) {
     if (draft == DraftVersion::kDraft14) {
         return decode_publish_namespace_ok(bytes, message);
@@ -922,12 +995,11 @@ bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draf
     std::size_t offset = payload_offset;
     const std::size_t payload_end = payload_offset + payload_length;
     if (draft == DraftVersion::kDraft16) {
-        std::uint64_t parameter_count = 0;
         return decode_moqint_impl(bytes, offset, draft, message.request_id) &&
                decode_moqint_impl(bytes, offset, draft, message.error_code) &&
                decode_moqint_impl(bytes, offset, draft, message.retry_interval) &&
                decode_reason_phrase(bytes.subspan(0, payload_end), offset, draft, message.reason) &&
-               decode_moqint_impl(bytes, offset, draft, parameter_count) && parameter_count == 0 && offset == payload_end;
+               offset == payload_end;
     }
 
     if (!uses_moq_vi64(draft) && !decode_moqint_impl(bytes, offset, draft, message.request_id)) {
@@ -1181,13 +1253,15 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
                 return false;
             }
             switch (parameter_type) {
-                case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT) — spec §9.2.2.2: value 0 is illegal on the wire.
-                    if (value == 0) { return false; }
-                    message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT).
+                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
+                    message.delivery_timeouts.object_ms = value;
                     break;
-                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
+                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
                     if (draft == DraftVersion::kDraft18) {
-                        message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                        message.delivery_timeouts.subgroup_ms = value;
+                    } else if (draft == DraftVersion::kDraft16) {
+                        return false;
                     }
                     break;
                 case kParamForward:  // FORWARD
@@ -1271,7 +1345,13 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
     std::uint64_t previous_parameter_type = 0;
     for (std::uint64_t index = 0; index < parameter_count; ++index) {
         std::uint64_t parameter_type = 0;
-        if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
+        if (!decode_parameter_type(bytes,
+                                   offset,
+                                   draft,
+                                   previous_parameter_type,
+                                   true,
+                                   parameter_type,
+                                   kParamAuthorizationToken)) {
             return false;
         }
         if ((parameter_type & 0x1ULL) == 0) {
@@ -1298,10 +1378,178 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
     return offset == payload_end;
 }
 
-bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, SubscribeUpdateMessage& message) {
+bool decode_request_update_message(std::span<const std::uint8_t> bytes,
+                                   DraftVersion draft,
+                                   RequestUpdateMessage& message,
+                                   RequestUpdateDecodeError* error) {
+    const auto fail = [error](RequestUpdateDecodeError failure) {
+        if (error != nullptr) {
+            *error = failure;
+        }
+        return false;
+    };
+    if (error != nullptr) {
+        *error = RequestUpdateDecodeError::kNone;
+    }
+    if (draft != DraftVersion::kDraft16 && draft != DraftVersion::kDraft18) {
+        return fail(RequestUpdateDecodeError::kSemantic);
+    }
+
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
-    if (!parse_uint16_length_message(bytes, DraftVersion::kDraft16, kSubscribeUpdateType, payload_offset, payload_length)) {
+    if (!parse_uint16_length_message(bytes, draft, kSubscribeUpdateType, payload_offset, payload_length)) {
+        return fail(RequestUpdateDecodeError::kSemantic);
+    }
+
+    message = {};
+    std::size_t offset = payload_offset;
+    const std::size_t payload_end = payload_offset + payload_length;
+    std::uint64_t parameter_count = 0;
+    if (!decode_moqint_impl(bytes, offset, draft, message.request_id)) {
+        return fail(RequestUpdateDecodeError::kSemantic);
+    }
+    if (draft == DraftVersion::kDraft16) {
+        std::uint64_t existing_request_id = 0;
+        if (!decode_moqint_impl(bytes, offset, draft, existing_request_id)) {
+            return fail(RequestUpdateDecodeError::kSemantic);
+        }
+        message.existing_request_id = existing_request_id;
+    }
+    if (!decode_moqint_impl(bytes, offset, draft, parameter_count)) {
+        return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+    }
+
+    std::uint64_t previous_parameter_type = 0;
+    for (std::uint64_t index = 0; index < parameter_count; ++index) {
+        std::uint64_t parameter_type = 0;
+        ParameterTypeDecodeError parameter_type_error =
+            ParameterTypeDecodeError::kNone;
+        if (!decode_parameter_type(bytes,
+                                   offset,
+                                   draft,
+                                   previous_parameter_type,
+                                   true,
+                                   parameter_type,
+                                   kParamAuthorizationToken,
+                                   &parameter_type_error)) {
+            return fail(
+                parameter_type_error ==
+                        ParameterTypeDecodeError::kProtocolViolation
+                    ? RequestUpdateDecodeError::kSemantic
+                    : RequestUpdateDecodeError::kKeyValueFormatting);
+        }
+
+        if ((parameter_type & 0x1ULL) == 0) {
+            std::uint64_t value = 0;
+            if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
+                return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+            }
+            switch (parameter_type) {
+                case 0x02:
+                    if (message.object_delivery_timeout_ms.has_value() ||
+                        (draft == DraftVersion::kDraft16 && value == 0)) {
+                        return fail(RequestUpdateDecodeError::kSemantic);
+                    }
+                    message.object_delivery_timeout_ms = value;
+                    break;
+                case 0x06:
+                    if (draft != DraftVersion::kDraft18 ||
+                        message.subgroup_delivery_timeout_ms.has_value()) {
+                        return fail(RequestUpdateDecodeError::kSemantic);
+                    }
+                    message.subgroup_delivery_timeout_ms = value;
+                    break;
+                case 0x08:  // EXPIRES is known but outside REQUEST_UPDATE.
+                    if (draft == DraftVersion::kDraft18) {
+                        return fail(RequestUpdateDecodeError::kSemantic);
+                    }
+                    break;
+                case kParamForward:
+                    if (message.forward.has_value() || value > 1) {
+                        return fail(RequestUpdateDecodeError::kSemantic);
+                    }
+                    message.forward = static_cast<std::uint8_t>(value);
+                    break;
+                case kParamSubscriberPriority:
+                    if (message.subscriber_priority.has_value() || value > 255) {
+                        return fail(RequestUpdateDecodeError::kSemantic);
+                    }
+                    message.subscriber_priority = static_cast<std::uint8_t>(value);
+                    break;
+                case kParamGroupOrder:
+                    // Draft 16 requires known parameters outside their message
+                    // scope to be ignored. Draft 18 makes the same condition a
+                    // connection-level protocol violation.
+                    if (draft == DraftVersion::kDraft18) {
+                        return fail(RequestUpdateDecodeError::kSemantic);
+                    }
+                    break;
+                case 0x32:
+                    if (message.new_group_request.has_value()) {
+                        return fail(RequestUpdateDecodeError::kSemantic);
+                    }
+                    message.new_group_request = value;
+                    break;
+                default:
+                    return fail(RequestUpdateDecodeError::kSemantic);
+            }
+            continue;
+        }
+
+        std::uint64_t parameter_length = 0;
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) ||
+            parameter_length > payload_end - offset) {
+            return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+        }
+        const std::size_t parameter_end = offset + static_cast<std::size_t>(parameter_length);
+        switch (parameter_type) {
+            case kParamAuthorizationToken:
+                if (!valid_authorization_token(bytes,
+                                               offset,
+                                               parameter_end,
+                                               draft)) {
+                    return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+                }
+                message.has_authorization_token = true;
+                break;
+            case 0x09:  // LARGEST_OBJECT is known but outside REQUEST_UPDATE.
+                if (draft == DraftVersion::kDraft18) {
+                    return fail(RequestUpdateDecodeError::kSemantic);
+                }
+                break;
+            case 0x21: {
+                if (message.subscription_filter.has_value()) {
+                    return fail(RequestUpdateDecodeError::kSemantic);
+                }
+                SubscribeMessage decoded_filter;
+                std::size_t filter_offset = offset;
+                if (!decode_subscribe_filter(bytes, filter_offset, parameter_end, draft, decoded_filter)) {
+                    return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+                }
+                message.subscription_filter = SubscriptionFilter{
+                    .filter_type = decoded_filter.filter_type,
+                    .start_group_id = decoded_filter.start_group_id,
+                    .start_object_id = decoded_filter.start_object_id,
+                    .end_group_id = decoded_filter.end_group_id,
+                };
+                break;
+            }
+            default:
+                return fail(RequestUpdateDecodeError::kSemantic);
+        }
+        offset = parameter_end;
+    }
+
+    return offset == payload_end ||
+           fail(RequestUpdateDecodeError::kKeyValueFormatting);
+}
+
+bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
+                                     SubscribeUpdateMessage& message) {
+    std::size_t payload_offset = 0;
+    std::size_t payload_length = 0;
+    if (!parse_uint16_length_message(
+            bytes, DraftVersion::kDraft16, kSubscribeUpdateType, payload_offset, payload_length)) {
         return false;
     }
 
@@ -1315,8 +1563,7 @@ bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, Subscr
         !decode_varint_impl(bytes, offset, message.subscription_request_id) ||
         !decode_varint_impl(bytes, offset, start_group_id) ||
         !decode_varint_impl(bytes, offset, start_object_id) ||
-        !decode_varint_impl(bytes, offset, end_group_plus_one) ||
-        offset + 2 > payload_end) {
+        !decode_varint_impl(bytes, offset, end_group_plus_one) || offset + 2 > payload_end) {
         return false;
     }
 
@@ -1328,8 +1575,8 @@ bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes, Subscr
     if (message.forward > 1) {
         return false;
     }
-
-    return decode_varint_impl(bytes, offset, parameter_count) && parameter_count == 0 && offset == payload_end;
+    return decode_varint_impl(bytes, offset, parameter_count) && parameter_count == 0 &&
+           offset == payload_end;
 }
 
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
@@ -1404,9 +1651,6 @@ std::vector<std::uint8_t> encode_request_error_message(DraftVersion draft,
     append_moqint(payload, draft, error_code);
     append_moqint(payload, draft, retry_interval);
     append_string(payload, draft, reason);
-    if (!uses_moq_vi64(draft)) {
-        append_moqint(payload, draft, 0);
-    }
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kRequestErrorType);
@@ -1645,12 +1889,14 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             }
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT)
-                    if (value == 0) { return false; }
-                    message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
+                    message.delivery_timeouts.object_ms = value;
                     break;
-                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT; unassigned (ignored) in earlier drafts.
+                case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
                     if (draft == DraftVersion::kDraft18) {
-                        message.delivery_timeout_ms = std::max(message.delivery_timeout_ms, value);
+                        message.delivery_timeouts.subgroup_ms = value;
+                    } else if (draft == DraftVersion::kDraft16) {
+                        return false;
                     }
                     break;
                 case 0x08:  // EXPIRES
