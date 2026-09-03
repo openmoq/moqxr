@@ -2476,7 +2476,7 @@ private:
         for (auto it = stream_keys_.begin(); it != stream_keys_.end();) {
             const bool expired = transport.media_stream_expired(it->first);
             const bool peer_stopped =
-                !expired && transport.media_stream_peer_stopped(it->first);
+                transport.media_stream_peer_stopped(it->first);
             if (!expired && !peer_stopped) {
                 ++it;
                 continue;
@@ -2489,10 +2489,13 @@ private:
             }
             pending_objects_.erase(key);
             closed_subgroups_.insert(key);
-            if (peer_stopped) {
+            if (peer_stopped && !expired) {
                 peer_stopped_subgroups_.insert(key);
             }
             it = stream_keys_.erase(it);
+            if (peer_stopped) {
+                transport.acknowledge_media_stream_peer_stopped(stream_id);
+            }
         }
     }
 

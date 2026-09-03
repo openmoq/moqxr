@@ -139,6 +139,13 @@ public:
         static_cast<void>(stream_id);
         return false;
     }
+    // Releases a previously observed peer-stop notification after the owning
+    // session has retired the subgroup. Optional transports have no retained
+    // notification state to release.
+    virtual void acknowledge_media_stream_peer_stopped(
+        std::uint64_t stream_id) {
+        static_cast<void>(stream_id);
+    }
     virtual TransportStatus close(std::uint64_t application_error_code) = 0;
 };
 

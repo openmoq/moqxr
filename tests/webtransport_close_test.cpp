@@ -11,11 +11,13 @@
 
 #include "openmoq/publisher/transport/webtransport_client.h"
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -73,8 +75,8 @@ struct SilentServer {
     bool stream_fin_received = false;
     std::set<std::uint64_t> stream_fins;
     std::map<std::uint64_t, std::uint64_t> stream_reset_errors;
-    std::optional<std::uint64_t> stop_sending_stream_id;
-    bool stop_sending_sent = false;
+    std::set<std::uint64_t> stop_sending_stream_ids;
+    std::set<std::uint64_t> stop_sending_sent_streams;
     picohttp_server_path_item_t path_item{};
     picohttp_server_parameters_t params{};
 };
@@ -113,9 +115,9 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         std::lock_guard<std::mutex> lock(server->mutex);
         server->stream_bytes_received += length;
         if (stream_ctx != nullptr && length != 0 &&
-            server->stop_sending_stream_id == stream_ctx->stream_id &&
-            !server->stop_sending_sent) {
-            server->stop_sending_sent = true;
+            server->stop_sending_stream_ids.contains(stream_ctx->stream_id) &&
+            !server->stop_sending_sent_streams.contains(stream_ctx->stream_id)) {
+            server->stop_sending_sent_streams.insert(stream_ctx->stream_id);
             if (picoquic_stop_sending(cnx, stream_ctx->stream_id, 0x01) != 0) {
                 return -1;
             }
@@ -437,8 +439,8 @@ int main() {
             std::lock_guard<std::mutex> lock(server.mutex);
             bytes_before_stop = server.stream_bytes_received;
             server.stream_reset_errors.erase(peer_stopped_stream_id);
-            server.stop_sending_stream_id = peer_stopped_stream_id;
-            server.stop_sending_sent = false;
+            server.stop_sending_stream_ids.insert(peer_stopped_stream_id);
+            server.stop_sending_sent_streams.erase(peer_stopped_stream_id);
         }
         const std::vector<std::uint8_t> peer_stopped_first(
             2 * 1024 * 1024, 0x61);
@@ -484,6 +486,64 @@ int main() {
                          after_peer_stop.message.find("stopped by peer") !=
                              std::string::npos,
                      "expected WebTransport to reject later admission on a peer-stopped stream");
+        drain_client->acknowledge_media_stream_peer_stopped(
+            peer_stopped_stream_id);
+        ok &= expect(!drain_client->media_stream_peer_stopped(
+                             peer_stopped_stream_id) &&
+                         drain_client->peer_stopped_media_stream_count_for_testing() == 0,
+                     "expected WebTransport acknowledgement to release retained peer-stop state");
+
+        constexpr std::size_t kPeerStopStressCount = 24;
+        std::vector<std::uint64_t> peer_stop_stress_streams;
+        peer_stop_stress_streams.reserve(kPeerStopStressCount);
+        for (std::size_t index = 0; index < kPeerStopStressCount; ++index) {
+            std::uint64_t stress_stream_id = 0;
+            ok &= expect(drain_client->open_stream(
+                             StreamDirection::kUnidirectional,
+                             stress_stream_id).ok,
+                         "expected WebTransport stress peer-stop stream open to succeed");
+            peer_stop_stress_streams.push_back(stress_stream_id);
+        }
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            server.stop_sending_stream_ids.insert(
+                peer_stop_stress_streams.begin(),
+                peer_stop_stress_streams.end());
+        }
+        std::size_t acknowledged_peer_stops = 0;
+        std::thread peer_stop_consumer([&] {
+            std::vector<bool> consumed(peer_stop_stress_streams.size(), false);
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (acknowledged_peer_stops < peer_stop_stress_streams.size() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                for (std::size_t index = 0;
+                     index < peer_stop_stress_streams.size(); ++index) {
+                    if (!consumed[index] &&
+                        drain_client->media_stream_peer_stopped(
+                            peer_stop_stress_streams[index])) {
+                        drain_client->acknowledge_media_stream_peer_stopped(
+                            peer_stop_stress_streams[index]);
+                        consumed[index] = true;
+                        ++acknowledged_peer_stops;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+        for (std::size_t index = 0;
+             index < peer_stop_stress_streams.size(); ++index) {
+            const std::array<std::uint8_t, 1> payload = {
+                static_cast<std::uint8_t>(index)};
+            ok &= expect(drain_client->try_write_object(
+                             peer_stop_stress_streams[index], payload, false, {})
+                             .disposition == ObjectWriteDisposition::kAccepted,
+                         "expected WebTransport stress peer-stop object admission");
+        }
+        peer_stop_consumer.join();
+        ok &= expect(acknowledged_peer_stops == peer_stop_stress_streams.size() &&
+                         drain_client->peer_stopped_media_stream_count_for_testing() == 0,
+                     "expected concurrent WebTransport consumption to bound retained peer-stop state");
         {
             std::lock_guard<std::mutex> lock(server.mutex);
             bytes_before_drain = server.stream_bytes_received;
@@ -654,6 +714,36 @@ int main() {
                              reset->second == 0x02,
                          "expected activation-time WebTransport expiry reset before connection close");
         }
+    }
+
+    {
+        auto* reset_failure_client = new WebTransportClient();
+        ok &= expect(reset_failure_client->configure(endpoint, tls).ok,
+                     "expected reset-failure WebTransport client configure to succeed");
+        ok &= expect(reset_failure_client->connect().ok,
+                     "expected reset-failure WebTransport client connect to succeed");
+        constexpr std::uint64_t kInvalidResetStreamId =
+            std::numeric_limits<std::uint64_t>::max();
+        ok &= expect(reset_failure_client->reset_stream(
+                         kInvalidResetStreamId, 0x02).ok,
+                     "expected invalid WebTransport reset to enter packet-loop processing");
+        auto close_future = std::async(std::launch::async, [reset_failure_client] {
+            return reset_failure_client->close(0);
+        });
+        const bool close_completed =
+            close_future.wait_for(std::chrono::seconds(5)) ==
+            std::future_status::ready;
+        ok &= expect(close_completed,
+                     "expected failed WebTransport reset processing to terminate without hanging close");
+        if (!close_completed) {
+            std::cerr << "reset-failure close is hung; leaking client and exiting\n";
+            stop_server(server);
+            std::_Exit(1);
+        }
+        static_cast<void>(close_future.get());
+        ok &= expect(!reset_failure_client->connection_close_sent_for_testing(),
+                     "expected WebTransport reset failure to prevent connection close overtaking the reset");
+        delete reset_failure_client;
     }
 
     stop_server(server);

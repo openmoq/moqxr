@@ -4,6 +4,7 @@
 #include "openmoq/publisher/transport/moqt_session.h"
 #include "openmoq/publisher/transport/picoquic_client.h"
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -63,8 +64,8 @@ struct SmokeServer {
     bool media_stream_fin_received = false;
     std::set<std::uint64_t> media_stream_fins;
     std::map<std::uint64_t, std::uint64_t> media_stream_reset_errors;
-    std::optional<std::uint64_t> stop_sending_stream_id;
-    bool stop_sending_sent = false;
+    std::set<std::uint64_t> stop_sending_stream_ids;
+    std::set<std::uint64_t> stop_sending_sent_streams;
     std::vector<std::uint8_t> control_bytes;
     std::size_t publish_response_count = 0;
     bool loop_ready = false;
@@ -174,9 +175,9 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
             if ((stream_id & 0x3) == 0x2) {
                 if (bytes != nullptr && length != 0) {
                     server->media_stream_bytes.insert(server->media_stream_bytes.end(), bytes, bytes + length);
-                    if (server->stop_sending_stream_id == stream_id &&
-                        !server->stop_sending_sent) {
-                        server->stop_sending_sent = true;
+                    if (server->stop_sending_stream_ids.contains(stream_id) &&
+                        !server->stop_sending_sent_streams.contains(stream_id)) {
+                        server->stop_sending_sent_streams.insert(stream_id);
                         if (picoquic_stop_sending(cnx, stream_id, 0x01) != 0) {
                             return PICOQUIC_ERROR_UNEXPECTED_ERROR;
                         }
@@ -690,8 +691,8 @@ int main() {
     {
         std::lock_guard<std::mutex> lock(delivery_server.mutex);
         media_bytes_before_stop = delivery_server.media_stream_bytes.size();
-        delivery_server.stop_sending_stream_id = peer_stopped_stream_id;
-        delivery_server.stop_sending_sent = false;
+        delivery_server.stop_sending_stream_ids.insert(peer_stopped_stream_id);
+        delivery_server.stop_sending_sent_streams.erase(peer_stopped_stream_id);
     }
     const std::vector<std::uint8_t> peer_stopped_first(2 * 1024 * 1024, 0x51);
     const std::vector<std::uint8_t> peer_stopped_second(2 * 1024 * 1024, 0x52);
@@ -733,6 +734,64 @@ int main() {
                      after_peer_stop.message.find("stopped by peer") !=
                          std::string::npos,
                  "expected raw-QUIC to reject later admission on a peer-stopped stream");
+    delivery_client.acknowledge_media_stream_peer_stopped(
+        peer_stopped_stream_id);
+    ok &= expect(!delivery_client.media_stream_peer_stopped(
+                         peer_stopped_stream_id) &&
+                     delivery_client.peer_stopped_media_stream_count_for_testing() == 0,
+                 "expected raw-QUIC acknowledgement to release retained peer-stop state");
+
+    constexpr std::size_t kPeerStopStressCount = 24;
+    std::vector<std::uint64_t> peer_stop_stress_streams;
+    peer_stop_stress_streams.reserve(kPeerStopStressCount);
+    for (std::size_t index = 0; index < kPeerStopStressCount; ++index) {
+        std::uint64_t stream_id = 0;
+        status = delivery_client.open_stream(
+            openmoq::publisher::transport::StreamDirection::kUnidirectional,
+            stream_id);
+        ok &= expect(status.ok,
+                     "expected raw-QUIC stress peer-stop stream open to succeed");
+        peer_stop_stress_streams.push_back(stream_id);
+    }
+    {
+        std::lock_guard<std::mutex> lock(delivery_server.mutex);
+        delivery_server.stop_sending_stream_ids.insert(
+            peer_stop_stress_streams.begin(), peer_stop_stress_streams.end());
+    }
+    std::size_t acknowledged_peer_stops = 0;
+    std::thread peer_stop_consumer([&] {
+        std::vector<bool> consumed(peer_stop_stress_streams.size(), false);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (acknowledged_peer_stops < peer_stop_stress_streams.size() &&
+               std::chrono::steady_clock::now() < deadline) {
+            for (std::size_t index = 0;
+                 index < peer_stop_stress_streams.size(); ++index) {
+                if (!consumed[index] &&
+                    delivery_client.media_stream_peer_stopped(
+                        peer_stop_stress_streams[index])) {
+                    delivery_client.acknowledge_media_stream_peer_stopped(
+                        peer_stop_stress_streams[index]);
+                    consumed[index] = true;
+                    ++acknowledged_peer_stops;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    for (std::size_t index = 0; index < peer_stop_stress_streams.size();
+         ++index) {
+        const std::array<std::uint8_t, 1> payload = {
+            static_cast<std::uint8_t>(index)};
+        ok &= expect(delivery_client.try_write_object(
+                         peer_stop_stress_streams[index], payload, false, {})
+                         .disposition == ObjectWriteDisposition::kAccepted,
+                     "expected raw-QUIC stress peer-stop object admission");
+    }
+    peer_stop_consumer.join();
+    ok &= expect(acknowledged_peer_stops == peer_stop_stress_streams.size() &&
+                     delivery_client.peer_stopped_media_stream_count_for_testing() == 0,
+                 "expected concurrent raw-QUIC consumption to bound retained peer-stop state");
     std::uint64_t empty_fin_stream_id = 0;
     status = delivery_client.open_stream(
         openmoq::publisher::transport::StreamDirection::kUnidirectional,

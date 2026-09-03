@@ -603,7 +603,6 @@ int client_callback(picoquic_cnx_t* cnx,
             impl->pending_media_activations.clear();
             impl->media_streams_with_pending.clear();
             impl->timed_out_media_streams.clear();
-            impl->peer_stopped_media_streams.clear();
             if (!impl->connected) {
                 impl->failed = true;
                 impl->last_error = "connection closed before reaching ready state";
@@ -943,7 +942,6 @@ TransportStatus PicoquicClient::connect() {
         impl->pending_media_activations.clear();
         impl->media_streams_with_pending.clear();
         impl->timed_out_media_streams.clear();
-        impl->peer_stopped_media_streams.clear();
         if (!impl->connected && !impl->failed && !impl->disconnected) {
             impl->failed = true;
             impl->last_error = "picoquic packet loop exited before handshake completed";
@@ -1369,6 +1367,28 @@ bool PicoquicClient::media_stream_peer_stopped(
 #endif
 }
 
+void PicoquicClient::acknowledge_media_stream_peer_stopped(
+    std::uint64_t stream_id) {
+#ifdef OPENMOQ_HAS_PICOQUIC
+    if (impl_ != nullptr) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->peer_stopped_media_streams.erase(stream_id);
+        impl_->condition.notify_all();
+    }
+#else
+    static_cast<void>(stream_id);
+#endif
+}
+
+std::size_t PicoquicClient::peer_stopped_media_stream_count_for_testing()
+    const {
+    if (impl_ == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->peer_stopped_media_streams.size();
+}
+
 TransportStatus PicoquicClient::close(std::uint64_t application_error_code) {
     static_cast<void>(application_error_code);
 
@@ -1394,7 +1414,6 @@ TransportStatus PicoquicClient::close(std::uint64_t application_error_code) {
             impl_->pending_media_activations.clear();
             impl_->media_streams_with_pending.clear();
             impl_->timed_out_media_streams.clear();
-            impl_->peer_stopped_media_streams.clear();
             impl_->condition.notify_all();
         }
     }

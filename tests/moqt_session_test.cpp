@@ -325,6 +325,12 @@ struct MockTransport final : PublisherTransport {
         return peer_stopped_media_streams.contains(stream_id);
     }
 
+    void acknowledge_media_stream_peer_stopped(
+        std::uint64_t stream_id) override {
+        acknowledged_peer_stopped_media_streams.push_back(stream_id);
+        peer_stopped_media_streams.erase(stream_id);
+    }
+
     TransportStatus reset_stream(std::uint64_t stream_id, std::uint64_t error_code) override {
         reset_calls.emplace_back(stream_id, error_code);
         if (failing_reset_streams.contains(stream_id)) {
@@ -354,6 +360,7 @@ struct MockTransport final : PublisherTransport {
     std::vector<std::chrono::milliseconds> delivery_timeouts;
     std::set<std::uint64_t> expired_media_streams;
     std::set<std::uint64_t> peer_stopped_media_streams;
+    std::vector<std::uint64_t> acknowledged_peer_stopped_media_streams;
     std::set<std::uint64_t> failing_reset_streams;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
     std::set<std::uint64_t> keep_open_streams;
@@ -5144,6 +5151,9 @@ int main() {
                              transport.object_write_attempts[1].stream_id,
                          "expected peer stop to prevent reopening the original subgroup stream");
         }
+        ok &= expect(transport.acknowledged_peer_stopped_media_streams.size() == 1 &&
+                         transport.peer_stopped_media_streams.empty(),
+                     "expected the session to acknowledge the stable peer-stop event after retiring its subgroup");
     }
 
     {
@@ -5193,6 +5203,9 @@ int main() {
                          transport.object_write_attempts[0].stream_id !=
                              transport.object_write_attempts[1].stream_id,
                      "expected Forward 0-to-1 renewal to use a fresh subgroup stream");
+        ok &= expect(transport.acknowledged_peer_stopped_media_streams.size() == 1 &&
+                         transport.peer_stopped_media_streams.empty(),
+                     "expected draft-18 renewal to retain subgroup state after consuming the backend peer-stop event");
     }
 
     {
