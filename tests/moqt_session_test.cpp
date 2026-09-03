@@ -2004,6 +2004,64 @@ int main() {
     }
 
     {
+        // Reproduces the audio-starvation-behind-a-dense-video-track scenario
+        // (moqxr PR fixing red5-moq-relay bug report): a fast, equal-priority
+        // "video" track with ten evenly spaced objects (media_time 0..900),
+        // and a "audio" track with a single object sitting between video's
+        // 4th and 5th object (media_time 450). With real-deadline tie-break,
+        // "audio" must be served exactly where its deadline falls in the
+        // interleave, not only after every video object has drained.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "video", 1, DraftVersion::kDraft16,
+            0, 0, 128, 1));
+        transport.reads[0].push_back(encode_subscribe_message(
+            3, kTestTrackNamespace, "audio", 1, DraftVersion::kDraft16,
+            0, 0, 128, 1));
+        std::vector<SchedulingObjectSpec> specs;
+        for (int i = 0; i < 10; ++i) {
+            specs.push_back({.track_name = "video",
+                             .group_id = 0,
+                             .subgroup_id = 0,
+                             .object_id = static_cast<std::size_t>(i),
+                             .media_time_us = static_cast<std::uint64_t>(i * 100),
+                             .marker = static_cast<std::uint8_t>('0' + i)});
+        }
+        specs.push_back({.track_name = "audio",
+                         .group_id = 0,
+                         .subgroup_id = 0,
+                         .object_id = 0,
+                         .media_time_us = 450,
+                         .marker = 'A'});
+        const PublishPlan plan = make_scheduling_plan(specs);
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected cross-track deadline session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected cross-track deadline publish to succeed");
+
+        std::vector<std::uint8_t> markers;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 0 || write.bytes.empty()) {
+                continue;
+            }
+            const std::uint8_t marker = write.bytes.back();
+            if ((marker >= '0' && marker <= '9') || marker == 'A') {
+                markers.push_back(marker);
+            }
+        }
+        const auto audio_it = std::find(markers.begin(), markers.end(), 'A');
+        ok &= expect(audio_it != markers.end(),
+                     "expected cross-track audio object to be served");
+        const auto position = std::distance(markers.begin(), audio_it);
+        ok &= expect(position == 5,
+                     "expected audio (deadline 450) to interleave between video objects "
+                     "4 (400) and 5 (500), not after the whole video backlog drains");
+    }
+
+    {
         MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
