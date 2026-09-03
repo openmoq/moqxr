@@ -4879,6 +4879,18 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     }
                     ++frontier_it->second.next;
                     ++active.scheduling_round;
+                    if (trace_enabled()) {
+                        std::cerr << "[moqt-session] frontier-advance track=" << source_object.track_name
+                                  << " group=" << source_object.group_id
+                                  << " subgroup=" << source_object.subgroup_id
+                                  << " served_object=" << source_object.object_id
+                                  << " next=" << frontier_it->second.next
+                                  << " size=" << frontier_it->second.object_indices.size()
+                                  << " has_successor=" << (frontier_it->second.next < frontier_it->second.object_indices.size() ? 1 : 0)
+                                  << " scheduler_frontiers_size=" << active.scheduler_frontiers.size()
+                                  << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
+                                  << std::endl;
+                    }
                     if (frontier_it->second.next <
                         frontier_it->second.object_indices.size()) {
                         const std::size_t successor_index =
