@@ -44,6 +44,8 @@ thread_local bool count_priority_comparisons = false;
 thread_local std::uint64_t priority_comparison_count = 0;
 thread_local bool track_generation_availability_storage = false;
 thread_local std::size_t peak_generation_availability_entries = 0;
+thread_local bool track_subgroup_completion_storage = false;
+thread_local std::size_t peak_subgroup_completion_entries = 0;
 
 struct CandidatePriority {
     std::uint8_t subscriber_priority = 128;
@@ -129,6 +131,23 @@ void note_generation_availability_storage(std::size_t entries) {
     if (track_generation_availability_storage) {
         peak_generation_availability_entries =
             (std::max)(peak_generation_availability_entries, entries);
+    }
+}
+
+void begin_subgroup_completion_storage_tracking_for_testing() {
+    peak_subgroup_completion_entries = 0;
+    track_subgroup_completion_storage = true;
+}
+
+std::size_t end_subgroup_completion_storage_tracking_for_testing() {
+    track_subgroup_completion_storage = false;
+    return peak_subgroup_completion_entries;
+}
+
+void note_subgroup_completion_storage(std::size_t entries) {
+    if (track_subgroup_completion_storage) {
+        peak_subgroup_completion_entries =
+            (std::max)(peak_subgroup_completion_entries, entries);
     }
 }
 
@@ -2057,6 +2076,99 @@ bool subgroup_contains_group_largest(const openmoq::publisher::PublishPlan& plan
     return true;
 }
 
+// Exact completed-subgroup membership with compact contiguous group ranges.
+// One range is the normal live-track frontier for a fixed Subgroup ID; a
+// small number of additional ranges preserves legitimate out-of-order gaps.
+// If an application exceeds that bounded sparse representation, publishing
+// fails explicitly rather than either reopening a completed subgroup or
+// conservatively suppressing an unseen group in the gap.
+class BoundedSubgroupCompletionTracker {
+public:
+    bool contains(std::uint64_t group_id,
+                  std::uint64_t subgroup_id) const {
+        const auto subgroup_it = ranges_by_subgroup_.find(subgroup_id);
+        if (subgroup_it == ranges_by_subgroup_.end()) {
+            return false;
+        }
+        const auto& ranges = subgroup_it->second;
+        auto range_it = ranges.upper_bound(group_id);
+        if (range_it == ranges.begin()) {
+            return false;
+        }
+        --range_it;
+        return group_id <= range_it->second;
+    }
+
+    bool insert(std::uint64_t group_id, std::uint64_t subgroup_id) {
+        auto [subgroup_it, inserted_subgroup] =
+            ranges_by_subgroup_.try_emplace(subgroup_id);
+        auto& ranges = subgroup_it->second;
+        auto next_it = ranges.upper_bound(group_id);
+        auto previous_it = next_it;
+        const bool has_previous = previous_it != ranges.begin();
+        if (has_previous) {
+            --previous_it;
+            if (group_id <= previous_it->second) {
+                return true;
+            }
+        }
+
+        const bool joins_next =
+            next_it != ranges.end() &&
+            group_id != (std::numeric_limits<std::uint64_t>::max)() &&
+            group_id + 1 == next_it->first;
+        const bool joins_previous =
+            has_previous &&
+            previous_it->second !=
+                (std::numeric_limits<std::uint64_t>::max)() &&
+            previous_it->second + 1 == group_id;
+        if (joins_previous && joins_next) {
+            previous_it->second = next_it->second;
+            ranges.erase(next_it);
+            --range_count_;
+            return true;
+        }
+        if (joins_previous) {
+            previous_it->second = group_id;
+            return true;
+        }
+        if (joins_next) {
+            const std::uint64_t next_last = next_it->second;
+            ranges.erase(next_it);
+            ranges.emplace(group_id, next_last);
+            return true;
+        }
+        if (range_count_ >= kMaximumSparseRanges) {
+            if (inserted_subgroup) {
+                ranges_by_subgroup_.erase(subgroup_it);
+            }
+            exhausted_ = true;
+            return false;
+        }
+        ranges.emplace(group_id, group_id);
+        ++range_count_;
+        return true;
+    }
+
+    void clear() {
+        ranges_by_subgroup_.clear();
+        range_count_ = 0;
+        exhausted_ = false;
+    }
+
+    std::size_t storage_entry_count() const {
+        return range_count_ + ranges_by_subgroup_.size();
+    }
+    bool exhausted() const { return exhausted_; }
+
+private:
+    static constexpr std::size_t kMaximumSparseRanges = 256;
+    std::map<std::uint64_t, std::map<std::uint64_t, std::uint64_t>>
+        ranges_by_subgroup_;
+    std::size_t range_count_ = 0;
+    bool exhausted_ = false;
+};
+
 // Tracks per-subgroup open QUIC streams so that the same subgroup's objects
 // are appended onto a single data stream rather than splitting across streams
 // (draft-16 §2.2 / §10.4.2). Callers instantiate one of these per "sending
@@ -2131,7 +2243,11 @@ public:
                               std::nullopt) {
         const Key key{static_cast<std::uint64_t>(object.group_id), object.subgroup_id};
         observe_transport_stream_state(transport);
-        if (closed_subgroups_.contains(key)) {
+        const TransportStatus history_status = completion_history_status();
+        if (!history_status.ok) {
+            return {history_status, ServeDisposition::kSkipped};
+        }
+        if (is_closed(key)) {
             return {TransportStatus::success(), ServeDisposition::kSkipped};
         }
 
@@ -2161,12 +2277,22 @@ public:
                 if (expired_stream_it != streams_.end()) {
                     const std::uint64_t expired_stream_id =
                         expired_stream_it->second.stream_id;
-                    close_subgroup(key);
+                    const bool completion_recorded = close_subgroup(key);
                     const TransportStatus reset_status = transport.reset_stream(
                         expired_stream_id, kDeliveryTimeoutErrorCode);
+                    if (!reset_status.ok) {
+                        return {reset_status, ServeDisposition::kSkipped};
+                    }
+                    if (!completion_recorded) {
+                        return {completion_history_status(),
+                                ServeDisposition::kSkipped};
+                    }
                     return {reset_status, ServeDisposition::kSkipped};
                 }
-                closed_subgroups_.insert(key);
+                if (!record_permanent_completion(key)) {
+                    return {completion_history_status(),
+                            ServeDisposition::kSkipped};
+                }
                 return {TransportStatus::success(), ServeDisposition::kSkipped};
             }
 
@@ -2259,9 +2385,16 @@ public:
         if (deadline_reached(read_now(now_function),
                              options.object_deadline,
                              options.subgroup_deadline)) {
-            close_subgroup(key);
+            const bool completion_recorded = close_subgroup(key);
             const TransportStatus reset_status =
                 transport.reset_stream(stream_id, kDeliveryTimeoutErrorCode);
+            if (!reset_status.ok) {
+                return {reset_status, ServeDisposition::kSkipped};
+            }
+            if (!completion_recorded) {
+                return {completion_history_status(),
+                        ServeDisposition::kSkipped};
+            }
             return {reset_status, ServeDisposition::kSkipped};
         }
 
@@ -2275,7 +2408,7 @@ public:
         }
         if (result.disposition == ObjectWriteDisposition::kFailed) {
             observe_transport_stream_state(transport);
-            if (closed_subgroups_.contains(key)) {
+            if (is_closed(key)) {
                 return {TransportStatus::success(), ServeDisposition::kSkipped};
             }
             return {TransportStatus::failure(
@@ -2288,7 +2421,10 @@ public:
         const bool fin = pending_it->second.fin;
         pending_objects_.erase(pending_it);
         if (fin) {
-            close_subgroup(key);
+            if (!close_subgroup(key)) {
+                return {completion_history_status(),
+                        ServeDisposition::kSkipped};
+            }
         } else {
             stream_it = streams_.find(key);
             if (stream_it != streams_.end()) {
@@ -2370,10 +2506,8 @@ public:
 
     void renew_peer_stopped_subgroups(PublisherTransport& transport) {
         observe_transport_stream_state(transport);
-        for (const Key& key : peer_stopped_subgroups_) {
-            closed_subgroups_.erase(key);
-        }
         peer_stopped_subgroups_.clear();
+        note_completion_storage();
     }
 
     TransportStatus cancel_all_open_subgroups(PublisherTransport& transport,
@@ -2383,7 +2517,9 @@ public:
             streams_.begin(), streams_.end());
         TransportStatus first_failure = TransportStatus::success();
         for (const auto& [key, stream] : open_streams) {
-            close_subgroup(key);
+            if (!close_subgroup(key) && first_failure.ok) {
+                first_failure = completion_history_status();
+            }
             const TransportStatus reset_status =
                 transport.reset_stream(stream.stream_id, error_code);
             if (!reset_status.ok && first_failure.ok) {
@@ -2411,9 +2547,13 @@ public:
         const auto subgroup_deadline =
             deadline_after(read_now(now_function), delivery_timeouts.subgroup_ms);
         observe_transport_stream_state(transport);
+        const TransportStatus history_status = completion_history_status();
+        if (!history_status.ok) {
+            return history_status;
+        }
         const std::vector<std::pair<Key, OpenStream>> open_streams(streams_.begin(), streams_.end());
         for (const auto& [key, stream] : open_streams) {
-            if (closed_subgroups_.contains(key)) {
+            if (is_closed(key)) {
                 continue;
             }
             pending_objects_.erase(key);
@@ -2427,11 +2567,14 @@ public:
                 }
                 if (deadline_reached(read_now(now_function), std::nullopt, subgroup_deadline)) {
                     const std::uint64_t stream_id = stream.stream_id;
-                    close_subgroup(key);
+                    const bool completion_recorded = close_subgroup(key);
                     const TransportStatus status =
                         transport.reset_stream(stream_id, kDeliveryTimeoutErrorCode);
                     if (!status.ok) {
                         return status;
+                    }
+                    if (!completion_recorded) {
+                        return completion_history_status();
                     }
                     break;
                 }
@@ -2446,7 +2589,7 @@ public:
                     });
                 if (result.disposition == ObjectWriteDisposition::kFailed) {
                     observe_transport_stream_state(transport);
-                    if (closed_subgroups_.contains(key)) {
+                    if (is_closed(key)) {
                         break;
                     }
                     return TransportStatus::failure(
@@ -2458,7 +2601,9 @@ public:
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            close_subgroup(key);
+            if (!close_subgroup(key)) {
+                return completion_history_status();
+            }
         }
         streams_.clear();
         stream_keys_.clear();
@@ -2486,14 +2631,49 @@ private:
         ObjectWriteOptions options;
     };
 
-    void close_subgroup(const Key& key) {
+    bool is_closed(const Key& key) const {
+        return closed_subgroups_.contains(key.group_id, key.subgroup_id) ||
+               peer_stopped_subgroups_.contains(key.group_id,
+                                                 key.subgroup_id);
+    }
+
+    void note_completion_storage() const {
+        priority_scheduler_internal::note_subgroup_completion_storage(
+            closed_subgroups_.storage_entry_count() +
+            peer_stopped_subgroups_.storage_entry_count());
+    }
+
+    bool record_permanent_completion(const Key& key) {
+        const bool recorded =
+            closed_subgroups_.insert(key.group_id, key.subgroup_id);
+        note_completion_storage();
+        return recorded;
+    }
+
+    bool record_peer_stopped_completion(const Key& key) {
+        const bool recorded =
+            peer_stopped_subgroups_.insert(key.group_id, key.subgroup_id);
+        note_completion_storage();
+        return recorded;
+    }
+
+    TransportStatus completion_history_status() const {
+        if (closed_subgroups_.exhausted() ||
+            peer_stopped_subgroups_.exhausted()) {
+            return TransportStatus::failure(
+                "subgroup completion history exceeded bounded sparse range capacity");
+        }
+        return TransportStatus::success();
+    }
+
+    bool close_subgroup(const Key& key) {
         const auto stream_it = streams_.find(key);
         if (stream_it != streams_.end()) {
             stream_keys_.erase(stream_it->second.stream_id);
             streams_.erase(stream_it);
         }
         pending_objects_.erase(key);
-        closed_subgroups_.insert(key);
+        return record_permanent_completion(key);
     }
 
     bool retire_transport_stream(std::uint64_t stream_id,
@@ -2510,9 +2690,10 @@ private:
             streams_.erase(stream_it);
         }
         pending_objects_.erase(key);
-        closed_subgroups_.insert(key);
         if (peer_stopped && !expired) {
-            peer_stopped_subgroups_.insert(key);
+            static_cast<void>(record_peer_stopped_completion(key));
+        } else {
+            static_cast<void>(record_permanent_completion(key));
         }
         stream_keys_.erase(key_it);
         return true;
@@ -2547,8 +2728,8 @@ private:
     std::map<Key, OpenStream> streams_;
     std::map<Key, PendingObject> pending_objects_;
     std::map<std::uint64_t, Key> stream_keys_;
-    std::set<Key> closed_subgroups_;
-    std::set<Key> peer_stopped_subgroups_;
+    BoundedSubgroupCompletionTracker closed_subgroups_;
+    BoundedSubgroupCompletionTracker peer_stopped_subgroups_;
     std::uint64_t stream_count_ = 0;
 };
 

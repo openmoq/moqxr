@@ -33,6 +33,8 @@ void begin_priority_comparison_count_for_testing();
 std::uint64_t end_priority_comparison_count_for_testing();
 void begin_generation_availability_storage_tracking_for_testing();
 std::size_t end_generation_availability_storage_tracking_for_testing();
+void begin_subgroup_completion_storage_tracking_for_testing();
+std::size_t end_subgroup_completion_storage_tracking_for_testing();
 
 }  // namespace openmoq::publisher::transport::priority_scheduler_internal
 
@@ -5227,6 +5229,53 @@ int main() {
     }
 
     {
+        // Forward renewal removes only the renewable peer-stop reason. A
+        // normally FIN-completed subgroup remains permanently closed.
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, DraftVersion::kDraft18,
+            1000, 0, 1, 1));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 8, .subgroup_id = 4,
+             .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 8, .subgroup_id = 4,
+             .object_id = 0, .marker = 'B'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+        transport.on_try_write_object =
+            [](MockTransport& current,
+               const MockTransport::ObjectWriteEvent&) {
+                if (current.object_write_attempts.size() == 1) {
+                    current.reads[1].push_back(encode_request_update_message(
+                        DraftVersion::kDraft18, 93, 0, 0x10));
+                    current.reads[1].push_back(encode_request_update_message(
+                        DraftVersion::kDraft18, 95, 1, 0x10));
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::chrono::seconds(1));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok,
+                     "expected permanent-FIN renewal session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok &&
+                         transport.object_write_attempts.size() == 1,
+                     "expected draft-18 Forward renewal not to reopen a normally FIN-completed subgroup");
+    }
+
+    {
         // Every object below completes its subgroup before the following
         // callback reports STOP_SENDING for that now-retired stream.  A
         // session-wide snapshot must consume these ownerless late events;
@@ -5383,6 +5432,164 @@ int main() {
         ok &= expect(status.ok, "expected a duplicate completed-key publication to be ignored nonfatally");
         ok &= expect(transport.object_write_attempts.size() == 2,
                      "expected a completed subgroup not to reopen while another subgroup publishes");
+    }
+
+    for (const std::uint8_t group_order : {std::uint8_t{1},
+                                           std::uint8_t{2}}) {
+        // Long-running live-style tracks normally complete adjacent group
+        // IDs, although the scheduler can visit them in either negotiated
+        // direction and the source plan itself can be out of order. Exact
+        // completion ranges must stay compact without changing admissions.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "retention", 1,
+            DraftVersion::kDraft16, 0, 0, 128, group_order));
+        constexpr std::size_t kCompletionChurnCount = 1024;
+        std::vector<SchedulingObjectSpec> objects;
+        objects.reserve(kCompletionChurnCount);
+        for (std::size_t index = 0; index < kCompletionChurnCount; ++index) {
+            const std::size_t shuffled =
+                (index % 2 == 0) ? index / 2
+                                 : kCompletionChurnCount - 1 - index / 2;
+            objects.push_back({
+                .track_name = "retention",
+                .group_id = shuffled,
+                .subgroup_id = 0,
+                .object_id = 0,
+                .marker = static_cast<std::uint8_t>(index),
+            });
+        }
+        objects.push_back({
+            .track_name = "retention",
+            .group_id = kCompletionChurnCount / 2,
+            .subgroup_id = 0,
+            .object_id = 0,
+            .marker = 0xff,
+        });
+        openmoq::publisher::transport::priority_scheduler_internal::
+            begin_subgroup_completion_storage_tracking_for_testing();
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected subgroup-retention session connect to succeed");
+        status = session.publish(make_scheduling_plan(std::move(objects)));
+        const std::size_t peak_entries =
+            openmoq::publisher::transport::priority_scheduler_internal::
+                end_subgroup_completion_storage_tracking_for_testing();
+        ok &= expect(status.ok &&
+                         transport.object_write_attempts.size() ==
+                             kCompletionChurnCount,
+                     "expected every high-churn subgroup to publish exactly once");
+        ok &= expect(peak_entries <= 4,
+                     "expected ascending and descending contiguous completion history to remain compact");
+    }
+
+    {
+        // Peer-stopped keys use their own compact range history so a long
+        // request remains bounded until a draft-18 renewal clears that
+        // reason; they must not accumulate one exact Key allocation per FIN.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "peer-retention", 1,
+            DraftVersion::kDraft16, 0, 0, 128, 1));
+        constexpr std::size_t kPeerStopCompletionChurnCount = 512;
+        std::vector<SchedulingObjectSpec> objects;
+        objects.reserve(kPeerStopCompletionChurnCount * 2);
+        for (std::size_t group_id = 0;
+             group_id < kPeerStopCompletionChurnCount;
+             ++group_id) {
+            objects.push_back({
+                .track_name = "peer-retention",
+                .group_id = group_id,
+                .subgroup_id = 0,
+                .object_id = 0,
+                .marker = static_cast<std::uint8_t>(group_id),
+            });
+            objects.push_back({
+                .track_name = "peer-retention",
+                .group_id = group_id,
+                .subgroup_id = 0,
+                .object_id = 1,
+                .marker = static_cast<std::uint8_t>(group_id + 1),
+            });
+        }
+        transport.on_try_write_object =
+            [](MockTransport& current,
+               const MockTransport::ObjectWriteEvent& event) {
+                current.peer_stopped_media_streams.insert(event.stream_id);
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+        openmoq::publisher::transport::priority_scheduler_internal::
+            begin_subgroup_completion_storage_tracking_for_testing();
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected peer-stop retention session connect to succeed");
+        status = session.publish(make_scheduling_plan(std::move(objects)));
+        const std::size_t peak_entries =
+            openmoq::publisher::transport::priority_scheduler_internal::
+                end_subgroup_completion_storage_tracking_for_testing();
+        ok &= expect(status.ok &&
+                         transport.object_write_attempts.size() ==
+                             kPeerStopCompletionChurnCount &&
+                         transport.acknowledged_peer_stopped_media_streams.size() ==
+                             kPeerStopCompletionChurnCount,
+                     "expected each peer-stopped subgroup to retire without admitting its successor");
+        ok &= expect(peak_entries <= 4,
+                     "expected peer-stopped subgroup completion ranges to remain compact under churn");
+    }
+
+    {
+        // Arbitrarily sparse history cannot be represented exactly in fixed
+        // memory. Keep every key exact up to the documented range cap, admit
+        // the next unseen key (never mistake a gap for completion), and then
+        // fail explicitly rather than reopen a duplicate or grow without
+        // bound. Storage instrumentation counts both outer-map and range
+        // nodes, not only the logical range counter.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "sparse-retention", 1,
+            DraftVersion::kDraft16, 0, 0, 128, 1));
+        constexpr std::size_t kSparseRangeCapacity = 256;
+        std::vector<SchedulingObjectSpec> objects;
+        objects.reserve(kSparseRangeCapacity + 2);
+        for (std::size_t index = 0; index <= kSparseRangeCapacity; ++index) {
+            objects.push_back({
+                .track_name = "sparse-retention",
+                .group_id = 17,
+                .subgroup_id = index * 2,
+                .object_id = 0,
+                .marker = static_cast<std::uint8_t>(index),
+            });
+        }
+        objects.push_back({
+            .track_name = "sparse-retention",
+            .group_id = 17,
+            .subgroup_id = 0,
+            .object_id = 0,
+            .marker = 0xff,
+        });
+        openmoq::publisher::transport::priority_scheduler_internal::
+            begin_subgroup_completion_storage_tracking_for_testing();
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected sparse-retention session connect to succeed");
+        status = session.publish(make_scheduling_plan(std::move(objects)));
+        const std::size_t peak_entries =
+            openmoq::publisher::transport::priority_scheduler_internal::
+                end_subgroup_completion_storage_tracking_for_testing();
+        ok &= expect(
+            !status.ok &&
+                status.message ==
+                    "subgroup completion history exceeded bounded sparse range capacity" &&
+                transport.object_write_attempts.size() ==
+                    kSparseRangeCapacity + 1,
+            "expected sparse overflow to admit unseen keys, suppress the duplicate, and return the stable capacity failure");
+        ok &= expect(
+            peak_entries == kSparseRangeCapacity * 2,
+            "expected the global sparse cap to bound both subgroup-map and exact range-node storage");
     }
 
     MockTransport draft16_transport;
