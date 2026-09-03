@@ -325,6 +325,11 @@ struct MockTransport final : PublisherTransport {
         return peer_stopped_media_streams.contains(stream_id);
     }
 
+    std::vector<std::uint64_t> media_stream_peer_stop_events() const override {
+        return {peer_stopped_media_streams.begin(),
+                peer_stopped_media_streams.end()};
+    }
+
     void acknowledge_media_stream_peer_stopped(
         std::uint64_t stream_id) override {
         acknowledged_peer_stopped_media_streams.push_back(stream_id);
@@ -5206,6 +5211,74 @@ int main() {
         ok &= expect(transport.acknowledged_peer_stopped_media_streams.size() == 1 &&
                          transport.peer_stopped_media_streams.empty(),
                      "expected draft-18 renewal to retain subgroup state after consuming the backend peer-stop event");
+    }
+
+    {
+        // Every object below completes its subgroup before the following
+        // callback reports STOP_SENDING for that now-retired stream.  A
+        // session-wide snapshot must consume these ownerless late events;
+        // sender-local stream-key scans cannot see them after FIN.  The last
+        // event is delivered immediately before close to cover the
+        // callback-quiesced shutdown drain as well.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1,
+            kTestTrackNamespace,
+            "events",
+            1,
+            DraftVersion::kDraft16,
+            1000));
+        std::vector<SchedulingObjectSpec> objects;
+        constexpr std::size_t kLatePeerStopCount = 24;
+        objects.reserve(kLatePeerStopCount);
+        for (std::size_t index = 0; index < kLatePeerStopCount; ++index) {
+            objects.push_back({
+                .track_name = "events",
+                .group_id = 7,
+                .subgroup_id = index,
+                .object_id = 0,
+                .marker = static_cast<std::uint8_t>(index + 1),
+            });
+        }
+        std::optional<std::uint64_t> previous_finished_stream;
+        transport.on_try_write_object =
+            [&previous_finished_stream](
+                MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                if (previous_finished_stream.has_value()) {
+                    current.peer_stopped_media_streams.insert(
+                        *previous_finished_stream);
+                }
+                previous_finished_stream = event.stream_id;
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok,
+                     "expected late peer-stop session connect to succeed");
+        status = session.publish(make_scheduling_plan(std::move(objects)));
+        ok &= expect(status.ok,
+                     "expected FIN-retired subgroups to publish successfully");
+        ok &= expect(
+            transport.acknowledged_peer_stopped_media_streams.size() ==
+                    kLatePeerStopCount - 1 &&
+                transport.peer_stopped_media_streams.empty(),
+            "expected the running session to drain each completed-stream peer stop before the next object");
+        if (previous_finished_stream.has_value()) {
+            transport.peer_stopped_media_streams.insert(
+                *previous_finished_stream);
+        }
+        status = session.close();
+        ok &= expect(status.ok,
+                     "expected late peer-stop session close to succeed");
+        ok &= expect(
+            transport.acknowledged_peer_stopped_media_streams.size() ==
+                    kLatePeerStopCount &&
+                transport.peer_stopped_media_streams.empty(),
+            "expected repeated STOP_SENDING after FIN retirement to be consumed without retained growth");
     }
 
     {

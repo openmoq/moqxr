@@ -453,10 +453,10 @@ int main() {
                          ObjectWriteDisposition::kAccepted &&
                          drain_client->try_write_object(peer_stopped_stream_id,
                                                        peer_stopped_second,
-                                                       false,
+                                                       true,
                                                        {}).disposition ==
                              ObjectWriteDisposition::kAccepted,
-                     "expected queued WebTransport media before peer STOP_SENDING");
+                     "expected FIN-retired WebTransport media before peer STOP_SENDING");
         {
             std::unique_lock<std::mutex> lock(server.mutex);
             ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
@@ -478,6 +478,13 @@ int main() {
         ok &= expect(drain_client->media_stream_peer_stopped(
                          peer_stopped_stream_id),
                      "expected WebTransport peer-stop state to remain queryable");
+        const auto peer_stop_snapshot =
+            drain_client->media_stream_peer_stop_events();
+        ok &= expect(std::find(peer_stop_snapshot.begin(),
+                              peer_stop_snapshot.end(),
+                              peer_stopped_stream_id) !=
+                         peer_stop_snapshot.end(),
+                     "expected WebTransport snapshot to retain STOP_SENDING received after FIN admission");
         const std::vector<std::uint8_t> after_stop_payload = {0x63};
         const auto after_peer_stop = drain_client->try_write_object(
             peer_stopped_stream_id, after_stop_payload, true, {});
@@ -517,15 +524,23 @@ int main() {
                 std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (acknowledged_peer_stops < peer_stop_stress_streams.size() &&
                    std::chrono::steady_clock::now() < deadline) {
-                for (std::size_t index = 0;
-                     index < peer_stop_stress_streams.size(); ++index) {
-                    if (!consumed[index] &&
-                        drain_client->media_stream_peer_stopped(
-                            peer_stop_stress_streams[index])) {
-                        drain_client->acknowledge_media_stream_peer_stopped(
-                            peer_stop_stress_streams[index]);
-                        consumed[index] = true;
-                        ++acknowledged_peer_stops;
+                for (const std::uint64_t stopped_stream_id :
+                     drain_client->media_stream_peer_stop_events()) {
+                    const auto stopped_it = std::find(
+                        peer_stop_stress_streams.begin(),
+                        peer_stop_stress_streams.end(),
+                        stopped_stream_id);
+                    if (stopped_it != peer_stop_stress_streams.end()) {
+                        const std::size_t index = static_cast<std::size_t>(
+                            std::distance(peer_stop_stress_streams.begin(),
+                                          stopped_it));
+                        if (!consumed[index]) {
+                            drain_client
+                                ->acknowledge_media_stream_peer_stopped(
+                                    stopped_stream_id);
+                            consumed[index] = true;
+                            ++acknowledged_peer_stops;
+                        }
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));

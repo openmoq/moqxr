@@ -1367,6 +1367,20 @@ bool PicoquicClient::media_stream_peer_stopped(
 #endif
 }
 
+std::vector<std::uint64_t> PicoquicClient::media_stream_peer_stop_events()
+    const {
+#ifndef OPENMOQ_HAS_PICOQUIC
+    return {};
+#else
+    if (impl_ == nullptr) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return {impl_->peer_stopped_media_streams.begin(),
+            impl_->peer_stopped_media_streams.end()};
+#endif
+}
+
 void PicoquicClient::acknowledge_media_stream_peer_stopped(
     std::uint64_t stream_id) {
 #ifdef OPENMOQ_HAS_PICOQUIC

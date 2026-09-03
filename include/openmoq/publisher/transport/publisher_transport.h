@@ -139,6 +139,13 @@ public:
         static_cast<void>(stream_id);
         return false;
     }
+    // Returns a stable, non-destructive snapshot of all unacknowledged media
+    // stream peer-stop notifications. A session can inspect every sender for
+    // ownership before acknowledging an entry, so one independent sender
+    // cannot consume another sender's event.
+    virtual std::vector<std::uint64_t> media_stream_peer_stop_events() const {
+        return {};
+    }
     // Releases a previously observed peer-stop notification after the owning
     // session has retired the subgroup. Optional transports have no retained
     // notification state to release.

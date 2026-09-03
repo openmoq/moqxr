@@ -703,10 +703,10 @@ int main() {
                      ObjectWriteDisposition::kAccepted &&
                      delivery_client.try_write_object(peer_stopped_stream_id,
                                                       peer_stopped_second,
-                                                      false,
+                                                      true,
                                                       {}).disposition ==
                          ObjectWriteDisposition::kAccepted,
-                 "expected queued raw-QUIC media before peer STOP_SENDING");
+                 "expected FIN-retired raw-QUIC media before peer STOP_SENDING");
     {
         std::unique_lock<std::mutex> lock(delivery_server.mutex);
         ok &= expect(delivery_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
@@ -728,6 +728,12 @@ int main() {
     ok &= expect(delivery_client.media_stream_peer_stopped(
                      peer_stopped_stream_id),
                  "expected raw-QUIC peer-stop state to remain queryable");
+    const auto peer_stop_snapshot =
+        delivery_client.media_stream_peer_stop_events();
+    ok &= expect(std::find(peer_stop_snapshot.begin(),
+                          peer_stop_snapshot.end(),
+                          peer_stopped_stream_id) != peer_stop_snapshot.end(),
+                 "expected raw-QUIC snapshot to retain STOP_SENDING received after FIN admission");
     const auto after_peer_stop = delivery_client.try_write_object(
         peer_stopped_stream_id, std::vector<std::uint8_t>{0x53}, true, {});
     ok &= expect(after_peer_stop.disposition == ObjectWriteDisposition::kFailed &&
@@ -765,15 +771,23 @@ int main() {
             std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (acknowledged_peer_stops < peer_stop_stress_streams.size() &&
                std::chrono::steady_clock::now() < deadline) {
-            for (std::size_t index = 0;
-                 index < peer_stop_stress_streams.size(); ++index) {
-                if (!consumed[index] &&
-                    delivery_client.media_stream_peer_stopped(
-                        peer_stop_stress_streams[index])) {
-                    delivery_client.acknowledge_media_stream_peer_stopped(
-                        peer_stop_stress_streams[index]);
-                    consumed[index] = true;
-                    ++acknowledged_peer_stops;
+            for (const std::uint64_t stopped_stream_id :
+                 delivery_client.media_stream_peer_stop_events()) {
+                const auto stopped_it = std::find(
+                    peer_stop_stress_streams.begin(),
+                    peer_stop_stress_streams.end(),
+                    stopped_stream_id);
+                if (stopped_it != peer_stop_stress_streams.end()) {
+                    const std::size_t index = static_cast<std::size_t>(
+                        std::distance(peer_stop_stress_streams.begin(),
+                                      stopped_it));
+                    if (!consumed[index]) {
+                        delivery_client
+                            .acknowledge_media_stream_peer_stopped(
+                                stopped_stream_id);
+                        consumed[index] = true;
+                        ++acknowledged_peer_stops;
+                    }
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

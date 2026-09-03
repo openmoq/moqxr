@@ -2344,6 +2344,20 @@ public:
         pending_it->second.options.subgroup_deadline = subgroup_deadline;
     }
 
+    // Retires a peer-stopped stream only when this sender owns it. The caller
+    // acknowledges the transport event after checking every independent
+    // sender, so sender iteration order cannot steal an event.
+    bool retire_peer_stopped_stream(PublisherTransport& transport,
+                                    std::uint64_t stream_id) {
+        if (!transport.media_stream_peer_stopped(stream_id)) {
+            return false;
+        }
+        return retire_transport_stream(
+            stream_id,
+            true,
+            transport.media_stream_expired(stream_id));
+    }
+
     void renew_peer_stopped_subgroups(PublisherTransport& transport) {
         observe_transport_stream_state(transport);
         for (const Key& key : peer_stopped_subgroups_) {
@@ -2472,27 +2486,45 @@ private:
         closed_subgroups_.insert(key);
     }
 
+    bool retire_transport_stream(std::uint64_t stream_id,
+                                 bool peer_stopped,
+                                 bool expired) {
+        const auto key_it = stream_keys_.find(stream_id);
+        if (key_it == stream_keys_.end()) {
+            return false;
+        }
+        const Key key = key_it->second;
+        const auto stream_it = streams_.find(key);
+        if (stream_it != streams_.end() &&
+            stream_it->second.stream_id == stream_id) {
+            streams_.erase(stream_it);
+        }
+        pending_objects_.erase(key);
+        closed_subgroups_.insert(key);
+        if (peer_stopped && !expired) {
+            peer_stopped_subgroups_.insert(key);
+        }
+        stream_keys_.erase(key_it);
+        return true;
+    }
+
     void observe_transport_stream_state(PublisherTransport& transport) {
-        for (auto it = stream_keys_.begin(); it != stream_keys_.end();) {
-            const bool expired = transport.media_stream_expired(it->first);
+        std::vector<std::uint64_t> changed_stream_ids;
+        changed_stream_ids.reserve(stream_keys_.size());
+        for (const auto& [stream_id, key] : stream_keys_) {
+            static_cast<void>(key);
+            const bool expired = transport.media_stream_expired(stream_id);
             const bool peer_stopped =
-                transport.media_stream_peer_stopped(it->first);
-            if (!expired && !peer_stopped) {
-                ++it;
-                continue;
+                transport.media_stream_peer_stopped(stream_id);
+            if (expired || peer_stopped) {
+                changed_stream_ids.push_back(stream_id);
             }
-            const std::uint64_t stream_id = it->first;
-            const Key key = it->second;
-            const auto stream_it = streams_.find(key);
-            if (stream_it != streams_.end() && stream_it->second.stream_id == stream_id) {
-                streams_.erase(stream_it);
-            }
-            pending_objects_.erase(key);
-            closed_subgroups_.insert(key);
-            if (peer_stopped && !expired) {
-                peer_stopped_subgroups_.insert(key);
-            }
-            it = stream_keys_.erase(it);
+        }
+        for (const std::uint64_t stream_id : changed_stream_ids) {
+            const bool expired = transport.media_stream_expired(stream_id);
+            const bool peer_stopped =
+                transport.media_stream_peer_stopped(stream_id);
+            retire_transport_stream(stream_id, peer_stopped, expired);
             if (peer_stopped) {
                 transport.acknowledge_media_stream_peer_stopped(stream_id);
             }
@@ -2506,6 +2538,57 @@ private:
     std::set<Key> peer_stopped_subgroups_;
     std::uint64_t stream_count_ = 0;
 };
+
+template <typename VisitSenders>
+void dispatch_peer_stopped_media_streams(PublisherTransport& transport,
+                                         VisitSenders&& visit_senders) {
+    for (const std::uint64_t stream_id :
+         transport.media_stream_peer_stop_events()) {
+        bool owned = false;
+        visit_senders([&](SubgroupSenderState& sender) {
+            if (!owned) {
+                owned = sender.retire_peer_stopped_stream(transport,
+                                                          stream_id);
+            }
+        });
+        // No owner means the stream was already retired, most commonly by an
+        // accepted FIN. It is safe to release only after every sender had the
+        // opportunity to claim the stable snapshot entry.
+        transport.acknowledge_media_stream_peer_stopped(stream_id);
+    }
+}
+
+void dispatch_peer_stopped_media_streams(
+    PublisherTransport& transport,
+    std::map<std::uint64_t, ActiveSubscription>& active_subscriptions) {
+    dispatch_peer_stopped_media_streams(
+        transport,
+        [&](const auto& visit) {
+            for (auto& [request_id, active] : active_subscriptions) {
+                static_cast<void>(request_id);
+                visit(*active.sender);
+            }
+        });
+}
+
+void dispatch_peer_stopped_media_streams(
+    PublisherTransport& transport,
+    std::map<std::string, SubgroupSenderState>& sender_by_track) {
+    dispatch_peer_stopped_media_streams(
+        transport,
+        [&](const auto& visit) {
+            for (auto& [track_name, sender] : sender_by_track) {
+                static_cast<void>(track_name);
+                visit(sender);
+            }
+        });
+}
+
+void acknowledge_ownerless_peer_stopped_media_streams(
+    PublisherTransport& transport) {
+    dispatch_peer_stopped_media_streams(
+        transport, [](const auto&) {});
+}
 
 std::uint64_t live_srt_resource_reset_code(
     openmoq::publisher::DraftVersion draft) {
@@ -2752,6 +2835,7 @@ public:
           now_function_(now_function) {}
 
     TransportStatus publishing_status(TransportStatus status) const {
+        dispatch_peer_stopped_media_streams(transport_, sender_by_track_);
         return queue_.publishing_status(std::move(status));
     }
 
@@ -3514,6 +3598,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     };
 
     while (true) {
+        dispatch_peer_stopped_media_streams(transport,
+                                            active_subscriptions);
         if (uses_request_streams(draft)) {
             while (true) {
                 std::uint64_t request_stream_id = 0;
@@ -4845,6 +4931,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
     std::size_t cycle_start_index = 0;
 
     while (true) {
+        dispatch_peer_stopped_media_streams(transport, sender_by_track);
         for (std::size_t object_index = cycle_start_index; object_index < plan.objects.size(); ++object_index) {
             const auto& source_object = plan.objects[object_index];
             const auto track_it = tracks_by_name.find(source_object.track_name);
@@ -4892,6 +4979,8 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                 &object_published,
                 {.subscriber = publish_ok_it->second.subscriber_priority,
                  .publisher = 128});
+            dispatch_peer_stopped_media_streams(transport,
+                                                sender_by_track);
             if (!status.ok) {
                 return status;
             }
@@ -5081,6 +5170,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
     std::size_t loop_cycle = 0;
     std::size_t cycle_start_index = 0;
     while (true) {
+        dispatch_peer_stopped_media_streams(transport, sender_by_track);
         for (std::size_t object_index = cycle_start_index; object_index < plan.objects.size(); ++object_index) {
             const auto& source_object = plan.objects[object_index];
             const auto track_it = tracks_by_name.find(source_object.track_name);
@@ -5151,6 +5241,8 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                 &object_published,
                 {.subscriber = publish_ok_it->second.subscriber_priority,
                  .publisher = 128});
+            dispatch_peer_stopped_media_streams(transport,
+                                                sender_by_track);
             if (!status.ok) {
                 return status;
             }
@@ -7166,6 +7258,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         // No pacing needed: trimming prevents backlog accumulation and
         // ffmpeg's realtime encoding rate naturally limits throughput.
         while (true) {
+            dispatch_peer_stopped_media_streams(transport_,
+                                                sender_by_track);
             openmoq::publisher::MediaFragment fragment;
             {
                 std::lock_guard<std::mutex> lock(queue->mutex);
@@ -7245,6 +7339,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                          ? published_settings_it->second.subscriber_priority
                          : 128),
                  .publisher = 128});
+            dispatch_peer_stopped_media_streams(transport_,
+                                                sender_by_track);
             if (!write_status.ok) {
                 return write_status;
             }
@@ -7915,6 +8011,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
         std::optional<std::chrono::steady_clock::time_point> eof_deadline;
         while (true) {
+            dispatch_peer_stopped_media_streams(transport_,
+                                                sender_by_track);
             // Drain media continuously in auto-forward mode.
             {
                 status = drain_queue();
@@ -7977,6 +8075,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
 
         while (true) {
+            dispatch_peer_stopped_media_streams(transport_,
+                                                sender_by_track);
             bool is_eof;
             {
                 std::lock_guard<std::mutex> lock(queue->mutex);
@@ -8828,6 +8928,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     };
     const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
     while (!source_eof) {
+        dispatch_peer_stopped_media_streams(transport_, sender_by_track);
         if (stop_requested_.load(std::memory_order_acquire)) {
             break;
         }
@@ -9026,6 +9127,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                      ? published_settings_it->second.subscriber_priority
                      : 128),
              .publisher = 128});
+        dispatch_peer_stopped_media_streams(transport_, sender_by_track);
         if (!status.ok) {
             // A send failure that races with a concurrent close() is a benign
             // stop, not a transport error: break to the flush.
@@ -9139,7 +9241,13 @@ TransportStatus MoqtSession::close(std::uint64_t application_error_code) {
     control_stream_id_ = 0;
     peer_control_stream_open_ = false;
     peer_control_stream_id_ = 0;
-    return transport_.close(application_error_code);
+    const TransportStatus status = transport_.close(application_error_code);
+    if (status.ok) {
+        // close() has joined the backend callback loop, so no new STOP_SENDING
+        // notification can race this final ownerless drain.
+        acknowledge_ownerless_peer_stopped_media_streams(transport_);
+    }
+    return status;
 }
 
 TransportStatus MoqtSession::end_broadcast(openmoq::publisher::EndBroadcastMode mode,

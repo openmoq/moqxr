@@ -45,6 +45,7 @@ public:
     void note_delivery_timeout(std::chrono::milliseconds timeout) override;
     bool media_stream_expired(std::uint64_t stream_id) const override;
     bool media_stream_peer_stopped(std::uint64_t stream_id) const override;
+    std::vector<std::uint64_t> media_stream_peer_stop_events() const override;
     void acknowledge_media_stream_peer_stopped(
         std::uint64_t stream_id) override;
     std::size_t peer_stopped_media_stream_count_for_testing() const;
