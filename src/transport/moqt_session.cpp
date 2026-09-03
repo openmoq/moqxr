@@ -50,6 +50,17 @@ thread_local std::size_t peak_subgroup_completion_entries = 0;
 struct CandidatePriority {
     std::uint8_t subscriber_priority = 128;
     std::uint8_t publisher_priority = 128;
+    // Real playout deadline of this candidate's object (source_object.media_time_us,
+    // pre-loop-offset). Non-media objects (catalog/init/metadata) default to 0 so they
+    // are never held behind an in-progress media backlog. Compared ahead of
+    // request_fairness_round so that across two equal-priority tracks the one whose
+    // next object is due sooner always wins a tie, instead of a pure per-request turn
+    // count -- a track with a higher native object rate (e.g. ~43 AAC objects/s vs
+    // ~24 video objects/s) would otherwise be capped to the same turn count as a
+    // slower track and fall further behind every round, surfacing as a multi-second
+    // silent burst-then-catch-up whenever the other track has an unusually large
+    // backlog to drain (e.g. an outsized trailing GOP at end-of-file/loop-wrap).
+    std::uint64_t media_time_us = 0;
     std::uint64_t request_fairness_round = 0;
     std::uint8_t group_order = 1;
     std::uint64_t group_id = 0;
@@ -106,6 +117,33 @@ struct CandidatePriorityLess {
         return precedes(first, second);
     }
 };
+
+// Cross-request ordering for the session-wide eligible_candidates heap, where each
+// active request contributes at most one representative entry (its own frontier
+// head). Unlike precedes() -- which also orders entries *within* one request's own
+// scheduler_frontiers set and therefore must preserve that request's requested
+// group_order (ascending/descending SUBSCRIBE delivery order) untouched -- this
+// comparator additionally breaks ties by real playout deadline (media_time_us)
+// ahead of the per-request fairness round. Plain round-robin gives every request an
+// equal *count* of turns, which silently caps a track with a higher native object
+// rate (e.g. ~43 AAC objects/s vs ~24 video objects/s) to the same turn rate as a
+// slower one; it then falls further behind every round and only catches up in a
+// burst once the other track's backlog drains (e.g. an outsized trailing GOP at
+// end-of-file/loop-wrap), which surfaces as a multi-second audio silence. Ties on
+// deadline (including the common case where neither candidate is a kMedia object)
+// fall through to precedes() unchanged.
+bool precedes_cross_request(const CandidatePriority& first, const CandidatePriority& second) {
+    if (first.subscriber_priority != second.subscriber_priority) {
+        return first.subscriber_priority < second.subscriber_priority;
+    }
+    if (first.publisher_priority != second.publisher_priority) {
+        return first.publisher_priority < second.publisher_priority;
+    }
+    if (first.media_time_us != second.media_time_us) {
+        return first.media_time_us < second.media_time_us;
+    }
+    return precedes(first, second);
+}
 
 void begin_priority_comparison_count_for_testing() {
     priority_comparison_count = 0;
@@ -1948,6 +1986,9 @@ void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
             active.scheduler_frontiers.insert({
                 .subscriber_priority = active.subscribe.subscriber_priority,
                 .publisher_priority = active.publisher_priority,
+                .media_time_us = object.kind == openmoq::publisher::CmsfObjectKind::kMedia
+                                     ? object.media_time_us
+                                     : 0,
                 .request_fairness_round = 0,
                 .group_order = active.subscribe.group_order,
                 .group_id = static_cast<std::uint64_t>(object.group_id),
@@ -3540,7 +3581,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     struct LaterCandidate {
         bool operator()(const EligibleCandidate& first,
                         const EligibleCandidate& second) const {
-            return priority_scheduler_internal::precedes(
+            return priority_scheduler_internal::precedes_cross_request(
                 second.priority, first.priority);
         }
     };
@@ -4783,6 +4824,10 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             .subscriber_priority =
                                 active.subscribe.subscriber_priority,
                             .publisher_priority = active.publisher_priority,
+                            .media_time_us =
+                                successor.kind == openmoq::publisher::CmsfObjectKind::kMedia
+                                    ? successor.media_time_us
+                                    : 0,
                             .request_fairness_round = 0,
                             .group_order = active.subscribe.group_order,
                             .group_id = static_cast<std::uint64_t>(
