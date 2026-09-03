@@ -10,13 +10,13 @@
 #include <cerrno>
 #include <cctype>
 #include <chrono>
-#include <cstring>
 #include <iostream>
 #include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -31,6 +31,12 @@
 
 namespace openmoq::publisher {
 namespace {
+
+#if !defined(_WIN32)
+std::string system_error_message(std::string_view context, int error_number) {
+    return std::string(context) + ": " + std::system_category().message(error_number);
+}
+#endif
 
 std::string path_slug(std::string_view path) {
     const std::size_t slash = path.find_last_of('/');
@@ -607,7 +613,9 @@ transport::TransportStatus LiveDashIngestServer::start() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (impl_->listen_fd < 0) {
-        return transport::TransportStatus::failure("failed to create DASH ingest socket");
+        const int socket_errno = errno;
+        return transport::TransportStatus::failure(
+            system_error_message("failed to create DASH ingest socket", socket_errno));
     }
 
     int reuse = 1;
@@ -622,14 +630,18 @@ transport::TransportStatus LiveDashIngestServer::start() {
         return transport::TransportStatus::failure("invalid DASH ingest listen host");
     }
     if (::bind(impl_->listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        const int bind_errno = errno;
         close_fd(impl_->listen_fd);
         impl_->listen_fd = -1;
-        return transport::TransportStatus::failure("failed to bind DASH ingest socket");
+        return transport::TransportStatus::failure(
+            system_error_message("failed to bind DASH ingest socket", bind_errno));
     }
     if (::listen(impl_->listen_fd, 16) != 0) {
+        const int listen_errno = errno;
         close_fd(impl_->listen_fd);
         impl_->listen_fd = -1;
-        return transport::TransportStatus::failure("failed to listen on DASH ingest socket");
+        return transport::TransportStatus::failure(
+            system_error_message("failed to listen on DASH ingest socket", listen_errno));
     }
     // Non-blocking so accept() cannot park if a ready connection is aborted
     // between the accept loop's poll() wakeup and the accept() call.

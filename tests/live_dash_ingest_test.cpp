@@ -2,6 +2,7 @@
 #include "openmoq/publisher/mp4_box.h"
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <future>
@@ -10,6 +11,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -625,6 +627,27 @@ int main() {
         const auto status = server.start();
         ok &= expect(status.ok, "expected live DASH server to start: " + status.message);
         ok &= expect(server.bound_port() != 0, "expected live DASH server to expose a bound port");
+        server.stop();
+    }
+
+    {
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for bind failure test: " + status.message);
+        if (status.ok) {
+            config.port = server.bound_port();
+            LiveDashIngestServer conflicting_server(config);
+            const auto conflicting_status = conflicting_server.start();
+            const std::string expected_message =
+                "failed to bind DASH ingest socket: " + std::system_category().message(EADDRINUSE);
+            ok &= expect(!conflicting_status.ok, "expected conflicting DASH ingest server bind to fail");
+            ok &= expect(conflicting_status.message == expected_message,
+                         "expected bind failure to include OS error; got: " + conflicting_status.message);
+        }
         server.stop();
     }
 
