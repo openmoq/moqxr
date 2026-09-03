@@ -1954,6 +1954,7 @@ private:
 };
 
 void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
+                                const LoopState& loop_state,
                                 ActiveSubscription& active,
                                 openmoq::publisher::DraftVersion draft,
                                 GenerationAvailability& availability) {
@@ -1994,8 +1995,15 @@ void rebuild_priority_frontiers(const openmoq::publisher::PublishPlan& plan,
             active.scheduler_frontiers.insert({
                 .subscriber_priority = active.subscribe.subscriber_priority,
                 .publisher_priority = active.publisher_priority,
+                // Loop-adjusted, not the raw plan value: once this subscription is
+                // mid-cycle N (active.loop_cycle >= 1), the raw media_time_us of a
+                // freshly rebuilt frontier restarts near 0 for the new cycle. Left
+                // unadjusted, a fast track wrapping into loop_cycle+1 would compare
+                // as perpetually "more due" than a slower track still finishing
+                // loop_cycle -- starving it for the length of an entire cycle
+                // (precedes_cross_request has no other signal to break the tie).
                 .media_time_us = object.kind == openmoq::publisher::CmsfObjectKind::kMedia
-                                     ? object.media_time_us
+                                     ? make_looped_object(object, loop_state, active.loop_cycle).media_time_us
                                      : 0,
                 .request_fairness_round = 0,
                 .group_order = active.subscribe.group_order,
@@ -2124,7 +2132,7 @@ bool advance_subscription_to_next_loop_object(const openmoq::publisher::PublishP
     active.send_sequence_by_object_index.clear();
     active.availability_by_object_index.clear();
     if (uses_priority_scheduler(draft)) {
-        rebuild_priority_frontiers(plan, active, draft, availability);
+        rebuild_priority_frontiers(plan, loop_state, active, draft, availability);
     }
     active.completed = false;
     return true;
@@ -3818,7 +3826,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         if (uses_priority_scheduler(draft)) {
             active.generation_lead_parked = false;
             rebuild_priority_frontiers(
-                plan, active, draft, generation_availability);
+                plan, loop_state, active, draft, generation_availability);
             if (active.subgroup_frontiers.empty()) {
                 active.completed = !advance_active_subscription(active);
             }
@@ -4094,7 +4102,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         active.next_object_index = next_object_index;
                         if (uses_priority_scheduler(draft)) {
                             rebuild_priority_frontiers(
-                                plan, active, draft,
+                                plan, loop_state, active, draft,
                                 generation_availability);
                         }
                         active_subscriptions.insert_or_assign(subscribe.request_id, std::move(active));
@@ -4705,7 +4713,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 active.next_object_index = next_object_index;
                 if (uses_priority_scheduler(draft)) {
                     rebuild_priority_frontiers(
-                        plan, active, draft,
+                        plan, loop_state, active, draft,
                         generation_availability);
                 }
                 active_subscriptions.insert_or_assign(request_id, std::move(active));
@@ -4977,9 +4985,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             .subscriber_priority =
                                 active.subscribe.subscriber_priority,
                             .publisher_priority = active.publisher_priority,
+                            // Loop-adjusted -- see the matching comment in
+                            // rebuild_priority_frontiers().
                             .media_time_us =
                                 successor.kind == openmoq::publisher::CmsfObjectKind::kMedia
-                                    ? successor.media_time_us
+                                    ? make_looped_object(successor, loop_state, active.loop_cycle).media_time_us
                                     : 0,
                             .request_fairness_round = 0,
                             .group_order = active.subscribe.group_order,
