@@ -59,7 +59,7 @@ public:
             if (is_video) {
                 const auto [track_it, inserted] =
                     video_tracks_.insert(fragment.track_name);
-                if (recovery_started_ && inserted) {
+                if (active_recovery_boundary_.has_value() && inserted) {
                     awaiting_recovery_keyframe_.insert(*track_it);
                 }
             }
@@ -116,7 +116,6 @@ public:
             }
         }
         entries_ = std::move(retained);
-        recovery_started_ = true;
         active_recovery_boundary_ = recovery;
         awaiting_recovery_keyframe_ = video_tracks_;
         for (const auto& [track_name, started] : video_started) {
@@ -293,7 +292,6 @@ private:
     std::chrono::microseconds queued_media_duration_{0};
     bool eof_ = false;
     bool resource_limit_exceeded_ = false;
-    bool recovery_started_ = false;
 };
 
 namespace transport {
