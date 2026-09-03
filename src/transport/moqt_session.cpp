@@ -2504,6 +2504,14 @@ public:
         return retire_transport_stream(stream_id, false, true);
     }
 
+    TransportStatus completion_history_status() const {
+        if (completion_history_exhausted_) {
+            return TransportStatus::failure(
+                "subgroup completion history exceeded bounded sparse range capacity");
+        }
+        return TransportStatus::success();
+    }
+
     void renew_peer_stopped_subgroups(PublisherTransport& transport) {
         observe_transport_stream_state(transport);
         peer_stopped_subgroups_.clear();
@@ -2646,6 +2654,9 @@ private:
     bool record_permanent_completion(const Key& key) {
         const bool recorded =
             closed_subgroups_.insert(key.group_id, key.subgroup_id);
+        if (!recorded) {
+            completion_history_exhausted_ = true;
+        }
         note_completion_storage();
         return recorded;
     }
@@ -2653,17 +2664,11 @@ private:
     bool record_peer_stopped_completion(const Key& key) {
         const bool recorded =
             peer_stopped_subgroups_.insert(key.group_id, key.subgroup_id);
+        if (!recorded) {
+            completion_history_exhausted_ = true;
+        }
         note_completion_storage();
         return recorded;
-    }
-
-    TransportStatus completion_history_status() const {
-        if (closed_subgroups_.exhausted() ||
-            peer_stopped_subgroups_.exhausted()) {
-            return TransportStatus::failure(
-                "subgroup completion history exceeded bounded sparse range capacity");
-        }
-        return TransportStatus::success();
     }
 
     bool close_subgroup(const Key& key) {
@@ -2730,12 +2735,14 @@ private:
     std::map<std::uint64_t, Key> stream_keys_;
     BoundedSubgroupCompletionTracker closed_subgroups_;
     BoundedSubgroupCompletionTracker peer_stopped_subgroups_;
+    bool completion_history_exhausted_ = false;
     std::uint64_t stream_count_ = 0;
 };
 
 template <typename VisitSenders>
-void dispatch_peer_stopped_media_streams(PublisherTransport& transport,
-                                         VisitSenders&& visit_senders) {
+[[nodiscard]] TransportStatus dispatch_peer_stopped_media_streams(
+    PublisherTransport& transport,
+    VisitSenders&& visit_senders) {
     for (const std::uint64_t stream_id :
          transport.media_stream_expiry_events()) {
         bool owned = false;
@@ -2762,12 +2769,22 @@ void dispatch_peer_stopped_media_streams(PublisherTransport& transport,
         // opportunity to claim the stable snapshot entry.
         transport.acknowledge_media_stream_peer_stopped(stream_id);
     }
+
+    TransportStatus terminal_status = TransportStatus::success();
+    visit_senders([&](SubgroupSenderState& sender) {
+        const TransportStatus sender_status =
+            sender.completion_history_status();
+        if (terminal_status.ok && !sender_status.ok) {
+            terminal_status = sender_status;
+        }
+    });
+    return terminal_status;
 }
 
-void dispatch_peer_stopped_media_streams(
+[[nodiscard]] TransportStatus dispatch_peer_stopped_media_streams(
     PublisherTransport& transport,
     std::map<std::uint64_t, ActiveSubscription>& active_subscriptions) {
-    dispatch_peer_stopped_media_streams(
+    return dispatch_peer_stopped_media_streams(
         transport,
         [&](const auto& visit) {
             for (auto& [request_id, active] : active_subscriptions) {
@@ -2777,10 +2794,10 @@ void dispatch_peer_stopped_media_streams(
         });
 }
 
-void dispatch_peer_stopped_media_streams(
+[[nodiscard]] TransportStatus dispatch_peer_stopped_media_streams(
     PublisherTransport& transport,
     std::map<std::string, SubgroupSenderState>& sender_by_track) {
-    dispatch_peer_stopped_media_streams(
+    return dispatch_peer_stopped_media_streams(
         transport,
         [&](const auto& visit) {
             for (auto& [track_name, sender] : sender_by_track) {
@@ -2790,10 +2807,20 @@ void dispatch_peer_stopped_media_streams(
         });
 }
 
-void acknowledge_ownerless_peer_stopped_media_streams(
+[[nodiscard]] TransportStatus acknowledge_ownerless_peer_stopped_media_streams(
     PublisherTransport& transport) {
-    dispatch_peer_stopped_media_streams(
+    return dispatch_peer_stopped_media_streams(
         transport, [](const auto&) {});
+}
+
+template <typename SenderMap>
+[[nodiscard]] TransportStatus finish_after_media_event_dispatch(
+    PublisherTransport& transport,
+    SenderMap& senders,
+    TransportStatus operation_status) {
+    const TransportStatus event_status =
+        dispatch_peer_stopped_media_streams(transport, senders);
+    return operation_status.ok ? event_status : operation_status;
 }
 
 std::uint64_t live_srt_resource_reset_code(
@@ -3041,8 +3068,9 @@ public:
           now_function_(now_function) {}
 
     TransportStatus publishing_status(TransportStatus status) const {
-        dispatch_peer_stopped_media_streams(transport_, sender_by_track_);
-        return queue_.publishing_status(std::move(status));
+        status = queue_.publishing_status(std::move(status));
+        return finish_after_media_event_dispatch(
+            transport_, sender_by_track_, std::move(status));
     }
 
     TransportStatus poll_control() {
@@ -3804,8 +3832,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     };
 
     while (true) {
-        dispatch_peer_stopped_media_streams(transport,
-                                            active_subscriptions);
+        const TransportStatus event_status =
+            dispatch_peer_stopped_media_streams(transport,
+                                                active_subscriptions);
+        if (!event_status.ok) {
+            return event_status;
+        }
         if (uses_request_streams(draft)) {
             while (true) {
                 std::uint64_t request_stream_id = 0;
@@ -5028,9 +5060,16 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                   << '\n';
         pending_control_bytes = std::move(buffer);
         if (!send_namespace_done) {
-            return TransportStatus::success();
+            return finish_after_media_event_dispatch(
+                transport, active_subscriptions,
+                TransportStatus::success());
         }
-        return write_namespace_done_for_request(transport, draft, control_stream_id, namespace_stream_id, namespace_message);
+        return finish_after_media_event_dispatch(
+            transport,
+            active_subscriptions,
+            write_namespace_done_for_request(
+                transport, draft, control_stream_id, namespace_stream_id,
+                namespace_message));
     }
 
     if (send_namespace_done && catalog_last_served_at.has_value()) {
@@ -5046,9 +5085,16 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
 
     pending_control_bytes = std::move(buffer);
     if (!send_namespace_done) {
-        return TransportStatus::success();
+        return finish_after_media_event_dispatch(
+            transport, active_subscriptions,
+            TransportStatus::success());
     }
-    return write_namespace_done_for_request(transport, draft, control_stream_id, namespace_stream_id, namespace_message);
+    return finish_after_media_event_dispatch(
+        transport,
+        active_subscriptions,
+        write_namespace_done_for_request(
+            transport, draft, control_stream_id, namespace_stream_id,
+            namespace_message));
 }
 
 TransportStatus forward_published_tracks(PublisherTransport& transport,
@@ -5137,7 +5183,11 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
     std::size_t cycle_start_index = 0;
 
     while (true) {
-        dispatch_peer_stopped_media_streams(transport, sender_by_track);
+        status = dispatch_peer_stopped_media_streams(transport,
+                                                     sender_by_track);
+        if (!status.ok) {
+            return status;
+        }
         for (std::size_t object_index = cycle_start_index; object_index < plan.objects.size(); ++object_index) {
             const auto& source_object = plan.objects[object_index];
             const auto track_it = tracks_by_name.find(source_object.track_name);
@@ -5185,10 +5235,14 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                 &object_published,
                 {.subscriber = publish_ok_it->second.subscriber_priority,
                  .publisher = 128});
-            dispatch_peer_stopped_media_streams(transport,
-                                                sender_by_track);
+            const TransportStatus event_status =
+                dispatch_peer_stopped_media_streams(transport,
+                                                    sender_by_track);
             if (!status.ok) {
                 return status;
+            }
+            if (!event_status.ok) {
+                return event_status;
             }
             if (!object_published) {
                 continue;
@@ -5273,19 +5327,23 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
     }
 
     if (loop_state.enabled) {
-        return TransportStatus::success();
+        return finish_after_media_event_dispatch(
+            transport, sender_by_track, TransportStatus::success());
     }
 
-    return write_namespace_done_for_request(transport,
-                                            plan.draft.version,
-                                            control_stream_id,
-                                            namespace_stream_id,
-                                            {
-                                                .draft = plan.draft.version,
-                                                .track_namespace = std::string(track_namespace),
-                                                .request_id = 0,
-                                                .authorization_token = std::nullopt,
-                                            });
+    return finish_after_media_event_dispatch(
+        transport,
+        sender_by_track,
+        write_namespace_done_for_request(transport,
+                                         plan.draft.version,
+                                         control_stream_id,
+                                         namespace_stream_id,
+                                         {
+                                             .draft = plan.draft.version,
+                                             .track_namespace = std::string(track_namespace),
+                                             .request_id = 0,
+                                             .authorization_token = std::nullopt,
+                                         }));
 }
 
 TransportStatus publish_selected_tracks(PublisherTransport& transport,
@@ -5376,7 +5434,11 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
     std::size_t loop_cycle = 0;
     std::size_t cycle_start_index = 0;
     while (true) {
-        dispatch_peer_stopped_media_streams(transport, sender_by_track);
+        status = dispatch_peer_stopped_media_streams(transport,
+                                                     sender_by_track);
+        if (!status.ok) {
+            return status;
+        }
         for (std::size_t object_index = cycle_start_index; object_index < plan.objects.size(); ++object_index) {
             const auto& source_object = plan.objects[object_index];
             const auto track_it = tracks_by_name.find(source_object.track_name);
@@ -5447,10 +5509,14 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                 &object_published,
                 {.subscriber = publish_ok_it->second.subscriber_priority,
                  .publisher = 128});
-            dispatch_peer_stopped_media_streams(transport,
-                                                sender_by_track);
+            const TransportStatus event_status =
+                dispatch_peer_stopped_media_streams(transport,
+                                                    sender_by_track);
             if (!status.ok) {
                 return status;
+            }
+            if (!event_status.ok) {
+                return event_status;
             }
             if (!object_published) {
                 continue;
@@ -5511,7 +5577,8 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
         }
     }
 
-    return TransportStatus::success();
+    return finish_after_media_event_dispatch(
+        transport, sender_by_track, TransportStatus::success());
 }
 
 // RAII guard ensuring the catalog subscription's deferred PUBLISH_DONE (see
@@ -5572,6 +5639,61 @@ private:
 };
 
 }  // namespace
+
+namespace priority_scheduler_internal {
+
+TransportStatus exercise_terminal_completion_overflow_for_testing(
+    PublisherTransport& transport,
+    bool renew_peer_stops_after_overflow) {
+    std::map<std::string, SubgroupSenderState> senders;
+    SubgroupSenderState& sender = senders["terminal-overflow"];
+    constexpr std::size_t kSparseRangeCapacity = 256;
+    const std::array<std::uint8_t, 1> payload{0x42};
+    for (std::size_t index = 0; index <= kSparseRangeCapacity; ++index) {
+        const openmoq::publisher::CmsfObject object{
+            .kind = openmoq::publisher::CmsfObjectKind::kMedia,
+            .track_name = "terminal-overflow",
+            .group_id = 17,
+            .subgroup_id = index * 2,
+            .object_id = 0,
+            .media_time_us = 0,
+            .media_duration_us = 0,
+            .payload = {},
+            .owned_payload = {},
+        };
+        const SubgroupSenderState::ServeResult serve_result = sender.try_serve(
+            transport,
+            openmoq::publisher::DraftVersion::kDraft16,
+            1,
+            index,
+            object,
+            true,
+            false,
+            payload,
+            {},
+            steady_now_function(),
+            {128, 128});
+        if (!serve_result.status.ok) {
+            return serve_result.status;
+        }
+        const TransportStatus dispatch_status =
+            finish_after_media_event_dispatch(
+                transport, senders, TransportStatus::success());
+        if (!dispatch_status.ok) {
+            if (renew_peer_stops_after_overflow) {
+                sender.renew_peer_stopped_subgroups(transport);
+            }
+            // Model an otherwise-successful operation exit after the event
+            // was already acknowledged. The sender's terminal status must
+            // remain observable, including across draft-18-style renewal.
+            return finish_after_media_event_dispatch(
+                transport, senders, TransportStatus::success());
+        }
+    }
+    return TransportStatus::success();
+}
+
+}  // namespace priority_scheduler_internal
 
 namespace live_srt_internal {
 
@@ -6992,8 +7114,11 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         }
     }
 
-    return transport_.write_stream(control_stream_id_,
-        encode_publish_namespace_done_message(namespace_message), false);
+    return live_srt_flow.publishing_status(
+        transport_.write_stream(
+            control_stream_id_,
+            encode_publish_namespace_done_message(namespace_message),
+            false));
 }
 
 namespace {
@@ -7464,8 +7589,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         // No pacing needed: trimming prevents backlog accumulation and
         // ffmpeg's realtime encoding rate naturally limits throughput.
         while (true) {
-            dispatch_peer_stopped_media_streams(transport_,
-                                                sender_by_track);
+            const TransportStatus event_status =
+                dispatch_peer_stopped_media_streams(transport_,
+                                                    sender_by_track);
+            if (!event_status.ok) {
+                return event_status;
+            }
             openmoq::publisher::MediaFragment fragment;
             {
                 std::lock_guard<std::mutex> lock(queue->mutex);
@@ -7545,10 +7674,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                          ? published_settings_it->second.subscriber_priority
                          : 128),
                  .publisher = 128});
-            dispatch_peer_stopped_media_streams(transport_,
-                                                sender_by_track);
+            const TransportStatus post_write_event_status =
+                dispatch_peer_stopped_media_streams(transport_,
+                                                    sender_by_track);
             if (!write_status.ok) {
                 return write_status;
+            }
+            if (!post_write_event_status.ok) {
+                return post_write_event_status;
             }
             if (!object_published) {
                 continue;
@@ -8217,8 +8350,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
         std::optional<std::chrono::steady_clock::time_point> eof_deadline;
         while (true) {
-            dispatch_peer_stopped_media_streams(transport_,
-                                                sender_by_track);
+            status = dispatch_peer_stopped_media_streams(transport_,
+                                                         sender_by_track);
+            if (!status.ok) {
+                join_stdin_thread();
+                return status;
+            }
             // Drain media continuously in auto-forward mode.
             {
                 status = drain_queue();
@@ -8281,8 +8418,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
 
         while (true) {
-            dispatch_peer_stopped_media_streams(transport_,
-                                                sender_by_track);
+            status = dispatch_peer_stopped_media_streams(transport_,
+                                                         sender_by_track);
+            if (!status.ok) {
+                join_stdin_thread();
+                return status;
+            }
             bool is_eof;
             {
                 std::lock_guard<std::mutex> lock(queue->mutex);
@@ -8472,11 +8613,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
     std::cerr << "[moqt-session] live: stdin EOF, publishing complete\n";
 
-    return write_namespace_done_for_request(transport_,
-                                            draft_version,
-                                            control_stream_id_,
-                                            namespace_stream_id_,
-                                            namespace_message);
+    return finish_after_media_event_dispatch(
+        transport_,
+        sender_by_track,
+        write_namespace_done_for_request(transport_,
+                                         draft_version,
+                                         control_stream_id_,
+                                         namespace_stream_id_,
+                                         namespace_message));
 }
 
 TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::LiveObjectSource& source,
@@ -9134,7 +9278,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     };
     const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
     while (!source_eof) {
-        dispatch_peer_stopped_media_streams(transport_, sender_by_track);
+        status = dispatch_peer_stopped_media_streams(transport_,
+                                                     sender_by_track);
+        if (!status.ok) {
+            return status;
+        }
         if (stop_requested_.load(std::memory_order_acquire)) {
             break;
         }
@@ -9333,7 +9481,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                      ? published_settings_it->second.subscriber_priority
                      : 128),
              .publisher = 128});
-        dispatch_peer_stopped_media_streams(transport_, sender_by_track);
+        const TransportStatus event_status =
+            dispatch_peer_stopped_media_streams(transport_, sender_by_track);
         if (!status.ok) {
             // A send failure that races with a concurrent close() is a benign
             // stop, not a transport error: break to the flush.
@@ -9341,6 +9490,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 break;
             }
             return status;
+        }
+        if (!event_status.ok) {
+            return event_status;
         }
         if (!object_published) {
             continue;
@@ -9370,7 +9522,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
     for (auto& [track_name, sender] : sender_by_track) {
         if (flush_budget_exhausted()) {
-            return TransportStatus::success();
+            return finish_after_media_event_dispatch(
+                transport_, sender_by_track, TransportStatus::success());
         }
         status = sender.finish_group(
             transport_,
@@ -9378,13 +9531,18 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             effective_delivery_timeouts(track_name),
             now_function_);
         if (!status.ok) {
-            return stopping() ? TransportStatus::success() : status;
+            return stopping()
+                       ? finish_after_media_event_dispatch(
+                             transport_, sender_by_track,
+                             TransportStatus::success())
+                       : status;
         }
     }
 
     for (const auto& [request_id, subscribe] : active_subscriptions) {
         if (flush_budget_exhausted()) {
-            return TransportStatus::success();
+            return finish_after_media_event_dispatch(
+                transport_, sender_by_track, TransportStatus::success());
         }
         const auto stream_it = active_subscription_stream_ids.find(request_id);
         const std::uint64_t response_stream_id =
@@ -9396,7 +9554,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                              draft_version, request_id, sender_by_track[subscribe.track_name].stream_count()),
                                          false);
         if (!status.ok) {
-            return stopping() ? TransportStatus::success() : status;
+            return stopping()
+                       ? finish_after_media_event_dispatch(
+                             transport_, sender_by_track,
+                             TransportStatus::success())
+                       : status;
         }
     }
     for (const auto& [track_name, request_id] : published_track_request_ids) {
@@ -9404,7 +9566,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             continue;
         }
         if (flush_budget_exhausted()) {
-            return TransportStatus::success();
+            return finish_after_media_event_dispatch(
+                transport_, sender_by_track, TransportStatus::success());
         }
         status = write_publish_done_for_request(transport_,
                                                 draft_version,
@@ -9413,13 +9576,18 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                 request_id,
                                                 sender_by_track[track_name].stream_count());
         if (!status.ok) {
-            return stopping() ? TransportStatus::success() : status;
+            return stopping()
+                       ? finish_after_media_event_dispatch(
+                             transport_, sender_by_track,
+                             TransportStatus::success())
+                       : status;
         }
         publish_stream_id_by_request_id_.erase(request_id);
     }
 
     if (flush_budget_exhausted()) {
-        return TransportStatus::success();
+        return finish_after_media_event_dispatch(
+            transport_, sender_by_track, TransportStatus::success());
     }
     const auto namespace_done_status = write_namespace_done_for_request(transport_,
                                             draft_version,
@@ -9427,9 +9595,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                             namespace_stream_id_,
                                             namespace_message);
     if (!namespace_done_status.ok && stopping()) {
-        return TransportStatus::success();
+        return finish_after_media_event_dispatch(
+            transport_, sender_by_track, TransportStatus::success());
     }
-    return namespace_done_status;
+    return finish_after_media_event_dispatch(
+        transport_, sender_by_track, namespace_done_status);
 }
 
 TransportStatus MoqtSession::close(std::uint64_t application_error_code) {
@@ -9451,7 +9621,7 @@ TransportStatus MoqtSession::close(std::uint64_t application_error_code) {
     if (status.ok) {
         // close() has joined the backend callback loop, so no new STOP_SENDING
         // notification can race this final ownerless drain.
-        acknowledge_ownerless_peer_stopped_media_streams(transport_);
+        return acknowledge_ownerless_peer_stopped_media_streams(transport_);
     }
     return status;
 }

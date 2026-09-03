@@ -35,6 +35,9 @@ void begin_generation_availability_storage_tracking_for_testing();
 std::size_t end_generation_availability_storage_tracking_for_testing();
 void begin_subgroup_completion_storage_tracking_for_testing();
 std::size_t end_subgroup_completion_storage_tracking_for_testing();
+TransportStatus exercise_terminal_completion_overflow_for_testing(
+    PublisherTransport& transport,
+    bool renew_peer_stops_after_overflow);
 
 }  // namespace openmoq::publisher::transport::priority_scheduler_internal
 
@@ -5590,6 +5593,46 @@ int main() {
         ok &= expect(
             peak_entries == kSparseRangeCapacity * 2,
             "expected the global sparse cap to bound both subgroup-map and exact range-node storage");
+    }
+
+    for (const bool expire_streams : {true, false}) {
+        // The final transport event is deliberately the operation's last
+        // action: there is no subsequent serve or finish_group call available
+        // to surface sparse completion-history exhaustion. Dispatch must both
+        // acknowledge that event and return the sticky terminal failure.
+        MockTransport transport;
+        transport.state_ = ConnectionState::kConnected;
+        transport.on_try_write_object =
+            [expire_streams](MockTransport& current,
+                             const MockTransport::ObjectWriteEvent& event) {
+                if (expire_streams) {
+                    current.expired_media_streams.insert(event.stream_id);
+                } else {
+                    current.peer_stopped_media_streams.insert(event.stream_id);
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+        status = openmoq::publisher::transport::priority_scheduler_internal::
+            exercise_terminal_completion_overflow_for_testing(
+                transport, !expire_streams);
+        const std::size_t acknowledged =
+            expire_streams
+                ? transport.acknowledged_expired_media_streams.size()
+                : transport.acknowledged_peer_stopped_media_streams.size();
+        ok &= expect(
+            !status.ok &&
+                status.message ==
+                    "subgroup completion history exceeded bounded sparse range capacity",
+            expire_streams
+                ? "expected terminal expiry overflow to propagate without a later sender operation"
+                : "expected terminal peer-stop overflow to propagate without a later sender operation");
+        ok &= expect(
+            acknowledged == 257 && transport.expired_media_streams.empty() &&
+                transport.peer_stopped_media_streams.empty(),
+            expire_streams
+                ? "expected every expiry event, including terminal overflow, to be acknowledged"
+                : "expected every peer-stop event, including terminal overflow, to be acknowledged");
     }
 
     MockTransport draft16_transport;
