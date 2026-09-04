@@ -923,6 +923,12 @@ TransportStatus WebTransportClient::connect() {
     register_connection_impl(impl_->cnx, impl_.get());
     picoquic_set_callback(impl_->cnx, webtransport_connection_callback, impl_->h3_ctx);
 
+    // Draft-18 section 13.6.1 explicitly permits QUIC PING keep-alives for
+    // idle MOQT sessions. This is below MOQT framing and is therefore also
+    // draft-neutral for the supported draft-14 and draft-16 sessions. Let
+    // picoquic derive the interval from the negotiated idle timeout.
+    picoquic_enable_keep_alive(impl_->cnx, 0);
+
     if (picoquic_start_client_cnx(impl_->cnx) != 0) {
         unregister_connection_impl(impl_->cnx);
         picoquic_free(impl_->quic);
