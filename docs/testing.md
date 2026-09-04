@@ -165,6 +165,66 @@ cat sample.mp4 | ./build/openmoq-publisher --input - --draft 14 --dump-plan
 
 Push CMAF segments with HTTP/1.1 chunked transfer encoding (curl or the FFmpeg DASH recipe in `docs/quickstart.md`) at `http://127.0.0.1:8099/ingest/...`. Like a live publish, the dry run keeps draining objects until it is interrupted; wrap it in `timeout` for scripted checks.
 
+### Live Red5 Relay Smoke Test
+
+Use the Red5 WebTransport endpoint at `/moq` for a bounded draft-18 relay
+smoke test. On GNU/Linux, start the publisher in one terminal:
+
+```bash
+OPENMOQ_PICOQUIC_TRACE=1 \
+timeout --signal=INT --kill-after=5s 45s \
+./build/openmoq-publisher \
+  --live-source dash \
+  --dash-listen 127.0.0.1:8080 \
+  --dash-path /ingest \
+  --endpoint https://moq-relay.red5.net:4433/moq \
+  --transport webtransport \
+  --namespace live/dasher \
+  --draft 18 \
+  --publish-catalog \
+  --forward 1 \
+  --insecure
+```
+
+Then send simulated DASH input from a second terminal:
+
+```bash
+timeout --signal=INT --kill-after=5s 22s \
+ffmpeg -hide_banner -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+  -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -filter_complex "[0:v]split=2[v1][v2];[v1]scale=1280:720[v720];[v2]scale=640:360[v360]" \
+  -map "[v720]" -c:v:0 libx264 -b:v:0 1500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map "[v360]" -c:v:1 libx264 -b:v:1 500k -g 50 -keyint_min 50 -sc_threshold 0 \
+  -map 1:a -c:a aac -b:a 128k \
+  -f dash -seg_duration 2 -use_template 1 -use_timeline 0 \
+  -init_seg_name 'video$RepresentationID$' \
+  -media_seg_name 'video$RepresentationID$' \
+  -adaptation_sets "id=0,streams=v id=1,streams=a" \
+  -multiple_requests 1 -streaming 1 -remove_at_exit 0 \
+  -window_size 20 -extra_window_size 20 \
+  http://127.0.0.1:8080/ingest/
+```
+
+The `timeout` exit status is expected because it bounds otherwise-live
+processes. A passing run has all of these signals:
+
+- `dash_ingest_bound_port=8080` and `connection_id=` confirm local ingest and
+  WebTransport/MOQT setup
+- the trace shows `PUBLISH_NAMESPACE_OK` and `PUBLISH_OK` acceptance before
+  media objects are sent
+- the relay sends a live `SUBSCRIBE` for `catalog`
+- FFmpeg opens `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`
+- the publisher opens subgroup streams and sends objects for both video tracks
+  and the audio track without a transport or protocol error
+- both commands exit after their bounds and no publisher or FFmpeg process is
+  left running
+
+Do not treat `connection_id=` alone as a passing result. On macOS, where the
+GNU `timeout` command is not installed by default, run the same commands
+without the wrappers and stop FFmpeg and the publisher with Control-C after the
+trace has shown media objects for all three tracks.
+
 Run the focused DASH ingest and subscriber-interest regressions with:
 
 ```bash

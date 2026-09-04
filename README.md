@@ -181,7 +181,7 @@ Start the publisher with an HTTP/1.1 chunked CMAF listener and a MoQ relay targe
   --endpoint https://127.0.0.1:4433/moq \
   --transport webtransport \
   --namespace live/dash \
-  --draft 16 \
+  --draft 18 \
   --publish-catalog \
   --forward 1 \
   --insecure

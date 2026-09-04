@@ -535,6 +535,10 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+    const std::size_t video_track_count = std::count_if(
+        tracks_.begin(), tracks_.end(), [](const RegisteredTrack& registered) {
+            return registered.description.handler_type == "vide";
+        });
 
     for (const auto& registered : tracks_) {
         // CTE ingest always produces CMAF regardless of the parsed value;
@@ -544,6 +548,9 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
         TrackDescription track = registered.description;
         track.packaging = "cmaf";
         MsfTrack msf_track = make_msf_track(track, /*is_live=*/true);
+        if (video_track_count > 1 && track.handler_type == "vide") {
+            msf_track.alt_group = 1;
+        }
 
         if (!registered.init_data_base64.empty()) {
             attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);

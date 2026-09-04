@@ -173,6 +173,16 @@ std::string as_string(const std::vector<std::uint8_t>& bytes) {
     return std::string(bytes.begin(), bytes.end());
 }
 
+std::size_t count_occurrences(std::string_view text, std::string_view needle) {
+    std::size_t count = 0;
+    for (std::size_t position = 0;
+         (position = text.find(needle, position)) != std::string_view::npos;
+         position += needle.size()) {
+        ++count;
+    }
+    return count;
+}
+
 // CENC fixture helpers ported from tests/cmaf_segmenter_test.cpp (around
 // lines 320-356). Their byte layouts match what parse_track_protection and
 // parse_pssh_boxes actually read; do not hand-roll replacements here.
@@ -524,6 +534,32 @@ int main() {
     }
 
     {
+        // Multiple video representations from one DASH ingest session form a
+        // switching set. CMSF requires each video catalog entry to carry the
+        // same altGroup, while the accompanying audio is not an alternative.
+        LiveDashIngestSession session(8);
+        const auto video_init = make_init_segment(1);
+        const auto audio_init = make_init_segment(1, "soun");
+        session.ingest("/ingest/video0",
+                       std::span<const std::uint8_t>(video_init.data(), video_init.size()));
+        session.ingest("/ingest/video1",
+                       std::span<const std::uint8_t>(video_init.data(), video_init.size()));
+        session.ingest("/ingest/video2",
+                       std::span<const std::uint8_t>(audio_init.data(), audio_init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected alternate video tracks before altGroup catalog test");
+        const auto source = session.source();
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected catalog for alternate video tracks");
+        if (catalog.has_value()) {
+            const std::string catalog_text = as_string(catalog->payload);
+            ok &= expect(count_occurrences(catalog_text, "\"altGroup\":1") == 2,
+                         "expected exactly the two video representations in altGroup 1");
+        }
+    }
+
+    {
         // The catalog must embed each track's base64 CMAF init segment so
         // subscribers can initialize their decoders.
         LiveDashIngestSession session(8);
@@ -551,6 +587,8 @@ int main() {
                          "expected isLive true in CTE catalog");
             ok &= expect(catalog_text.find("\"renderGroup\":1") != std::string::npos,
                          "expected DASH catalog track to declare its render group");
+            ok &= expect(catalog_text.find("\"altGroup\"") == std::string::npos,
+                         "expected a lone video track not to declare an alternate group");
             ok &= expect(catalog_text.find("\"width\":320") != std::string::npos &&
                              catalog_text.find("\"height\":240") != std::string::npos,
                          "expected DASH catalog video dimensions for renderer selection");

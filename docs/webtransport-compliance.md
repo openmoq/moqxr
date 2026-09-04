@@ -162,7 +162,8 @@ coverage rather than initial session establishment:
 
 ## Current interoperability state
 
-Observed behavior as of May 16, 2026:
+Observed behavior as of May 16, 2026, with the Red5 relay result refreshed on
+September 4, 2026:
 
 - `<moqx-la-relay-host>:4433/moq-relay`
   - draft-16 CONNECT succeeds with verified TLS
@@ -178,6 +179,12 @@ Observed behavior as of May 16, 2026:
   - a live `SUBSCRIBE` for `catalog` was observed and served successfully
   - draft-14 and draft-18 psychedelic publisher flows have both connected and
     published against the Red5 relay during local interop checks
+  - a September 4 draft-18 CTE LL-DASH run published namespace `live/dasher`
+    from simulated FFmpeg input with two H.264 representations and AAC audio
+  - FFmpeg opened `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`; the
+    publisher received the catalog subscription and emitted more than 2,000
+    media objects across 12 shared media groups without a transport or protocol
+    error
 - `moq-relay.red5.net:4433/moq-relay`
   - WebTransport CONNECT is rejected with HTTP `404`
   - use `/moq` for the Red5 relay on port 4433
