@@ -8587,6 +8587,116 @@ int main() {
     }
 
     {
+        // draft-16 sections 5.1 and 9.11: a PUBLISH-initiated subscription has a
+        // Forward State. PUBLISH_OK with FORWARD=0 means "send nothing yet", and
+        // the subscriber later flips it with a REQUEST_UPDATE whose Existing
+        // Request ID is the PUBLISH request id. The live path used to know only
+        // SUBSCRIBE request ids and closed the session with PROTOCOL_VIOLATION on
+        // that update (red5-moq-relay answers PUBLISH_OK forward=0 while no viewer
+        // is attached and sends REQUEST_UPDATE forward=1 when the first arrives).
+        MockTransport paused_transport;
+        paused_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        paused_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        paused_transport.reads[0].push_back(encode_publish_ok_message(DraftVersion::kDraft16, 2, 0));
+
+        MoqtSession paused_session(
+            paused_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = paused_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected paused-publish draft-16 session connect to succeed");
+
+        const auto paused_bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::string paused_input_bytes(paused_bytes.begin(), paused_bytes.end());
+        std::istringstream paused_input(paused_input_bytes);
+        status = paused_session.publish_live(paused_input, DraftVersion::kDraft16, true);
+        ok &= expect(status.ok, "expected PUBLISH_OK forward=0 to be accepted, not treated as an error");
+        ok &= expect(paused_session.publish_stats().objects_published == 0,
+                     "expected Forward State 0 from PUBLISH_OK to hold every object back");
+        ok &= expect(std::none_of(paused_transport.writes.begin(), paused_transport.writes.end(),
+                                  [](const auto& write) { return is_data_stream_write(write); }),
+                     "expected no data stream while the PUBLISH subscription is at Forward State 0");
+    }
+
+    {
+        MockTransport resumed_transport;
+        resumed_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        resumed_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        std::vector<std::uint8_t> resume_control = encode_publish_ok_message(DraftVersion::kDraft16, 2, 0);
+        // REQUEST_UPDATE{request_id=1, existing_request_id=2, FORWARD=1}
+        append_bytes(resume_control, encode_request_update_message(DraftVersion::kDraft16, 1, 1, 0x10, 2));
+        resumed_transport.reads[0].push_back(std::move(resume_control));
+
+        MoqtSession resumed_session(
+            resumed_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = resumed_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected resumed-publish draft-16 session connect to succeed");
+
+        const auto resumed_bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::string resumed_input_bytes(resumed_bytes.begin(), resumed_bytes.end());
+        std::istringstream resumed_input(resumed_input_bytes);
+        status = resumed_session.publish_live(resumed_input, DraftVersion::kDraft16, true);
+        ok &= expect(status.ok,
+                     "expected a REQUEST_UPDATE naming the PUBLISH request id to be applied, "
+                     "not rejected as an invalid existing subscription");
+        ok &= expect(resumed_session.publish_stats().objects_published >= 1,
+                     "expected REQUEST_UPDATE forward=1 to resume the PUBLISHed track");
+
+        std::optional<std::size_t> request_ok;
+        std::optional<std::size_t> first_data;
+        std::size_t request_ok_count = 0;
+        for (std::size_t i = 0; i < resumed_transport.writes.size(); ++i) {
+            const auto& write = resumed_transport.writes[i];
+            if (write.stream_id == 0 && message_type(write.bytes) == 0x07) {
+                ++request_ok_count;
+                if (!request_ok) {
+                    request_ok = i;
+                }
+            }
+            if (!first_data && is_data_stream_write(write)) {
+                first_data = i;
+            }
+        }
+        ok &= expect(request_ok_count == 1,
+                     "expected exactly one REQUEST_OK in reply to the REQUEST_UPDATE (draft-16 section 9.11)");
+        ok &= expect(request_ok && resumed_transport.writes[*request_ok].bytes.size() >= 4 &&
+                         resumed_transport.writes[*request_ok].bytes[3] == 0x01,
+                     "expected the REQUEST_OK to carry the REQUEST_UPDATE's request id (1)");
+        ok &= expect(request_ok && first_data && *request_ok < *first_data,
+                     "expected the REQUEST_OK before the first object of the resumed track");
+    }
+
+    {
+        MockTransport unknown_transport;
+        unknown_transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        unknown_transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        std::vector<std::uint8_t> unknown_control = encode_publish_ok_message(DraftVersion::kDraft16, 2, 0);
+        // Existing Request ID 9 names nothing this session ever requested.
+        append_bytes(unknown_control, encode_request_update_message(DraftVersion::kDraft16, 1, 1, 0x10, 9));
+        unknown_transport.reads[0].push_back(std::move(unknown_control));
+
+        MoqtSession unknown_session(
+            unknown_transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = unknown_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected unknown-existing-id draft-16 session connect to succeed");
+
+        const auto unknown_bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::string unknown_input_bytes(unknown_bytes.begin(), unknown_bytes.end());
+        std::istringstream unknown_input(unknown_input_bytes);
+        status = unknown_session.publish_live(unknown_input, DraftVersion::kDraft16, true);
+        ok &= expect(!status.ok && unknown_transport.last_close_code == 0x03,
+                     "expected a REQUEST_UPDATE with an unknown Existing Request ID to still close "
+                     "the session with PROTOCOL_VIOLATION (draft-16 section 9.11)");
+    }
+
+    {
         // Forward mode on a request-stream draft: each media track is PUBLISHed
         // on its own request stream before any object is pushed. The catalog is
         // not preannounced -- it stays SUBSCRIBE-driven, as on draft-14/16.

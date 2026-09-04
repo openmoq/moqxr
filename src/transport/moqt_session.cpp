@@ -8011,6 +8011,78 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         return publish_live_tracks(live_track_names);
     };
 
+    // A PUBLISH-initiated subscription is gated by the union of the subscriber's
+    // own SUBSCRIBEs for the track and the PUBLISH's Forward State (draft-16 /
+    // draft-18 section 5.1): objects flow while any of them forwards.
+    const auto refresh_published_track_forwarding =
+        [&](const std::string& track_name) {
+            const bool subscriber_forward = std::any_of(
+                active_subscriptions.begin(),
+                active_subscriptions.end(),
+                [&](const auto& entry) {
+                    return entry.second.track_name == track_name &&
+                           entry.second.forward != 0;
+                });
+            const auto published_it =
+                published_track_settings.find(track_name);
+            const bool publisher_forward =
+                published_it != published_track_settings.end() &&
+                published_it->second.forward != 0;
+            if (subscriber_forward || publisher_forward) {
+                subscribed_tracks.insert(track_name);
+            } else {
+                subscribed_tracks.erase(track_name);
+            }
+        };
+
+    // Applies a REQUEST_UPDATE to a subscription this session established with
+    // PUBLISH and answers it with exactly one REQUEST_OK (draft-16 section 9.11,
+    // draft-18 section 10.9). On draft-16 the update names the PUBLISH's request
+    // id as Existing Request ID on the control stream; on draft-17/18 it arrives
+    // on the PUBLISH's own request stream. Both land here.
+    const auto apply_published_track_update =
+        [&](const std::string& track_name,
+            std::uint64_t response_stream_id,
+            const RequestUpdateMessage& update) -> TransportStatus {
+            if (update.new_group_request.has_value()) {
+                return protocol_violation(
+                    transport_,
+                    "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
+            }
+            auto settings_it = published_track_settings.find(track_name);
+            if (settings_it == published_track_settings.end()) {
+                // The update overtook PUBLISH_OK: start from the PUBLISH's own
+                // defaults (FORWARD omitted = 1, draft-16 section 9.2.2.8).
+                SubscribeMessage settings;
+                settings.track_name = track_name;
+                settings.subscriber_priority = 128;
+                settings.forward = 1;
+                settings_it = published_track_settings
+                                  .insert_or_assign(track_name, settings)
+                                  .first;
+            }
+            const bool renew_peer_stopped_subgroups =
+                request_update_renews_peer_stopped_subgroups(
+                    draft_version, settings_it->second, update);
+            apply_request_update(settings_it->second, update);
+            if (renew_peer_stopped_subgroups) {
+                sender_by_track[track_name]
+                    .renew_peer_stopped_subgroups(transport_);
+            }
+            published_track_delivery_timeouts.insert_or_assign(
+                track_name, settings_it->second.delivery_timeouts);
+            note_delivery_timeouts(
+                transport_, settings_it->second.delivery_timeouts);
+            refresh_published_track_forwarding(track_name);
+            const std::vector<std::uint8_t> response =
+                encode_live_request_ok_message(draft_version,
+                                               update.request_id,
+                                               track_name,
+                                               largest_object_by_track);
+            return transport_.write_stream(
+                response_stream_id, response, false);
+        };
+
     const auto apply_subscriber_request_update =
         [&](std::uint64_t existing_request_id,
             std::uint64_t response_stream_id,
@@ -8018,6 +8090,15 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             const auto active_it =
                 active_subscriptions.find(existing_request_id);
             if (active_it == active_subscriptions.end()) {
+                // draft-16 section 9.11: the Existing Request ID may be the
+                // request id of a PUBLISH this session sent (a subscriber
+                // updating a subscription established with PUBLISH).
+                const auto published_it =
+                    publish_request_id_to_track.find(existing_request_id);
+                if (published_it != publish_request_id_to_track.end()) {
+                    return apply_published_track_update(
+                        published_it->second, response_stream_id, update);
+                }
                 return protocol_violation(
                     transport_,
                     "REQUEST_UPDATE specified an invalid existing subscription");
@@ -8063,10 +8144,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         }
                     }
                 }
-            } else if (forward) {
-                subscribed_tracks.insert(track_name);
             } else {
-                subscribed_tracks.erase(track_name);
+                refresh_published_track_forwarding(track_name);
             }
             const std::vector<std::uint8_t> response =
                 encode_live_request_ok_message(draft_version,
@@ -8091,41 +8170,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 std::uint64_t response_stream_id,
                 const RequestUpdateMessage& update) -> TransportStatus {
                 static_cast<void>(request_id);
-                if (update.new_group_request.has_value()) {
-                    return protocol_violation(
-                        transport_,
-                        "REQUEST_UPDATE NEW_GROUP requires negotiated DYNAMIC_GROUPS");
-                }
-                const auto settings_it =
-                    published_track_settings.find(track_name);
-                if (settings_it == published_track_settings.end()) {
-                    return TransportStatus::failure(
-                        "missing settings for draft-18 PUBLISH request");
-                }
-                const bool renew_peer_stopped_subgroups =
-                    request_update_renews_peer_stopped_subgroups(
-                        draft_version, settings_it->second, update);
-                apply_request_update(settings_it->second, update);
-                if (renew_peer_stopped_subgroups) {
-                    sender_by_track[track_name]
-                        .renew_peer_stopped_subgroups(transport_);
-                }
-                published_track_delivery_timeouts.insert_or_assign(
-                    track_name, settings_it->second.delivery_timeouts);
-                note_delivery_timeouts(
-                    transport_, settings_it->second.delivery_timeouts);
-                if (settings_it->second.forward != 0) {
-                    subscribed_tracks.insert(track_name);
-                } else {
-                    subscribed_tracks.erase(track_name);
-                }
-                const std::vector<std::uint8_t> response =
-                    encode_live_request_ok_message(draft_version,
-                                                   update.request_id,
-                                                   track_name,
-                                                   largest_object_by_track);
-                return transport_.write_stream(
-                    response_stream_id, response, false);
+                return apply_published_track_update(
+                    track_name, response_stream_id, update);
             },
             [&](const std::string& track_name, std::uint64_t request_id) {
                 static_cast<void>(track_name);
@@ -8522,8 +8568,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             } else if (message_type == 0x1e) {  // PUBLISH_OK
                 // Relay accepted a PUBLISHed track. Some relays (e.g. moqx) do not
                 // forward SUBSCRIBE after PUBLISH_OK; they expect the publisher to
-                // start sending data once the track is accepted. Mark the track as
-                // subscribed so drain_queue will forward fragments.
+                // start sending data once the track is accepted. Keep the
+                // subscriber's settings: PUBLISH_OK establishes the subscription
+                // and its FORWARD parameter (omitted = 1) is the Forward State
+                // (draft-16 section 5.1). A FORWARD=0 answer parks the track until
+                // a REQUEST_UPDATE naming this PUBLISH request id sets forward=1.
                 PublishOk publish_ok_msg;
                 if (decode_publish_ok(message_bytes, draft_version, publish_ok_msg)) {
                     note_delivery_timeouts(transport_, publish_ok_msg.delivery_timeouts);
@@ -8531,10 +8580,20 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     if (it != publish_request_id_to_track.end()) {
                         published_track_delivery_timeouts.insert_or_assign(
                             it->second, publish_ok_msg.delivery_timeouts);
-                        subscribed_tracks.insert(it->second);
+                        SubscribeMessage settings;
+                        settings.request_id = publish_ok_msg.request_id;
+                        settings.track_name = it->second;
+                        settings.subscriber_priority = publish_ok_msg.subscriber_priority;
+                        settings.group_order = publish_ok_msg.group_order;
+                        settings.forward = publish_ok_msg.forward;
+                        settings.filter_type = publish_ok_msg.filter_type;
+                        settings.delivery_timeouts = publish_ok_msg.delivery_timeouts;
+                        published_track_settings.insert_or_assign(it->second, settings);
+                        refresh_published_track_forwarding(it->second);
                         ++new_subs;
                         std::cerr << "[moqt-session] live: PUBLISH_OK track=" << it->second
-                                  << " request_id=" << publish_ok_msg.request_id << '\n';
+                                  << " request_id=" << publish_ok_msg.request_id
+                                  << " forward=" << static_cast<int>(publish_ok_msg.forward) << '\n';
                     }
                 }
             }
