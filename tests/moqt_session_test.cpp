@@ -69,6 +69,7 @@ using openmoq::publisher::PublishPlan;
 using openmoq::publisher::TrackDescription;
 using openmoq::publisher::materialize_publish_plan;
 using openmoq::publisher::transport::ConnectionState;
+using openmoq::publisher::transport::FailureKind;
 using openmoq::publisher::transport::SubscribeMessage;
 using openmoq::publisher::transport::SubscribeNamespaceMessage;
 using openmoq::publisher::transport::EndpointConfig;
@@ -5870,6 +5871,8 @@ int main() {
         ok &= expect(status.ok, "expected draft-16 publish-reject session connect to succeed");
         status = draft16_publish_reject_session.publish(draft16_materialized);
         ok &= expect(!status.ok, "expected draft-16 publish to fail on REQUEST_ERROR publish rejection");
+        ok &= expect(status.failure_kind == FailureKind::kEndpointPermanent,
+                     "expected a relay publish rejection to skip same-endpoint retries");
         ok &= expect(status.message != "timed out waiting for publish acknowledgements",
                      "expected draft-16 publish REQUEST_ERROR to fail directly, not via ack timeout");
     }
@@ -6511,6 +6514,8 @@ int main() {
         ok &= expect(!status.ok, "expected draft-18 publish to surface request-stream GOAWAY migration");
         ok &= expect(status.message == "request stream received GOAWAY migration",
                      "expected explicit GOAWAY request-stream migration message");
+        ok &= expect(status.failure_kind == FailureKind::kRetryable,
+                     "expected request-stream GOAWAY to re-establish publication");
         ok &= expect(draft18_goaway_transport.state() == ConnectionState::kConnected,
                      "expected request-stream GOAWAY not to close draft-18 session");
         ok &= expect(!draft18_goaway_transport.reset_calls.empty() &&

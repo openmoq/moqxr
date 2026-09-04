@@ -433,6 +433,7 @@ add_library(openmoq_publisher_lib STATIC
     src/cmaf_segmenter.cpp
     src/cmsf_packager.cpp
     src/drm_config.cpp
+    src/endpoint_failover.cpp
     src/live_srt_ingest.cpp
     src/live_srt_config.cpp
     src/live_dash_ingest.cpp
@@ -630,6 +631,13 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-cli-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-cli-tests COMMAND openmoq-publisher-cli-tests)
+
+    add_executable(openmoq-publisher-endpoint-failover-tests
+        tests/endpoint_failover_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-endpoint-failover-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-endpoint-failover-tests
+        COMMAND openmoq-publisher-endpoint-failover-tests)
 
     add_executable(openmoq-publisher-live-srt-config-tests
         tests/live_srt_config_test.cpp

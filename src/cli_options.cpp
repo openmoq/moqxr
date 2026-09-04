@@ -1,5 +1,6 @@
 #include "openmoq/publisher/cli_options.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -177,6 +178,14 @@ std::chrono::seconds parse_catalog_republish_interval(std::string_view value) {
     return std::chrono::seconds(seconds);
 }
 
+std::size_t parse_retry_count(std::string_view value) {
+    const int retries = parse_strict_int(value, "--retry");
+    if (retries < 0) {
+        throw std::runtime_error("--retry must be zero or greater");
+    }
+    return static_cast<std::size_t>(retries);
+}
+
 }  // namespace
 
 CliOptions parse_cli_options(int argc, char** argv) {
@@ -184,6 +193,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
     bool dash_path_set = false;
     bool dash_queue_depth_set = false;
     bool transport_set = false;
+    bool retry_set = false;
     // Tracks whether --endpoint / --url were themselves given on the command
     // line, as opposed to options.endpoint simply having a value (--alpn and
     // --sni also construct an EndpointConfig when none exists yet). Guarding
@@ -245,14 +255,13 @@ CliOptions parse_cli_options(int argc, char** argv) {
             // skipped its own draft-appropriate selection: the connection went
             // out with a struct default nobody chose. Mirrors what --url does.
             const transport::EndpointConfig parsed = parse_endpoint(require_value("--endpoint"));
+            transport::EndpointConfig configured = parsed;
             if (options.endpoint.has_value()) {
-                options.endpoint->host = parsed.host;
-                options.endpoint->port = parsed.port;
-                options.endpoint->path = parsed.path;
-                options.endpoint->path_explicit = parsed.path_explicit;
-            } else {
-                options.endpoint = parsed;
+                configured.alpn = options.endpoint->alpn;
+                configured.sni = options.endpoint->sni;
             }
+            options.endpoints.push_back(configured);
+            options.endpoint = options.endpoints.front();
             endpoint_set = true;
         } else if (argument == "--url") {
             if (url_set) {
@@ -314,6 +323,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
                 endpoint.path_explicit = endpoint_path_explicit;
                 options.endpoint = endpoint;
             }
+            options.endpoints = {*options.endpoint};
             endpoint_set = true;
             url_set = true;
 
@@ -340,12 +350,18 @@ CliOptions parse_cli_options(int argc, char** argv) {
                 options.endpoint = transport::EndpointConfig{};
             }
             options.endpoint->alpn = std::string(require_value("--alpn"));
+            for (auto& endpoint : options.endpoints) {
+                endpoint.alpn = options.endpoint->alpn;
+            }
             options.endpoint_alpn_overridden = true;
         } else if (argument == "--sni") {
             if (!options.endpoint.has_value()) {
                 options.endpoint = transport::EndpointConfig{};
             }
             options.endpoint->sni = std::string(require_value("--sni"));
+            for (auto& endpoint : options.endpoints) {
+                endpoint.sni = options.endpoint->sni;
+            }
         } else if (argument == "--cert") {
             options.tls.certificate_path = std::string(require_value("--cert"));
         } else if (argument == "--key") {
@@ -376,6 +392,9 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.stream_per_object = true;
         } else if (argument == "--timeout") {
             options.subscriber_timeout = parse_timeout(require_value("--timeout"));
+        } else if (argument == "--retry") {
+            options.retry_count = parse_retry_count(require_value("--retry"));
+            retry_set = true;
         } else if (argument == "--preannounce-tracks") {
             options.preannounce_tracks = true;
         } else if (argument == "--paced") {
@@ -452,6 +471,9 @@ CliOptions parse_cli_options(int argc, char** argv) {
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
         throw std::runtime_error("--alpn and --sni require --endpoint to be provided first");
     }
+    if (retry_set && options.endpoints.empty()) {
+        throw std::runtime_error("--retry requires --endpoint or --url");
+    }
 
     // Resolve any --url connection requirement against --transport exactly
     // once, regardless of which flag appeared first on the command line.
@@ -466,13 +488,25 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
     if (options.endpoint.has_value()) {
         options.endpoint->transport = options.transport;
+        for (auto& endpoint : options.endpoints) {
+            endpoint.transport = options.transport;
+        }
     }
     if (options.transport == transport::TransportKind::kWebTransport) {
         if (!options.endpoint.has_value()) {
             throw std::runtime_error("--transport webtransport requires --endpoint");
         }
-        if (!options.endpoint->path_explicit) {
-            throw std::runtime_error("--transport webtransport requires an endpoint path such as https://host:port/moq");
+        const bool all_paths_explicit =
+            std::all_of(options.endpoints.begin(), options.endpoints.end(),
+                        [](const transport::EndpointConfig& endpoint) {
+                            return endpoint.path_explicit;
+                        });
+        if (!all_paths_explicit) {
+            if (options.endpoints.size() == 1) {
+                throw std::runtime_error("--transport webtransport requires an endpoint path such as https://host:port/moq");
+            }
+            throw std::runtime_error(
+                "all WebTransport endpoints require an explicit path such as https://host:port/moq");
         }
     }
     if (options.track_namespace.empty()) {
@@ -508,7 +542,8 @@ std::string build_usage(const char* argv0) {
            " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
-           " [--endpoint host:port|moqt://host:port/path|https://host:port/path] [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
+           " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
+           " [--retry <count>]"
            " [--cert file] [--key file] [--ca file] [--insecure]"
            " [--version] [--help]";
 }

@@ -69,6 +69,20 @@ BatchPublishStats summarize_batch_publish_stats(const PublishPlan& plan) {
     return snapshot;
 }
 
+transport::FailureKind publish_failure_kind(
+    const transport::TransportStatus& status,
+    const transport::PublisherTransport& publisher_transport) {
+    if (status.failure_kind != transport::FailureKind::kFatal) {
+        return status.failure_kind;
+    }
+    const transport::ConnectionState state = publisher_transport.state();
+    if (state == transport::ConnectionState::kClosed ||
+        state == transport::ConnectionState::kFailed) {
+        return transport::FailureKind::kRetryable;
+    }
+    return transport::FailureKind::kFatal;
+}
+
 }  // namespace
 
 struct Publisher::ActiveSession {
@@ -199,16 +213,19 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
     if (!status.ok) {
         const std::string error = "transport connect failed: " + status.message;
         clear_active_session(active, false, error);
-        return transport::TransportStatus::failure(error);
+        return transport::TransportStatus::failure(
+            error, transport::FailureKind::kRetryable);
     }
 
     const PublishPlan materialized = materialize_publish_plan(prepared.plan, prepared.input_bytes);
     status = active->session->publish(materialized);
     if (!status.ok) {
         const std::string error = "transport publish failed: " + status.message;
+        const transport::FailureKind failure_kind =
+            publish_failure_kind(status, *active->transport);
         static_cast<void>(active->session->close(0));
         clear_active_session(active, true, error);
-        return transport::TransportStatus::failure(error);
+        return transport::TransportStatus::failure(error, failure_kind);
     }
     {
         const auto batch_stats = summarize_batch_publish_stats(materialized);
@@ -367,7 +384,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     if (!status.ok) {
         const std::string error = "transport connect failed: " + status.message;
         clear_active_session(active, false, error);
-        return transport::TransportStatus::failure(error);
+        return transport::TransportStatus::failure(
+            error, transport::FailureKind::kRetryable);
     }
 
     transport::LiveIngestOptions session_ingest;
@@ -397,9 +415,11 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                                            config_.live_stream_per_object);
     if (!status.ok) {
         const std::string error = "transport live publish failed: " + status.message;
+        const transport::FailureKind failure_kind =
+            publish_failure_kind(status, *active->transport);
         static_cast<void>(active->session->close(0));
         clear_active_session(active, true, error);
-        return transport::TransportStatus::failure(error);
+        return transport::TransportStatus::failure(error, failure_kind);
     }
     {
         const auto live_stats = active->session->publish_stats();
@@ -502,15 +522,18 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
     if (!status.ok) {
         const std::string error = "transport connect failed: " + status.message;
         clear_active_session(active, false, error);
-        return transport::TransportStatus::failure(error);
+        return transport::TransportStatus::failure(
+            error, transport::FailureKind::kRetryable);
     }
 
     status = active->session->publish_live_objects(source, config_.draft_version);
     if (!status.ok) {
         const std::string error = "transport live object publish failed: " + status.message;
+        const transport::FailureKind failure_kind =
+            publish_failure_kind(status, *active->transport);
         static_cast<void>(active->session->close(0));
         clear_active_session(active, true, error);
-        return transport::TransportStatus::failure(error);
+        return transport::TransportStatus::failure(error, failure_kind);
     }
     {
         const auto live_stats = active->session->publish_stats();

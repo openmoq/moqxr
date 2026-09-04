@@ -81,6 +81,50 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
+## Endpoint Failover and Retries
+
+Repeat `--endpoint` to provide relay targets in preference order. `--retry N`
+allows `N` retries of the current endpoint after its initial attempt, with a
+one-second pause before each retry. The default is `--retry 0`, so each endpoint
+is attempted once before the publisher advances or exits.
+
+```bash
+OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
+  --input sample.mp4 \
+  --endpoint moqt://primary.example.com:443/moq \
+  --endpoint moqt://backup.example.com:443/moq \
+  --retry 2 \
+  --namespace interop \
+  --forward 0 \
+  --timeout 10 \
+  --paced
+```
+
+In this example the publisher makes at most three attempts per endpoint. A
+retryable connection or transport failure consumes the current endpoint's retry
+budget. A relay rejection that cannot improve by reconnecting, such as rejecting
+the namespace or track, advances immediately to the next endpoint. Invalid input,
+other fatal local failures, and cancellation stop the sequence. Exhausting the
+last endpoint returns the final failure.
+
+`--url` still describes one endpoint and remains mutually exclusive with
+`--endpoint`; it can be combined with `--retry` for same-endpoint retries. Global
+connection options such as `--transport`, `--alpn`, `--sni`, `--ca`, and
+`--insecure` apply to every configured endpoint. Consequently, use endpoints
+that share those settings. Every endpoint used with WebTransport must include an
+explicit path.
+
+File input is materialized before publication and can be reused for every
+attempt. DASH live ingest keeps a bounded replay window, republishes the retained
+catalog, and resumes from the newest retained video group boundary when a new
+session starts. Stdin and SRT start a fresh publish attempt against the current
+source; an upstream live producer must remain available and provide the
+initialization/keyframe data needed by the replacement session.
+
+The CLI reports `endpoint_attempt`, `endpoint_retry`, `endpoint_failover`, and
+`endpoints_exhausted` records on standard error. `--print-msf-urls` prints one
+catalog URL for each configured endpoint in the same order.
+
 Transport-oriented CLI flags:
 
 ```bash

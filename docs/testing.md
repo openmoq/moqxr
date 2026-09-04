@@ -15,6 +15,7 @@ This covers:
 - fragmented MP4 packaging
 - progressive MP4 remux into CMAF-style objects
 - CLI option parsing and validation
+- ordered endpoint parsing, retry-count validation, retry/failover sequencing, failure classification, cancellation, and bounded live-object replay
 - MOQT setup and control-message encoding/decoding for drafts 14, 16, 17, and 18
 - binary namespace announcement plus subscribe-serving or forward-publish control/object sequencing
 - draft-18 fragmented request-stream reads and same-stream `SUBSCRIBE_OK` responses
@@ -67,6 +68,17 @@ track/object translation, readiness and demand waits, bounded backpressure
 retries, cancellation, and live-object metadata validation. CMake also detects
 the 24-hour managed dependency refresh policy through
 `openmoq-dependency-refresh-policy-tests`.
+
+The backend-independent failover policy has focused coverage in
+`openmoq-publisher-endpoint-failover-tests`. Run the policy and CLI tests with:
+
+```bash
+cmake --build build --target \
+  openmoq-publisher-cli-tests \
+  openmoq-publisher-endpoint-failover-tests
+ctest --test-dir build --output-on-failure \
+  -R 'openmoq-publisher-(cli|endpoint-failover)-tests'
+```
 
 ## MSFTS Example Tests
 

@@ -14,6 +14,43 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
+## Relay Failover
+
+List relays in preferred order by repeating `--endpoint`. `--retry N` retries
+the current connection `N` times after the initial attempt, waiting one second
+before each retry. Only after that budget is exhausted does the publisher move
+to the next endpoint.
+
+```bash
+OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
+  --input sample.mp4 \
+  --transport webtransport \
+  --endpoint https://primary.example.com:443/moq \
+  --endpoint https://backup.example.com:443/moq \
+  --retry 2 \
+  --namespace interop \
+  --forward 1 \
+  --paced
+```
+
+Transport closure, connection failure, readiness/subscriber timeout, and a
+draft-18 `GOAWAY` migration signal are retryable. Namespace or track rejection
+is endpoint-permanent and advances without spending retries. Fatal local errors
+and cancellation do not fail over. The standard-error records identify each
+attempt and transition:
+
+```text
+endpoint_attempt endpoint=primary.example.com:443 attempt=1/3
+endpoint_retry endpoint=primary.example.com:443 retry=1/2 delay_ms=1000 reason="..."
+endpoint_failover from=primary.example.com:443 to=backup.example.com:443 reason="..."
+endpoints_exhausted count=2 reason="..."
+```
+
+All endpoints use the same command-line transport, ALPN, SNI, and TLS trust
+configuration. WebTransport therefore requires an explicit path on every
+endpoint, and an explicit `--sni` must be valid for every target. Without
+`--sni`, each connection uses its endpoint host for server-name verification.
+
 Publish the same stream with SAP timeline tracks included:
 
 ```bash
@@ -146,6 +183,7 @@ Rows include `pacing_before`, `pacing_after`, `enqueue`, and `served`/`sent` eve
 - when multiple tracks are subscribed, matching objects are served in publish-plan order so time-aligned audio/video stay interleaved
 - `--forward 1` proactively publishes tracks and objects after namespace setup completes
 - `--timeout <seconds>` controls how long the publisher waits for inbound `SUBSCRIBE` requests; the default is 30 seconds
+- repeated `--endpoint` options define the ordered failover list; `--retry <count>` is the number of retries after each endpoint's initial attempt
 - `--sni <value>` overrides the TLS SNI sent to the relay, useful when `--endpoint` uses a raw IP address
 - WebTransport still sends HTTP authority from the configured endpoint host
 - `--paced` applies pacing only to media-object sends; setup and publish control messages are sent immediately
