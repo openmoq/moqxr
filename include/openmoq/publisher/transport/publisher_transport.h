@@ -30,6 +30,14 @@ enum class ConnectionState {
     kFailed,
 };
 
+enum class FailureKind {
+    kNone,
+    kRetryable,
+    kEndpointPermanent,
+    kFatal,
+    kCancelled,
+};
+
 struct EndpointConfig {
     TransportKind transport = TransportKind::kRawQuic;
     std::string host;
@@ -57,9 +65,11 @@ struct TlsConfig {
 struct TransportStatus {
     bool ok = true;
     std::string message;
+    FailureKind failure_kind = FailureKind::kFatal;
 
     static TransportStatus success();
-    static TransportStatus failure(std::string_view error_message);
+    static TransportStatus failure(std::string_view error_message,
+                                   FailureKind failure_kind = FailureKind::kFatal);
 };
 
 struct ObjectWriteOptions {

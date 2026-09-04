@@ -1202,7 +1202,9 @@ TransportStatus collect_control_acknowledgements(PublisherTransport& transport,
                 if (!decode_request_error(message_bytes, draft, message)) {
                     return protocol_violation(transport, "received invalid PUBLISH_NAMESPACE_ERROR");
                 }
-                return TransportStatus::failure("peer rejected namespace publish: " + message.reason);
+                return TransportStatus::failure(
+                    "peer rejected namespace publish: " + message.reason,
+                    FailureKind::kEndpointPermanent);
             } else if (draft == openmoq::publisher::DraftVersion::kDraft16 &&
                        message_type == 0x05) {
                 RequestError message;
@@ -1210,7 +1212,9 @@ TransportStatus collect_control_acknowledgements(PublisherTransport& transport,
                     return protocol_violation(transport, "received invalid REQUEST_ERROR");
                 }
                 if (message.request_id == 0 && namespace_responses < expected_namespace_responses) {
-                    return TransportStatus::failure("peer rejected namespace publish: " + message.reason);
+                    return TransportStatus::failure(
+                        "peer rejected namespace publish: " + message.reason,
+                        FailureKind::kEndpointPermanent);
                 }
                 if (message.request_id != 0 && publish_responses < expected_publish_responses) {
                     if (message.request_id % 2 != 0) {
@@ -1220,7 +1224,9 @@ TransportStatus collect_control_acknowledgements(PublisherTransport& transport,
                         return TransportStatus::failure("received duplicate publish response request_id");
                     }
                     seen_publish_response_ids.insert(message.request_id);
-                    return TransportStatus::failure("peer rejected track publish: " + message.reason);
+                    return TransportStatus::failure(
+                        "peer rejected track publish: " + message.reason,
+                        FailureKind::kEndpointPermanent);
                 }
             } else if (message_type == 0x1e && publish_responses < expected_publish_responses) {
                 PublishOk message;
@@ -1254,7 +1260,9 @@ TransportStatus collect_control_acknowledgements(PublisherTransport& transport,
                     return TransportStatus::failure("received duplicate publish response request_id");
                 }
                 seen_publish_response_ids.insert(message.request_id);
-                return TransportStatus::failure("peer rejected track publish: " + message.reason);
+                return TransportStatus::failure(
+                    "peer rejected track publish: " + message.reason,
+                    FailureKind::kEndpointPermanent);
             }
             if (!handled) {
                 deferred_messages.insert(deferred_messages.end(), message_bytes.begin(), message_bytes.end());
@@ -1380,7 +1388,9 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                 if (!reset_status.ok) {
                     return reset_status;
                 }
-                return TransportStatus::failure("request stream received GOAWAY migration");
+                return TransportStatus::failure(
+                    "request stream received GOAWAY migration",
+                    FailureKind::kRetryable);
             }
 
             bool response_type_allowed = false;
@@ -1397,7 +1407,9 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
 
             RequestError request_error;
             if (decode_request_error(message_bytes, draft, request_error)) {
-                return TransportStatus::failure("request failed: " + request_error.reason);
+                return TransportStatus::failure(
+                    "request failed: " + request_error.reason,
+                    FailureKind::kEndpointPermanent);
             }
 
             if (expect_publish_ack) {

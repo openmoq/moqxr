@@ -125,6 +125,8 @@ int main() {
         ok &= expect(!status.ok, "expected mock connect failure to propagate");
         ok &= expect(status.message == "transport connect failed: mock connect failure",
                      "expected connect failure message to be wrapped");
+        ok &= expect(status.failure_kind == openmoq::publisher::transport::FailureKind::kRetryable,
+                     "expected connection failures to be eligible for endpoint retry");
         ok &= expect(state->configure_called,
                      "expected transport configure to be invoked");
         ok &= expect(state->configured_endpoint.alpn == "moqt-16",
@@ -257,6 +259,8 @@ int main() {
         ok &= expect(!status.ok, "expected live-object publish mock connect failure to propagate");
         ok &= expect(status.message == "transport connect failed: mock connect failure",
                      "expected live-object connect failure message to be wrapped");
+        ok &= expect(status.failure_kind == openmoq::publisher::transport::FailureKind::kRetryable,
+                     "expected live-object connection failures to be eligible for endpoint retry");
         ok &= expect(state->configured_endpoint.alpn == "moqt-16",
                      "expected live-object publish to preserve default raw draft ALPN");
     }

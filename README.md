@@ -17,6 +17,7 @@ It packages file and live media for Media over QUIC Transport (MOQT), builds MSF
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
 - Accepts live fragmented MP4 from stdin, MPEG-TS over SRT when libsrt is available, and CMAF over HTTP/1.1 chunked CTE LL-DASH ingest.
 - Parses MSF URLs with `--url` and prints the catalog discovery URL with `--print-msf-urls`.
+- Supports ordered relay failover with repeated `--endpoint` options and configurable same-endpoint retries with `--retry`.
 - Provides C++ Publisher API examples for FFmpeg-generated live media, CAT4MOQ authorization, and MPEG-2 TS/M2TS packaging.
 - Optionally routes publishing through the [moq5](https://github.com/openmoq/moq5) C11 Media-over-QUIC library for drafts 16 and 18.
 
@@ -66,6 +67,13 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
 ```
 
 `--forward 1` sends objects immediately. `--forward 0` waits for the relay to forward subscriber interest. A printed `connection_id=` confirms transport and MOQT setup only; it does not confirm namespace acceptance or a downstream subscription.
+
+Add endpoints in preferred order and use `--retry N` to retry each current
+endpoint `N` times before advancing. For example, `--endpoint primary:4433
+--endpoint backup:4433 --retry 2` makes up to three attempts at the primary,
+then up to three attempts at the backup. See the
+[CLI quick start](docs/quickstart.md#endpoint-failover-and-retries) for failure
+handling and live-source details.
 
 On Windows, replace `./build/openmoq-publisher` with `build\Release\openmoq-publisher.exe` or the path for the selected build configuration.
 

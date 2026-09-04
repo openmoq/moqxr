@@ -39,7 +39,11 @@ struct CliOptions {
     std::string dash_path_prefix = "/ingest";
     std::size_t dash_queue_depth = 128;
     std::optional<std::filesystem::path> emit_dir;
+    // Ordered connection targets. Repeating --endpoint appends failover
+    // targets; endpoint remains the primary alias for source compatibility.
+    std::vector<transport::EndpointConfig> endpoints;
     std::optional<transport::EndpointConfig> endpoint;
+    std::size_t retry_count = 0;
     transport::TransportKind transport = transport::TransportKind::kRawQuic;
     transport::TlsConfig tls;
     DraftVersion draft_version = DraftVersion::kDraft16;

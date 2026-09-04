@@ -1,6 +1,7 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/cli_options.h"
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/endpoint_failover.h"
 #include "openmoq/publisher/live_srt_config.h"
 #include "openmoq/publisher/live_dash_ingest.h"
 #include "openmoq/publisher/msf_url.h"
@@ -12,6 +13,53 @@
 #include <iostream>
 #include <thread>
 #include <utility>
+
+namespace {
+
+std::string endpoint_label(
+    const openmoq::publisher::transport::EndpointConfig& endpoint) {
+    return endpoint.host + ":" + std::to_string(endpoint.port);
+}
+
+openmoq::publisher::transport::TransportStatus publish_with_cli_failover(
+    const openmoq::publisher::CliOptions& options,
+    const openmoq::publisher::EndpointPublishAttempt& publish_attempt) {
+    using namespace openmoq::publisher;
+
+    return publish_with_failover(
+        options.endpoints,
+        options.retry_count,
+        publish_attempt,
+        [](std::chrono::milliseconds delay) { std::this_thread::sleep_for(delay); },
+        [&options](const EndpointFailoverEvent& event) {
+            const auto& endpoint = options.endpoints[event.endpoint_index];
+            switch (event.kind) {
+                case EndpointFailoverEventKind::kAttempt:
+                    std::cerr << "endpoint_attempt endpoint=" << endpoint_label(endpoint)
+                              << " attempt=" << event.attempt << "/" << event.max_attempts
+                              << std::endl;
+                    break;
+                case EndpointFailoverEventKind::kRetry:
+                    std::cerr << "endpoint_retry endpoint=" << endpoint_label(endpoint)
+                              << " retry=" << (event.attempt - 1) << "/"
+                              << (event.max_attempts - 1)
+                              << " delay_ms=" << event.delay.count()
+                              << " reason=\"" << event.status.message << "\"" << std::endl;
+                    break;
+                case EndpointFailoverEventKind::kAdvance:
+                    std::cerr << "endpoint_failover from=" << endpoint_label(endpoint)
+                              << " to=" << endpoint_label(options.endpoints[event.endpoint_index + 1])
+                              << " reason=\"" << event.status.message << "\"" << std::endl;
+                    break;
+                case EndpointFailoverEventKind::kExhausted:
+                    std::cerr << "endpoints_exhausted count=" << options.endpoints.size()
+                              << " reason=\"" << event.status.message << "\"" << std::endl;
+                    break;
+            }
+        });
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     using namespace openmoq::publisher;
@@ -33,10 +81,12 @@ int main(int argc, char** argv) {
                                     : options.transport == transport::TransportKind::kWebTransport
                                         ? ConnectionRequirement::kWebTransport
                                         : ConnectionRequirement::kRawQuic;
-            std::cout << build_track_msf_url(options.endpoint->host, options.endpoint->port,
-                                             options.endpoint->path, options.endpoint->path_explicit,
-                                             options.track_namespace, "catalog", connection)
-                      << '\n';
+            for (const auto& endpoint : options.endpoints) {
+                std::cout << build_track_msf_url(endpoint.host, endpoint.port,
+                                                 endpoint.path, endpoint.path_explicit,
+                                                 options.track_namespace, "catalog", connection)
+                          << '\n';
+            }
             std::cout.flush();
         }
 
@@ -152,11 +202,18 @@ int main(int argc, char** argv) {
                 }
                 dash_server.stop();
             } else {
-                const auto status = publisher.publish_live_objects(
-                    source,
-                    *options.endpoint,
-                    options.tls,
-                    options.endpoint_alpn_overridden);
+                ReplayableLiveObjectSource replayable_source(
+                    std::move(source), options.dash_queue_depth);
+                const auto status = publish_with_cli_failover(
+                    options,
+                    [&](const transport::EndpointConfig& endpoint) {
+                        replayable_source.begin_attempt();
+                        return publisher.publish_live_objects(
+                            replayable_source.source(),
+                            endpoint,
+                            options.tls,
+                            options.endpoint_alpn_overridden);
+                    });
                 dash_server.stop();
                 if (!status.ok) {
                     throw std::runtime_error(status.message);
@@ -194,12 +251,16 @@ int main(int argc, char** argv) {
             }
 
             std::istream* stdin_input = live_stdin ? &std::cin : nullptr;
-            const auto status = publisher.publish_live(
-                ingest,
-                stdin_input,
-                *options.endpoint,
-                options.tls,
-                options.endpoint_alpn_overridden);
+            const auto status = publish_with_cli_failover(
+                options,
+                [&](const transport::EndpointConfig& endpoint) {
+                    return publisher.publish_live(
+                        ingest,
+                        stdin_input,
+                        endpoint,
+                        options.tls,
+                        options.endpoint_alpn_overridden);
+                });
             if (!status.ok) {
                 throw std::runtime_error(status.message);
             }
@@ -222,11 +283,15 @@ int main(int argc, char** argv) {
             }
 
             if (options.endpoint.has_value()) {
-                const auto status = publisher.publish(
-                    prepared,
-                    *options.endpoint,
-                    options.tls,
-                    options.endpoint_alpn_overridden);
+                const auto status = publish_with_cli_failover(
+                    options,
+                    [&](const transport::EndpointConfig& endpoint) {
+                        return publisher.publish(
+                            prepared,
+                            endpoint,
+                            options.tls,
+                            options.endpoint_alpn_overridden);
+                    });
                 if (!status.ok) {
                     throw std::runtime_error(status.message);
                 }

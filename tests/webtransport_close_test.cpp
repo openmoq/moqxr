@@ -192,7 +192,9 @@ int silent_server_loop_callback(picoquic_quic_t* quic,
     }
 }
 
-bool start_server(SilentServer& server, bool hold_unidirectional_data = false) {
+bool start_server(SilentServer& server,
+                  bool hold_unidirectional_data = false,
+                  std::uint64_t max_idle_timeout_ms = 0) {
     const std::string cert_path = std::string(kPicoquicSourceDir) + "/certs/cert.pem";
     const std::string key_path = std::string(kPicoquicSourceDir) + "/certs/key.pem";
 
@@ -215,6 +217,9 @@ bool start_server(SilentServer& server, bool hold_unidirectional_data = false) {
     picoquic_tp_t tp = *picoquic_get_default_tp(server.quic);
     tp.max_datagram_frame_size = PICOQUIC_MAX_PACKET_SIZE;
     tp.is_reset_stream_at_enabled = 1;
+    if (max_idle_timeout_ms != 0) {
+        tp.max_idle_timeout = max_idle_timeout_ms;
+    }
     if (hold_unidirectional_data) {
         tp.initial_max_stream_data_uni = 0;
     }
@@ -841,6 +846,34 @@ int main() {
     }
 
     stop_server(server);
+
+    // An idle publisher can wait indefinitely for media or subscriber demand.
+    // The WebTransport transport must keep QUIC alive underneath that wait so
+    // a later MOQT control/request write still succeeds.
+    SilentServer idle_server;
+    constexpr std::uint64_t kIdleTimeoutMs = 1000;
+    ok &= expect(start_server(idle_server, false, kIdleTimeoutMs),
+                 "expected idle-liveness webtransport server to start");
+    if (!ok) {
+        stop_server(idle_server);
+        return 1;
+    }
+    EndpointConfig idle_endpoint = endpoint;
+    idle_endpoint.port = idle_server.port;
+    WebTransportClient idle_client;
+    ok &= expect(idle_client.configure(idle_endpoint, tls).ok,
+                 "expected idle-liveness client configure to succeed");
+    ok &= expect(idle_client.connect().ok,
+                 "expected idle-liveness client CONNECT to succeed");
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(2 * kIdleTimeoutMs + 500));
+    std::uint64_t post_idle_request_stream_id = 0;
+    ok &= expect(idle_client.open_stream(StreamDirection::kBidirectional,
+                                         post_idle_request_stream_id).ok,
+                 "expected WebTransport request stream after more than two idle timeouts");
+    ok &= expect(idle_client.close(0).ok,
+                 "expected idle-liveness client close to succeed");
+    stop_server(idle_server);
 
     // Deterministic admission contract: zero peer credit keeps media queued,
     // while bidirectional request traffic remains independently writable.

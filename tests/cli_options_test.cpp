@@ -103,6 +103,55 @@ int main() {
 
     {
         const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4",
+                   "--endpoint", "primary.example.com:4433",
+                   "--endpoint", "backup.example.com:4443", "--retry", "3"});
+        ok &= expect(options.endpoints.size() == 2,
+                     "expected repeated --endpoint values to form a failover list");
+        ok &= expect(options.endpoints[0].host == "primary.example.com" &&
+                         options.endpoints[0].port == 4433,
+                     "expected the first --endpoint to remain the primary");
+        ok &= expect(options.endpoints[1].host == "backup.example.com" &&
+                         options.endpoints[1].port == 4443,
+                     "expected failover endpoints to preserve command-line order");
+        ok &= expect(options.retry_count == 3,
+                     "expected --retry to configure retries per endpoint");
+    }
+
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4",
+                   "--endpoint", "relay.example.com:4433"});
+        ok &= expect(options.retry_count == 0,
+                     "expected omitted --retry to disable same-endpoint retries");
+    }
+
+    ok &= expect(parse_throws(
+                         {"openmoq-publisher", "--input", "sample.mp4", "--retry", "-1"},
+                         "--retry must be zero or greater",
+                         "expected a negative retry count to be rejected"),
+                 "expected --retry negative-value validation");
+    ok &= expect(parse_throws(
+                         {"openmoq-publisher", "--input", "sample.mp4", "--retry", "three"},
+                         "--retry must be a valid integer",
+                         "expected a nonnumeric retry count to be rejected"),
+                 "expected --retry numeric validation");
+    ok &= expect(parse_throws(
+                         {"openmoq-publisher", "--input", "sample.mp4", "--retry", "1"},
+                         "--retry requires --endpoint or --url",
+                         "expected retry policy without a connection target to be rejected"),
+                 "expected --retry endpoint validation");
+    ok &= expect(parse_throws(
+                         {"openmoq-publisher", "--input", "sample.mp4",
+                          "--transport", "webtransport",
+                          "--endpoint", "https://primary.example.com:443/moq",
+                          "--endpoint", "backup.example.com:443"},
+                         "all WebTransport endpoints require an explicit path",
+                         "expected every failover endpoint to satisfy WebTransport path validation"),
+                 "expected failover WebTransport path validation");
+
+    {
+        const CliOptions options =
             parse({"openmoq-publisher", "--input", "sample.mp4", "--timeout", "9", "--forward", "0"});
         ok &= expect(options.subscriber_timeout == std::chrono::seconds(9),
                      "expected --timeout to override subscriber timeout");

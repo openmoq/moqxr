@@ -363,7 +363,8 @@ void on_demand_left(void* ctx, moq_media_sender_t* /*sender*/,
 
 TransportStatus teardown(moq_media_sender_t* sender,
                          moq_endpoint_t* ep,
-                         const std::string& error) {
+                         const std::string& error,
+                         FailureKind failure_kind = FailureKind::kFatal) {
     if (sender) {
         moq_media_sender_destroy(sender);
     }
@@ -371,18 +372,20 @@ TransportStatus teardown(moq_media_sender_t* sender,
         moq_endpoint_stop(ep);
         moq_endpoint_destroy(ep);
     }
-    return error.empty() ? TransportStatus::success() : TransportStatus::failure(error);
+    return error.empty() ? TransportStatus::success()
+                         : TransportStatus::failure(error, failure_kind);
 }
 
 // Tear down a live publish, first unregistering the endpoint from the shared
 // handle (under its mutex) so a concurrent disconnect() cannot touch the
 // endpoint while it is being destroyed.
 TransportStatus live_teardown(LibmoqLiveHandle* live, moq_media_sender_t* sender,
-                              moq_endpoint_t* ep, const std::string& error) {
+                              moq_endpoint_t* ep, const std::string& error,
+                              FailureKind failure_kind = FailureKind::kFatal) {
     if (live != nullptr) {
         live->set_endpoint(nullptr);
     }
-    return teardown(sender, ep, error);
+    return teardown(sender, ep, error, failure_kind);
 }
 
 // Clean stop on a disconnect()-initiated cancel: publish the stats gathered so
@@ -468,8 +471,9 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
     moq_endpoint_t* ep = nullptr;
     moq_result_t rc = moq_endpoint_connect(&ep_cfg, &ep);
     if (rc != MOQ_OK || ep == nullptr) {
-        return TransportStatus::failure(std::string("endpoint connect failed: ") +
-                                        moq_strerror(rc));
+        return TransportStatus::failure(
+            std::string("endpoint connect failed: ") + moq_strerror(rc),
+            FailureKind::kRetryable);
     }
 
     moq_bytes_t ns_part{reinterpret_cast<const std::uint8_t*>(ns_str.data()), ns_str.size()};
@@ -526,11 +530,14 @@ TransportStatus ready_failure_teardown(LibmoqLiveHandle* live, moq_media_sender_
                                        moq_endpoint_t* ep, LibmoqReadyOutcome outcome) {
     switch (outcome) {
         case LibmoqReadyOutcome::kFatal:
-            return live_teardown(live, sender, ep, "endpoint/sender became fatal before readiness");
+            return live_teardown(live, sender, ep, "endpoint/sender became fatal before readiness",
+                                 FailureKind::kRetryable);
         case LibmoqReadyOutcome::kTimeout:
-            return live_teardown(live, sender, ep, "timed out waiting for media sender readiness");
+            return live_teardown(live, sender, ep, "timed out waiting for media sender readiness",
+                                 FailureKind::kRetryable);
         case LibmoqReadyOutcome::kClosed:
-            return live_teardown(live, sender, ep, "endpoint closed before readiness");
+            return live_teardown(live, sender, ep, "endpoint closed before readiness",
+                                 FailureKind::kRetryable);
         case LibmoqReadyOutcome::kReady:
         case LibmoqReadyOutcome::kCancelled:
             break;
@@ -567,11 +574,14 @@ TransportStatus demand_failure_teardown(LibmoqLiveHandle* live, moq_media_sender
     switch (outcome) {
         case LibmoqDemandOutcome::kFatal:
             return live_teardown(live, sender, ep,
-                                 "endpoint/sender became fatal before a media subscriber");
+                                 "endpoint/sender became fatal before a media subscriber",
+                                 FailureKind::kRetryable);
         case LibmoqDemandOutcome::kTimeout:
-            return live_teardown(live, sender, ep, "timed out waiting for media subscriber");
+            return live_teardown(live, sender, ep, "timed out waiting for media subscriber",
+                                 FailureKind::kRetryable);
         case LibmoqDemandOutcome::kClosed:
-            return live_teardown(live, sender, ep, "endpoint closed before a media subscriber");
+            return live_teardown(live, sender, ep, "endpoint closed before a media subscriber",
+                                 FailureKind::kRetryable);
         case LibmoqDemandOutcome::kSubscriber:
         case LibmoqDemandOutcome::kCancelled:
             break;
@@ -631,15 +641,19 @@ TransportStatus retry_failure_teardown(LibmoqLiveHandle* live, moq_media_sender_
     switch (outcome) {
         case LibmoqRetryOutcome::kFatal:
             return live_teardown(live, sender, ep,
-                                 std::string("endpoint/sender became fatal during ") + what);
+                                 std::string("endpoint/sender became fatal during ") + what,
+                                 FailureKind::kRetryable);
         case LibmoqRetryOutcome::kClosed:
-            return live_teardown(live, sender, ep, std::string("endpoint closed during ") + what);
+            return live_teardown(live, sender, ep, std::string("endpoint closed during ") + what,
+                                 FailureKind::kRetryable);
         case LibmoqRetryOutcome::kTimeout:
             return live_teardown(live, sender, ep,
                                  std::string("timed out waiting for media send queue capacity (") +
-                                     what + ")");
+                                     what + ")",
+                                 FailureKind::kRetryable);
         case LibmoqRetryOutcome::kNoDemand:
-            return live_teardown(live, sender, ep, "media subscriber disappeared during publish");
+            return live_teardown(live, sender, ep, "media subscriber disappeared during publish",
+                                 FailureKind::kRetryable);
         case LibmoqRetryOutcome::kError:
             return live_teardown(live, sender, ep,
                                  std::string(what) + " failed: " + moq_strerror(rc));
@@ -1074,8 +1088,14 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
             // Only WOULD_BLOCK is a tolerated live drop (drop-to-keyframe policy);
             // any other write error (INVAL/NOMEM/WRONG_STATE/CLOSED/...) is fatal.
             if (wrc != MOQ_OK && wrc != MOQ_ERR_WOULD_BLOCK) {
+                const FailureKind failure_kind =
+                    (moq_media_sender_is_fatal(sender) || moq_media_sender_is_closed(sender) ||
+                     moq_endpoint_is_fatal(ep) || moq_endpoint_is_closed(ep))
+                        ? FailureKind::kRetryable
+                        : FailureKind::kFatal;
                 return live_teardown(live, sender, ep,
-                                     std::string("media write failed: ") + moq_strerror(wrc));
+                                     std::string("media write failed: ") + moq_strerror(wrc),
+                                     failure_kind);
             }
         }
 
@@ -1291,7 +1311,8 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
     }
 
     if (fatal) {
-        return live_teardown(live, sender, ep, fatal_msg);
+        return live_teardown(live, sender, ep, fatal_msg,
+                             FailureKind::kRetryable);
     }
 
     stats.groups_published = static_cast<std::uint64_t>(groups.size());
@@ -1419,8 +1440,14 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
         // Only WOULD_BLOCK is a tolerated live drop (drop-to-keyframe policy);
         // any other write error is fatal.
         if (wrc != MOQ_OK && wrc != MOQ_ERR_WOULD_BLOCK) {
+            const FailureKind failure_kind =
+                (moq_media_sender_is_fatal(sender) || moq_media_sender_is_closed(sender) ||
+                 moq_endpoint_is_fatal(ep) || moq_endpoint_is_closed(ep))
+                    ? FailureKind::kRetryable
+                    : FailureKind::kFatal;
             return live_teardown(live, sender, ep,
-                                 std::string("media write failed: ") + moq_strerror(wrc));
+                                 std::string("media write failed: ") + moq_strerror(wrc),
+                                 failure_kind);
         }
     }
 
