@@ -6,7 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(openmoq_publisher
-    VERSION 0.3.21
+    VERSION 0.3.22
     DESCRIPTION "OpenMOQ contribution project: C++20 publisher for fragmented MP4 to CMSF/MOQT"
     LANGUAGES C CXX)
 
