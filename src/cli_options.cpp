@@ -49,6 +49,20 @@ transport::TransportKind parse_transport_kind(std::string_view value) {
     throw std::runtime_error("unsupported --transport value: expected raw or webtransport");
 }
 
+transport::LibmoqBackend parse_libmoq_backend(std::string_view value) {
+    if (value == "auto") {
+        return transport::LibmoqBackend::kAuto;
+    }
+    if (value == "picoquic") {
+        return transport::LibmoqBackend::kPicoquic;
+    }
+    if (value == "mvfst") {
+        return transport::LibmoqBackend::kMvfst;
+    }
+
+    throw std::runtime_error("unsupported --libmoq-backend value: expected auto, picoquic or mvfst");
+}
+
 transport::EndpointConfig parse_endpoint(std::string_view value) {
     transport::EndpointConfig endpoint;
     std::string_view authority = value;
@@ -244,6 +258,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.transport = parse_transport_kind(require_value("--transport"));
             transport_set = true;
             options.transport_explicit = true;
+        } else if (argument == "--libmoq-backend") {
+            options.libmoq_backend = parse_libmoq_backend(require_value("--libmoq-backend"));
         } else if (argument == "--endpoint") {
             if (url_set) {
                 throw std::runtime_error("--url and --endpoint are mutually exclusive");
@@ -539,7 +555,7 @@ std::string build_usage(const char* argv0) {
     return build_version_banner() + "\nUsage: " + argv0 +
            " --input <mp4|-> [--live-source auto|stdin|srt|dash] [--srt-config <path>]"
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
-           " [--transport raw|webtransport] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
+           " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"

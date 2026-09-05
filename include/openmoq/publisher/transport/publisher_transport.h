@@ -17,6 +17,17 @@ enum class TransportKind {
     kWebTransport,
 };
 
+// QUIC stack the libmoq publish route asks the libmoq endpoint for. kAuto is
+// libmoq's stable default (picoquic for raw QUIC, picoquic WebTransport for
+// WebTransport). kMvfst selects Meta's mvfst; it is raw QUIC only and needs
+// a build with OPENMOQ_LIBMOQ_ENABLE_MVFST=ON. Ignored by the legacy
+// MoqtSession path.
+enum class LibmoqBackend {
+    kAuto,
+    kPicoquic,
+    kMvfst,
+};
+
 enum class StreamDirection {
     kBidirectional,
     kUnidirectional,

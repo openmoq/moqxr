@@ -489,6 +489,27 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
     ep_cfg.protocol = endpoint.transport == TransportKind::kWebTransport
                           ? MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT
                           : MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
+    switch (config.libmoq_backend) {
+        case LibmoqBackend::kAuto:
+            ep_cfg.backend = MOQ_TRANSPORT_BACKEND_AUTO;
+            break;
+        case LibmoqBackend::kPicoquic:
+            ep_cfg.backend = MOQ_TRANSPORT_BACKEND_PICOQUIC;
+            break;
+        case LibmoqBackend::kMvfst:
+#ifndef OPENMOQ_HAS_LIBMOQ_MVFST
+            return TransportStatus::failure(
+                "--libmoq-backend mvfst needs a build with OPENMOQ_LIBMOQ_ENABLE_MVFST=ON");
+#else
+            if (endpoint.transport == TransportKind::kWebTransport) {
+                return TransportStatus::failure(
+                    "--libmoq-backend mvfst is raw QUIC only (libmoq's mvfst adapter has no "
+                    "WebTransport facade); use --transport raw or a moqt:// endpoint");
+            }
+            ep_cfg.backend = MOQ_TRANSPORT_BACKEND_MVFST;
+            break;
+#endif
+    }
     moq_version_t versions[1] = {version};
     ep_cfg.versions.struct_size = sizeof(ep_cfg.versions);
     ep_cfg.versions.policy = MOQ_VERSION_POLICY_EXACT;  // request the configured draft exactly

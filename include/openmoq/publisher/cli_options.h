@@ -66,6 +66,7 @@ struct CliOptions {
     bool stream_per_object = false;
     bool paced = false;
     bool loop = false;
+    transport::LibmoqBackend libmoq_backend = transport::LibmoqBackend::kAuto;
     // See PublisherConfig::preannounce_tracks.
     bool preannounce_tracks = false;
     bool dump_plan = false;

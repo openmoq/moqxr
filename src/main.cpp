@@ -113,6 +113,7 @@ int main(int argc, char** argv) {
             .live_stream_per_object = options.stream_per_object,
             .paced = options.paced,
             .loop = options.loop,
+            .libmoq_backend = options.libmoq_backend,
             .vod = options.vod,
             .drm_systems = options.drm_systems,
             .catalog_republish_interval = options.catalog_republish_interval,

@@ -32,6 +32,12 @@ option(OPENMOQ_ENABLE_SRT "Enable libsrt ingest support when libsrt is available
 # old/moxygen publish path as the default until the migration is accepted; the
 # libmoq integration code still builds and is tested whenever libmoq is present.
 option(OPENMOQ_USE_LIBMOQ_PUBLISHER "Use libmoq as the production publish backend (requires libmoq)" OFF)
+# Also build libmoq's mvfst (Meta QUIC) adapter so --libmoq-backend mvfst is
+# available on raw QUIC endpoints. Needs an installed mvfst/fizz/folly/fmt
+# prefix (OPENMOQ_MVFST_PREFIX); C++ only, off by default.
+option(OPENMOQ_LIBMOQ_ENABLE_MVFST "Build libmoq's mvfst adapter for --libmoq-backend mvfst" OFF)
+set(OPENMOQ_MVFST_PREFIX "" CACHE PATH
+    "Install prefix holding mvfst, fizz, folly and fmt CMake packages (OPENMOQ_LIBMOQ_ENABLE_MVFST)")
 
 # Install rules default to ON only for top-level builds; when moqxr is vendored
 # via add_subdirectory or FetchContent, the consuming project owns the install
@@ -386,6 +392,20 @@ if(_openmoq_configure_libmoq)
         message(STATUS "libmoq: picoquic not available; building core/service tier without the raw QUIC adapter")
     endif()
 
+    set(OPENMOQ_HAS_LIBMOQ_MVFST OFF)
+    if(OPENMOQ_LIBMOQ_ENABLE_MVFST)
+        if(NOT OPENMOQ_MVFST_PREFIX)
+            message(FATAL_ERROR
+                "OPENMOQ_LIBMOQ_ENABLE_MVFST=ON needs OPENMOQ_MVFST_PREFIX (mvfst/fizz/folly/fmt install prefix)")
+        endif()
+        set(MOQ_BUILD_ADAPTER_MVFST ON CACHE BOOL "" FORCE)
+        set(MOQ_MVFST_PREFIX "${OPENMOQ_MVFST_PREFIX}" CACHE PATH "" FORCE)
+        set(MOQ_FIZZ_PREFIX  "${OPENMOQ_MVFST_PREFIX}" CACHE PATH "" FORCE)
+        set(MOQ_FOLLY_PREFIX "${OPENMOQ_MVFST_PREFIX}" CACHE PATH "" FORCE)
+        list(APPEND CMAKE_PREFIX_PATH "${OPENMOQ_MVFST_PREFIX}")
+        set(OPENMOQ_HAS_LIBMOQ_MVFST ON)
+    endif()
+
     if(_openmoq_managed_libmoq)
         FetchContent_MakeAvailable(moq5)
         add_subdirectory("${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}"
@@ -510,6 +530,9 @@ endif()
 set(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER OFF)
 if(OPENMOQ_HAS_LIBMOQ AND TARGET moq::service)
     target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_HAS_LIBMOQ=1)
+    if(OPENMOQ_HAS_LIBMOQ_MVFST)
+        target_compile_definitions(openmoq_publisher_lib PRIVATE OPENMOQ_HAS_LIBMOQ_MVFST=1)
+    endif()
     target_link_libraries(openmoq_publisher_lib PRIVATE moq::service)
     if(OPENMOQ_USE_LIBMOQ_PUBLISHER)
         set(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER ON)
@@ -523,6 +546,9 @@ endif()
 
 # Migration-gate status (temporary): availability vs. selected backend.
 message(STATUS "OpenMOQ: libmoq available .......... ${OPENMOQ_HAS_LIBMOQ}")
+if(OPENMOQ_HAS_LIBMOQ)
+    message(STATUS "OpenMOQ: libmoq mvfst backend ....... ${OPENMOQ_HAS_LIBMOQ_MVFST}")
+endif()
 if(OPENMOQ_ENABLE_LIBMOQ_PUBLISHER)
     message(STATUS "OpenMOQ: publish backend .......... libmoq (OPENMOQ_USE_LIBMOQ_PUBLISHER=ON)")
 else()

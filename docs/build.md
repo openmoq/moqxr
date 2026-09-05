@@ -116,6 +116,12 @@ GitHub Actions workflows set `OPENSSL_ROOT_DIR` automatically from the runner's 
 - `-DOPENSSL_ROOT_DIR=/path/to/openssl`
 - `-DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON|OFF`
 - `-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON|OFF` (default `OFF`)
+- `-DOPENMOQ_LIBMOQ_ENABLE_MVFST=ON|OFF` (default `OFF`) with
+  `-DOPENMOQ_MVFST_PREFIX=/prefix` holding the mvfst, fizz, folly and fmt
+  CMake packages: also builds libmoq's mvfst adapter so
+  `--libmoq-backend mvfst` can drive raw QUIC (`moqt://`) endpoints through
+  Meta's QUIC stack instead of picoquic. mvfst has no WebTransport facade in
+  libmoq, so the option is refused on `--transport webtransport`.
 
 ### Publish backend (temporary migration gate)
 
