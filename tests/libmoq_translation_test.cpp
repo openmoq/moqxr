@@ -8,6 +8,7 @@
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <iostream>
@@ -156,6 +157,17 @@ int main() {
     // catalog publication.
     ok &= expect(tr.tracks.size() == 2,
                  "expected only the two media tracks (catalog + timelines skipped)");
+    // One loop cycle spans the latest media object's end (media_time + duration).
+    {
+        std::uint64_t expected_cycle = 0;
+        for (const auto& obj : plan.objects) {
+            if (obj.kind == CmsfObjectKind::kMedia) {
+                expected_cycle = std::max(expected_cycle, obj.media_time_us + obj.media_duration_us);
+            }
+        }
+        ok &= expect(expected_cycle > 0 && tr.cycle_duration_us == expected_cycle,
+                     "expected cycle_duration_us to cover the last media object's end");
+    }
     for (const auto& t : tr.tracks) {
         ok &= expect(t.name != "catalog" && t.name != "video.timeline" && t.name != "video.sap",
                      "expected no synthetic catalog/timeline track to be configured as media");
@@ -725,6 +737,27 @@ int main() {
         no_path.port = 1;
         ok &= expect(libmoq_endpoint_url(no_path) == "moqt://h:1/",
                      "expected empty path to default to '/'");
+    }
+
+    {
+        // The wire Track Namespace is a tuple; a '/'-joined --namespace must be
+        // split into its elements or a subscriber requesting {"live","stream1"}
+        // never matches the announced single element "live/stream1".
+        const std::vector<std::string> two = libmoq_namespace_tuple("live/stream1");
+        ok &= expect(two.size() == 2 && two[0] == "live" && two[1] == "stream1",
+                     "expected 'live/stream1' to split into two tuple elements");
+
+        const std::vector<std::string> one = libmoq_namespace_tuple("single");
+        ok &= expect(one.size() == 1 && one[0] == "single",
+                     "expected a slash-free namespace to stay one element");
+
+        const std::vector<std::string> sparse = libmoq_namespace_tuple("/a//b/");
+        ok &= expect(sparse.size() == 2 && sparse[0] == "a" && sparse[1] == "b",
+                     "expected empty components to be dropped");
+
+        const std::vector<std::string> empty = libmoq_namespace_tuple("");
+        ok &= expect(empty.size() == 1 && empty[0].empty(),
+                     "expected an empty namespace to yield one (empty) element like the legacy path");
     }
 
     if (!ok) {
