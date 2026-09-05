@@ -13,6 +13,7 @@
 #include <iosfwd>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <moq/cmaf.h>  // moq_sap_type_t / MOQ_SAP_*
@@ -76,6 +77,12 @@ struct LibmoqObjectTranslation {
 struct LibmoqPlanTranslation {
     std::vector<LibmoqTrackTranslation> tracks;
     std::vector<LibmoqObjectTranslation> objects;  // media objects only
+    // One pass of the plan covers this much media time: max(media_time_us +
+    // media_duration_us) over the media objects. A looped publish (--loop)
+    // re-emits the objects with their timestamps advanced by one cycle per
+    // pass, the same rebasing the legacy MoqtSession make_looped_object() does.
+    // libmoq derives groups from starts_group/ends_group, so only time moves.
+    std::uint64_t cycle_duration_us = 0;
 };
 
 // Translate a *materialized* PublishPlan into libmoq track + object configs.
@@ -122,6 +129,14 @@ LibmoqObjectTranslation make_libmoq_live_source_object(const LiveObject& object)
 //   raw QUIC      -> moqt://host:port/path
 //   WebTransport  -> https://host:port/path
 std::string libmoq_endpoint_url(const EndpointConfig& endpoint);
+
+// Split moqxr's flat '/'-joined namespace into the ordered tuple elements the
+// MoQ wire format carries (Track Namespace is an N-tuple; draft-16 section
+// 2.4). Empty components are dropped ("a//b" -> {"a","b"}); a string with no
+// non-empty component yields a single element holding the input unchanged.
+// Mirrors the legacy MoqtSession path, so a subscriber that requests
+// {"live","stream1"} matches a publisher started with --namespace live/stream1.
+std::vector<std::string> libmoq_namespace_tuple(std::string_view flat_namespace);
 
 // -- Driver (batch publish over a real endpoint) -------------------------
 

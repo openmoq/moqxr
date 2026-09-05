@@ -1,7 +1,9 @@
 #include "openmoq/publisher/transport/libmoq_publisher.h"
+#include "tls_verification.h"
 
 #ifdef OPENMOQ_HAS_LIBMOQ
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -225,6 +227,8 @@ LibmoqPlanTranslation translate_plan_for_libmoq(const PublishPlan& plan) {
             o.payload = obj.owned_payload;
         }
         out.objects.push_back(std::move(o));
+        out.cycle_duration_us =
+            std::max(out.cycle_duration_us, obj.media_time_us + obj.media_duration_us);
     }
 
     return out;
@@ -238,6 +242,26 @@ std::string libmoq_endpoint_url(const EndpointConfig& endpoint) {
     }
     return (wt ? std::string("https://") : std::string("moqt://")) + endpoint.host + ":" +
            std::to_string(endpoint.port) + path;
+}
+
+std::vector<std::string> libmoq_namespace_tuple(std::string_view flat_namespace) {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= flat_namespace.size()) {
+        const std::size_t slash = flat_namespace.find('/', start);
+        const std::size_t end = slash == std::string_view::npos ? flat_namespace.size() : slash;
+        if (end > start) {
+            parts.emplace_back(flat_namespace.substr(start, end - start));
+        }
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    if (parts.empty()) {
+        parts.emplace_back(flat_namespace);
+    }
+    return parts;
 }
 
 LibmoqTrackTranslation make_libmoq_live_track(const TrackDescription& track,
@@ -441,9 +465,23 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
 
     const std::string url = libmoq_endpoint_url(endpoint);
     const std::string sni = endpoint.sni;
-    const std::string ca = tls.ca_path;
     const std::string wt_path = endpoint.path;
-    const std::string ns_str = config.track_namespace;
+    const std::vector<std::string> ns_parts = libmoq_namespace_tuple(config.track_namespace);
+
+    // libmoq verifies against ca_file when given and otherwise against
+    // OpenSSL's compiled-in default trust store, which is empty or points at a
+    // build-time directory for a relocated or vendored OpenSSL (the legacy
+    // MoqtSession path hit the same thing). Resolve the bundle the way that
+    // path does -- explicit --ca, then SSL_CERT_FILE, then the well-known
+    // system bundle locations -- so a public relay with a CA-issued
+    // certificate verifies without --insecure.
+    std::string ca;
+    if (!tls.insecure_skip_verify) {
+        const TransportStatus resolved = tlsverify::resolve_root_certificate_file(tls, ca);
+        if (!resolved.ok) {
+            return resolved;
+        }
+    }
 
     moq_endpoint_cfg_t ep_cfg;
     moq_endpoint_cfg_init(&ep_cfg);
@@ -476,8 +514,12 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
             FailureKind::kRetryable);
     }
 
-    moq_bytes_t ns_part{reinterpret_cast<const std::uint8_t*>(ns_str.data()), ns_str.size()};
-    moq_namespace_t ns{&ns_part, 1};
+    std::vector<moq_bytes_t> ns_bytes;
+    ns_bytes.reserve(ns_parts.size());
+    for (const std::string& part : ns_parts) {
+        ns_bytes.push_back(bytes_of(part));
+    }
+    moq_namespace_t ns{ns_bytes.data(), ns_bytes.size()};
 
     moq_media_sender_cfg_t s_cfg;
     if (live) {
@@ -852,34 +894,73 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
     const moq_alloc_t* alloc = moq_alloc_default();
     LibmoqPublishStats stats;
     std::set<std::pair<std::string, std::size_t>> groups;
-    for (const auto& o : tr.objects) {
-        const auto hit = handles.find(o.track_name);
-        if (hit == handles.end()) {
-            continue;  // media object for a track that was not configured
-        }
-        moq_rcbuf_t* buf = nullptr;
-        rc = moq_rcbuf_create(alloc, o.payload.data(), o.payload.size(), &buf);
-        if (rc != MOQ_OK || buf == nullptr) {
-            return teardown(sender, ep, "payload buffer allocation failed");
-        }
-        moq_media_send_object_t so = o.object();
-        so.payload = buf;
-        // Bounded retry: if the subscriber leaves or the queue never drains, bail
-        // with a clear reason instead of spinning forever on WOULD_BLOCK.
-        int wrc = MOQ_OK;
-        const LibmoqRetryOutcome wout = retry_write(sender, ep, hit->second, &so,
-                                                    /*cancel=*/nullptr, /*check_demand=*/true,
-                                                    timeout_us, &wrc);
-        if (wout != LibmoqRetryOutcome::kOk) {
-            moq_rcbuf_decref(buf);  // no ownership transfer on a non-OK write
-            return retry_failure_teardown(/*live=*/nullptr, sender, ep, wout, wrc, "media write");
-        }
-        // kOk transfers the buf ref to the sender; do not decref.
-        stats.bytes_published += static_cast<std::uint64_t>(o.payload.size());
-        stats.objects_published += 1;
-        groups.emplace(o.track_name, o.group_id);
+
+    // --paced: hold each object until its media time, measured from the first
+    // object's time, so a 6 s clip takes 6 s on the wire instead of arriving in
+    // one burst (which leaves a viewer that subscribed with NEXT_GROUP_START a
+    // moment later with nothing to receive). --loop: re-emit the plan with the
+    // timestamps advanced by one cycle per pass until the subscriber leaves.
+    // Both mirror the legacy MoqtSession batch path (pace_until /
+    // make_looped_object).
+    const auto pacing_start = std::chrono::steady_clock::now();
+    std::uint64_t first_media_time_us = 0;
+    for (std::size_t i = 0; i < tr.objects.size(); ++i) {
+        first_media_time_us =
+            i == 0 ? tr.objects[i].decode_time_us
+                   : std::min(first_media_time_us, tr.objects[i].decode_time_us);
     }
-    stats.groups_published = static_cast<std::uint64_t>(groups.size());
+    const bool loop = config.loop && tr.cycle_duration_us > 0;
+    bool demand_lost = false;
+    for (std::size_t cycle = 0; !demand_lost; ++cycle) {
+        const std::uint64_t cycle_offset_us = tr.cycle_duration_us * cycle;
+        for (const auto& o : tr.objects) {
+            const auto hit = handles.find(o.track_name);
+            if (hit == handles.end()) {
+                continue;  // media object for a track that was not configured
+            }
+            moq_media_send_object_t so = o.object();
+            so.decode_time_us += cycle_offset_us;
+            so.presentation_time_us += cycle_offset_us;
+            if (config.paced && so.decode_time_us >= first_media_time_us) {
+                std::this_thread::sleep_until(
+                    pacing_start + std::chrono::microseconds(so.decode_time_us - first_media_time_us));
+            }
+            moq_rcbuf_t* buf = nullptr;
+            rc = moq_rcbuf_create(alloc, o.payload.data(), o.payload.size(), &buf);
+            if (rc != MOQ_OK || buf == nullptr) {
+                return teardown(sender, ep, "payload buffer allocation failed");
+            }
+            so.payload = buf;
+            // Bounded retry: if the subscriber leaves or the queue never drains, bail
+            // with a clear reason instead of spinning forever on WOULD_BLOCK.
+            int wrc = MOQ_OK;
+            const LibmoqRetryOutcome wout = retry_write(sender, ep, hit->second, &so,
+                                                        /*cancel=*/nullptr, /*check_demand=*/true,
+                                                        timeout_us, &wrc);
+            if (wout == LibmoqRetryOutcome::kNoDemand && loop && cycle > 0) {
+                // A looped publish only exists to keep serving viewers: the last
+                // one leaving after a full pass ends it cleanly rather than as a
+                // failed write.
+                moq_rcbuf_decref(buf);
+                demand_lost = true;
+                break;
+            }
+            if (wout != LibmoqRetryOutcome::kOk) {
+                moq_rcbuf_decref(buf);  // no ownership transfer on a non-OK write
+                return retry_failure_teardown(/*live=*/nullptr, sender, ep, wout, wrc, "media write");
+            }
+            // kOk transfers the buf ref to the sender; do not decref.
+            stats.bytes_published += static_cast<std::uint64_t>(o.payload.size());
+            stats.objects_published += 1;
+            groups.emplace(o.track_name, o.group_id);
+        }
+        // Every pass re-emits the plan's groups as new groups on the wire.
+        stats.groups_published += static_cast<std::uint64_t>(groups.size());
+        groups.clear();
+        if (!loop) {
+            break;
+        }
+    }
 
     for (const auto& t : tr.tracks) {
         const auto hit = handles.find(t.name);

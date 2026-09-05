@@ -125,7 +125,11 @@ reviewed, the backend is selectable:
 
 - **`-DOPENMOQ_USE_LIBMOQ_PUBLISHER=ON`** — the production `Publisher` routes
   batch, live stdin, live SRT, and `LiveObjectSource` publishing through a
-  managed checkout of `openmoq/moq5` `main`.
+  managed checkout of `openmoq/moq5` `main`. The libmoq route splits
+  `--namespace a/b` into the wire tuple `{a, b}`, resolves the root CA bundle
+  the same way the legacy path does (`--ca`, then `SSL_CERT_FILE`, then the
+  well-known system bundles) instead of relying on OpenSSL's compiled-in
+  default directory, and honours `--paced` and `--loop` for batch input.
 - **local libmoq override** — setting `OPENMOQ_LIBMOQ_SOURCE_DIR` builds and
   validates that source tree even when the legacy backend remains selected.
 - **Caller-supplied catalog exception** — a `LiveObjectSource` using
