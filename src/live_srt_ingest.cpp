@@ -1525,23 +1525,33 @@ transport::TransportStatus LiveSrtIngestManager::start() {
     struct CodecDiscovery {
         std::mutex mutex;
         std::condition_variable cv;
-        std::size_t discovered = 0;
         std::vector<bool> ready;
         std::vector<bool> video_private_ready;
         std::vector<bool> audio_private_ready;
+        std::vector<bool> worker_finished;
+        std::vector<std::optional<std::chrono::steady_clock::time_point>> deadlines;
         std::atomic<bool> phase_done{false};
 
         explicit CodecDiscovery(std::size_t count)
-            : ready(count, false), video_private_ready(count, false), audio_private_ready(count, false) {}
+            : ready(count, false), video_private_ready(count, false), audio_private_ready(count, false),
+              worker_finished(count, false), deadlines(count) {}
 
-        bool all_codec_private_ready() const {
-            for (std::size_t j = 0; j < video_private_ready.size(); ++j) {
-                if (!video_private_ready[j] || !audio_private_ready[j]) return false;
+        struct WorkerCompletion {
+            CodecDiscovery& discovery;
+            std::size_t index;
+
+            ~WorkerCompletion() {
+                std::lock_guard<std::mutex> lock(discovery.mutex);
+                discovery.worker_finished[index] = true;
+                discovery.cv.notify_one();
             }
-            return true;
-        }
+        };
     };
     auto discovery = std::make_shared<CodecDiscovery>(callers_.size());
+    const auto caller_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (std::size_t i = 0; i < callers_.size(); ++i) {
+        if (callers_[i].mode != "listener") discovery->deadlines[i] = caller_deadline;
+    }
 
     for (std::size_t i = 0; i < callers_.size(); ++i) {
         const auto caller = callers_[i];
@@ -1553,6 +1563,7 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                                       video_track,
                                       audio_track,
                                       discovery]() {
+            CodecDiscovery::WorkerCompletion completion{*discovery, i};
             try {
                 auto [host, port] = split_host_port(caller.endpoint);
                 CallerTrackState state;
@@ -1585,26 +1596,54 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                     return;
                 }
 
-                const int connect_rc = srt_connect(sock, result->ai_addr, static_cast<int>(result->ai_addrlen));
-                freeaddrinfo(result);
-                if (connect_rc == SRT_ERROR) {
-                    std::cerr << "[SRT] Connection FAILED to " << caller.endpoint << "\n";
+                SRTSOCKET data_sock = sock;
+                if (caller.mode == "listener") {
+                    if (srt_bind(sock, result->ai_addr, static_cast<int>(result->ai_addrlen)) == SRT_ERROR ||
+                        srt_listen(sock, 1) == SRT_ERROR) {
+                        std::cerr << "[SRT] Listener FAILED on " << caller.endpoint << "\n";
+                        freeaddrinfo(result);
+                        srt_close(sock);
+                        return;
+                    }
+                    freeaddrinfo(result);
+                    std::cout << "[SRT] Listening on " << caller.endpoint
+                              << " (latency=" << caller.latency_ms << "ms)\n";
+                    const SRTSOCKET listeners[] = {sock};
+                    data_sock = SRT_INVALID_SOCK;
+                    while (!stop_requested_.load()) {
+                        data_sock = srt_accept_bond(listeners, 1, 200);
+                        if (data_sock != SRT_INVALID_SOCK) break;
+                    }
                     srt_close(sock);
-                    return;
+                    if (data_sock == SRT_INVALID_SOCK) return;
+                    {
+                        std::lock_guard<std::mutex> lock(discovery->mutex);
+                        discovery->deadlines[i] = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    }
+                    discovery->cv.notify_one();
+                    std::cout << "[SRT] Accepted connection on " << caller.endpoint << "\n";
+                } else {
+                    const int connect_rc = srt_connect(sock, result->ai_addr, static_cast<int>(result->ai_addrlen));
+                    freeaddrinfo(result);
+                    if (connect_rc == SRT_ERROR) {
+                        std::cerr << "[SRT] Connection FAILED to " << caller.endpoint << "\n";
+                        srt_close(sock);
+                        return;
+                    }
+                    std::cout << "[SRT] Connected to " << caller.endpoint
+                              << " (latency=" << caller.latency_ms << "ms)\n";
                 }
-                std::cout << "[SRT] Connected to " << caller.endpoint
-                          << " (latency=" << caller.latency_ms << "ms)\n";
 
                 TsPesDemuxer demuxer(caller);
                 std::array<std::uint8_t, 1316> recv_buf{};
                 bool video_codec_private_captured = false;
                 bool audio_codec_private_captured = false;
                 while (!stop_requested_.load()) {
-                    const int received = srt_recv(sock, reinterpret_cast<char*>(recv_buf.data()), static_cast<int>(recv_buf.size()));
+                    const int received = srt_recv(data_sock, reinterpret_cast<char*>(recv_buf.data()), static_cast<int>(recv_buf.size()));
                     if (received <= 0) {
                         // On any recv failure, check socket state to distinguish
                         // a transient timeout from a dead connection.
-                        const SRT_SOCKSTATUS sock_state = srt_getsockstate(sock);
+                        const SRT_SOCKSTATUS sock_state = srt_getsockstate(data_sock);
                         if (sock_state == SRTS_BROKEN || sock_state == SRTS_CLOSED ||
                             sock_state == SRTS_NONEXIST) {
                             std::cerr << "[SRT] Connection lost to " << caller.endpoint << "\n";
@@ -1627,7 +1666,6 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                                                 // Main thread finalized; skip track mutation.
                                             } else if (!discovery->ready[i]) {
                                                 discovery->ready[i] = true;
-                                                ++discovery->discovered;
                                                 const std::size_t video_index = i * 2;
                                                 if (video_index < bootstrap_.tracks.size()) {
                                                     bootstrap_.tracks[video_index] = make_track(
@@ -1761,7 +1799,7 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                     std::cerr << "[SRT] Worker exited without discovering video codec_private for "
                               << caller.id << "\n";
                 }
-                srt_close(sock);
+                srt_close(data_sock);
             } catch (...) {
             }
         });
@@ -1769,12 +1807,24 @@ transport::TransportStatus LiveSrtIngestManager::start() {
 
     {
         std::unique_lock<std::mutex> lock(discovery->mutex);
-        discovery->cv.wait_for(lock,
-                              std::chrono::seconds(5),
-                              [&]() {
-                                  return discovery->discovered >= callers_.size() &&
-                                         discovery->all_codec_private_ready();
-                              });
+        while (!stop_requested_.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            // Poll the external stop flag even when a listener has no encoder yet.
+            auto wake_at = now + std::chrono::milliseconds(100);
+            bool complete = true;
+            for (std::size_t i = 0; i < callers_.size(); ++i) {
+                if ((discovery->ready[i] && discovery->video_private_ready[i] && discovery->audio_private_ready[i]) ||
+                    (callers_[i].mode == "listener" && discovery->worker_finished[i])) {
+                    continue;
+                }
+                const auto& deadline = discovery->deadlines[i];
+                if (deadline && now >= *deadline) continue;
+                complete = false;
+                if (deadline) wake_at = std::min(wake_at, *deadline);
+            }
+            if (complete) break;
+            discovery->cv.wait_until(lock, wake_at);
+        }
         // Set phase_done while holding the mutex so workers that already passed
         // the phase_done check but haven't acquired the mutex yet will re-check.
         discovery->phase_done.store(true, std::memory_order_release);

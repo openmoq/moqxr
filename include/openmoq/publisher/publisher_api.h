@@ -134,6 +134,8 @@ struct LiveSrtCaller {
     std::optional<std::uint32_t> program_number;
     std::optional<std::uint32_t> video_pid;
     std::optional<std::uint32_t> audio_pid;
+    // Retain the caller-named API for compatibility; listener receives on endpoint.
+    std::string mode = "caller";
 };
 
 struct LiveIngestConfig {

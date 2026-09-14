@@ -29,6 +29,8 @@ struct LiveSrtCallerRuntimeConfig {
     bool has_video_pid = false;
     std::uint32_t audio_pid = 0;
     bool has_audio_pid = false;
+    // Retain the caller-named API for compatibility; listener receives on endpoint.
+    std::string mode = "caller";
 };
 
 struct LiveSrtBootstrap {

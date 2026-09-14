@@ -323,6 +323,10 @@ if(OPENMOQ_ENABLE_PICOQUIC)
         set(_openmoq_managed_dependency_used ON)
     endif()
 
+    include(cmake/OpenMoqPicoquicCompat.cmake)
+    openmoq_adapt_picoquic_save_ticket(
+        "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}" "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}")
+
     # Sanitize after both dependency projects have configured their targets.
     openmoq_sanitize_target_link_directories(picotls-core)
     set(OPENMOQ_HAS_PICOQUIC ON)
@@ -689,6 +693,14 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-live-srt-config-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-live-srt-config-tests COMMAND openmoq-publisher-live-srt-config-tests)
+
+    if(OPENMOQ_HAS_SRT)
+        add_executable(openmoq-publisher-live-srt-discovery-tests tests/live_srt_discovery_test.cpp)
+        target_include_directories(openmoq-publisher-live-srt-discovery-tests PRIVATE ${OPENMOQ_SRT_INCLUDE_DIR})
+        target_link_libraries(openmoq-publisher-live-srt-discovery-tests PRIVATE openmoq_publisher_lib ${OPENMOQ_SRT_LIBRARY})
+        add_test(NAME openmoq-publisher-live-srt-discovery-tests COMMAND openmoq-publisher-live-srt-discovery-tests)
+        set_tests_properties(openmoq-publisher-live-srt-discovery-tests PROPERTIES TIMEOUT 30)
+    endif()
 
     add_executable(openmoq-publisher-live-dash-tests
         tests/live_dash_ingest_test.cpp

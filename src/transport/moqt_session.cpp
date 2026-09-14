@@ -6563,6 +6563,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         openmoq::publisher::LiveSrtCallerRuntimeConfig config;
         config.id = caller.id;
         config.endpoint = caller.endpoint;
+        config.mode = caller.mode;
         config.fragment_on_keyframe = caller.fragment_on_keyframe;
         config.empty_moov = caller.empty_moov;
         config.default_base_moof = caller.default_base_moof;

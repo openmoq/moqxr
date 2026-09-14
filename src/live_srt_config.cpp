@@ -50,8 +50,8 @@ LiveSrtConfig parse_live_srt_config_file(const std::filesystem::path& path) {
         }
         const JsonObject& srt_obj = expect_object(srt_it->second, "srt");
         caller.srt.mode = expect_string(srt_obj, "mode");
-        if (caller.srt.mode != "caller") {
-            throw std::runtime_error("unsupported srt.mode '" + caller.srt.mode + "': only 'caller' is supported");
+        if (caller.srt.mode != "caller" && caller.srt.mode != "listener") {
+            throw std::runtime_error("unsupported srt.mode '" + caller.srt.mode + "': expected 'caller' or 'listener'");
         }
         caller.srt.host = expect_string(srt_obj, "host");
         const auto port = read_optional_u32(srt_obj, "port");

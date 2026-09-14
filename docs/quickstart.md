@@ -153,7 +153,7 @@ cat sample.mp4 | ./build/openmoq-publisher \
 
 ## SRT Live Ingest
 
-The SRT ingest path receives MPEG-TS from one or more configured SRT listeners, discovers the selected MPEG-TS program, converts the elementary streams to CMAF objects, and publishes them to the relay. The publisher supports SRT `caller` mode, so each configured host and port must already be listening.
+The SRT ingest path receives MPEG-TS from one or more configured SRT sources, discovers the selected MPEG-TS program, converts the elementary streams to CMAF objects, and publishes them to the relay. Each entry can use SRT `caller` mode to connect to an existing listener, or `listener` mode to bind the configured host and port and accept one incoming source.
 
 Create `/tmp/srt_callers.json`:
 
@@ -211,7 +211,7 @@ In the second terminal, start the publisher:
   --forward 0
 ```
 
-The `mpegts` object can either auto-detect the first program or pin `program_number`, `video_pid`, and `audio_pid`. The `cmaf` object controls keyframe fragmentation and generated CMAF layout. Use `--forward 1` for an immediate relay smoke test, or keep `--forward 0` to wait for subscriber interest. SRT ingest requires a build in which libsrt was detected; see [build.md](build.md) and [srt-ingest-technical-note.md](srt-ingest-technical-note.md).
+The `mpegts` object can either auto-detect the first program or pin `program_number`, `video_pid`, and `audio_pid`. The `cmaf` object controls keyframe fragmentation and generated CMAF layout. For listener mode, set `srt.mode` to `listener` and use a bind address such as `0.0.0.0`; the listener accepts one connection for that entry. Use `--forward 1` for an immediate relay smoke test, or keep `--forward 0` to wait for subscriber interest. SRT ingest requires a build in which libsrt was detected; see [build.md](build.md) and [srt-ingest-technical-note.md](srt-ingest-technical-note.md).
 
 ## CTE LL-DASH Live Ingest
 

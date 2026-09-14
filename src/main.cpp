@@ -235,6 +235,7 @@ int main(int argc, char** argv) {
                     LiveSrtCaller live_caller;
                     live_caller.id = caller.id;
                     live_caller.endpoint = caller.srt.host + ":" + std::to_string(caller.srt.port);
+                    live_caller.mode = caller.srt.mode;
                     live_caller.fragment_on_keyframe = caller.cmaf.fragment_on_keyframe;
                     live_caller.empty_moov = caller.cmaf.empty_moov;
                     live_caller.default_base_moof = caller.cmaf.default_base_moof;

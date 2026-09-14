@@ -314,6 +314,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
             LiveSrtCallerRuntimeConfig rc;
             rc.id = caller.id;
             rc.endpoint = caller.endpoint;
+            rc.mode = caller.mode;
             rc.fragment_on_keyframe = caller.fragment_on_keyframe;
             rc.empty_moov = caller.empty_moov;
             rc.default_base_moof = caller.default_base_moof;
@@ -395,6 +396,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         transport::LiveSrtCallerOptions session_caller;
         session_caller.id = caller.id;
         session_caller.endpoint = caller.endpoint;
+        session_caller.mode = caller.mode;
         session_caller.fragment_on_keyframe = caller.fragment_on_keyframe;
         session_caller.empty_moov = caller.empty_moov;
         session_caller.default_base_moof = caller.default_base_moof;

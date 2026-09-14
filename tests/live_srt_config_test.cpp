@@ -63,6 +63,21 @@ int main() {
     ok &= expect(config.srt_callers.front().mpegts.program_number.value_or(0) == 1,
                  "expected program_number=1");
 
+    for (const std::string mode : {"listener", "caller", "rendezvous"}) {
+        {
+            std::ofstream out(config_path);
+            out << "{\"srt_callers\":[{\"id\":\"cam\",\"srt\":{\"mode\":\""
+                << mode << "\",\"host\":\"0.0.0.0\",\"port\":9000}}]}";
+        }
+        try {
+            const auto parsed = openmoq::publisher::parse_live_srt_config_file(config_path);
+            ok &= expect(mode != "rendezvous", "unsupported mode must be rejected");
+            ok &= expect(parsed.srt_callers.front().srt.mode == mode, "SRT mode must be preserved");
+        } catch (const std::exception& e) {
+            ok &= expect(mode == "rendezvous", mode + " should be accepted: " + e.what());
+        }
+    }
+
     std::error_code ec;
     std::filesystem::remove(config_path, ec);
 

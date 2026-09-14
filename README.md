@@ -167,7 +167,7 @@ In the second terminal, start the SRT caller and MoQ publisher:
   --forward 0
 ```
 
-The only supported SRT mode is `caller`; the configured host and port must identify an existing SRT listener. Use `--forward 1` for an immediate relay smoke test, or keep `--forward 0` to wait for subscriber interest.
+Set `srt.mode` to `caller` to connect to an existing SRT listener, or to `listener` to bind the configured host and port and accept an incoming SRT source. Listener mode accepts one connection per configured entry and uses the same MPEG-TS ingest pipeline. Use `--forward 1` for an immediate relay smoke test, or keep `--forward 0` to wait for subscriber interest.
 
 ### CTE LL-DASH ingest
 
