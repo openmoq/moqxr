@@ -415,7 +415,9 @@ CallerTrackState (per SRT connection):
 ---
 
 ## Codec Discovery Phase
-Before streaming begins, the system waits up to 5 seconds for:
+Before streaming begins, each source gets up to 5 seconds for codec discovery. For listeners, this window starts after accepting the encoder connection; waiting for the encoder does not consume it. Callers retain the startup-based window. Startup waits for every source to finish discovery or exhaust its window, and a listener without an encoder waits until a connection, shutdown, or worker failure.
+
+Discovery collects:
 
 1. First video frame → detect codec type (H.264 vs HEVC) from stream_type or NAL inspection
 2. First video keyframe → extract SPS/PPS/VPS → build avcC or hvcC
