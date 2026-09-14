@@ -323,6 +323,10 @@ if(OPENMOQ_ENABLE_PICOQUIC)
         set(_openmoq_managed_dependency_used ON)
     endif()
 
+    include(cmake/OpenMoqPicoquicCompat.cmake)
+    openmoq_adapt_picoquic_save_ticket(
+        "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}" "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}")
+
     # Sanitize after both dependency projects have configured their targets.
     openmoq_sanitize_target_link_directories(picotls-core)
     set(OPENMOQ_HAS_PICOQUIC ON)
