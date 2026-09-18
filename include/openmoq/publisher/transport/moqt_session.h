@@ -3,6 +3,7 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
+#include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
@@ -129,7 +130,10 @@ public:
         preannounce_tracks_ = enabled;
     }
 
+    void set_media_packaging(MediaPackaging packaging) { media_packaging_ = packaging; }
+
 private:
+    MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
     void record_published_object(const std::string& track_name, std::uint64_t group_id, std::size_t payload_bytes);
     std::optional<std::vector<std::uint8_t>> setup_authorization_token() const;

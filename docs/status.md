@@ -14,6 +14,19 @@ Draft status:
 - CTE LL-DASH regressions cover FFmpeg-style multi-representation paths and draft-16 await-subscribe delivery
 - the main CLI supports ordered relay failover through repeated `--endpoint` values and `--retry N` same-endpoint retries; transport/connectivity failures are retryable, relay namespace/track rejections skip directly to the next endpoint, and fatal or cancelled work stops
 
+## LOCMAF Status
+
+LOCMAF-01, packaging version `0.3`, is implemented as an opt-in addition;
+CMAF remains the primary default. File, live stdin, SRT, and CTE DASH input
+use the default backend's conversion path. Published objects use independent
+full headers; automatic delta-header publication and libmoq LOCMAF publishing
+are not enabled. Multiplexed fragments require demuxing first.
+
+Golden-vector and offline moq-playa reconstruction checks pass. Relay-to-player
+LOCMAF delivery remains to be validated. See the [quickstart](quickstart.md#opt-in-to-locmaf),
+[protocol details](protocol-mapping.md#locmaf-packaging), and
+[validation record](testing.md#locmaf-tests).
+
 ## Roadmap
 
 1. Keep draft-14, draft-16, draft-17, and draft-18 message/subgroup serde tests aligned with the current relay matrix so wire placement regressions are caught in CI.

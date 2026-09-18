@@ -373,6 +373,42 @@ int main() {
     ok &= expect_chunked_rejects("FFFFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n");
 
     {
+        LiveDashIngestSession session(8, openmoq::publisher::MediaPackaging::kLocmaf);
+        const auto init = make_init_segment(1);
+        session.ingest("/ingest/video", init);
+        const auto source = session.source();
+        ok &= expect(source.tracks.size() == 2 &&
+                         source.tracks.back().packaging == openmoq::publisher::LivePackaging::kLocmaf,
+                     "expected DASH LOCMAF track metadata");
+        session.ingest("/ingest/video", make_dash_media_fragment(1, 0, {0x11, 0x22, 0x33}));
+        const auto catalog = session.try_next_object();
+        const auto media = session.try_next_object();
+        ok &= expect(catalog.has_value() && media.has_value(), "expected DASH LOCMAF catalog and media");
+        if (catalog) {
+            const std::string json(catalog->payload.begin(), catalog->payload.end());
+            ok &= expect(json.find("\"packaging\":\"locmaf\"") != std::string::npos &&
+                             json.find("\"locmafVersion\":\"0.3\"") != std::string::npos,
+                         "expected DASH catalog LOCMAF signaling");
+        }
+        if (media) {
+            ok &= expect(!media->payload.empty() && media->payload.front() == 2 &&
+                             !media->final_in_subgroup && media->subgroup_id == 0,
+                         "expected LOCMAF bytes on single open subgroup");
+        }
+        auto malformed = make_dash_media_fragment(1, 512, {0x11, 0x22, 0x33});
+        malformed.resize(malformed.size() - 11);
+        const auto short_mdat = make_box("mdat", {0x11});
+        malformed.insert(malformed.end(), short_mdat.begin(), short_mdat.end());
+        session.ingest("/ingest/video", malformed);
+        bool failed_cleanly = false;
+        try { (void)session.try_next_object(); }
+        catch (const std::runtime_error& error) {
+            failed_cleanly = std::string(error.what()).find("LOCMAF") != std::string::npos;
+        }
+        ok &= expect(failed_cleanly, "expected later LOCMAF encoding failure without CMAF substitution");
+    }
+
+    {
         // FFmpeg's DASH muxer stores duration, size, and default flags in
         // tfhd and omits them from trun. The relay consumes trun samples
         // directly, so the live ingest must materialize those defaults.

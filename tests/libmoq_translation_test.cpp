@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -147,6 +149,54 @@ PublishPlan make_plan() {
 
 int main() {
     bool ok = true;
+
+    // LOCMAF needs catalog locmafVersion signaling absent from libmoq's API.
+    {
+        const auto rejects_locmaf = [&](auto operation, const std::string& label) {
+            try {
+                operation();
+            } catch (const std::invalid_argument& error) {
+                return expect(std::string(error.what()).find("LOCMAF") != std::string::npos,
+                              label + " must explain LOCMAF refusal");
+            }
+            return expect(false, label + " must reject unsupported LOCMAF");
+        };
+        auto track = make_video_track();
+        track.packaging = "locmaf";
+        ok &= rejects_locmaf([&] { make_libmoq_live_track(track, {}); }, "live track translation");
+        PublishPlan plan;
+        plan.tracks = {track};
+        ok &= rejects_locmaf([&] { translate_plan_for_libmoq(plan); }, "plan translation");
+        LiveTrack live_track;
+        live_track.packaging = LivePackaging::kLocmaf;
+        ok &= rejects_locmaf([&] { make_libmoq_live_object_track(live_track); },
+                             "live object track translation");
+
+        const auto refused = [&](const TransportStatus& status, const std::string& label) {
+            return expect(!status.ok && status.message.find("LOCMAF") != std::string::npos,
+                          label + " must refuse LOCMAF before setup");
+        };
+        PublisherConfig config;
+        config.draft_version = static_cast<DraftVersion>(0);  // guarantees no network on regression
+        config.media_packaging = MediaPackaging::kLocmaf;
+        EndpointConfig endpoint;
+        LibmoqPublishStats stats;
+        ok &= refused(publish_plan_via_libmoq({}, config, endpoint, {}, stats), "batch config");
+        std::istringstream input;
+        ok &= refused(publish_live_stdin_via_libmoq(input, config, endpoint, {}, stats, nullptr),
+                      "stdin config");
+        ok &= refused(publish_live_srt_via_libmoq({}, config, endpoint, {}, stats, nullptr),
+                      "SRT config");
+        ok &= refused(publish_live_objects_via_libmoq({}, config, endpoint, {}, stats, nullptr),
+                      "live config");
+        config.media_packaging = MediaPackaging::kCmaf;
+        ok &= refused(publish_plan_via_libmoq(plan, config, endpoint, {}, stats), "batch track");
+        LiveObjectSource source;
+        source.tracks = {live_track};
+        source.next_object = [] { return std::optional<LiveObject>{}; };
+        ok &= refused(publish_live_objects_via_libmoq(source, config, endpoint, {}, stats, nullptr),
+                      "live track");
+    }
 
     const PublishPlan plan = make_plan();
     const LibmoqPlanTranslation tr = translate_plan_for_libmoq(plan);

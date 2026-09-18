@@ -45,6 +45,49 @@ cmake --build build-nosmoke
 ctest --test-dir build-nosmoke --output-on-failure
 ```
 
+## LOCMAF Tests
+
+The regular suite includes LOCMAF encoding, catalog signaling, CLI validation,
+batch fallback and emission, progressive initialization, live stdin/DASH,
+and subgroup behavior. Run the focused coverage with:
+
+```bash
+cmake --build build
+ctest --test-dir build --output-on-failure \
+  -R 'openmoq-publisher-(locmaf|locmaf-publisher|msf-catalog|cli|packaging|live-dash|transport)-tests'
+```
+
+`tests/fixtures/locmaf/` contains 38 objects across 14 Eyevinn golden-vector
+cases, mirrored from moq-playa. Its manifest records the upstream revision,
+license, and file hashes. `tests/fixtures/generated.txt` records the FFmpeg
+commands for the small publisher fixtures. The optional libmoq translation
+test verifies that unsupported LOCMAF publishing is rejected.
+
+For an independent decoder and playback check, use a moq-playa checkout with
+LOCMAF support (reference: [moq-playa PR #15](https://github.com/openmoq/moq-playa/pull/15)):
+
+```bash
+bun scripts/test-locmaf-playa.mjs build/openmoq-publisher ../moq-playa
+# Retain generated media and reconstructed output for inspection:
+bun scripts/test-locmaf-playa.mjs build/openmoq-publisher ../moq-playa --keep
+```
+
+This requires Bun, FFmpeg with libx264/AAC, and ffprobe. It creates H.264 with
+B-frames plus AAC, emits both default CMAF and LOCMAF, reconstructs LOCMAF with
+Playa's decoder, and compares sample bytes, packet hashes/timing/durations/
+flags, and decoded frame hashes. Failed runs retain their temporary artifacts.
+CMAF and LOCMAF use different chunking here; emitted byte totals are not a
+controlled measurement of header compression alone.
+
+On September 18, 2026, the implementation passed all 25 tests in the local
+picoquic-enabled suite, the focused libmoq translation test, and the Playa
+check (6 objects, 232 samples) against Playa revision
+`2d5820664a9186f0a77ec48111e44ed12bdefe05`. These are local results. Delivery
+through red5-moq-relay to Playa remains unverified: sandbox restrictions
+blocked the test relay socket and the elevated launch was aborted. The
+script above validates offline reconstruction, not network delivery or
+browser playback.
+
 ## Libmoq Backend Tests
 
 To fetch current `openmoq/moq5` `main`, compile the libmoq translation test, and

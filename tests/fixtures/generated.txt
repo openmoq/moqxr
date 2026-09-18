@@ -1,0 +1,7 @@
+Generated LOCMAF publisher integration fixtures (run from repository root):
+
+ffmpeg -f lavfi -i testsrc2=size=32x32:rate=4 -t 1 -c:v libx264 -pix_fmt yuv420p -g 2 -bf 0 -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof -f mp4 tests/fixtures/locmaf-publisher.mp4
+
+ffmpeg -hide_banner -loglevel error -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -c:a aac -b:a 32k -movflags empty_moov+default_base_moof+frag_keyframe -frag_duration 500000 tests/fixtures/locmaf-audio.mp4
+
+ffmpeg -hide_banner -loglevel error -i tests/fixtures/locmaf-publisher.mp4 -c copy -movflags +faststart tests/fixtures/locmaf-progressive.mp4

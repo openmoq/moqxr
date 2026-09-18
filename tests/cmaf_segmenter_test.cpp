@@ -1157,6 +1157,57 @@ int main() {
 
     bool ok = true;
 
+    // LOCMAF preserves the source moof: live timing and SAP must honor trex
+    // when tfhd/trun omit the corresponding defaults.
+    {
+        auto bytes = make_fragmented_hevc_mp4({1, 2, 3, 4});
+        const auto boxes = parse_mp4_boxes(bytes);
+        const auto* moov = find_first_box(boxes, "moov");
+        const auto* mdia = find_child_box(*find_child_box(*moov, "trak"), "mdia");
+        const auto* mdhd = find_child_box(*mdia, "mdhd");
+        patch_be32(bytes, mdhd->payload.offset + 12, 1000);
+        const auto* trex = find_child_box(*find_child_box(*moov, "mvex"), "trex");
+        patch_be32(bytes, trex->payload.offset + 12, 40);
+        patch_be32(bytes, trex->payload.offset + 16, 4);
+        patch_be32(bytes, trex->payload.offset + 20, 0x01010000);
+        auto tracks = extract_tracks(boxes, bytes);
+        const auto* moof = find_first_box(boxes, "moof");
+        const auto* mdat = find_first_box(boxes, "mdat");
+        const auto old_cmaf = build_live_fragment(slice_bytes(bytes, moof->span),
+                                                   slice_bytes(bytes, mdat->span), tracks, 0);
+        ok &= expect(old_cmaf.duration_us == 0 && old_cmaf.is_video_keyframe,
+                     "default CMAF live metadata behavior must remain unchanged");
+        ok &= expect(tracks.front().fragment_defaults.has_value() &&
+                         tracks.front().fragment_defaults->sample_size == 4,
+                     "track extraction must retain matching trex sample size");
+        tracks.front().packaging = "locmaf";
+        const auto inherited = build_live_fragment(slice_bytes(bytes, moof->span),
+                                                   slice_bytes(bytes, mdat->span), tracks, 0);
+        ok &= expect(inherited.duration_us == 40000,
+                     "LOCMAF live duration must inherit the matching trex duration");
+        ok &= expect(!inherited.is_video_keyframe && inherited.sap_type == 0,
+                     "LOCMAF trex non-sync flags must not start a random-access group");
+
+        const auto tfhd_override = make_full_box_with_flags(
+            "tfhd", 0, 0x000038,
+            concat({be32_bytes(1), be32_bytes(50), be32_bytes(4), be32_bytes(0x02000000)}));
+        const auto tfdt = make_full_box("tfdt", be32_bytes(0));
+        const auto default_trun = make_full_box_with_flags(
+            "trun", 0, 0x000001, concat({be32_bytes(1), be32_bytes(0)}));
+        const auto tfhd_moof = make_box("moof", make_box("traf", concat({tfhd_override, tfdt, default_trun})));
+        const auto tfhd_result = build_live_fragment(tfhd_moof, slice_bytes(bytes, mdat->span), tracks, 0);
+        ok &= expect(tfhd_result.duration_us == 50000 && tfhd_result.is_video_keyframe,
+                     "LOCMAF tfhd defaults must override trex");
+        const auto explicit_trun = make_full_box_with_flags(
+            "trun", 0, 0x000701,
+            concat({be32_bytes(1), be32_bytes(0), be32_bytes(60), be32_bytes(4), be32_bytes(0x01010000)}));
+        const auto trun_moof = make_box("moof", make_box("traf", concat({tfhd_override, tfdt, explicit_trun})));
+        const auto trun_result = build_live_fragment(trun_moof, slice_bytes(bytes, mdat->span), tracks, 0);
+        ok &= expect(trun_result.duration_us == 60000 && !trun_result.is_video_keyframe,
+                     "LOCMAF explicit trun entries must override tfhd and trex");
+    }
+
+
     const auto fragmented_bytes = make_fragmented_test_mp4();
     ParsedMp4 fragmented{
         .bytes = fragmented_bytes,

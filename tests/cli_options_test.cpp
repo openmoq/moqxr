@@ -74,11 +74,29 @@ std::filesystem::path write_drm_config_file(std::string_view name) {
 int main() {
     bool ok = true;
 
+    try {
+        const auto options = parse({"prog", "--input", "sample.mp4", "--packaging", "locmaf"});
+        ok &= expect(options.media_packaging == openmoq::publisher::MediaPackaging::kLocmaf,
+                     "explicit LOCMAF packaging must be retained");
+    } catch (const std::runtime_error& error) {
+        ok &= expect(false, std::string("LOCMAF opt-in must parse: ") + error.what());
+    }
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--packaging", "unknown"},
+                       "--packaging must be", "invalid packaging must be rejected");
+    for (const auto* incompatible : {"--stream-per-object", "--coalesce-cmaf-chunks"}) {
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--packaging", "locmaf", incompatible},
+                           "LOCMAF requires", "LOCMAF must reject incompatible delivery modes");
+    }
+    ok &= expect(parse({"prog", "--input", "sample.mp4", "--packaging", "cmaf"}).media_packaging ==
+                     openmoq::publisher::MediaPackaging::kCmaf, "explicit CMAF must remain available");
+
     {
         const CliOptions options = parse({"openmoq-publisher", "--input", "sample.mp4"});
         ok &= expect(options.subscriber_timeout == std::chrono::seconds(30),
                      "expected default subscriber timeout to be 30 seconds");
         ok &= expect(options.split_cmaf_chunks, "expected chunk splitting to be enabled by default");
+        ok &= expect(options.media_packaging == openmoq::publisher::MediaPackaging::kCmaf,
+                     "CMAF must remain the default packaging");
         ok &= expect(options.input_source.kind == openmoq::publisher::InputSourceKind::kFile,
                      "expected file input to remain the default input source kind");
         ok &= expect(options.input_source.path == "sample.mp4",

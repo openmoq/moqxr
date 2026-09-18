@@ -52,6 +52,13 @@ struct CencSystem {
     std::string pssh_base64;       // the whole pssh box, Base64
 };
 
+// Fragment defaults from the matching moov.mvex.trex, before tfhd/trun overrides.
+struct TrackFragmentDefaults {
+    std::uint32_t sample_duration = 0;
+    std::uint32_t sample_size = 0;
+    std::uint32_t sample_flags = 0;
+};
+
 struct TrackDescription {
     std::uint32_t track_id = 0;
     std::string handler_type;
@@ -75,6 +82,7 @@ struct TrackDescription {
     // Present when the sample entry is encv or enca and its sinf parsed.
     std::optional<CencTrackProtection> protection;
     std::vector<std::uint8_t> codec_private;  // avcC, hvcC, or esds box bytes (including box header)
+    std::optional<TrackFragmentDefaults> fragment_defaults = std::nullopt;
 };
 
 struct ParsedMp4 {

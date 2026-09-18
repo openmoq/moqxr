@@ -1518,6 +1518,11 @@ MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
     std::uint32_t default_sample_duration = 0;
     std::uint32_t default_sample_size = 0;
     std::uint32_t default_sample_flags = 0x02000000U;
+    if (track_desc->packaging == "locmaf" && track_desc->fragment_defaults.has_value()) {
+        default_sample_duration = track_desc->fragment_defaults->sample_duration;
+        default_sample_size = track_desc->fragment_defaults->sample_size;
+        default_sample_flags = track_desc->fragment_defaults->sample_flags;
+    }
     if (const Mp4Box* tfhd = find_child_box(*traf, "tfhd")) {
         const std::uint32_t flags = read_full_box_flags(*tfhd, moof_bytes);
         std::size_t cursor = tfhd->payload.offset + 8;

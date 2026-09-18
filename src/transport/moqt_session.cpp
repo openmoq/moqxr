@@ -2,6 +2,7 @@
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_srt_ingest.h"
+#include "openmoq/publisher/locmaf_encoder.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
 #include "../live_media_queue.h"
@@ -6353,6 +6354,14 @@ TransportStatus MoqtSession::connect(const EndpointConfig& endpoint, const TlsCo
 }
 
 TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan) {
+    for (const auto& track : plan.tracks) {
+        if (track.packaging != "locmaf") continue;
+        for (const auto& object : plan.objects) {
+            if (object.track_name == track.track_name && object.subgroup_id != 0) {
+                return TransportStatus::failure("LOCMAF requires a single subgroup (zero) per group");
+            }
+        }
+    }
     if (transport_.state() != ConnectionState::kConnected) {
         return TransportStatus::failure("transport is not connected");
     }
@@ -6510,11 +6519,58 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                now_function_);
 }
 
+namespace {
+using LiveLocmafEncoders = std::map<std::string, std::unique_ptr<openmoq::publisher::LocmafEncoder>>;
+
+openmoq::publisher::LiveCatalog prepare_live_catalog(
+    std::vector<openmoq::publisher::TrackDescription>& tracks,
+    std::span<const std::uint8_t> init, MediaPackaging packaging,
+    LiveLocmafEncoders& encoders) {
+    auto catalog = openmoq::publisher::build_live_catalog(tracks, init, true);
+    if (packaging != MediaPackaging::kLocmaf) return catalog;
+    for (auto& track : tracks) {
+        const auto found = std::find_if(catalog.track_initializations.begin(),
+            catalog.track_initializations.end(), [&](const auto& item) {
+                return item.track_name == track.track_name;
+            });
+        if (found == catalog.track_initializations.end()) continue;
+        try {
+            encoders.emplace(track.track_name,
+                std::make_unique<openmoq::publisher::LocmafEncoder>(found->init_segment));
+            track.packaging = "locmaf";
+        } catch (const openmoq::publisher::LocmafIneligible& error) {
+            std::cerr << "[moqt-session] LOCMAF init ineligible, retaining CMAF for "
+                      << track.track_name << ": " << error.what() << '\n';
+        }
+    }
+    return openmoq::publisher::build_live_catalog(tracks, init, true);
+}
+
+TransportStatus encode_live_fragment(openmoq::publisher::MediaFragment& fragment,
+                                     LiveLocmafEncoders& encoders) {
+    const auto found = encoders.find(fragment.track_name);
+    if (found == encoders.end()) return TransportStatus::success();
+    try {
+        // Live queue trimming and admission can discard arbitrary objects. Each
+        // delivered object must therefore be independently reconstructible.
+        fragment.payload.owned_bytes = found->second->encode(
+            fragment.payload.owned_bytes, fragment.group_id, fragment.object_id, true);
+        return TransportStatus::success();
+    } catch (const std::exception& error) {
+        return TransportStatus::failure("LOCMAF live encoding failed for " +
+                                        fragment.track_name + ": " + error.what());
+    }
+}
+}  // namespace
+
 TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                           std::istream* stdin_input,
                                           openmoq::publisher::DraftVersion draft_version,
                                           bool split_cmaf_chunks,
                                           bool stream_per_object) {
+    if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
+        return TransportStatus::failure("LOCMAF requires a single subgroup stream per group");
+    }
     if (ingest.use_stdin && !ingest.srt_callers.empty()) {
         return TransportStatus::failure("mixed stdin+SRT ingest is not supported; use either stdin or srt");
     }
@@ -6595,7 +6651,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return status;
     }
     const auto& srt_bootstrap = srt_manager.bootstrap();
-    const auto& tracks = srt_bootstrap.tracks;
+    auto tracks = srt_bootstrap.tracks;
 
     if (tracks.empty()) {
         stop_requested = true;
@@ -6605,8 +6661,15 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     const std::vector<std::uint8_t> synthetic_init =
         openmoq::publisher::LiveSrtIngestManager::build_synthetic_init_segment(tracks);
-    openmoq::publisher::LiveCatalog live_catalog =
-        openmoq::publisher::build_live_catalog(tracks, synthetic_init, true);
+    LiveLocmafEncoders locmaf_encoders;
+    openmoq::publisher::LiveCatalog live_catalog;
+    try {
+        live_catalog = prepare_live_catalog(tracks, synthetic_init, media_packaging_, locmaf_encoders);
+    } catch (const std::exception& error) {
+        stop_requested = true;
+        srt_manager.join();
+        return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
+    }
 
     std::thread srt_join_thread([&srt_manager, queue]() {
         srt_manager.join();
@@ -6799,6 +6862,9 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             if (alias_it == alias_by_track.end()) {
                 continue;
             }
+
+            const TransportStatus encode_status = encode_live_fragment(fragment, locmaf_encoders);
+            if (!encode_status.ok) return encode_status;
 
             const openmoq::publisher::CmsfObject object{
                 .kind = openmoq::publisher::CmsfObjectKind::kMedia,
@@ -7402,6 +7468,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                            openmoq::publisher::DraftVersion draft_version,
                                            bool /*split_cmaf_chunks*/,
                                            bool stream_per_object) {
+    if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
+        return TransportStatus::failure("LOCMAF requires a single subgroup stream per group");
+    }
     if (transport_.state() != ConnectionState::kConnected) {
         return TransportStatus::failure("transport is not connected");
     }
@@ -7480,9 +7549,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // only runs its normal teardown -- close(0) + clear_active_session(),
     // which populates stats_.last_error and closes the MOQT session cleanly
     // -- when publish_live() returns rather than throws.
+    LiveLocmafEncoders locmaf_encoders;
     openmoq::publisher::LiveCatalog live_catalog;
     try {
-        live_catalog = openmoq::publisher::build_live_catalog(tracks, init_segment, true);
+        live_catalog = prepare_live_catalog(tracks, init_segment, media_packaging_, locmaf_encoders);
     } catch (const std::runtime_error& error) {
         return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
     }
@@ -7705,87 +7775,140 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         std::mutex mutex;
         std::deque<openmoq::publisher::MediaFragment> fragments;
         bool eof = false;
+        std::string error;
     };
     auto queue = std::make_shared<LiveMediaQueue>();
 
     std::atomic<bool> stdin_stop{false};
-    std::thread stdin_thread([&reader, &input, &tracks, queue, &stdin_stop]() {
+    const bool retain_locmaf_boxes = !locmaf_encoders.empty();
+    std::thread stdin_thread([&reader, &input, &tracks, queue, &stdin_stop, retain_locmaf_boxes]() {
         std::vector<std::uint8_t> pending_moof;
+        std::vector<std::uint8_t> pending_chunk;
         std::size_t shared_group_id = 0;
         std::map<std::string, std::size_t> object_id_in_group;  // per track, resets on new group
-        bool first_keyframe_seen = false;
+        const bool locmaf_audio_only = retain_locmaf_boxes &&
+            std::none_of(tracks.begin(), tracks.end(), [](const auto& track) {
+                return track.handler_type == "vide";
+            });
+        bool first_keyframe_seen = locmaf_audio_only;
 
-        while (true) {
-            if (stdin_stop.load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> lock(queue->mutex);
-                queue->eof = true;
-                break;
-            }
-            const std::size_t bytes_read = read_live_input(input, reader, &stdin_stop);
+        try {
+            while (true) {
+                if (stdin_stop.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lock(queue->mutex);
+                    queue->eof = true;
+                    break;
+                }
+                const std::size_t bytes_read = read_live_input(input, reader, &stdin_stop);
 
-            while (auto box = reader.next_box()) {
-                if (box->type == "moof") {
-                    pending_moof = std::move(box->bytes);
-                } else if (box->type == "mdat") {
-                    if (pending_moof.empty()) {
-                        std::cerr << "[moqt-session] live: mdat without preceding moof, skipping\n";
-                        continue;
-                    }
-                    try {
-                        // Build fragment (group_id=0 placeholder, we'll assign below)
-                        auto fragment = openmoq::publisher::build_live_fragment(
-                            pending_moof, box->bytes, tracks, 0);
-
-                        // Keyframe-based grouping:
-                        // When a video keyframe arrives, start a new group for ALL tracks.
-                        if (fragment.is_video_keyframe) {
-                            if (first_keyframe_seen) {
-                                ++shared_group_id;
-                            }
-                            first_keyframe_seen = true;
-                            // Reset object counters for all tracks on new group
-                            object_id_in_group.clear();
+                while (auto box = reader.next_box()) {
+                    if (retain_locmaf_boxes) {
+                        if (box->bytes.size() > 16 * 1024 * 1024 - pending_chunk.size()) {
+                            std::lock_guard<std::mutex> lock(queue->mutex);
+                            queue->error = "LOCMAF live chunk exceeds 16 MiB";
+                            queue->eof = true;
+                            return;
                         }
-
-                        if (!first_keyframe_seen) {
-                            // Drop fragments before first keyframe (can't decode without IDR)
-                            pending_moof.clear();
+                        if (box->type != "mdat") {
+                            pending_chunk.insert(pending_chunk.end(), box->bytes.begin(), box->bytes.end());
+                        }
+                    }
+                    if (box->type == "moof") {
+                        pending_moof = std::move(box->bytes);
+                    } else if (box->type == "mdat") {
+                        if (pending_moof.empty()) {
+                            std::cerr << "[moqt-session] live: mdat without preceding moof, skipping\n";
                             continue;
                         }
-
-                        // Assign shared group_id and per-track object_id
-                        fragment.group_id = shared_group_id;
-                        fragment.object_id = object_id_in_group[fragment.track_name]++;
-
-                        {
-                            std::lock_guard<std::mutex> lock(queue->mutex);
-                            queue->fragments.push_back(std::move(fragment));
-                            // Trim queue: keep only fragments from the latest 2 groups.
-                            // This prevents unbounded backlog when ffmpeg encodes
-                            // faster than realtime, while keeping enough data for
-                            // A/V sync (audio from the previous group).
-                            if (!queue->fragments.empty()) {
-                                const std::size_t latest = queue->fragments.back().group_id;
-                                const std::size_t min_keep = latest > 1 ? latest - 1 : 0;
-                                while (!queue->fragments.empty() &&
-                                       queue->fragments.front().group_id < min_keep) {
-                                    queue->fragments.pop_front();
+                        try {
+                            if (retain_locmaf_boxes) {
+                                const auto boxes = openmoq::publisher::parse_mp4_boxes(pending_moof);
+                                if (boxes.size() != 1 || std::count_if(
+                                        boxes.front().children.begin(), boxes.front().children.end(),
+                                        [](const auto& child) { return child.type == "traf"; }) != 1) {
+                                    throw std::runtime_error(
+                                        "LOCMAF requires one traf per moof; demux or use separate_moof");
                                 }
                             }
-                        }
-                    } catch (const std::exception& e) {
-                        std::cerr << "[moqt-session] live: fragment parse error: " << e.what() << '\n';
-                    }
-                    pending_moof.clear();
-                }
-                // Skip other box types (styp, free, etc.)
-            }
+                            // Build fragment (group_id=0 placeholder, we'll assign below)
+                            auto fragment = openmoq::publisher::build_live_fragment(
+                                pending_moof, box->bytes, tracks, 0);
+                            const auto track = std::find_if(tracks.begin(), tracks.end(), [&](const auto& item) {
+                                return item.track_name == fragment.track_name;
+                            });
+                            if (track != tracks.end() && track->packaging == "locmaf") {
+                                pending_chunk.insert(pending_chunk.end(), box->bytes.begin(), box->bytes.end());
+                                fragment.payload.owned_bytes = std::move(pending_chunk);
+                            }
+                            pending_chunk.clear();
 
-            if (bytes_read == 0) {
-                std::lock_guard<std::mutex> lock(queue->mutex);
-                queue->eof = true;
-                break;
+                            if (locmaf_audio_only && !object_id_in_group.empty()) {
+                                ++shared_group_id;
+                                object_id_in_group.clear();
+                            }
+
+                            // Keyframe-based grouping:
+                            // When a video keyframe arrives, start a new group for ALL tracks.
+                            if (fragment.is_video_keyframe) {
+                                if (first_keyframe_seen) {
+                                    ++shared_group_id;
+                                }
+                                first_keyframe_seen = true;
+                                // Reset object counters for all tracks on new group
+                                object_id_in_group.clear();
+                            }
+
+                            if (!first_keyframe_seen) {
+                                // Drop fragments before first keyframe (can't decode without IDR)
+                                pending_moof.clear();
+                                continue;
+                            }
+
+                            // Assign shared group_id and per-track object_id
+                            fragment.group_id = shared_group_id;
+                            fragment.object_id = object_id_in_group[fragment.track_name]++;
+
+                            {
+                                std::lock_guard<std::mutex> lock(queue->mutex);
+                                queue->fragments.push_back(std::move(fragment));
+                                // Trim queue: keep only fragments from the latest 2 groups.
+                                // This prevents unbounded backlog when ffmpeg encodes
+                                // faster than realtime, while keeping enough data for
+                                // A/V sync (audio from the previous group).
+                                if (!queue->fragments.empty()) {
+                                    const std::size_t latest = queue->fragments.back().group_id;
+                                    const std::size_t min_keep = latest > 1 ? latest - 1 : 0;
+                                    while (!queue->fragments.empty() &&
+                                           queue->fragments.front().group_id < min_keep) {
+                                        queue->fragments.pop_front();
+                                    }
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            if (retain_locmaf_boxes) {
+                                std::lock_guard<std::mutex> lock(queue->mutex);
+                                queue->error = std::string("LOCMAF live fragment parse failed: ") + e.what();
+                                queue->eof = true;
+                                return;
+                            }
+                            std::cerr << "[moqt-session] live: fragment parse error: " << e.what() << '\n';
+                        }
+                        pending_moof.clear();
+                        pending_chunk.clear();
+                    }
+                    // Skip other box types (styp, free, etc.)
+                }
+
+                if (bytes_read == 0) {
+                    std::lock_guard<std::mutex> lock(queue->mutex);
+                    queue->eof = true;
+                    break;
+                }
             }
+        } catch (const std::exception& error) {
+            std::lock_guard<std::mutex> lock(queue->mutex);
+            queue->error = std::string("live input reader failed: ") + error.what();
+            queue->eof = true;
         }
     });
 
@@ -7829,6 +7952,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             openmoq::publisher::MediaFragment fragment;
             {
                 std::lock_guard<std::mutex> lock(queue->mutex);
+                if (!queue->error.empty()) return TransportStatus::failure(queue->error);
                 if (queue->fragments.empty()) break;
                 fragment = std::move(queue->fragments.front());
                 queue->fragments.pop_front();
@@ -7849,6 +7973,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (alias_it == alias_by_track.end()) {
                 continue;
             }
+
+            const TransportStatus encode_status = encode_live_fragment(fragment, locmaf_encoders);
+            if (!encode_status.ok) return encode_status;
 
             const openmoq::publisher::CmsfObject object{
                 .kind = openmoq::publisher::CmsfObjectKind::kMedia,
@@ -8817,6 +8944,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     }
 
     join_stdin_thread();
+    {
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        if (!queue->error.empty()) return TransportStatus::failure(queue->error);
+    }
 
     for (auto& [track_name, sender] : sender_by_track) {
         const auto publisher_timeout_it = published_track_delivery_timeouts.find(track_name);
@@ -8923,6 +9054,24 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     }
     if (!source.next_object) {
         return TransportStatus::failure("live object source has no object reader");
+    }
+
+    std::set<std::string> locmaf_tracks;
+    for (const auto& track : source.tracks) {
+        if (track.packaging == openmoq::publisher::LivePackaging::kLocmaf) {
+            locmaf_tracks.insert(track.track_name);
+        }
+    }
+    if (media_packaging_ == MediaPackaging::kLocmaf || !locmaf_tracks.empty()) {
+        if (source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject) {
+            return TransportStatus::failure("LOCMAF cannot transform a source-owned catalog");
+        }
+        for (const auto& track : source.tracks) {
+            if (track.track_name != "catalog" &&
+                track.packaging == openmoq::publisher::LivePackaging::kRaw) {
+                return TransportStatus::failure("LOCMAF requires a source with explicit media packaging");
+            }
+        }
     }
 
     TransportStatus status = ensure_setup(draft_version);
@@ -9707,6 +9856,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
         if (!auto_forward_ && !subscribed_tracks.contains(next->track_name)) {
             continue;
+        }
+
+        if (locmaf_tracks.contains(next->track_name)) {
+            if (next->subgroup_id != 0) {
+                return TransportStatus::failure("LOCMAF requires a single subgroup (zero) per group");
+            }
+            next->final_in_subgroup = false;
         }
 
         const openmoq::publisher::CmsfObject object{

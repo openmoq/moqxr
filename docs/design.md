@@ -20,6 +20,27 @@ For non-fragmented input:
 
 This keeps the project aligned with CMAF-style publication while reusing the same publish-plan model for local inspection and transport-driven publication.
 
+## Optional LOCMAF Output
+
+`MediaPackaging::kCmaf` remains the default. `MediaPackaging::kLocmaf` adds a
+conversion stage between CMAF chunk preparation and publication. The batch
+path in `src/locmaf_packager.cpp` retains original fragmented chunks and their
+auxiliary boxes, preflights each complete track, and then replaces its media
+payloads and catalog packaging together. Progressive input is remuxed first;
+the LOCMAF path clears the old progressive sample tables in the generated
+initialization so they cannot reference stale offsets.
+
+`LocmafEncoder` in `src/locmaf_encoder.cpp` owns per-track encoding state.
+Live stdin and SRT sessions and DASH ingest create encoders from their
+per-track initialization segments. Production conversion forces full headers
+on every object, allowing queue trimming and arbitrary cached-object access
+without earlier delta state. The standalone encoder supports deltas, but
+publishing them is deferred until recovery and cache behavior are validated.
+
+The default CMAF splitter remains the primary path. LOCMAF constraints,
+raw-box handling, and track fallback are documented in
+[protocol-mapping.md](protocol-mapping.md#locmaf-packaging).
+
 ## Catalog Metadata
 
 The catalog format includes:

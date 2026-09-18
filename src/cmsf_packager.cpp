@@ -684,13 +684,22 @@ void emit_plan_objects(const PublishPlan& plan,
     }
 
     for (const auto& object : plan.objects) {
+        const bool locmaf = object.kind == CmsfObjectKind::kMedia &&
+            std::any_of(plan.tracks.begin(), plan.tracks.end(), [&](const auto& track) {
+                return track.track_name == object.track_name && track.packaging == "locmaf";
+            });
+        auto filename = object_filename(object);
+        if (locmaf) {
+            filename = object.track_name + "_g" + std::to_string(object.group_id) + "_o" +
+                       std::to_string(object.object_id) + "_media.locmafobj";
+        }
         if (object.owned_payload.empty()) {
-            write_bytes(output_dir / object_filename(object), slice_bytes(bytes, object.payload));
+            write_bytes(output_dir / filename, slice_bytes(bytes, object.payload));
         } else {
-            write_bytes(output_dir / object_filename(object), object.owned_payload);
+            write_bytes(output_dir / filename, object.owned_payload);
         }
 
-        if (object.kind != CmsfObjectKind::kMedia) {
+        if (object.kind != CmsfObjectKind::kMedia || locmaf) {
             continue;
         }
 

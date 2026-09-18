@@ -21,6 +21,7 @@ enum class LiveMediaType {
 enum class LivePackaging {
     kRaw,
     kCmaf,
+    kLocmaf,
 };
 
 // Controls ownership of the catalog track for arbitrary live-object sources.

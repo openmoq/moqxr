@@ -15,6 +15,8 @@
 
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_object.h"
+#include "openmoq/publisher/media_packaging.h"
+#include "openmoq/publisher/locmaf_encoder.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -57,11 +59,13 @@ struct LiveDashIngestConfig {
     std::string path_prefix = "/ingest";
     std::size_t queue_depth = 128;
     std::size_t max_chunk_size = 1024 * 1024;
+    MediaPackaging media_packaging = MediaPackaging::kCmaf;
 };
 
 class LiveDashIngestSession {
 public:
-    explicit LiveDashIngestSession(std::size_t queue_depth = 128);
+    explicit LiveDashIngestSession(std::size_t queue_depth = 128,
+                                   MediaPackaging packaging = MediaPackaging::kCmaf);
 
     void ingest(std::string path, std::span<const std::uint8_t> bytes);
     void close();
@@ -79,6 +83,7 @@ private:
         std::vector<std::uint8_t> init_bytes;
         std::vector<TrackDescription> tracks;
         std::vector<std::uint8_t> pending_moof;
+        std::vector<std::uint8_t> pending_chunk;
         std::map<std::string, std::size_t> next_group_by_track;
         bool initialized = false;
     };
@@ -107,6 +112,9 @@ private:
     std::vector<LiveTrack> snapshot_tracks_locked() const;
     LiveObject build_catalog_locked();
 
+    MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
+    std::map<std::string, std::unique_ptr<LocmafEncoder>> locmaf_encoders_;
+    std::string encoding_error_;
     std::size_t queue_depth_ = 0;
     std::map<std::string, PathState> paths_;
     std::vector<RegisteredTrack> tracks_;

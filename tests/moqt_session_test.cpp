@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -65,6 +67,7 @@ using openmoq::publisher::LiveCatalogMode;
 using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
 using openmoq::publisher::LiveTrack;
+using openmoq::publisher::MediaPackaging;
 using openmoq::publisher::PublishPlan;
 using openmoq::publisher::TrackDescription;
 using openmoq::publisher::materialize_publish_plan;
@@ -8321,7 +8324,69 @@ int main() {
                      "expected media object plus retained catalog replay for late catalog subscription");
     }
 
+    for (const bool audio_only : {false, true}) {
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16, .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), true, false, false,
+                            std::chrono::seconds(1));
+        session.set_media_packaging(MediaPackaging::kLocmaf);
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected LOCMAF stdin session connect");
+        std::ifstream input(std::filesystem::path(__FILE__).parent_path() /
+                            (audio_only ? "fixtures/locmaf-audio.mp4" : "fixtures/locmaf-publisher.mp4"),
+                            std::ios::binary);
+        ok &= expect(input.good(), "expected real LOCMAF stdin fixture");
+        status = session.publish_live(input, DraftVersion::kDraft16, false);
+        ok &= expect(status.ok, "expected LOCMAF stdin publish: " + status.message);
+        std::size_t full_objects = 0;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 0 || write.bytes.empty()) continue;
+            std::uint64_t type, alias, group, object, length;
+            std::vector<std::uint8_t> payload;
+            if (decode_object_stream_fields(write.bytes, type, alias, group, object, length, payload)) {
+                ok &= expect(!payload.empty() && payload.front() == 2,
+                             "expected each stdin media group to carry a full LOCMAF object");
+                ++full_objects;
+            }
+        }
+        ok &= expect(full_objects >= 2 && session.publish_stats().objects_published == full_objects,
+                     "expected LOCMAF stdin media objects without prefix markers");
+    }
+
     {
+        MockTransport locmaf_transport;
+        MoqtSession session(locmaf_transport);
+        session.set_media_packaging(MediaPackaging::kLocmaf);
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected LOCMAF constraint session connect");
+        std::istringstream input;
+        status = session.publish_live(input, DraftVersion::kDraft16, true, true);
+        ok &= expect(!status.ok && status.message.find("single subgroup") != std::string::npos,
+                     "expected LOCMAF per-object stream rejection before input/setup");
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = []() -> std::optional<LiveObject> { return std::nullopt; },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        status = session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(!status.ok && status.message.find("source-owned catalog") != std::string::npos,
+                     "expected LOCMAF opaque source catalog rejection before setup");
+        PublishPlan invalid_plan;
+        invalid_plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft16);
+        invalid_plan.tracks.push_back(TrackDescription{.track_name = "video", .packaging = "locmaf"});
+        invalid_plan.objects.push_back(CmsfObject{.kind = CmsfObjectKind::kMedia,
+            .track_name = "video", .subgroup_id = 1, .owned_payload = {2}});
+        status = session.publish(invalid_plan);
+        ok &= expect(!status.ok && status.message.find("single subgroup") != std::string::npos,
+                     "expected LOCMAF batch nonzero subgroup rejection before setup");
+        ok &= expect(locmaf_transport.writes.empty(),
+                     "expected invalid LOCMAF options to emit no setup or media");
+    }
+
+    for (const bool locmaf : {false, true}) {
         MockTransport grouped_live_transport;
         grouped_live_transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
@@ -8337,15 +8402,16 @@ int main() {
 
         std::vector<LiveObject> objects = {
             LiveObject{.track_name = "video", .group_id = 0, .object_id = 0,
-                       .payload = {'V', '0'}, .final_in_subgroup = false},
+                       .payload = {'V', '0'}, .final_in_subgroup = locmaf},
             LiveObject{.track_name = "video", .group_id = 0, .object_id = 1,
-                       .payload = {'V', '1'}, .final_in_subgroup = false},
+                       .payload = {'V', '1'}, .final_in_subgroup = locmaf},
             LiveObject{.track_name = "video", .group_id = 1, .object_id = 0,
-                       .payload = {'V', '2'}, .final_in_subgroup = false},
+                       .payload = {'V', '2'}, .final_in_subgroup = locmaf},
         };
         std::size_t object_index = 0;
         LiveObjectSource source{
-            .tracks = {LiveTrack{.track_name = "video"}},
+            .tracks = {LiveTrack{.track_name = "video", .packaging = locmaf
+                ? openmoq::publisher::LivePackaging::kLocmaf : openmoq::publisher::LivePackaging::kRaw}},
             .next_object = [&]() -> std::optional<LiveObject> {
                 if (object_index >= objects.size()) {
                     return std::nullopt;

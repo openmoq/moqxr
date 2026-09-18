@@ -53,6 +53,32 @@ config.subscriber_timeout = std::chrono::seconds(30);
 openmoq::publisher::Publisher publisher(config);
 ```
 
+### Optional LOCMAF packaging
+
+`PublisherConfig::media_packaging` defaults to `MediaPackaging::kCmaf`.
+Choose LOCMAF before constructing the publisher or calling `set_config()`:
+
+```cpp
+using namespace openmoq::publisher;
+PublisherConfig config;
+config.media_packaging = MediaPackaging::kLocmaf;
+Publisher publisher(config);
+```
+
+This converts prepared file/stream input and incremental stdin/SRT input on
+the default backend. Keep `split_cmaf_chunks = true` and
+`live_stream_per_object = false`; incompatible configurations are rejected.
+Batch preparation may retain an ineligible track as CMAF, so inspect the
+prepared plan's track packaging rather than assuming every track converted.
+See [LOCMAF constraints](quickstart.md#opt-in-to-locmaf).
+
+For CTE DASH ingest, also set
+`LiveDashIngestConfig::media_packaging = MediaPackaging::kLocmaf` on the ingest
+server, or pass `MediaPackaging::kLocmaf` as the second constructor argument
+to `LiveDashIngestSession`. That producer performs the conversion before
+handing objects to `publish_live_objects()`. The CLI configures both sides
+when `--packaging locmaf` is selected.
+
 ## 4. Optional CAT4MOQ Authorization
 
 Applications that need CAT4MOQ or other MoQ authorization-token carriage configure tokens at the public API layer. Transport internals consume this config when encoding setup, namespace, and publish request messages.
@@ -255,6 +281,21 @@ Each `LiveObject` supplies the target track, group/object IDs, media timing, and
 the payload bytes to send. `object_id == 0` starts a group (and is treated as a
 sync point); `final_in_subgroup && subgroup_contains_group_largest` closes the
 group.
+
+### Already encoded LOCMAF objects
+
+`publish_live_objects()` forwards caller-provided payloads; setting the global
+packaging option does not convert arbitrary CMAF or RAW payloads. Declare an
+already encoded track as `LivePackaging::kLocmaf`, supply valid LOCMAF objects
+and matching catalog/initialization data through the source, and use subgroup
+zero. The native session keeps the subgroup open across objects, overriding
+`final_in_subgroup` for LOCMAF tracks. Callers own header state and recovery;
+full headers on every object match the built-in producers' behavior.
+
+LOCMAF sources reject `LiveCatalogMode::kSourceObject` and RAW media track
+declarations. The libmoq backend rejects LOCMAF as well. Use file/stream
+preparation, incremental `publish_live()`, or DASH ingest when the library
+should perform the conversion and catalog construction.
 
 ### Caller-supplied catalogs
 

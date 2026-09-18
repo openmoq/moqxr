@@ -861,6 +861,21 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             duration_ms = duration_ms_from_mdhd(*mdhd, timescale, bytes);
         }
 
+        std::optional<TrackFragmentDefaults> fragment_defaults;
+        if (const auto* mvex = find_child(*moov, "mvex")) {
+            for (const auto& trex : mvex->children) {
+                if (trex.type == "trex" && trex.payload.size >= 24 &&
+                    read_be32(bytes, trex.payload.offset + 4) == track_id) {
+                    fragment_defaults = TrackFragmentDefaults{
+                        .sample_duration = read_be32(bytes, trex.payload.offset + 12),
+                        .sample_size = read_be32(bytes, trex.payload.offset + 16),
+                        .sample_flags = read_be32(bytes, trex.payload.offset + 20),
+                    };
+                    break;
+                }
+            }
+        }
+
         tracks.push_back({
             .track_id = track_id,
             .handler_type = handler_type,
@@ -882,6 +897,7 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             .duration_ms = duration_ms,
             .language = language,
             .protection = std::move(protection),
+            .fragment_defaults = fragment_defaults,
         });
         ++track_index;
     }

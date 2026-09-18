@@ -69,6 +69,28 @@ int main() {
     video.framerate = 30.0;
     minimal.tracks.push_back(video);
 
+    {
+        auto locmaf = minimal;
+        locmaf.tracks[0].packaging = "locmaf";
+        ok &= throws_runtime_error(locmaf, "LOCMAF requires locmafVersion");
+        locmaf.tracks[0].locmaf_version = "0.3";
+        ok &= expect_contains(serialize_catalog(locmaf), "\"locmafVersion\":\"0.3\"",
+                              "LOCMAF version must be a string");
+        locmaf.tracks[0].locmaf_version = "0.2";
+        ok &= throws_runtime_error(locmaf, "unsupported LOCMAF version must be refused");
+        locmaf.tracks[0].packaging = "cmaf";
+        ok &= throws_runtime_error(locmaf, "CMAF must not carry locmafVersion");
+        locmaf.tracks[0].locmaf_version.reset();
+        locmaf.tracks[0].custom_fields["locmafVersion"] = "\"0.3\"";
+        ok &= throws_runtime_error(locmaf, "custom fields must not bypass LOCMAF version validation");
+        TrackDescription description;
+        description.track_name = "locmaf-video";
+        description.packaging = "locmaf";
+        description.handler_type = "vide";
+        ok &= expect(make_msf_track(description, true).locmaf_version == "0.3",
+                     "shared track factory must signal LOCMAF version");
+    }
+
     const std::string json = serialize_catalog(minimal);
     ok &= expect_contains(json, "\"version\":\"1\"", "expected version as a JSON string");
     ok &= expect_not_contains(json, "\"version\":1", "expected no numeric version");

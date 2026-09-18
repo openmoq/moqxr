@@ -50,6 +50,46 @@ The output directory should contain:
 
 When `--msf-timeline` is enabled, the output directory also contains `timeline_g0_o0.json` with explicit MSF media timeline records. When `--sap` is enabled, the output directory also contains one `*_sap_g*_o*.json` file per emitted SAP event timeline object.
 
+## Opt In to LOCMAF
+
+CMAF is the primary, default output format. `--packaging cmaf` selects it
+explicitly. To use [LOCMAF-01](draft-einarsson-moq-locmaf-01.txt), packaging
+version `0.3`, select `--packaging locmaf`:
+
+```bash
+./build/openmoq-publisher --input sample.mp4 --packaging locmaf --emit-dir out-locmaf/
+./build/openmoq-publisher --input sample.mp4 --packaging locmaf --dump-plan
+```
+
+LOCMAF compresses CMAF container metadata while retaining encoded media samples.
+The catalog marks converted tracks with `"packaging":"locmaf"` and
+`"locmafVersion":"0.3"`; initialization remains CMAF. Emitted media uses
+`<track>_g<group>_o<object>_media.locmafobj`. These files need a LOCMAF decoder;
+they are not MP4 files and have no generated `*_probe.mp4` counterpart.
+Tracks that remain CMAF retain the usual `.mp4` output names.
+
+Add the same flag to the relay, live stdin, SRT, and DASH commands below.
+The input formats stay the same: fragmented MP4 for stdin, MPEG-TS for SRT,
+and CMAF/fMP4 for DASH. The default publisher backend performs the conversion;
+LOCMAF publishing is not supported by the opt-in libmoq/moq5 backend.
+
+Current constraints:
+
+- Fragmented input must have one `traf` per `moof`; generate it with FFmpeg
+  `+separate_moof` using the [input recipes](ffmpeg.md). Multiplexed fragments
+  are rejected with a demuxing instruction.
+- `--stream-per-object` and `--coalesce-cmaf-chunks` cannot be combined with
+  LOCMAF. Published objects use full headers and subgroup zero so late joins
+  and dropped queued objects do not require earlier delta objects.
+- File preparation checks the whole track before selecting LOCMAF. An
+  ineligible track stays CMAF. Live initialization can also select CMAF, but
+  a track that becomes ineligible after being advertised as LOCMAF fails;
+  its packaging does not silently change.
+- Live stdin and DASH limit a retained chunk, including `mdat`, to 16 MiB.
+
+See [protocol mapping](protocol-mapping.md#locmaf-packaging) for encoding and
+fallback rules, and [testing](testing.md#locmaf-tests) for playback validation.
+
 ## Use Standard Input
 
 Stream input over stdin instead of reading it from a file path:
@@ -317,7 +357,7 @@ config, token generation, relay connection, and focused-test workflow.
 - `--msf-timeline` additionally creates a `timeline` media timeline track and metadata object
 - `--sap` additionally creates `*_sap` metadata tracks and objects
 - default packaging emits lower-latency split MOQT objects per group when chunk/sample boundaries are available
-- `--coalesce-cmaf-chunks` restores one media object per group
+- `--coalesce-cmaf-chunks` restores one media object per group for CMAF; it is rejected with LOCMAF
 - draft-16 defaults to ALPN `moqt-16`
 - draft-18 defaults to ALPN `moqt-18`
 - drafts 14, 17, and 19 are retained as local text or implementation-history references but are not selectable in the main CLI

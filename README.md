@@ -53,6 +53,26 @@ Emit the catalog and packaged media objects:
 ./build/openmoq-publisher --input sample.mp4 --emit-dir out/
 ```
 
+CMAF remains the default. Add `--packaging locmaf` to opt into
+[LOCMAF-01](docs/draft-einarsson-moq-locmaf-01.txt), packaging version `0.3`, for
+file, live stdin, SRT, or CTE LL-DASH publishing on the default backend. The
+publisher retains CMAF initialization and encoded sample bytes, signals LOCMAF in the
+catalog, and emits full headers so late joins and queue drops do not depend on
+earlier delta objects. File input retains original CMAF chunks, including
+encryption and auxiliary boxes; source constraints can keep an entire track on
+CMAF. A live track that becomes ineligible fails instead of changing its
+advertised packaging. `--stream-per-object`, `--coalesce-cmaf-chunks`, and the
+libmoq publishing backend are currently incompatible with LOCMAF.
+Multiplexed fragments must be demuxed first (for FFmpeg, use `separate_moof`).
+
+`--emit-dir` writes LOCMAF media as `.locmafobj` alongside the usual catalog and
+initialization segments. For a playback equivalence check against a moq-playa
+checkout with LOCMAF support, run
+`bun scripts/test-locmaf-playa.mjs build/openmoq-publisher ../moq-playa`
+(requires FFmpeg and ffprobe). See the [LOCMAF quickstart](docs/quickstart.md#opt-in-to-locmaf),
+[C++ API configuration](docs/publisher-api.md#optional-locmaf-packaging), and
+[validation coverage](docs/testing.md#locmaf-tests).
+
 Publish to a relay with the default draft-16 profile:
 
 ```bash
