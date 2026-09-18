@@ -25,6 +25,33 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
   sample boundaries are available; object IDs advance within the group.
   `--coalesce-cmaf-chunks` selects the older one-media-object-per-group path.
 
+## LOC packaging
+
+`--packaging loc --draft 18` maps the clear H.264/AAC subset of
+[LOC-04](draft-ietf-moq-loc-04.txt) onto draft-18 subgroup properties. This does
+not enable MOQT-19. CMAF remains the default.
+
+- One encoded sample per object, with no MP4 box headers in the payload.
+- Timestamp `0x10` contains source PTS and Timescale `0x08` the source clock.
+- Video frame marking `0x09` is a byte vector: complete frames set S/E;
+  independently decodable IDRs also set I. Other marking bits remain zero.
+- Video config `0x0D` carries avcC record bytes; audio config `0x0F` carries
+  AudioSpecificConfig bytes. Configuration is repeated on every generated object.
+- Video uses one subgroup (zero) per GOP; audio uses one frame per group.
+- Property IDs are sorted and delta-encoded using draft-18 vi64; value type
+  follows the absolute ID parity. A property-bearing stream retains that framing
+  for its lifetime. Duplicate IDs, type mismatches, oversized values/blocks,
+  and properties on older transport profiles fail explicitly.
+- Catalogs signal `packaging: "loc"` and codec extradata; neither `locVersion`
+  nor `locmafVersion` is emitted.
+
+Live queue loss suppresses the remainder of the affected video group until a
+new independent entry point. Source decode timing controls ordering; source
+presentation timing remains in LOC metadata. SRT source clocks are carried
+separately from synthesized CMAF timing; its repeated matching AVC parameter
+sets are stripped only on the LOC conversion path. Secure Objects and LOC-01 fallback
+are not implemented. See [LOC constraints](quickstart.md#opt-in-to-loc).
+
 ## LOCMAF packaging
 
 The opt-in implementation follows the local

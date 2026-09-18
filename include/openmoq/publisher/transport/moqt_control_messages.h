@@ -1,5 +1,7 @@
 #pragma once
 
+#include "openmoq/publisher/object_properties.h"
+
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
@@ -230,7 +232,8 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
                                                  std::uint64_t track_alias,
                                                  std::uint64_t group_id,
                                                  std::uint64_t subgroup_id,
-                                                 bool end_of_group);
+                                                 bool end_of_group,
+                                                 bool properties_present = false);
 
 // Object fields to append to an already-open subgroup stream. The first object
 // on the stream carries its absolute Object ID (pass std::nullopt for
@@ -240,7 +243,9 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
 std::vector<std::uint8_t> encode_subgroup_object(DraftVersion draft,
                                                  std::optional<std::uint64_t> previous_object_id,
                                                  std::uint64_t object_id,
-                                                 std::span<const std::uint8_t> payload);
+                                                 std::span<const std::uint8_t> payload,
+                                                 std::span<const ObjectProperty> properties = {},
+                                                 bool properties_present = false);
 
 bool decode_publish_namespace_ok(std::span<const std::uint8_t> bytes, PublishNamespaceOk& message);
 bool decode_publish_namespace_error(std::span<const std::uint8_t> bytes, PublishNamespaceError& message);

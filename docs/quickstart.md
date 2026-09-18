@@ -90,6 +90,48 @@ Current constraints:
 See [protocol mapping](protocol-mapping.md#locmaf-packaging) for encoding and
 fallback rules, and [testing](testing.md#locmaf-tests) for playback validation.
 
+## Opt In to LOC
+
+Select the clear-media subset of [LOC-04](draft-ietf-moq-loc-04.txt) with the
+native draft-18 transport:
+
+```bash
+./build/openmoq-publisher --input sample.mp4 --packaging loc --draft 18 --dump-plan
+./build/openmoq-publisher --input sample.mp4 --packaging loc --draft 18 --emit-dir out-loc/
+```
+
+Each object contains one encoded frame. The catalog uses `"packaging":"loc"`;
+video groups start at IDR frames, and each audio frame starts its own group.
+Presentation timestamps retain their source timescale, including B-frame
+reordering; transmission follows decode order. Every object repeats codec
+configuration so a retained group can initialize its decoder.
+
+Initial support is clear H.264 `avc1` and AAC-LC. Unsupported codecs, encrypted
+input, non-identity edit lists, mixed initial progressive samples plus fragments,
+negative presentation timestamps, and in-band AVC configuration changes fail
+explicitly. `--stream-per-object`, `--coalesce-cmaf-chunks`, other transport drafts,
+and the libmoq backend are incompatible with this LOC profile.
+
+The same flags select LOC for live stdin, SRT, and DASH ingest. Live MP4/DASH
+must start with an initialization segment whose sample tables are empty. SRT
+preserves its original 90 kHz PTS/DTS, including A/V offsets; matching repeated
+SPS/PPS are stripped from its converted samples, while changed parameters fail.
+SRT requires one AVC access unit per PES and one AAC raw data block per ADTS
+frame; AAC configuration changes and detected multi-picture AVC samples fail.
+Video uses one-sample lookahead to determine decode duration. At shutdown, the
+last sample reuses the last measured decode interval for scheduling; a lone
+sample with no measured interval fails. Missing or regressing PES clocks fail
+instead of rebasing the source timeline.
+
+Inspection output contains raw `*_media.loc` samples, `*_config.bin` codec
+extradata, and `*_properties.json` sidecars. Sidecars include the encoded property
+block and scheduling metadata; these inspection files are not a standalone LOC
+container and cannot be fed directly to ffprobe.
+
+The reference Playa branch currently implements older LOC-01 property IDs.
+LOCMAF support in a player or relay does not imply LOC-04 playback support. See
+[LOC tests](testing.md#loc-04-tests) for the independent decoder check.
+
 ## Use Standard Input
 
 Stream input over stdin instead of reading it from a file path:

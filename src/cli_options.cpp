@@ -409,10 +409,12 @@ CliOptions parse_cli_options(int argc, char** argv) {
             const auto value = require_value("--packaging");
             if (value == "cmaf") {
                 options.media_packaging = MediaPackaging::kCmaf;
+            } else if (value == "loc") {
+                options.media_packaging = MediaPackaging::kLoc;
             } else if (value == "locmaf") {
                 options.media_packaging = MediaPackaging::kLocmaf;
             } else {
-                throw std::runtime_error("--packaging must be cmaf or locmaf");
+                throw std::runtime_error("--packaging must be cmaf, locmaf, or loc");
             }
         } else if (argument == "--coalesce-cmaf-chunks") {
             options.split_cmaf_chunks = false;
@@ -459,6 +461,15 @@ CliOptions parse_cli_options(int argc, char** argv) {
         (options.stream_per_object || !options.split_cmaf_chunks)) {
         throw std::runtime_error("LOCMAF requires one chunk per object and one subgroup per group; "
                                  "--stream-per-object and --coalesce-cmaf-chunks are incompatible");
+    }
+
+    if (options.media_packaging == MediaPackaging::kLoc) {
+        if (options.draft_version != DraftVersion::kDraft18) {
+            throw std::runtime_error("LOC-04 requires --draft 18");
+        }
+        if (options.stream_per_object || !options.split_cmaf_chunks) {
+            throw std::runtime_error("LOC requires one sample per object and a stream per GOP");
+        }
     }
 
     const bool live_source_uses_stdin =
@@ -575,7 +586,7 @@ std::string build_usage(const char* argv0) {
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
            " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 14|16|17|18] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
-           " [--packaging cmaf|locmaf] [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
+           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--retry <count>]"
            " [--cert file] [--key file] [--ca file] [--insecure]"

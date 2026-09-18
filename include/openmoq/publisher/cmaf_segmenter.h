@@ -1,9 +1,11 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "openmoq/publisher/mp4_box.h"
+#include "openmoq/publisher/object_properties.h"
 
 namespace openmoq::publisher {
 
@@ -15,6 +17,21 @@ enum class CmafObjectMode {
 struct PayloadBuffer {
     ByteSpan span;
     std::vector<std::uint8_t> owned_bytes;
+};
+
+// Original elementary-stream clock, retained separately from synthesized CMAF.
+// SRT preserves the original 33-bit 90 kHz PES PTS/DTS and the A/V offset;
+// LOC rejects a backwards/wrapped clock rather than silently rebasing it.
+// A zero duration means the source does not signal it (e.g. video PES).
+// Sequence increments per track before queueing so consumers can detect drops.
+struct SourceSampleTiming {
+    std::uint64_t decode_time = 0;
+    std::int64_t presentation_time = 0;
+    std::uint64_t duration = 0;
+    std::uint32_t timescale = 90000;
+    std::uint64_t sequence = 0;
+    // AAC AudioSpecificConfig from this ADTS frame, for configuration checks.
+    std::vector<std::uint8_t> codec_config{};
 };
 
 struct MediaFragment {
@@ -29,6 +46,8 @@ struct MediaFragment {
     bool is_video_keyframe = false;  // True if this is a video track IDR/keyframe fragment
     std::uint64_t creation_time_us = 0;  // Wall-clock time when fragment was created (for queue delay measurement)
     PayloadBuffer payload;
+    std::vector<ObjectProperty> properties{};
+    std::optional<SourceSampleTiming> source_timing{};
 };
 
 struct SegmentedMp4 {

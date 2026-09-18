@@ -409,6 +409,7 @@ std::vector<std::uint8_t> annexb_to_avcc(std::span<const std::uint8_t> payload) 
 struct EsSample {
     bool is_video = false;
     std::uint64_t pts90k = 0;
+    std::optional<SourceSampleTiming> source_timing;
     std::uint8_t stream_type = 0;
     std::vector<std::uint8_t> payload;
     bool keyframe = false;
@@ -437,6 +438,7 @@ struct CallerTrackState {
     std::map<std::string, std::uint64_t> last_pts_by_track;
     std::map<std::string, std::uint64_t> last_duration_us_by_track;
     std::map<std::string, std::uint64_t> decode_time_by_track;
+    std::map<std::string, std::uint64_t> source_sequence_by_track;
     std::uint32_t moof_sequence = 1;
     VideoCodec video_codec = VideoCodec::kUnknown;
     // Shared PTS origin (90 kHz) for A/V timeline alignment.
@@ -1071,6 +1073,7 @@ private:
         bool active = false;
         bool is_video = false;
         std::uint64_t pts90k = 0;
+        std::optional<SourceSampleTiming> source_timing;
         std::vector<std::uint8_t> data;
     };
 
@@ -1206,6 +1209,26 @@ private:
                 pes.pts90k |= static_cast<std::uint64_t>(payload[cursor + 3]) << 7U;
                 pes.pts90k |= static_cast<std::uint64_t>((payload[cursor + 4] >> 1U) & 0x7FU);
             }
+            // Keep the PES clock for LOC; synthesized CMAF retains its legacy
+            // accumulated decode timeline. Invalid/missing clocks are not guessed.
+            const auto timestamp = [&](std::size_t at, std::uint8_t prefix)
+                -> std::optional<std::uint64_t> {
+                if (at + 5 > payload.size() || at + 5 > 9U + header_len ||
+                    (payload[at] >> 4U) != prefix || !(payload[at] & 1U) ||
+                    !(payload[at + 2] & 1U) || !(payload[at + 4] & 1U)) return std::nullopt;
+                return (static_cast<std::uint64_t>((payload[at] >> 1U) & 7U) << 30U) |
+                       (static_cast<std::uint64_t>(payload[at + 1]) << 22U) |
+                       (static_cast<std::uint64_t>((payload[at + 2] >> 1U) & 127U) << 15U) |
+                       (static_cast<std::uint64_t>(payload[at + 3]) << 7U) |
+                       ((payload[at + 4] >> 1U) & 127U);
+            };
+            const auto pts_dts = (flags >> 6U) & 3U;
+            const auto pts = timestamp(9, pts_dts == 3 ? 3 : 2);
+            const auto dts = pts_dts == 3 ? timestamp(14, 1) : pts;
+            if (pts_dts >= 2 && pts && dts) {
+                pes.source_timing = SourceSampleTiming{
+                    .decode_time = *dts, .presentation_time = static_cast<std::int64_t>(*pts)};
+            }
             cursor = 9 + header_len;
             if (cursor < payload.size()) {
                 pes.data.insert(pes.data.end(), payload.begin() + static_cast<std::ptrdiff_t>(cursor), payload.end());
@@ -1228,6 +1251,7 @@ private:
             EsSample sample;
             sample.is_video = true;
             sample.pts90k = pes.pts90k;
+            sample.source_timing = pes.source_timing;
             sample.stream_type = stream_type;
             sample.payload = std::move(pes.data);
             const VideoCodec codec = detect_video_codec_from_stream_type(stream_type);
@@ -1281,6 +1305,28 @@ private:
                     // Rational PTS: (frame_index * 1024 * 90000 + rate/2) / rate
                     sample.pts90k = pes.pts90k +
                         (frame_index * 1024ULL * 90000ULL + aac_sample_rate / 2) / aac_sample_rate;
+                    const auto header = std::span<const std::uint8_t>(pes.data).subspan(offset, header_len);
+                    const auto [frame_rate, frame_channels] = parse_adts_audio_params(header);
+                    // LOC verifies every frame's decoder configuration. Multiple
+                    // raw_data_blocks are outside the one-access-unit profile.
+                    if (pes.source_timing && frame_rate != 0 && frame_channels != 0 &&
+                        (header[6] & 3U) == 0) {
+                        const auto offset90k = (frame_index * 1024ULL * 90000ULL + frame_rate / 2) / frame_rate;
+                        const auto next90k = ((frame_index + 1) * 1024ULL * 90000ULL + frame_rate / 2) / frame_rate;
+                        sample.source_timing = *pes.source_timing;
+                        sample.source_timing->decode_time += offset90k;
+                        sample.source_timing->presentation_time += static_cast<std::int64_t>(offset90k);
+                        sample.source_timing->duration = next90k - offset90k;
+                        const auto object_type = static_cast<std::uint8_t>((header[2] >> 6U) + 1U);
+                        const auto frequency_index = static_cast<std::uint8_t>((header[2] >> 2U) & 15U);
+                        sample.source_timing->codec_config = {
+                            static_cast<std::uint8_t>((object_type << 3U) | (frequency_index >> 1U)),
+                            static_cast<std::uint8_t>((frequency_index << 7U) | (frame_channels << 3U))};
+                        if (sample.source_timing->decode_time >= (1ULL << 33U) ||
+                            sample.source_timing->presentation_time >= (1LL << 33U)) {
+                            sample.source_timing.reset(); // explicit LOC refusal at PES clock rollover
+                        }
+                    }
                     sample.stream_type = stream_type;
                     sample.keyframe = false;
                     // Preserve ADTS header on first frame for codec discovery
@@ -1304,6 +1350,7 @@ private:
                     EsSample sample;
                     sample.is_video = false;
                     sample.pts90k = pes.pts90k;
+                    sample.source_timing = pes.source_timing;
                     sample.stream_type = stream_type;
                     sample.keyframe = false;
                     sample.payload = std::move(pes.data);
@@ -1314,6 +1361,7 @@ private:
                 EsSample sample;
                 sample.is_video = false;
                 sample.pts90k = pes.pts90k;
+                sample.source_timing = pes.source_timing;
                 sample.stream_type = stream_type;
                 sample.keyframe = false;
                 sample.payload = std::move(pes.data);
@@ -1427,6 +1475,9 @@ MediaFragment build_fragment_from_sample(const LiveSrtCallerRuntimeConfig& confi
     auto mdat = build_mdat_box(sample_bytes);
 
     MediaFragment fragment;
+    fragment.source_timing = sample.source_timing;
+    const auto sequence = state.source_sequence_by_track[track_name]++;
+    if (fragment.source_timing) fragment.source_timing->sequence = sequence;
     fragment.group_id = state.group_id;
     fragment.object_id = state.object_id_by_track[track_name]++;
     fragment.track_name = track_name;
@@ -1494,6 +1545,36 @@ std::pair<std::string, std::uint16_t> split_host_port(std::string_view endpoint)
 }
 
 }  // namespace
+
+namespace live_srt_internal {
+std::vector<TrackDescription> codec_tracks_for_testing() {
+    auto video = make_track(1, "video", true, VideoCodec::kH264);
+    video.codec_private = build_avcc_box({0x67, 0x42, 0, 0x1e}, {0x68, 0xce, 0x06, 0xe2});
+    auto audio = make_track(2, "audio", false);
+    const std::array<std::uint8_t, 7> adts{0xff, 0xf1, 0x4c, 0x80, 0, 0xff, 0xfc};
+    audio.codec_private = build_esds_box(adts);
+    return {video, audio};
+}
+std::vector<MediaFragment> demux_fragments_for_testing(std::span<const std::uint8_t> bytes, bool discover) {
+    LiveSrtCallerRuntimeConfig config;
+    config.fragment_on_keyframe = false;
+    config.has_video_pid = !discover;
+    config.video_pid = 256;
+    config.has_audio_pid = !discover;
+    config.audio_pid = 257;
+    TsPesDemuxer demuxer(config);
+    CallerTrackState state;
+    state.video_track_name = "video";
+    state.audio_track_name = "audio";
+    state.video_track_id = 1;
+    state.audio_track_id = 2;
+    std::vector<MediaFragment> fragments;
+    demuxer.feed(bytes.data(), bytes.size(), [&](EsSample&& sample) {
+        fragments.push_back(build_fragment_from_sample(config, state, std::move(sample)));
+    });
+    return fragments;
+}
+}  // namespace live_srt_internal
 
 LiveSrtIngestManager::LiveSrtIngestManager(std::vector<LiveSrtCallerRuntimeConfig> callers,
                                            FragmentSink sink,

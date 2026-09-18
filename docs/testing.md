@@ -45,6 +45,30 @@ cmake --build build-nosmoke
 ctest --test-dir build-nosmoke --output-on-failure
 ```
 
+## LOC-04 Tests
+
+```bash
+ctest --test-dir build --output-on-failure
+bun scripts/test-loc04.mjs build/openmoq-publisher
+```
+
+The independent script requires Bun, FFmpeg, and ffprobe. It generates H.264
+with B-frames and AAC, verifies exact sample bytes and presentation timestamps,
+decodes draft-18 vi64 property blocks independently, reconstructs MP4 for decoder
+input, and compares decoded frame hashes. It validates 217 samples in its current
+fixture. Source DTS/durations are checked against inspection metadata before
+reconstruction; LOC itself does not carry a standalone DTS/duration property.
+
+CTest covers sample extraction and malformed input, LOC catalogs and grouping,
+property framing, session propagation, and live queue recovery. SRT tests check
+original PES timing, malformed clocks, AAC configuration changes, and decode
+lookahead without changing synthesized CMAF bytes. The libmoq
+translation suite checks explicit rejection of unsupported LOC publishing.
+Existing CMAF/LOCMAF fixture outputs were compared byte-for-byte (excluding only
+catalog generation time), and the offline LOCMAF Playa check still covers 232
+samples. These offline checks do not establish relay forwarding, cached FETCH,
+or browser LOC-04 playback.
+
 ## LOCMAF Tests
 
 The regular suite includes LOCMAF encoding, catalog signaling, CLI validation,
