@@ -22,6 +22,8 @@
 
 namespace openmoq::publisher {
 
+class LocTrackEncoder;
+
 class ChunkedBodyDecoder {
 public:
     explicit ChunkedBodyDecoder(std::size_t max_chunk_size = 1024 * 1024);
@@ -114,6 +116,8 @@ private:
 
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     std::map<std::string, std::unique_ptr<LocmafEncoder>> locmaf_encoders_;
+    std::map<std::string, std::shared_ptr<LocTrackEncoder>> loc_encoders_;
+    std::map<std::string, std::size_t> loc_dropped_group_;
     std::string encoding_error_;
     std::size_t queue_depth_ = 0;
     std::map<std::string, PathState> paths_;

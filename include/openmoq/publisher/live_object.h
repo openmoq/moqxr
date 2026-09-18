@@ -1,5 +1,7 @@
 #pragma once
 
+#include "openmoq/publisher/object_properties.h"
+
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -22,6 +24,7 @@ enum class LivePackaging {
     kRaw,
     kCmaf,
     kLocmaf,
+    kLoc,
 };
 
 // Controls ownership of the catalog track for arbitrary live-object sources.
@@ -64,6 +67,7 @@ struct LiveObject {
     std::vector<std::uint8_t> payload;
     bool subgroup_contains_group_largest = true;
     bool final_in_subgroup = true;
+    std::vector<ObjectProperty> properties{};
 };
 
 struct LiveObjectSource {

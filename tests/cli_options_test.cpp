@@ -847,5 +847,20 @@ int main() {
                      "expected usage to list --version");
     }
 
+    try {
+        const auto loc = parse({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "18"});
+        ok &= expect(loc.media_packaging != openmoq::publisher::MediaPackaging::kCmaf &&
+                     loc.media_packaging != openmoq::publisher::MediaPackaging::kLocmaf,
+                     "LOC must select its own packaging profile");
+    } catch (const std::exception& error) {
+        ok &= expect(false, std::string("LOC-04 CLI should be accepted: ") + error.what());
+    }
+    ok &= expect(parse_throws({"publisher", "--input", "sample.mp4", "--packaging", "loc"},
+                              "draft 18", "LOC must reject the default draft16"), "LOC draft gate");
+    for (const auto flag : {"--coalesce-cmaf-chunks", "--stream-per-object"}) {
+        ok &= expect(parse_throws({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "18", flag},
+                                  "LOC", "LOC must reject incompatible chunk delivery"), "LOC delivery gate");
+    }
+
     return ok ? 0 : 1;
 }

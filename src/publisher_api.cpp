@@ -1,5 +1,6 @@
 #include "openmoq/publisher/publisher_api.h"
 #include "locmaf_packager.h"
+#include "loc_packager.h"
 
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/mp4_box.h"
@@ -20,6 +21,10 @@ namespace openmoq::publisher {
 namespace {
 
 void validate_packaging(const PublisherConfig& config) {
+    if (config.media_packaging == MediaPackaging::kLoc) {
+        if (config.draft_version != DraftVersion::kDraft18) throw std::runtime_error("LOC-04 requires draft 18");
+        if (!config.split_cmaf_chunks || config.live_stream_per_object) throw std::runtime_error("LOC requires one sample per object and a stream per GOP");
+    }
     if (config.media_packaging == MediaPackaging::kLocmaf &&
         (!config.split_cmaf_chunks || config.live_stream_per_object)) {
         throw std::runtime_error("LOCMAF requires one chunk per object and one subgroup per group");
@@ -119,6 +124,9 @@ void Publisher::set_config(const PublisherConfig& config) {
 
 PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const {
     const ParsedMp4 parsed_mp4 = parse_mp4_file(path.string());
+    if (config_.media_packaging == MediaPackaging::kLoc) {
+        return {parsed_mp4.bytes, prepare_loc_plan(parsed_mp4, config_)};
+    }
     if (config_.media_packaging == MediaPackaging::kLocmaf) {
         return {parsed_mp4.bytes, prepare_locmaf_plan(parsed_mp4, config_)};
     }
@@ -137,6 +145,9 @@ PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const
 
 PreparedPublish Publisher::prepare_stream(std::istream& input, std::string_view source_name) const {
     const ParsedMp4 parsed_mp4 = parse_mp4_stream(input, source_name);
+    if (config_.media_packaging == MediaPackaging::kLoc) {
+        return {parsed_mp4.bytes, prepare_loc_plan(parsed_mp4, config_)};
+    }
     if (config_.media_packaging == MediaPackaging::kLocmaf) {
         return {parsed_mp4.bytes, prepare_locmaf_plan(parsed_mp4, config_)};
     }
@@ -172,10 +183,10 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
     // own methods below; the MoqtSession transport now only serves injected-
     // factory callers and builds without libmoq.
     if (!transport_factory_injected_) {
-        if (config_.media_packaging == MediaPackaging::kLocmaf ||
+        if (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf ||
             std::any_of(prepared.plan.tracks.begin(), prepared.plan.tracks.end(),
-                        [](const auto& track) { return track.packaging == "locmaf"; })) {
-            return transport::TransportStatus::failure("LOCMAF is not supported by the libmoq publishing backend");
+                        [](const auto& track) { return track.packaging == "loc" || track.packaging == "locmaf"; })) {
+            return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
         }
         const transport::EndpointConfig resolved_endpoint =
             resolve_endpoint(endpoint, endpoint_alpn_overridden);
@@ -292,8 +303,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                                                    const transport::TlsConfig& tls,
                                                    bool endpoint_alpn_overridden) const {
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
-    if (!transport_factory_injected_ && config_.media_packaging == MediaPackaging::kLocmaf) {
-        return transport::TransportStatus::failure("LOCMAF is not supported by the libmoq publishing backend");
+    if (!transport_factory_injected_ && (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf)) {
+        return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
     }
     // Live stdin and SRT publishing prefer the libmoq service tier unless a
     // custom TransportFactory was injected. (publish_live_objects routes to
@@ -485,10 +496,10 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
     // real media metadata per track; a bare/legacy LiveTrack fails with a clear
     // message rather than being faked as a generic media track.
     if (!transport_factory_injected_ && !source_supplies_catalog) {
-        if (config_.media_packaging == MediaPackaging::kLocmaf ||
+        if (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf ||
             std::any_of(source.tracks.begin(), source.tracks.end(),
-                        [](const auto& track) { return track.packaging == LivePackaging::kLocmaf; })) {
-            return transport::TransportStatus::failure("LOCMAF is not supported by the libmoq publishing backend");
+                        [](const auto& track) { return track.packaging == LivePackaging::kLoc || track.packaging == LivePackaging::kLocmaf; })) {
+            return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
         }
         for (const auto& track : source.tracks) {
             if (!transport::live_track_has_media_metadata(track)) {

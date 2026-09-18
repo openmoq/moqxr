@@ -5,3 +5,11 @@ ffmpeg -f lavfi -i testsrc2=size=32x32:rate=4 -t 1 -c:v libx264 -pix_fmt yuv420p
 ffmpeg -hide_banner -loglevel error -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -c:a aac -b:a 32k -movflags empty_moov+default_base_moof+frag_keyframe -frag_duration 500000 tests/fixtures/locmaf-audio.mp4
 
 ffmpeg -hide_banner -loglevel error -i tests/fixtures/locmaf-publisher.mp4 -c copy -movflags +faststart tests/fixtures/locmaf-progressive.mp4
+
+LOC B-frame fixtures (FFmpeg libx264, 64x64, 4 frames, no edit list):
+ffmpeg -v error -f lavfi -i testsrc2=size=64x64:rate=4 -t 1 -c:v libx264 -g 4 -bf 2 -an -use_editlist 0 -movflags +frag_keyframe+empty_moov+default_base_moof tests/fixtures/loc-bframes-fragmented.mp4
+ffmpeg -v error -f lavfi -i testsrc2=size=64x64:rate=4 -t 1 -c:v libx264 -g 4 -bf 2 -an -use_editlist 0 tests/fixtures/loc-bframes-progressive.mp4
+ffprobe -v error -show_packets -show_entries packet=pts,dts,duration,size,pos,flags -of csv=p=0 tests/fixtures/loc-bframes-fragmented.mp4
+Expected PTS: 8192,20480,12288,16384; DTS: 0,4096,8192,12288; duration: 4096.
+Packet sizes: 2105,812,537,436; fragmented positions: 921,3026,3838,4375.
+Progressive positions: 48,2153,2965,3502. First packet is IDR; remaining packets depend on it.

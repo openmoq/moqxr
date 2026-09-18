@@ -14,6 +14,21 @@ Draft status:
 - CTE LL-DASH regressions cover FFmpeg-style multi-representation paths and draft-16 await-subscribe delivery
 - the main CLI supports ordered relay failover through repeated `--endpoint` values and `--retry N` same-endpoint retries; transport/connectivity failures are retryable, relay namespace/track rejections skip directly to the next endpoint, and fatal or cancelled work stops
 
+## LOC Status
+
+The native backend implements the clear H.264/AAC subset of LOC-04 with
+`--packaging loc --draft 18`. CMAF remains the primary default and LOCMAF keeps
+its separate packaging path. LOC objects carry source presentation timing,
+timescale, frame marking, and codec extradata; video uses GOP groups and audio
+uses one sample per group. Unsupported input and configuration changes fail
+explicitly. The libmoq backend does not publish this LOC profile.
+
+Independent offline validation covers 217 encoded samples and decoded-frame
+equivalence, alongside property-wire and live-ingest regressions. Real relay
+forwarding, cached FETCH, and LOC-04 browser playback remain unverified; the
+reference Playa LOC decoder still uses LOC-01 IDs. See the
+[quickstart](quickstart.md#opt-in-to-loc) and [tests](testing.md#loc-04-tests).
+
 ## LOCMAF Status
 
 LOCMAF-01, packaging version `0.3`, is implemented as an opt-in addition;
