@@ -2,9 +2,11 @@
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_srt_ingest.h"
+#include "openmoq/publisher/locmaf_encoder.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
 #include "../live_media_queue.h"
+#include "../loc_packager.h"
 
 #include <algorithm>
 #include <array>
@@ -2410,6 +2412,28 @@ public:
             std::uint64_t stream_id = 0;
             std::vector<std::uint8_t> wire_bytes;
             const bool opened_stream = stream_it == streams_.end();
+            const bool properties_present = opened_stream
+                                                ? !object.properties.empty()
+                                                : stream_it->second.properties_present;
+            if (!properties_present && !object.properties.empty()) {
+                return {TransportStatus::failure("cannot add properties to a subgroup opened without PROPERTIES"),
+                        ServeDisposition::kSkipped};
+            }
+            if (!opened_stream) {
+                previous_object_id = stream_it->second.last_object_id;
+            }
+            std::vector<std::uint8_t> object_bytes;
+            try {
+                object_bytes = encode_subgroup_object(draft, previous_object_id, object.object_id,
+                                                      payload, object.properties, properties_present);
+                if (opened_stream) {
+                    wire_bytes = encode_subgroup_header(
+                        draft, track_alias, static_cast<std::uint64_t>(object.group_id),
+                        object.subgroup_id, subgroup_contains_group_largest, properties_present);
+                }
+            } catch (const std::exception& error) {
+                return {TransportStatus::failure(error.what()), ServeDisposition::kSkipped};
+            }
             if (opened_stream) {
                 const auto open_started_ms =
                     trace_enabled() ? trace_elapsed_ms(std::chrono::steady_clock::now()) : 0;
@@ -2430,21 +2454,15 @@ public:
                 if (!status.ok) {
                     return {status, ServeDisposition::kSkipped};
                 }
-                wire_bytes = encode_subgroup_header(
-                    draft, track_alias, static_cast<std::uint64_t>(object.group_id),
-                    object.subgroup_id, subgroup_contains_group_largest);
                 ++stream_count_;
                 stream_it = streams_.emplace(
-                    key, OpenStream{stream_id, std::nullopt, transport_priority}).first;
+                    key, OpenStream{stream_id, std::nullopt, transport_priority, properties_present}).first;
                 stream_keys_.insert_or_assign(stream_id, key);
             } else {
                 stream_id = stream_it->second.stream_id;
-                previous_object_id = stream_it->second.last_object_id;
                 stream_it->second.transport_priority = transport_priority;
             }
 
-            std::vector<std::uint8_t> object_bytes =
-                encode_subgroup_object(draft, previous_object_id, object.object_id, payload);
             wire_bytes.insert(wire_bytes.end(), object_bytes.begin(), object_bytes.end());
             if (!payload.empty() &&
                 (object_bytes.size() < payload.size() ||
@@ -2765,6 +2783,7 @@ private:
         std::uint64_t stream_id;
         std::optional<std::uint64_t> last_object_id;
         std::uint8_t transport_priority;
+        bool properties_present = false;
     };
     struct PendingObject {
         std::uint64_t object_id;
@@ -6353,6 +6372,29 @@ TransportStatus MoqtSession::connect(const EndpointConfig& endpoint, const TlsCo
 }
 
 TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan) {
+    try {
+        for (const auto& track : plan.tracks) {
+            if (track.packaging == "loc" && plan.draft.version != DraftVersion::kDraft18) {
+                return TransportStatus::failure("LOC requires draft 18");
+            }
+        }
+        for (const auto& object : plan.objects) {
+            if (!object.properties.empty() && plan.draft.version != DraftVersion::kDraft18) {
+                return TransportStatus::failure("object properties require draft 18");
+            }
+            openmoq::publisher::serialize_object_properties(object.properties);
+        }
+    } catch (const std::exception& error) {
+        return TransportStatus::failure(error.what());
+    }
+    for (const auto& track : plan.tracks) {
+        if (track.packaging != "locmaf" && track.packaging != "loc") continue;
+        for (const auto& object : plan.objects) {
+            if (object.track_name == track.track_name && object.subgroup_id != 0) {
+                return TransportStatus::failure("LOC/LOCMAF requires a single subgroup (zero) per group");
+            }
+        }
+    }
     if (transport_.state() != ConnectionState::kConnected) {
         return TransportStatus::failure("transport is not connected");
     }
@@ -6510,11 +6552,179 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                now_function_);
 }
 
+namespace {
+using LiveLocEncoders = std::map<std::string, std::unique_ptr<openmoq::publisher::LocTrackEncoder>>;
+using LiveLocmafEncoders = std::map<std::string, std::unique_ptr<openmoq::publisher::LocmafEncoder>>;
+
+openmoq::publisher::LiveCatalog prepare_live_catalog(
+    std::vector<openmoq::publisher::TrackDescription>& tracks,
+    std::span<const std::uint8_t> init, MediaPackaging packaging,
+    LiveLocmafEncoders& encoders, LiveLocEncoders& loc_encoders) {
+    if (packaging == MediaPackaging::kLoc) {
+        openmoq::publisher::ParsedMp4 parsed;
+        parsed.bytes.assign(init.begin(), init.end());
+        parsed.top_level_boxes = openmoq::publisher::parse_mp4_boxes(parsed.bytes);
+        parsed.tracks = tracks;
+        openmoq::publisher::validate_loc_init(parsed, true);
+        for (auto& track : tracks) {
+            loc_encoders.emplace(track.track_name, std::make_unique<openmoq::publisher::LocTrackEncoder>(track));
+            track.packaging = "loc";
+        }
+    }
+    auto catalog = openmoq::publisher::build_live_catalog(tracks, init, true);
+    if (packaging != MediaPackaging::kLocmaf) return catalog;
+    for (auto& track : tracks) {
+        const auto found = std::find_if(catalog.track_initializations.begin(),
+            catalog.track_initializations.end(), [&](const auto& item) {
+                return item.track_name == track.track_name;
+            });
+        if (found == catalog.track_initializations.end()) continue;
+        try {
+            encoders.emplace(track.track_name,
+                std::make_unique<openmoq::publisher::LocmafEncoder>(found->init_segment));
+            track.packaging = "locmaf";
+        } catch (const openmoq::publisher::LocmafIneligible& error) {
+            std::cerr << "[moqt-session] LOCMAF init ineligible, retaining CMAF for "
+                      << track.track_name << ": " << error.what() << '\n';
+        }
+    }
+    return openmoq::publisher::build_live_catalog(tracks, init, true);
+}
+
+class LiveSrtLocConverter {
+public:
+    LiveSrtLocConverter(const std::vector<openmoq::publisher::TrackDescription>& tracks,
+                        LiveLocEncoders& encoders) : tracks_(tracks), encoders_(encoders) {}
+
+    std::vector<openmoq::publisher::MediaFragment> push(const openmoq::publisher::MediaFragment& fragment) {
+        using namespace openmoq::publisher;
+        if (!fragment.source_timing) throw std::runtime_error("LOC SRT requires original PES timestamps");
+        const auto& timing = *fragment.source_timing;
+        std::span<const std::uint8_t> moof, mdat;
+        for (const auto& box : parse_mp4_boxes(fragment.payload.owned_bytes)) {
+            if (box.type == "moof") moof = slice_bytes(fragment.payload.owned_bytes, box.span);
+            if (box.type == "mdat") mdat = slice_bytes(fragment.payload.owned_bytes, box.span);
+        }
+        auto samples = read_fragment_samples(moof, mdat, tracks_, true);
+        if (samples.size() != 1 || samples.front().track_name != fragment.track_name || timing.timescale != 90000) {
+            throw std::runtime_error("LOC SRT requires exactly one sample with 90 kHz source timing");
+        }
+        auto sample = std::move(samples.front());
+        sample.timescale = timing.timescale;
+        sample.decode_time = timing.decode_time;
+        sample.presentation_time = timing.presentation_time;
+        const auto track = std::find_if(tracks_.begin(), tracks_.end(), [&](const auto& item) { return item.track_name == sample.track_name; });
+        if (track->handler_type != "vide") {
+            if (timing.codec_config != openmoq::publisher::loc_codec_config(*track)) {
+                throw std::runtime_error("LOC SRT AAC configuration differs from announced track");
+            }
+            if (timing.duration == 0 || timing.duration > UINT32_MAX) throw std::runtime_error("LOC SRT invalid AAC duration");
+            // PES starts reset the rational AAC phase. A conservative duration
+            // avoids a one-tick overlap while preserving original DTS and PTS.
+            const auto duration = std::min<std::uint64_t>(timing.duration, 90000ULL * 1024 / track->timescale);
+            if (duration == 0) throw std::runtime_error("LOC SRT invalid AAC timescale");
+            sample.duration = static_cast<std::uint32_t>(duration);
+            return encode(sample, fragment.creation_time_us);
+        }
+        std::vector<MediaFragment> output;
+        const auto pending = pending_.find(sample.track_name);
+        if (pending != pending_.end()) {
+            if (sample.decode_time <= pending->second.sample.decode_time) throw std::runtime_error("LOC SRT DTS regressed or repeated");
+            if (timing.sequence != pending->second.sequence + 1) {
+                encoders_.at(sample.track_name)->require_random_access();
+            } else {
+                const auto duration = sample.decode_time - pending->second.sample.decode_time;
+                if (duration > UINT32_MAX) throw std::runtime_error("LOC SRT video duration overflow");
+                pending->second.sample.duration = static_cast<std::uint32_t>(duration);
+                last_duration_[sample.track_name] = pending->second.sample.duration;
+                output = encode(pending->second.sample, pending->second.creation_time_us);
+            }
+        }
+        const auto name = sample.track_name;
+        pending_.insert_or_assign(name, Pending{std::move(sample), fragment.creation_time_us, timing.sequence});
+        return output;
+    }
+
+    std::vector<openmoq::publisher::MediaFragment> finish() {
+        std::vector<openmoq::publisher::MediaFragment> output;
+        for (auto& [name, pending] : pending_) {
+            const auto duration = last_duration_.find(name);
+            if (duration == last_duration_.end()) throw std::runtime_error("LOC SRT final video sample has no measured DTS duration");
+            // The final sample has no successor; reuse its last measured decode interval.
+            pending.sample.duration = duration->second;
+            auto tail = encode(pending.sample, pending.creation_time_us);
+            output.insert(output.end(), std::make_move_iterator(tail.begin()), std::make_move_iterator(tail.end()));
+        }
+        pending_.clear();
+        return output;
+    }
+private:
+    std::vector<openmoq::publisher::MediaFragment> encode(const openmoq::publisher::EncodedSample& sample, std::uint64_t created) {
+        auto output = encoders_.at(sample.track_name)->encode(std::span(&sample, 1));
+        for (auto& fragment : output) fragment.creation_time_us = created;
+        return output;
+    }
+    struct Pending {
+        openmoq::publisher::EncodedSample sample;
+        std::uint64_t creation_time_us;
+        std::uint64_t sequence;
+    };
+    const std::vector<openmoq::publisher::TrackDescription>& tracks_;
+    LiveLocEncoders& encoders_;
+    std::map<std::string, Pending> pending_;
+    std::map<std::string, std::uint32_t> last_duration_;
+};
+
+TransportStatus encode_live_fragment(openmoq::publisher::MediaFragment& fragment,
+                                     LiveLocmafEncoders& encoders) {
+    const auto found = encoders.find(fragment.track_name);
+    if (found == encoders.end()) return TransportStatus::success();
+    try {
+        // Live queue trimming and admission can discard arbitrary objects. Each
+        // delivered object must therefore be independently reconstructible.
+        fragment.payload.owned_bytes = found->second->encode(
+            fragment.payload.owned_bytes, fragment.group_id, fragment.object_id, true);
+        return TransportStatus::success();
+    } catch (const std::exception& error) {
+        return TransportStatus::failure("LOCMAF live encoding failed for " +
+                                        fragment.track_name + ": " + error.what());
+    }
+}
+}  // namespace
+
+namespace live_srt_internal {
+std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
+    std::span<const openmoq::publisher::MediaFragment> fragments,
+    const std::vector<openmoq::publisher::TrackDescription>& tracks) {
+    LiveLocEncoders encoders;
+    for (auto track : tracks) {
+        track.timescale = 90000;
+        encoders.emplace(track.track_name, std::make_unique<openmoq::publisher::LocTrackEncoder>(track));
+    }
+    LiveSrtLocConverter converter(tracks, encoders);
+    std::vector<openmoq::publisher::MediaFragment> result;
+    for (const auto& fragment : fragments) {
+        auto output = converter.push(fragment);
+        result.insert(result.end(), std::make_move_iterator(output.begin()), std::make_move_iterator(output.end()));
+    }
+    auto tail = converter.finish();
+    result.insert(result.end(), std::make_move_iterator(tail.begin()), std::make_move_iterator(tail.end()));
+    return result;
+}
+} // namespace live_srt_internal
+
 TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                           std::istream* stdin_input,
                                           openmoq::publisher::DraftVersion draft_version,
                                           bool split_cmaf_chunks,
                                           bool stream_per_object) {
+    if (media_packaging_ == MediaPackaging::kLoc &&
+        (draft_version != DraftVersion::kDraft18 || !split_cmaf_chunks || stream_per_object)) {
+        return TransportStatus::failure("LOC requires draft 18, split chunks, and GOP subgroup streams");
+    }
+    if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
+        return TransportStatus::failure("LOCMAF requires a single subgroup stream per group");
+    }
     if (ingest.use_stdin && !ingest.srt_callers.empty()) {
         return TransportStatus::failure("mixed stdin+SRT ingest is not supported; use either stdin or srt");
     }
@@ -6595,7 +6805,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return status;
     }
     const auto& srt_bootstrap = srt_manager.bootstrap();
-    const auto& tracks = srt_bootstrap.tracks;
+    auto tracks = srt_bootstrap.tracks;
 
     if (tracks.empty()) {
         stop_requested = true;
@@ -6605,8 +6815,22 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     const std::vector<std::uint8_t> synthetic_init =
         openmoq::publisher::LiveSrtIngestManager::build_synthetic_init_segment(tracks);
-    openmoq::publisher::LiveCatalog live_catalog =
-        openmoq::publisher::build_live_catalog(tracks, synthetic_init, true);
+    LiveLocmafEncoders locmaf_encoders;
+    LiveLocEncoders loc_encoders;
+    openmoq::publisher::LiveCatalog live_catalog;
+    try {
+        live_catalog = prepare_live_catalog(tracks, synthetic_init, media_packaging_, locmaf_encoders, loc_encoders);
+        if (media_packaging_ == MediaPackaging::kLoc) {
+            for (auto track : tracks) {
+                track.timescale = 90000;
+                loc_encoders[track.track_name] = std::make_unique<openmoq::publisher::LocTrackEncoder>(track);
+            }
+        }
+    } catch (const std::exception& error) {
+        stop_requested = true;
+        srt_manager.join();
+        return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
+    }
 
     std::thread srt_join_thread([&srt_manager, queue]() {
         srt_manager.join();
@@ -6748,6 +6972,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     std::map<std::string, SubgroupSenderState> sender_by_track;
     std::map<std::string, std::uint64_t> last_group_id_by_track;
+    std::set<std::string> loc_waiting_for_group;
     std::map<std::uint64_t, SubscribeMessage> active_subscriptions;
     std::map<std::uint64_t, std::uint64_t> active_subscription_stream_ids;
     std::map<std::uint64_t, std::vector<std::uint8_t>>
@@ -6770,6 +6995,9 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         sender_by_track,
         now_function_);
 
+    LiveSrtLocConverter loc_converter(tracks, loc_encoders);
+    std::deque<openmoq::publisher::MediaFragment> loc_ready;
+    bool loc_finished = false;
     auto drain_queue = [&]() -> TransportStatus {
         while (true) {
             const TransportStatus queue_status =
@@ -6778,8 +7006,27 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             if (!queue_status.ok) {
                 return queue_status;
             }
-            std::optional<openmoq::publisher::MediaFragment> queued_fragment =
-                queue->try_pop();
+            std::optional<openmoq::publisher::MediaFragment> queued_fragment;
+            if (media_packaging_ == MediaPackaging::kLoc) {
+                try {
+                    while (loc_ready.empty()) {
+                        auto original = queue->try_pop();
+                        std::vector<openmoq::publisher::MediaFragment> converted;
+                        if (original) converted = loc_converter.push(*original);
+                        else if (queue->done() && !loc_finished) {
+                            converted = loc_converter.finish();
+                            loc_finished = true;
+                        } else break;
+                        for (auto& item : converted) loc_ready.push_back(std::move(item));
+                    }
+                    if (!loc_ready.empty()) {
+                        queued_fragment = std::move(loc_ready.front());
+                        loc_ready.pop_front();
+                    }
+                } catch (const std::exception& error) {
+                    return TransportStatus::failure(std::string("LOC SRT encoding failed: ") + error.what());
+                }
+            } else queued_fragment = queue->try_pop();
             if (!queued_fragment.has_value()) break;
             openmoq::publisher::MediaFragment fragment =
                 std::move(*queued_fragment);
@@ -6792,6 +7039,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                      fragment.object_id);
 
             if (!auto_forward_ && !subscribed_tracks.count(fragment.track_name)) {
+                if (!fragment.properties.empty()) loc_waiting_for_group.insert(fragment.track_name);
                 continue;
             }
 
@@ -6799,6 +7047,14 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             if (alias_it == alias_by_track.end()) {
                 continue;
             }
+            if (!fragment.properties.empty() && fragment.object_id != 0) {
+                const auto delivered = last_group_id_by_track.find(fragment.track_name);
+                if (loc_waiting_for_group.contains(fragment.track_name) || delivered == last_group_id_by_track.end() || delivered->second != fragment.group_id) continue;
+            }
+
+            if (fragment.object_id == 0) loc_waiting_for_group.erase(fragment.track_name);
+            const TransportStatus encode_status = encode_live_fragment(fragment, locmaf_encoders);
+            if (!encode_status.ok) return encode_status;
 
             const openmoq::publisher::CmsfObject object{
                 .kind = openmoq::publisher::CmsfObjectKind::kMedia,
@@ -6810,11 +7066,13 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 .media_duration_us = fragment.duration_us,
                 .payload = {},
                 .owned_payload = fragment.payload.owned_bytes,
+                .properties = fragment.properties,
             };
             if (!live_object_matches_request_union(
                     object,
                     draft_version,
                     active_subscriptions)) {
+                if (!fragment.properties.empty()) loc_waiting_for_group.insert(fragment.track_name);
                 continue;
             }
 
@@ -6868,6 +7126,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 return write_status;
             }
             if (!object_published) {
+                if (!fragment.properties.empty()) loc_waiting_for_group.insert(fragment.track_name);
                 continue;
             }
             last_group_id_by_track[fragment.track_name] = static_cast<std::uint64_t>(fragment.group_id);
@@ -7400,8 +7659,15 @@ std::size_t read_live_input(std::istream& input,
 
 TransportStatus MoqtSession::publish_live(std::istream& input,
                                            openmoq::publisher::DraftVersion draft_version,
-                                           bool /*split_cmaf_chunks*/,
+                                           bool split_cmaf_chunks,
                                            bool stream_per_object) {
+    if (media_packaging_ == MediaPackaging::kLoc &&
+        (draft_version != DraftVersion::kDraft18 || !split_cmaf_chunks || stream_per_object)) {
+        return TransportStatus::failure("LOC requires draft 18, split chunks, and GOP subgroup streams");
+    }
+    if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
+        return TransportStatus::failure("LOCMAF requires a single subgroup stream per group");
+    }
     if (transport_.state() != ConnectionState::kConnected) {
         return TransportStatus::failure("transport is not connected");
     }
@@ -7480,9 +7746,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // only runs its normal teardown -- close(0) + clear_active_session(),
     // which populates stats_.last_error and closes the MOQT session cleanly
     // -- when publish_live() returns rather than throws.
+    LiveLocmafEncoders locmaf_encoders;
+    LiveLocEncoders loc_encoders;
     openmoq::publisher::LiveCatalog live_catalog;
     try {
-        live_catalog = openmoq::publisher::build_live_catalog(tracks, init_segment, true);
+        live_catalog = prepare_live_catalog(tracks, init_segment, media_packaging_, locmaf_encoders, loc_encoders);
     } catch (const std::runtime_error& error) {
         return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
     }
@@ -7705,87 +7973,175 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         std::mutex mutex;
         std::deque<openmoq::publisher::MediaFragment> fragments;
         bool eof = false;
+        std::string error;
     };
     auto queue = std::make_shared<LiveMediaQueue>();
 
     std::atomic<bool> stdin_stop{false};
-    std::thread stdin_thread([&reader, &input, &tracks, queue, &stdin_stop]() {
+    const bool retain_locmaf_boxes = !locmaf_encoders.empty();
+    std::thread stdin_thread([&reader, &input, &tracks, &loc_encoders, queue, &stdin_stop, retain_locmaf_boxes]() {
         std::vector<std::uint8_t> pending_moof;
+        std::vector<std::uint8_t> pending_chunk;
+        std::map<std::string, std::size_t> dropped_loc_groups;
         std::size_t shared_group_id = 0;
         std::map<std::string, std::size_t> object_id_in_group;  // per track, resets on new group
-        bool first_keyframe_seen = false;
+        const bool locmaf_audio_only = retain_locmaf_boxes &&
+            std::none_of(tracks.begin(), tracks.end(), [](const auto& track) {
+                return track.handler_type == "vide";
+            });
+        bool first_keyframe_seen = locmaf_audio_only;
 
-        while (true) {
-            if (stdin_stop.load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> lock(queue->mutex);
-                queue->eof = true;
-                break;
-            }
-            const std::size_t bytes_read = read_live_input(input, reader, &stdin_stop);
+        try {
+            while (true) {
+                if (stdin_stop.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lock(queue->mutex);
+                    queue->eof = true;
+                    break;
+                }
+                const std::size_t bytes_read = read_live_input(input, reader, &stdin_stop);
 
-            while (auto box = reader.next_box()) {
-                if (box->type == "moof") {
-                    pending_moof = std::move(box->bytes);
-                } else if (box->type == "mdat") {
-                    if (pending_moof.empty()) {
-                        std::cerr << "[moqt-session] live: mdat without preceding moof, skipping\n";
-                        continue;
+                while (auto box = reader.next_box()) {
+                    if (!loc_encoders.empty() && (box->type == "moov" || box->type == "ftyp")) {
+                        throw std::runtime_error("LOC live input does not support initialization changes");
                     }
-                    try {
-                        // Build fragment (group_id=0 placeholder, we'll assign below)
-                        auto fragment = openmoq::publisher::build_live_fragment(
-                            pending_moof, box->bytes, tracks, 0);
-
-                        // Keyframe-based grouping:
-                        // When a video keyframe arrives, start a new group for ALL tracks.
-                        if (fragment.is_video_keyframe) {
-                            if (first_keyframe_seen) {
-                                ++shared_group_id;
-                            }
-                            first_keyframe_seen = true;
-                            // Reset object counters for all tracks on new group
-                            object_id_in_group.clear();
+                    if (!loc_encoders.empty() && box->bytes.size() > 16 * 1024 * 1024) {
+                        throw std::runtime_error("LOC live input box exceeds 16 MiB");
+                    }
+                    if (retain_locmaf_boxes) {
+                        if (box->bytes.size() > 16 * 1024 * 1024 - pending_chunk.size()) {
+                            std::lock_guard<std::mutex> lock(queue->mutex);
+                            queue->error = "LOCMAF live chunk exceeds 16 MiB";
+                            queue->eof = true;
+                            return;
                         }
-
-                        if (!first_keyframe_seen) {
-                            // Drop fragments before first keyframe (can't decode without IDR)
-                            pending_moof.clear();
+                        if (box->type != "mdat") {
+                            pending_chunk.insert(pending_chunk.end(), box->bytes.begin(), box->bytes.end());
+                        }
+                    }
+                    if (box->type == "moof") {
+                        pending_moof = std::move(box->bytes);
+                    } else if (box->type == "mdat") {
+                        if (pending_moof.empty()) {
+                            std::cerr << "[moqt-session] live: mdat without preceding moof, skipping\n";
                             continue;
                         }
-
-                        // Assign shared group_id and per-track object_id
-                        fragment.group_id = shared_group_id;
-                        fragment.object_id = object_id_in_group[fragment.track_name]++;
-
-                        {
-                            std::lock_guard<std::mutex> lock(queue->mutex);
-                            queue->fragments.push_back(std::move(fragment));
-                            // Trim queue: keep only fragments from the latest 2 groups.
-                            // This prevents unbounded backlog when ffmpeg encodes
-                            // faster than realtime, while keeping enough data for
-                            // A/V sync (audio from the previous group).
-                            if (!queue->fragments.empty()) {
-                                const std::size_t latest = queue->fragments.back().group_id;
-                                const std::size_t min_keep = latest > 1 ? latest - 1 : 0;
-                                while (!queue->fragments.empty() &&
-                                       queue->fragments.front().group_id < min_keep) {
-                                    queue->fragments.pop_front();
+                        try {
+                            if (!loc_encoders.empty()) {
+                                const auto samples = openmoq::publisher::read_fragment_samples(pending_moof, box->bytes, tracks);
+                                for (const auto& sample : samples) {
+                                    auto fragments = loc_encoders.at(sample.track_name)->encode(std::span(&sample, 1));
+                                    std::lock_guard<std::mutex> lock(queue->mutex);
+                                    for (auto& fragment : fragments) {
+                                        const auto dropped = dropped_loc_groups.find(fragment.track_name);
+                                        if (dropped != dropped_loc_groups.end() && fragment.group_id <= dropped->second) continue;
+                                        queue->fragments.push_back(std::move(fragment));
+                                    }
+                                    // Drop complete track groups, never a dependency prefix.
+                                    auto queued_bytes = [&]() {
+                                        std::size_t size = 0;
+                                        for (const auto& item : queue->fragments) size += item.payload.owned_bytes.size();
+                                        return size;
+                                    };
+                                    while (queue->fragments.size() > 512 || queued_bytes() > 16 * 1024 * 1024) {
+                                        const auto name = queue->fragments.front().track_name;
+                                        const auto group = queue->fragments.front().group_id;
+                                        dropped_loc_groups[name] = group;
+                                        std::erase_if(queue->fragments, [&](const auto& item) {
+                                            return item.track_name == name && item.group_id == group;
+                                        });
+                                    }
+                                }
+                                pending_moof.clear();
+                                continue;
+                            }
+                            if (retain_locmaf_boxes) {
+                                const auto boxes = openmoq::publisher::parse_mp4_boxes(pending_moof);
+                                if (boxes.size() != 1 || std::count_if(
+                                        boxes.front().children.begin(), boxes.front().children.end(),
+                                        [](const auto& child) { return child.type == "traf"; }) != 1) {
+                                    throw std::runtime_error(
+                                        "LOCMAF requires one traf per moof; demux or use separate_moof");
                                 }
                             }
-                        }
-                    } catch (const std::exception& e) {
-                        std::cerr << "[moqt-session] live: fragment parse error: " << e.what() << '\n';
-                    }
-                    pending_moof.clear();
-                }
-                // Skip other box types (styp, free, etc.)
-            }
+                            // Build fragment (group_id=0 placeholder, we'll assign below)
+                            auto fragment = openmoq::publisher::build_live_fragment(
+                                pending_moof, box->bytes, tracks, 0);
+                            const auto track = std::find_if(tracks.begin(), tracks.end(), [&](const auto& item) {
+                                return item.track_name == fragment.track_name;
+                            });
+                            if (track != tracks.end() && track->packaging == "locmaf") {
+                                pending_chunk.insert(pending_chunk.end(), box->bytes.begin(), box->bytes.end());
+                                fragment.payload.owned_bytes = std::move(pending_chunk);
+                            }
+                            pending_chunk.clear();
 
-            if (bytes_read == 0) {
-                std::lock_guard<std::mutex> lock(queue->mutex);
-                queue->eof = true;
-                break;
+                            if (locmaf_audio_only && !object_id_in_group.empty()) {
+                                ++shared_group_id;
+                                object_id_in_group.clear();
+                            }
+
+                            // Keyframe-based grouping:
+                            // When a video keyframe arrives, start a new group for ALL tracks.
+                            if (fragment.is_video_keyframe) {
+                                if (first_keyframe_seen) {
+                                    ++shared_group_id;
+                                }
+                                first_keyframe_seen = true;
+                                // Reset object counters for all tracks on new group
+                                object_id_in_group.clear();
+                            }
+
+                            if (!first_keyframe_seen) {
+                                // Drop fragments before first keyframe (can't decode without IDR)
+                                pending_moof.clear();
+                                continue;
+                            }
+
+                            // Assign shared group_id and per-track object_id
+                            fragment.group_id = shared_group_id;
+                            fragment.object_id = object_id_in_group[fragment.track_name]++;
+
+                            {
+                                std::lock_guard<std::mutex> lock(queue->mutex);
+                                queue->fragments.push_back(std::move(fragment));
+                                // Trim queue: keep only fragments from the latest 2 groups.
+                                // This prevents unbounded backlog when ffmpeg encodes
+                                // faster than realtime, while keeping enough data for
+                                // A/V sync (audio from the previous group).
+                                if (!queue->fragments.empty()) {
+                                    const std::size_t latest = queue->fragments.back().group_id;
+                                    const std::size_t min_keep = latest > 1 ? latest - 1 : 0;
+                                    while (!queue->fragments.empty() &&
+                                           queue->fragments.front().group_id < min_keep) {
+                                        queue->fragments.pop_front();
+                                    }
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            if (retain_locmaf_boxes || !loc_encoders.empty()) {
+                                std::lock_guard<std::mutex> lock(queue->mutex);
+                                queue->error = std::string("live sample parse failed: ") + e.what();
+                                queue->eof = true;
+                                return;
+                            }
+                            std::cerr << "[moqt-session] live: fragment parse error: " << e.what() << '\n';
+                        }
+                        pending_moof.clear();
+                        pending_chunk.clear();
+                    }
+                    // Skip other box types (styp, free, etc.)
+                }
+
+                if (bytes_read == 0) {
+                    std::lock_guard<std::mutex> lock(queue->mutex);
+                    queue->eof = true;
+                    break;
+                }
             }
+        } catch (const std::exception& error) {
+            std::lock_guard<std::mutex> lock(queue->mutex);
+            queue->error = std::string("live input reader failed: ") + error.what();
+            queue->eof = true;
         }
     });
 
@@ -7799,6 +8155,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // Main loop: drain queue and publish fragments
     std::map<std::string, SubgroupSenderState> sender_by_track;
     std::map<std::string, std::uint64_t> last_group_id_by_track;
+    std::set<std::string> loc_waiting_for_group;
     std::map<std::uint64_t, SubscribeMessage> active_subscriptions;
     std::map<std::uint64_t, std::uint64_t> active_subscription_stream_ids;
     std::map<std::uint64_t, std::vector<std::uint8_t>>
@@ -7829,6 +8186,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             openmoq::publisher::MediaFragment fragment;
             {
                 std::lock_guard<std::mutex> lock(queue->mutex);
+                if (!queue->error.empty()) return TransportStatus::failure(queue->error);
                 if (queue->fragments.empty()) break;
                 fragment = std::move(queue->fragments.front());
                 queue->fragments.pop_front();
@@ -7842,6 +8200,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             // In auto-forward mode, publish media immediately even before a downstream
             // SUBSCRIBE arrives. Keep subscription gating for await-subscribe mode.
             if (!auto_forward_ && !subscribed_tracks.count(fragment.track_name)) {
+                if (!fragment.properties.empty()) loc_waiting_for_group.insert(fragment.track_name);
                 continue;
             }
 
@@ -7849,6 +8208,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (alias_it == alias_by_track.end()) {
                 continue;
             }
+            if (!fragment.properties.empty() && fragment.object_id != 0) {
+                const auto delivered = last_group_id_by_track.find(fragment.track_name);
+                if (loc_waiting_for_group.contains(fragment.track_name) || delivered == last_group_id_by_track.end() || delivered->second != fragment.group_id) continue;
+            }
+
+            if (fragment.object_id == 0) loc_waiting_for_group.erase(fragment.track_name);
+            const TransportStatus encode_status = encode_live_fragment(fragment, locmaf_encoders);
+            if (!encode_status.ok) return encode_status;
 
             const openmoq::publisher::CmsfObject object{
                 .kind = openmoq::publisher::CmsfObjectKind::kMedia,
@@ -7860,6 +8227,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 .media_duration_us = fragment.duration_us,
                 .payload = {},
                 .owned_payload = fragment.payload.owned_bytes,
+                .properties = fragment.properties,
             };
             const auto published_settings_it =
                 published_track_settings.find(fragment.track_name);
@@ -7870,6 +8238,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     published_settings_it != published_track_settings.end()
                         ? &published_settings_it->second
                         : nullptr)) {
+                if (!fragment.properties.empty()) loc_waiting_for_group.insert(fragment.track_name);
                 continue;
             }
 
@@ -7915,6 +8284,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 return post_write_event_status;
             }
             if (!object_published) {
+                if (!fragment.properties.empty()) loc_waiting_for_group.insert(fragment.track_name);
                 continue;
             }
             last_group_id_by_track[fragment.track_name] = static_cast<std::uint64_t>(fragment.group_id);
@@ -8817,6 +9187,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     }
 
     join_stdin_thread();
+    {
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        if (!queue->error.empty()) return TransportStatus::failure(queue->error);
+    }
 
     for (auto& [track_name, sender] : sender_by_track) {
         const auto publisher_timeout_it = published_track_delivery_timeouts.find(track_name);
@@ -8923,6 +9297,47 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     }
     if (!source.next_object) {
         return TransportStatus::failure("live object source has no object reader");
+    }
+
+    std::set<std::string> loc_tracks;
+    for (const auto& track : source.tracks) {
+        if (track.packaging == openmoq::publisher::LivePackaging::kLoc) loc_tracks.insert(track.track_name);
+    }
+    if (media_packaging_ == MediaPackaging::kLoc || !loc_tracks.empty()) {
+        if (draft_version != DraftVersion::kDraft18) return TransportStatus::failure("LOC requires draft 18");
+        if (source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject) {
+            return TransportStatus::failure("LOC cannot transform a source-owned catalog");
+        }
+        for (const auto& track : source.tracks) {
+            if (track.track_name == "catalog") continue;
+            if (track.packaging != openmoq::publisher::LivePackaging::kLoc || track.codec.empty() || track.init_data.empty()) {
+                return TransportStatus::failure("LOC object sources require LOC packaging and codec configuration");
+            }
+            const bool video = track.media_type == openmoq::publisher::LiveMediaType::kVideo;
+            const bool audio = track.media_type == openmoq::publisher::LiveMediaType::kAudio;
+            if ((!video && !audio) || (video && (!track.codec.starts_with("avc1.") || track.init_data.size() < 7 || track.init_data[0] != 1)) ||
+                (audio && (!track.codec.starts_with("mp4a.40.") || track.init_data.size() < 2))) {
+                return TransportStatus::failure("LOC requires explicit AVC or AAC media type and decoder configuration");
+            }
+        }
+    }
+
+    std::set<std::string> locmaf_tracks;
+    for (const auto& track : source.tracks) {
+        if (track.packaging == openmoq::publisher::LivePackaging::kLocmaf) {
+            locmaf_tracks.insert(track.track_name);
+        }
+    }
+    if (media_packaging_ == MediaPackaging::kLocmaf || !locmaf_tracks.empty()) {
+        if (source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject) {
+            return TransportStatus::failure("LOCMAF cannot transform a source-owned catalog");
+        }
+        for (const auto& track : source.tracks) {
+            if (track.track_name != "catalog" &&
+                track.packaging == openmoq::publisher::LivePackaging::kRaw) {
+                return TransportStatus::failure("LOCMAF requires a source with explicit media packaging");
+            }
+        }
     }
 
     TransportStatus status = ensure_setup(draft_version);
@@ -9493,6 +9908,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     std::optional<std::chrono::steady_clock::time_point> object_pacing_start;
     std::optional<std::uint64_t> object_first_media_time_us;
     std::map<std::string, std::uint64_t> last_group_id_by_track;
+    std::set<std::string> loc_waiting_for_group;
     bool live_object_catalog_sent = !alias_by_track.contains("catalog");
     std::optional<openmoq::publisher::LiveObject> retained_source_catalog;
     std::size_t served_catalog_subscription_count = 0;
@@ -9535,6 +9951,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             .media_duration_us = catalog.media_duration_us,
             .payload = {},
             .owned_payload = catalog.payload,
+            .properties = catalog.properties,
         };
         const std::uint64_t send_seq = next_send_seq();
         const DeliveryTimeouts delivery_timeouts =
@@ -9699,14 +10116,67 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             continue;
         }
         if (auto_forward_ && !live_object_catalog_sent) {
+            if (loc_tracks.contains(next->track_name)) loc_waiting_for_group.insert(next->track_name);
             continue;
         }
         if (auto_forward_ && uses_request_streams(draft_version) &&
             !subscribed_tracks.contains(next->track_name)) {
+            if (loc_tracks.contains(next->track_name)) loc_waiting_for_group.insert(next->track_name);
             continue;
         }
         if (!auto_forward_ && !subscribed_tracks.contains(next->track_name)) {
+            if (loc_tracks.contains(next->track_name)) loc_waiting_for_group.insert(next->track_name);
             continue;
+        }
+
+        if (loc_tracks.contains(next->track_name)) {
+            if (next->object_id != 0) {
+                const auto delivered = last_group_id_by_track.find(next->track_name);
+                if (loc_waiting_for_group.contains(next->track_name) || delivered == last_group_id_by_track.end() || delivered->second != next->group_id) continue;
+            }
+            if (next->object_id == 0) loc_waiting_for_group.erase(next->track_name);
+            if (next->subgroup_id != 0) return TransportStatus::failure("LOC requires subgroup zero");
+            bool timestamp = false;
+            bool timescale = false;
+            bool independent = false;
+            bool config_present = false;
+            const auto metadata = std::find_if(source.tracks.begin(), source.tracks.end(), [&](const auto& track) {
+                return track.track_name == next->track_name;
+            });
+            const bool video = metadata->media_type == openmoq::publisher::LiveMediaType::kVideo;
+            try {
+                openmoq::publisher::serialize_object_properties(next->properties);
+                for (const auto& property : next->properties) {
+                    if (property.id == 0x10) timestamp = true;
+                    if (property.id == 0x08) timescale = std::get<std::uint64_t>(property.value) != 0;
+                    if (property.id == 0x09) {
+                        const auto& bytes = std::get<std::vector<std::uint8_t>>(property.value);
+                        if (bytes.empty() || bytes.size() > 4) throw std::invalid_argument("LOC frame marking must contain 1-4 bytes");
+                        independent = (bytes[0] & 0x20) != 0;
+                    }
+                    if (property.id == 0x0d || property.id == 0x0f) {
+                        if (property.id != (video ? 0x0d : 0x0f) ||
+                            std::get<std::vector<std::uint8_t>>(property.value) != metadata->init_data) {
+                            throw std::invalid_argument("LOC object configuration differs from announced track");
+                        }
+                        config_present = true;
+                    }
+                }
+            } catch (const std::exception& error) {
+                return TransportStatus::failure(error.what());
+            }
+            if (!timestamp || !timescale) return TransportStatus::failure("LOC objects require Timestamp and nonzero Timescale");
+            if (next->object_id == 0 && ((!config_present) || (video && !independent))) {
+                return TransportStatus::failure("LOC group start requires matching configuration and independent video frame marking");
+            }
+            next->final_in_subgroup = false;
+        }
+
+        if (locmaf_tracks.contains(next->track_name)) {
+            if (next->subgroup_id != 0) {
+                return TransportStatus::failure("LOCMAF requires a single subgroup (zero) per group");
+            }
+            next->final_in_subgroup = false;
         }
 
         const openmoq::publisher::CmsfObject object{
@@ -9719,6 +10189,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             .media_duration_us = next->media_duration_us,
             .payload = {},
             .owned_payload = next->payload,
+            .properties = next->properties,
         };
         const auto published_settings_it =
             published_track_settings.find(next->track_name);
@@ -9729,6 +10200,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 published_settings_it != published_track_settings.end()
                     ? &published_settings_it->second
                     : nullptr)) {
+            if (loc_tracks.contains(next->track_name)) loc_waiting_for_group.insert(next->track_name);
             continue;
         }
         const std::uint64_t send_seq = next_send_seq();
@@ -9785,6 +10257,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return event_status;
         }
         if (!object_published) {
+            if (loc_tracks.contains(next->track_name)) loc_waiting_for_group.insert(next->track_name);
             continue;
         }
         record_published_object(next->track_name,

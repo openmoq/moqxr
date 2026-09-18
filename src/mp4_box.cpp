@@ -861,6 +861,30 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             duration_ms = duration_ms_from_mdhd(*mdhd, timescale, bytes);
         }
 
+        std::optional<TrackFragmentDefaults> fragment_defaults;
+        if (const auto* mvex = find_child(*moov, "mvex")) {
+            for (const auto& trex : mvex->children) {
+                if (trex.type == "trex" && trex.payload.size >= 24 &&
+                    read_be32(bytes, trex.payload.offset + 4) == track_id) {
+                    fragment_defaults = TrackFragmentDefaults{
+                        .sample_duration = read_be32(bytes, trex.payload.offset + 12),
+                        .sample_size = read_be32(bytes, trex.payload.offset + 16),
+                        .sample_flags = read_be32(bytes, trex.payload.offset + 20),
+                    };
+                    break;
+                }
+            }
+        }
+
+        std::vector<std::uint8_t> codec_private;
+        const std::string_view config_type = effective_type == "avc1" || effective_type == "avc3" ? "avcC" :
+            effective_type == "hvc1" || effective_type == "hev1" ? "hvcC" : "esds";
+        if (const auto config = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                                    sample_entry_child_offset, config_type)) {
+            const auto config_bytes = slice_bytes(bytes, *config);
+            codec_private.assign(config_bytes.begin(), config_bytes.end());
+        }
+
         tracks.push_back({
             .track_id = track_id,
             .handler_type = handler_type,
@@ -882,6 +906,8 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
             .duration_ms = duration_ms,
             .language = language,
             .protection = std::move(protection),
+            .codec_private = std::move(codec_private),
+            .fragment_defaults = fragment_defaults,
         });
         ++track_index;
     }

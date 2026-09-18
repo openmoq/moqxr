@@ -45,6 +45,16 @@ ffmpeg -i bbb_sunflower_2160p_60fps_normal.mp4 \
   -f mp4 sunflower265-frag.mp4
 ```
 
+## LOCMAF Output
+
+FFmpeg continues to produce ordinary fragmented MP4; add `--packaging locmaf`
+to the publisher command to convert its output. Use `+separate_moof` in the
+recipes above: LOCMAF input requires exactly one `traf` per `moof` and rejects
+multiplexed fragments. The same publisher flag applies to live stdin and DASH
+recipes below; the incoming HTTP body remains CMAF/fMP4. Omitting the flag
+keeps the default CMAF output. See the
+[LOCMAF quickstart](quickstart.md#opt-in-to-locmaf) for limits and emitted files.
+
 ## Practical Notes
 
 - `-map 0:v -map 0:a` keeps only video and audio streams, excluding subtitle and other non-A/V tracks
@@ -54,7 +64,7 @@ ffmpeg -i bbb_sunflower_2160p_60fps_normal.mp4 \
 - `+frag_keyframe` starts a new fragment on keyframes
 - `+empty_moov` writes initialization metadata up front
 - `+default_base_moof` and `+separate_moof` produce a layout that is easier for fragmented-MP4 pipelines to consume
-- omit `+separate_moof` only if you are sure downstream tooling can parse interleaved multi-track fragments
+- retain `+separate_moof` for LOCMAF; it is required for the publisher to accept multi-track fragmented input
 - when audio appears in the catalog but no audio media objects are sent, regenerate with `+separate_moof`
 - for HEVC, prefer streams that are already `hvc1`-compatible
 - if a source is tagged `hev1` but keeps VPS/SPS/PPS only in the init segment, the publisher normalizes the advertised codec and emitted init segment to `hvc1`

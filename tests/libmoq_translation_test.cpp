@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -147,6 +149,130 @@ PublishPlan make_plan() {
 
 int main() {
     bool ok = true;
+
+    // LOCMAF needs catalog locmafVersion signaling absent from libmoq's API.
+    {
+        const auto rejects_locmaf = [&](auto operation, const std::string& label) {
+            try {
+                operation();
+            } catch (const std::invalid_argument& error) {
+                return expect(std::string(error.what()).find("LOCMAF") != std::string::npos,
+                              label + " must explain LOCMAF refusal");
+            }
+            return expect(false, label + " must reject unsupported LOCMAF");
+        };
+        auto track = make_video_track();
+        track.packaging = "locmaf";
+        ok &= rejects_locmaf([&] { make_libmoq_live_track(track, {}); }, "live track translation");
+        PublishPlan plan;
+        plan.tracks = {track};
+        ok &= rejects_locmaf([&] { translate_plan_for_libmoq(plan); }, "plan translation");
+        LiveTrack live_track;
+        live_track.packaging = LivePackaging::kLocmaf;
+        ok &= rejects_locmaf([&] { make_libmoq_live_object_track(live_track); },
+                             "live object track translation");
+
+        const auto refused = [&](const TransportStatus& status, const std::string& label) {
+            return expect(!status.ok && status.message.find("LOCMAF") != std::string::npos,
+                          label + " must refuse LOCMAF before setup");
+        };
+        PublisherConfig config;
+        config.draft_version = static_cast<DraftVersion>(0);  // guarantees no network on regression
+        config.media_packaging = MediaPackaging::kLocmaf;
+        EndpointConfig endpoint;
+        LibmoqPublishStats stats;
+        ok &= refused(publish_plan_via_libmoq({}, config, endpoint, {}, stats), "batch config");
+        std::istringstream input;
+        ok &= refused(publish_live_stdin_via_libmoq(input, config, endpoint, {}, stats, nullptr),
+                      "stdin config");
+        ok &= refused(publish_live_srt_via_libmoq({}, config, endpoint, {}, stats, nullptr),
+                      "SRT config");
+        ok &= refused(publish_live_objects_via_libmoq({}, config, endpoint, {}, stats, nullptr),
+                      "live config");
+        config.media_packaging = MediaPackaging::kCmaf;
+        ok &= refused(publish_plan_via_libmoq(plan, config, endpoint, {}, stats), "batch track");
+        LiveObjectSource source;
+        source.tracks = {live_track};
+        source.next_object = [] { return std::optional<LiveObject>{}; };
+        ok &= refused(publish_live_objects_via_libmoq(source, config, endpoint, {}, stats, nullptr),
+                      "live track");
+    }
+
+    // LOC-04 properties and catalog signaling are unsupported by libmoq.
+    {
+        const auto rejects_loc = [&](auto operation, const std::string& label) {
+            try {
+                operation();
+            } catch (const std::invalid_argument& error) {
+                return expect(std::string(error.what()).find("LOC-04") != std::string::npos,
+                              label + " must explain LOC-04 refusal");
+            }
+            return expect(false, label + " must reject unsupported LOC-04");
+        };
+        auto track = make_video_track();
+        track.packaging = "loc";
+        ok &= rejects_loc([&] { make_libmoq_live_track(track, {}); }, "live track translation");
+        PublishPlan plan;
+        plan.tracks = {track};
+        ok &= rejects_loc([&] { translate_plan_for_libmoq(plan); }, "plan translation");
+        LiveTrack live_track;
+        live_track.packaging = LivePackaging::kLoc;
+        ok &= rejects_loc([&] { make_libmoq_live_object_track(live_track); },
+                             "live object track translation");
+
+        const auto refused = [&](const TransportStatus& status, const std::string& label) {
+            return expect(!status.ok && status.message.find("LOC-04") != std::string::npos,
+                          label + " must refuse LOC-04 before setup");
+        };
+        PublisherConfig config;
+        config.draft_version = static_cast<DraftVersion>(0);  // guarantees no network on regression
+        config.media_packaging = MediaPackaging::kLoc;
+        EndpointConfig endpoint;
+        LibmoqPublishStats stats;
+        ok &= refused(publish_plan_via_libmoq({}, config, endpoint, {}, stats), "batch config");
+        std::istringstream input;
+        ok &= refused(publish_live_stdin_via_libmoq(input, config, endpoint, {}, stats, nullptr),
+                      "stdin config");
+        ok &= refused(publish_live_srt_via_libmoq({}, config, endpoint, {}, stats, nullptr),
+                      "SRT config");
+        ok &= refused(publish_live_objects_via_libmoq({}, config, endpoint, {}, stats, nullptr),
+                      "live config");
+        config.media_packaging = MediaPackaging::kCmaf;
+        ok &= refused(publish_plan_via_libmoq(plan, config, endpoint, {}, stats), "batch track");
+        LiveObjectSource source;
+        source.tracks = {live_track};
+        source.next_object = [] { return std::optional<LiveObject>{}; };
+        ok &= refused(publish_live_objects_via_libmoq(source, config, endpoint, {}, stats, nullptr),
+                      "live track");
+    }
+
+    // Property-bearing objects must never silently lose their metadata.
+    {
+        auto plan_with_properties = make_plan();
+        plan_with_properties.objects.front().properties.push_back({8, std::uint64_t{123}});
+        const auto rejects_properties = [&](auto operation) {
+            try {
+                operation();
+            } catch (const std::invalid_argument& error) {
+                return expect(std::string(error.what()).find("properties") != std::string::npos,
+                              "property refusal must explain the unsupported metadata");
+            }
+            return expect(false, "libmoq must reject object properties");
+        };
+        ok &= rejects_properties([&] { translate_plan_for_libmoq(plan_with_properties); });
+        MediaFragment fragment;
+        fragment.properties.push_back({8, std::uint64_t{123}});
+        ok &= rejects_properties([&] { make_libmoq_live_object(fragment); });
+        LiveObject object;
+        object.properties.push_back({8, std::uint64_t{123}});
+        ok &= rejects_properties([&] { make_libmoq_live_source_object(object); });
+        PublisherConfig config;
+        config.draft_version = static_cast<DraftVersion>(0);
+        LibmoqPublishStats stats;
+        const auto status = publish_plan_via_libmoq(plan_with_properties, config, {}, {}, stats);
+        ok &= expect(!status.ok && status.message.find("properties") != std::string::npos,
+                     "batch properties must be refused before transport setup");
+    }
 
     const PublishPlan plan = make_plan();
     const LibmoqPlanTranslation tr = translate_plan_for_libmoq(plan);

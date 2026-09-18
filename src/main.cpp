@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
             .drm_systems = options.drm_systems,
             .catalog_republish_interval = options.catalog_republish_interval,
             .subscriber_timeout = options.subscriber_timeout,
+            .media_packaging = options.media_packaging,
         };
         Publisher publisher(config);
 
@@ -156,6 +157,7 @@ int main(int argc, char** argv) {
                       << ":" << options.dash_listen_port
                       << " path=" << options.dash_path_prefix << std::endl;
             LiveDashIngestConfig dash_config;
+            dash_config.media_packaging = options.media_packaging;
             dash_config.host = options.dash_listen_host;
             dash_config.port = options.dash_listen_port;
             dash_config.path_prefix = options.dash_path_prefix;

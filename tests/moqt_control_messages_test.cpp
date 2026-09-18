@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1530,8 +1531,58 @@ bool test_uint8_message_parameter_decoding() {
     return ok;
 }
 
+bool test_object_properties() {
+    using openmoq::publisher::ObjectProperty;
+    using openmoq::publisher::serialize_object_properties;
+    bool ok = true;
+    const std::vector<ObjectProperty> props{{0x10, std::uint64_t{42}}, {8, std::uint64_t{1000}}};
+    const std::vector<std::uint8_t> payload{0xaa, 0xbb};
+    ok &= expect(serialize_object_properties(props) == std::vector<std::uint8_t>({8, 0x83, 0xe8, 8, 42}), "sorted LOC-04 golden property block");
+    ok &= expect(encode_subgroup_header(DraftVersion::kDraft18, 0, 0, 0, false, true) == std::vector<std::uint8_t>({0x31, 0, 0}), "PROPERTIES header bit");
+    ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, {}, 0, payload, props) == std::vector<std::uint8_t>({0, 5, 8, 0x83, 0xe8, 8, 42, 2, 0xaa, 0xbb}), "LOC-04 golden object");
+    ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, 0, 1, payload, {}, true) == std::vector<std::uint8_t>({0, 0, 2, 0xaa, 0xbb}), "empty properties retain stream framing");
+    ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, {}, 0, payload) == std::vector<std::uint8_t>({0, 2, 0xaa, 0xbb}), "default wire unchanged");
+    auto stream = encode_subgroup_header(DraftVersion::kDraft18, 0, 0, 0, false, true);
+    const auto encoded_object = encode_subgroup_object(DraftVersion::kDraft18, {}, 0, payload, props);
+    stream.insert(stream.end(), encoded_object.begin(), encoded_object.end());
+    std::size_t offset = 0;
+    std::uint64_t decoded = 0;
+    for (const std::uint64_t expected : {0x31, 0, 0, 0, 5, 8, 1000, 8, 42, 2}) {
+        ok &= expect(read_vi64(stream, offset, decoded) && decoded == expected, "independent stream parser matches golden fields");
+    }
+    ok &= expect(std::vector<std::uint8_t>(stream.begin() + offset, stream.end()) == payload, "independent parser preserves elementary payload");
+    for (const std::uint64_t value : std::vector<std::uint64_t>{0, 127, 128, 16383, 16384, 2097151, 2097152, 268435455, 268435456, 34359738367ULL, 34359738368ULL, 4398046511103ULL, 4398046511104ULL, 562949953421311ULL, 562949953421312ULL, 72057594037927935ULL, 72057594037927936ULL, UINT64_MAX}) {
+        const auto block = serialize_object_properties(std::vector<ObjectProperty>{{0, value}});
+        offset = 0;
+        ok &= expect(read_vi64(block, offset, decoded) && decoded == 0 && read_vi64(block, offset, decoded) && decoded == value && offset == block.size(), "full vi64 integer boundary roundtrip");
+    }
+    ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, 0, 1, {}, {}, true) == std::vector<std::uint8_t>({0, 0, 0, 0}), "zero payload status follows property and payload lengths");
+    const auto max_id = serialize_object_properties(std::vector<ObjectProperty>{{UINT64_MAX, std::vector<std::uint8_t>{}}});
+    offset = 0;
+    ok &= expect(read_vi64(max_id, offset, decoded) && decoded == UINT64_MAX && read_vi64(max_id, offset, decoded) && decoded == 0 && offset == max_id.size(), "full uint64 property ID");
+    const std::vector<ObjectProperty> odd{{9, std::vector<std::uint8_t>{0x80}}, {13, std::vector<std::uint8_t>{1, 2}}};
+    ok &= expect(serialize_object_properties(odd) == std::vector<std::uint8_t>({9, 1, 0x80, 4, 2, 1, 2}), "odd absolute ID with even delta has length prefix");
+    auto rejects = [&](const std::vector<ObjectProperty>& fields) {
+        try { serialize_object_properties(fields); } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    ok &= expect(rejects({{9, std::uint64_t{1}}}), "reject LOC-01 integer frame marking");
+    ok &= expect(rejects({{8, std::vector<std::uint8_t>{1}}}), "reject even bytes");
+    ok &= expect(rejects({{8, std::uint64_t{1}}, {8, std::uint64_t{2}}}), "reject duplicate IDs");
+    ok &= expect(rejects({{13, std::vector<std::uint8_t>(65536)}}), "reject oversized odd value");
+    ok &= expect(rejects({{13, std::vector<std::uint8_t>(65535)}}), "reject oversized complete block");
+    ok &= expect(serialize_object_properties(std::vector<ObjectProperty>{{13, std::vector<std::uint8_t>(65532)}}).size() == 65536, "accept complete block boundary");
+    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17}) {
+        bool rejected = false;
+        try { encode_subgroup_object(draft, {}, 0, payload, props); } catch (const std::invalid_argument&) { rejected = true; }
+        ok &= expect(rejected, "properties require draft18");
+    }
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
     ok &= test_uint8_message_parameter_decoding();
     ok &= test_publisher_control_message_encoders_for_all_drafts();

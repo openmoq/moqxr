@@ -16,6 +16,7 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
+#include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
@@ -98,6 +99,7 @@ struct PublisherConfig {
     std::chrono::seconds catalog_republish_interval{0};
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     cat4moq::AuthorizationConfig authorization;
+    MediaPackaging media_packaging = MediaPackaging::kCmaf;
 };
 
 struct PreparedPublish {

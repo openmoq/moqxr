@@ -1,6 +1,7 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cenc.h"
 #include "openmoq/publisher/drm_config.h"
+#include "openmoq/publisher/encoded_sample.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/msf_catalog.h"
 
@@ -495,8 +496,10 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
     for (std::size_t index = 0; index < segmented_mp4.tracks.size(); ++index) {
         const auto& track = segmented_mp4.tracks[index];
         const std::vector<std::uint8_t> codec_init_data =
+            track.packaging == "loc" ? loc_codec_config(track) :
             build_track_codec_init_data(segmented_mp4.initialization_segment.owned_bytes, track, index);
         const std::vector<std::uint8_t> init_segment =
+            track.packaging == "loc" ? codec_init_data :
             build_track_specific_init_segment(segmented_mp4.initialization_segment.owned_bytes, track, index);
         plan.track_initializations.push_back({
             .track_name = track.track_name,
@@ -551,7 +554,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                 max_grp_sap_starting_type = std::max(max_grp_sap_starting_type, static_cast<std::uint32_t>(fragment.sap_type));
             }
         }
-        if (has_sap_info) {
+        if (has_sap_info && track.packaging != "loc") {
             msf_track.max_grp_sap_starting_type = max_grp_sap_starting_type;
             msf_track.max_obj_sap_starting_type = max_obj_sap_starting_type;
         }
@@ -607,6 +610,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
             .has_sap_type = fragment.has_sap_type,
             .payload = fragment.payload.span,
             .owned_payload = fragment.payload.owned_bytes,
+            .properties = fragment.properties,
         });
     }
 
@@ -680,17 +684,66 @@ void emit_plan_objects(const PublishPlan& plan,
     std::filesystem::create_directories(output_dir);
 
     for (const auto& track_init : plan.track_initializations) {
-        write_bytes(output_dir / init_filename(track_init.track_name), track_init.init_segment);
+        const bool loc = std::any_of(plan.tracks.begin(), plan.tracks.end(), [&](const auto& track) {
+            return track.track_name == track_init.track_name && track.packaging == "loc";
+        });
+        write_bytes(output_dir / (loc ? track_init.track_name + "_config.bin" : init_filename(track_init.track_name)), track_init.init_segment);
     }
 
     for (const auto& object : plan.objects) {
+        const bool locmaf = object.kind == CmsfObjectKind::kMedia &&
+            std::any_of(plan.tracks.begin(), plan.tracks.end(), [&](const auto& track) {
+                return track.track_name == object.track_name && track.packaging == "locmaf";
+            });
+        const bool loc = object.kind == CmsfObjectKind::kMedia &&
+            std::any_of(plan.tracks.begin(), plan.tracks.end(), [&](const auto& track) {
+                return track.track_name == object.track_name && track.packaging == "loc";
+            });
+        auto filename = object_filename(object);
+        if (locmaf) {
+            filename = object.track_name + "_g" + std::to_string(object.group_id) + "_o" +
+                       std::to_string(object.object_id) + "_media.locmafobj";
+        }
+        if (loc) {
+            const auto stem = object.track_name + "_g" + std::to_string(object.group_id) +
+                              "_o" + std::to_string(object.object_id);
+            filename = stem + "_media.loc";
+            const auto hex = [](std::span<const std::uint8_t> bytes) {
+                constexpr char digits[] = "0123456789abcdef";
+                std::string text;
+                text.reserve(bytes.size() * 2);
+                for (const auto byte : bytes) { text += digits[byte >> 4]; text += digits[byte & 15]; }
+                return text;
+            };
+            std::ofstream metadata(output_dir / (stem + "_properties.json"));
+            if (!metadata) throw std::runtime_error("failed to create LOC properties file");
+            metadata << "{\"decodeTimeUs\":\"" << object.media_time_us
+                     << "\",\"durationUs\":\"" << object.media_duration_us
+                     << "\",\"encoded\":\"" << hex(serialize_object_properties(object.properties))
+                     << "\",\"properties\":[";
+            auto properties = object.properties;
+            std::sort(properties.begin(), properties.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
+            bool first = true;
+            for (const auto& property : properties) {
+                if (!first) metadata << ',';
+                first = false;
+                metadata << "{\"id\":\"" << property.id << "\",";
+                if (const auto* value = std::get_if<std::uint64_t>(&property.value)) {
+                    metadata << "\"value\":\"" << *value << "\"}";
+                } else {
+                    metadata << "\"hex\":\"" << hex(std::get<std::vector<std::uint8_t>>(property.value)) << "\"}";
+                }
+            }
+            metadata << "]}\n";
+            if (!metadata) throw std::runtime_error("failed to write LOC properties file");
+        }
         if (object.owned_payload.empty()) {
-            write_bytes(output_dir / object_filename(object), slice_bytes(bytes, object.payload));
+            write_bytes(output_dir / filename, slice_bytes(bytes, object.payload));
         } else {
-            write_bytes(output_dir / object_filename(object), object.owned_payload);
+            write_bytes(output_dir / filename, object.owned_payload);
         }
 
-        if (object.kind != CmsfObjectKind::kMedia) {
+        if (object.kind != CmsfObjectKind::kMedia || locmaf || loc) {
             continue;
         }
 
@@ -735,8 +788,8 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
     for (std::size_t index = 0; index < tracks.size(); ++index) {
         const auto& track = tracks[index];
         std::vector<std::uint8_t> codec_init_data =
-            build_track_codec_init_data(init_segment, track, index);
-        std::vector<std::uint8_t> track_init = build_track_specific_init_segment(init_segment, track, index);
+            track.packaging == "loc" ? loc_codec_config(track) : build_track_codec_init_data(init_segment, track, index);
+        std::vector<std::uint8_t> track_init = track.packaging == "loc" ? codec_init_data : build_track_specific_init_segment(init_segment, track, index);
         init_data_by_track.emplace(track.track_name, base64_encode(track_init));
         result.track_initializations.push_back({
             .track_name = track.track_name,
@@ -805,7 +858,8 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
 std::string track_init_data_base64(std::span<const std::uint8_t> init_segment,
                                    const TrackDescription& track,
                                    std::size_t track_index) {
-    return base64_encode(build_track_specific_init_segment(init_segment, track, track_index));
+    return base64_encode(track.packaging == "loc" ? loc_codec_config(track) :
+                         build_track_specific_init_segment(init_segment, track, track_index));
 }
 
 }  // namespace openmoq::publisher

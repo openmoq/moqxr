@@ -476,6 +476,10 @@ add_library(openmoq_publisher_lib STATIC
     src/live_srt_ingest.cpp
     src/live_srt_config.cpp
     src/live_dash_ingest.cpp
+    src/encoded_sample.cpp
+    src/loc_packager.cpp
+    src/locmaf_encoder.cpp
+    src/locmaf_packager.cpp
     src/moq_draft.cpp
     src/msf_catalog.cpp
     src/msf_url.cpp
@@ -620,6 +624,23 @@ else()
 endif()
 
 if(OPENMOQ_BUILD_TESTS)
+    add_executable(openmoq-publisher-encoded-sample-tests tests/encoded_sample_test.cpp)
+    target_link_libraries(openmoq-publisher-encoded-sample-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-encoded-sample-tests COMMAND openmoq-publisher-encoded-sample-tests)
+    set_tests_properties(openmoq-publisher-encoded-sample-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_executable(openmoq-publisher-loc-publisher-tests tests/loc_publisher_test.cpp)
+    target_link_libraries(openmoq-publisher-loc-publisher-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-loc-publisher-tests COMMAND openmoq-publisher-loc-publisher-tests)
+    add_executable(openmoq-publisher-locmaf-tests tests/locmaf_encoder_test.cpp)
+    target_link_libraries(openmoq-publisher-locmaf-tests PRIVATE openmoq_publisher_lib)
+    target_compile_definitions(openmoq-publisher-locmaf-tests PRIVATE
+        LOCMAF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/locmaf")
+    add_test(NAME openmoq-publisher-locmaf-tests COMMAND openmoq-publisher-locmaf-tests)
+    add_executable(openmoq-publisher-locmaf-publisher-tests tests/locmaf_publisher_test.cpp)
+    target_link_libraries(openmoq-publisher-locmaf-publisher-tests PRIVATE openmoq_publisher_lib)
+    target_compile_definitions(openmoq-publisher-locmaf-publisher-tests PRIVATE
+        LOCMAF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/locmaf")
+    add_test(NAME openmoq-publisher-locmaf-publisher-tests COMMAND openmoq-publisher-locmaf-publisher-tests)
     add_test(NAME openmoq-dependency-refresh-policy-tests
         COMMAND "${CMAKE_COMMAND}"
             -DOPENMOQ_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

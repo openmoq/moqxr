@@ -21,7 +21,71 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
 
 - Initialization data is represented either as a binary payload or as a dedicated MOQT track with one group and one object.
 - Media objects follow the fast path of `styp? + moof + mdat`, with `moof`/`mdat` reused directly from fragmented MP4 input.
-- The current implementation uses one media object per fragment/group, which aligns with the fragment-to-group mapping in the current MOQT CMAF packaging draft.
+- The default CMAF path splits chunks into lower-latency media objects when
+  sample boundaries are available; object IDs advance within the group.
+  `--coalesce-cmaf-chunks` selects the older one-media-object-per-group path.
+
+## LOC packaging
+
+`--packaging loc --draft 18` maps the clear H.264/AAC subset of
+[LOC-04](draft-ietf-moq-loc-04.txt) onto draft-18 subgroup properties. This does
+not enable MOQT-19. CMAF remains the default.
+
+- One encoded sample per object, with no MP4 box headers in the payload.
+- Timestamp `0x10` contains source PTS and Timescale `0x08` the source clock.
+- Video frame marking `0x09` is a byte vector: complete frames set S/E;
+  independently decodable IDRs also set I. Other marking bits remain zero.
+- Video config `0x0D` carries avcC record bytes; audio config `0x0F` carries
+  AudioSpecificConfig bytes. Configuration is repeated on every generated object.
+- Video uses one subgroup (zero) per GOP; audio uses one frame per group.
+- Property IDs are sorted and delta-encoded using draft-18 vi64; value type
+  follows the absolute ID parity. A property-bearing stream retains that framing
+  for its lifetime. Duplicate IDs, type mismatches, oversized values/blocks,
+  and properties on older transport profiles fail explicitly.
+- Catalogs signal `packaging: "loc"` and codec extradata; neither `locVersion`
+  nor `locmafVersion` is emitted.
+
+Live queue loss suppresses the remainder of the affected video group until a
+new independent entry point. Source decode timing controls ordering; source
+presentation timing remains in LOC metadata. SRT source clocks are carried
+separately from synthesized CMAF timing; its repeated matching AVC parameter
+sets are stripped only on the LOC conversion path. Secure Objects and LOC-01 fallback
+are not implemented. See [LOC constraints](quickstart.md#opt-in-to-loc).
+
+## LOCMAF packaging
+
+The opt-in implementation follows the local
+[`draft-einarsson-moq-locmaf-01`](draft-einarsson-moq-locmaf-01.txt) text and
+LOCMAF version `0.3`. Transport draft selection remains independent of media
+packaging; CMAF remains the default.
+
+- Each converted media track advertises `packaging: "locmaf"` and
+  `locmafVersion: "0.3"`. The version field is required for LOCMAF and forbidden
+  on other packaging values. The normal `initRef`/`initDataList` mechanism
+  carries a single-track CMAF initialization segment.
+- Each object carries one chunk. Objects in a group use a single ordered
+  subgroup, subgroup zero. The integrated publisher forces full headers on
+  every encoded chunk; it does not publish delta-dependent chunks. The
+  standalone encoder also supports delta headers and resets its state on
+  group changes, object gaps, and raw-box fallback.
+- Supported encoding includes sample timing, signed composition offsets,
+  sample flags/sizes, CENC auxiliary data, and generic boxes. Encoded sample
+  payloads are preserved. The publisher does not encrypt or decrypt media.
+- A chunk outside the compact encoder's model can use the draft's `rawBoxes`
+  representation while remaining a LOCMAF object. This differs from a
+  track-wide CMAF fallback: excluded sample groups (`sgpd`/`sbgp`), `subs`, or
+  fragment-level `pssh` make a track ineligible for LOCMAF.
+- Batch preparation converts a track only after all its chunks pass
+  preflight; an ineligible track stays CMAF. Live initialization can select
+  CMAF before catalog publication. Later LOCMAF encoding failures terminate
+  the live path instead of switching an advertised track to CMAF.
+- Multiplexed `moof` boxes are rejected before publication; callers must
+  demux to one `traf` per `moof`. Malformed input is an error rather than an
+  automatic CMAF fallback.
+
+The default session backend supports LOCMAF for file, stdin, SRT, and DASH
+input. The libmoq/moq5 publishing backend rejects it. See
+[quickstart](quickstart.md#opt-in-to-locmaf) for usage and current limits.
 
 ## MSF v1 catalog
 
@@ -29,8 +93,9 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
   String `"1"`; there is no root `format` field.
 - Initialization data lives in the root `initDataList` array, referenced from
   each track by `initRef`, and is serialized after `tracks`.
-- Media tracks carry `packaging` of `cmaf` per `draft-ietf-moq-cmsf-01` section
-  3.5.1, along with `maxGrpSapStartingType` and `maxObjSapStartingType`.
+- Media tracks default to `packaging: "cmaf"` per `draft-ietf-moq-cmsf-01`
+  section 3.5.1, along with `maxGrpSapStartingType` and
+  `maxObjSapStartingType`. LOCMAF opt-in uses the signaling described above.
 - All catalog JSON is produced by `serialize_catalog()` in
   `src/msf_catalog.cpp`. Do not hand-assemble catalog JSON.
 - The `MsfCatalog::publish_tracks` field models the root `publishTracks` array

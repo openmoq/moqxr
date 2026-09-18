@@ -95,6 +95,7 @@ struct MsfTrack {
     std::map<std::string, std::string> custom_fields;
 
     std::vector<std::string> content_protection_ref_ids;     // 4.1.2
+    std::optional<std::string> locmaf_version;          // LOCMAF-01 section 5
 };
 
 // One operation in a delta update (MSF section 5.1.6). This version emits

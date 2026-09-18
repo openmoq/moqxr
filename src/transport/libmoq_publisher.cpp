@@ -28,6 +28,34 @@ namespace openmoq::publisher::transport {
 
 namespace {
 
+constexpr std::string_view kLocmafUnsupported =
+    "LOCMAF requires locmafVersion catalog signaling unavailable in the libmoq publisher; "
+    "use the native publisher backend";
+
+constexpr std::string_view kLocUnsupported =
+    "LOC-04 requires object properties and catalog signaling unavailable in the libmoq publisher; "
+    "use the native publisher backend";
+constexpr std::string_view kPropertiesUnsupported =
+    "object properties are unsupported by the libmoq publisher; use the native publisher backend";
+
+bool has_loc_tracks(const PublishPlan& plan) {
+    return std::any_of(plan.tracks.begin(), plan.tracks.end(), [](const TrackDescription& track) {
+        return track.packaging == "loc";
+    });
+}
+
+bool has_properties(const PublishPlan& plan) {
+    return std::any_of(plan.objects.begin(), plan.objects.end(), [](const CmsfObject& object) {
+        return !object.properties.empty();
+    });
+}
+
+bool has_locmaf_tracks(const PublishPlan& plan) {
+    return std::any_of(plan.tracks.begin(), plan.tracks.end(), [](const TrackDescription& track) {
+        return track.packaging == "locmaf";
+    });
+}
+
 moq_bytes_t bytes_of(const std::string& s) {
     return moq_bytes_t{reinterpret_cast<const std::uint8_t*>(s.data()), s.size()};
 }
@@ -67,6 +95,12 @@ LibmoqTrackTranslation make_track_translation(const TrackDescription& td,
                                               std::vector<std::uint8_t> init_data,
                                               std::uint64_t bitrate_hint,
                                               bool is_live) {
+    if (td.packaging == "loc") {
+        throw std::invalid_argument(std::string(kLocUnsupported));
+    }
+    if (td.packaging == "locmaf") {
+        throw std::invalid_argument(std::string(kLocmafUnsupported));
+    }
     LibmoqTrackTranslation t;
     t.name = !td.track_name.empty() ? td.track_name
                                     : ("track" + std::to_string(td.track_id));
@@ -155,6 +189,15 @@ void apply_sap(LibmoqObjectTranslation& o, bool src_has, std::uint8_t value) {
 }  // namespace
 
 LibmoqPlanTranslation translate_plan_for_libmoq(const PublishPlan& plan) {
+    if (has_loc_tracks(plan)) {
+        throw std::invalid_argument(std::string(kLocUnsupported));
+    }
+    if (has_properties(plan)) {
+        throw std::invalid_argument(std::string(kPropertiesUnsupported));
+    }
+    if (has_locmaf_tracks(plan)) {
+        throw std::invalid_argument(std::string(kLocmafUnsupported));
+    }
     LibmoqPlanTranslation out;
 
     // moqxr's TrackDescription carries no bitrate, but MSF-01 5.2.22 requires a
@@ -272,6 +315,9 @@ LibmoqTrackTranslation make_libmoq_live_track(const TrackDescription& track,
 }
 
 LibmoqObjectTranslation make_libmoq_live_object(const MediaFragment& fragment) {
+    if (!fragment.properties.empty()) {
+        throw std::invalid_argument(std::string(kPropertiesUnsupported));
+    }
     LibmoqObjectTranslation o;
     o.track_name = fragment.track_name;
     o.group_id = fragment.group_id;
@@ -311,6 +357,12 @@ bool live_track_has_media_metadata(const LiveTrack& track) {
 }
 
 LibmoqTrackTranslation make_libmoq_live_object_track(const LiveTrack& track) {
+    if (track.packaging == LivePackaging::kLoc) {
+        throw std::invalid_argument(std::string(kLocUnsupported));
+    }
+    if (track.packaging == LivePackaging::kLocmaf) {
+        throw std::invalid_argument(std::string(kLocmafUnsupported));
+    }
     LibmoqTrackTranslation t;
     t.name = track.track_name;
     t.media_type =
@@ -336,6 +388,9 @@ LibmoqTrackTranslation make_libmoq_live_object_track(const LiveTrack& track) {
 }
 
 LibmoqObjectTranslation make_libmoq_live_source_object(const LiveObject& object) {
+    if (!object.properties.empty()) {
+        throw std::invalid_argument(std::string(kPropertiesUnsupported));
+    }
     LibmoqObjectTranslation o;
     o.track_name = object.track_name;
     o.group_id = object.group_id;
@@ -897,6 +952,15 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
                                         const EndpointConfig& endpoint,
                                         const TlsConfig& tls,
                                         LibmoqPublishStats& out_stats) {
+    if (config.media_packaging == MediaPackaging::kLoc || has_loc_tracks(materialized_plan)) {
+        return TransportStatus::failure(kLocUnsupported);
+    }
+    if (has_properties(materialized_plan)) {
+        return TransportStatus::failure(kPropertiesUnsupported);
+    }
+    if (config.media_packaging == MediaPackaging::kLocmaf || has_locmaf_tracks(materialized_plan)) {
+        return TransportStatus::failure(kLocmafUnsupported);
+    }
     DemandMonitor demand;
     moq_endpoint_t* ep = nullptr;
     moq_media_sender_t* sender = nullptr;
@@ -1045,6 +1109,12 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
                                               const TlsConfig& tls,
                                               LibmoqPublishStats& out_stats,
                                               LibmoqLiveHandle* live) {
+    if (config.media_packaging == MediaPackaging::kLoc) {
+        return TransportStatus::failure(kLocUnsupported);
+    }
+    if (config.media_packaging == MediaPackaging::kLocmaf) {
+        return TransportStatus::failure(kLocmafUnsupported);
+    }
     std::atomic<bool>* cancel = (live != nullptr) ? &live->cancel : nullptr;
     if (cancelled(cancel)) {
         return TransportStatus::success();  // cancelled before connecting: clean stop
@@ -1258,6 +1328,12 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
                                             const TlsConfig& tls,
                                             LibmoqPublishStats& out_stats,
                                             LibmoqLiveHandle* live) {
+    if (config.media_packaging == MediaPackaging::kLoc) {
+        return TransportStatus::failure(kLocUnsupported);
+    }
+    if (config.media_packaging == MediaPackaging::kLocmaf) {
+        return TransportStatus::failure(kLocmafUnsupported);
+    }
     std::atomic<bool>* cancel = (live != nullptr) ? &live->cancel : nullptr;
     if (srt_callers.empty()) {
         return TransportStatus::failure("no SRT callers configured");
@@ -1469,6 +1545,18 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
                                                 const TlsConfig& tls,
                                                 LibmoqPublishStats& out_stats,
                                                 LibmoqLiveHandle* live) {
+    if (config.media_packaging == MediaPackaging::kLoc ||
+        std::any_of(source.tracks.begin(), source.tracks.end(), [](const LiveTrack& track) {
+            return track.packaging == LivePackaging::kLoc;
+        })) {
+        return TransportStatus::failure(kLocUnsupported);
+    }
+    if (config.media_packaging == MediaPackaging::kLocmaf ||
+        std::any_of(source.tracks.begin(), source.tracks.end(), [](const LiveTrack& track) {
+            return track.packaging == LivePackaging::kLocmaf;
+        })) {
+        return TransportStatus::failure(kLocmafUnsupported);
+    }
     std::atomic<bool>* cancel = (live != nullptr) ? &live->cancel : nullptr;
     if (source.tracks.empty()) {
         return TransportStatus::failure("live object source has no tracks");
@@ -1556,6 +1644,9 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
             break;  // source exhausted
         }
         const LiveObject& object = *next;
+        if (!object.properties.empty()) {
+            return live_teardown(live, sender, ep, std::string(kPropertiesUnsupported));
+        }
         const auto hit = handles.find(object.track_name);
         if (hit == handles.end()) {
             return live_teardown(live, sender, ep,

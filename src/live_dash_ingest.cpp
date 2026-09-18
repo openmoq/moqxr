@@ -1,4 +1,5 @@
 #include "openmoq/publisher/live_dash_ingest.h"
+#include "loc_packager.h"
 
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/mp4_box.h"
@@ -265,11 +266,12 @@ void ChunkedBodyDecoder::parse_available() {
     }
 }
 
-LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth)
-    : queue_depth_(queue_depth == 0 ? 1 : queue_depth) {}
+LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth, MediaPackaging packaging)
+    : media_packaging_(packaging), queue_depth_(queue_depth == 0 ? 1 : queue_depth) {}
 
 void LiveDashIngestSession::ingest(std::string path, std::span<const std::uint8_t> bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!encoding_error_.empty()) return;
     auto it = paths_.find(path);
     if (it == paths_.end()) {
         if (tracks_frozen_) {
@@ -281,6 +283,7 @@ void LiveDashIngestSession::ingest(std::string path, std::span<const std::uint8_
     path_state.reader.append(bytes.data(), bytes.size());
     while (std::optional<StreamingBoxResult> box = path_state.reader.next_box()) {
         process_box_locked(path_state, path, *box);
+        if (!encoding_error_.empty()) break;
     }
     cv_.notify_all();
 }
@@ -341,6 +344,7 @@ bool LiveDashIngestSession::finished() const {
 
 std::optional<LiveObject> LiveDashIngestSession::try_next_object() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!encoding_error_.empty()) throw std::runtime_error(encoding_error_);
     if (catalog_dirty_ && !tracks_.empty()) {
         // Clear the flag only after a successful build: build_catalog_locked
         // can throw (a protected track with no pssh anywhere in the init
@@ -368,7 +372,8 @@ std::optional<LiveObject> LiveDashIngestSession::next_object_blocking() {
     constexpr auto kPollInterval = std::chrono::milliseconds(200);
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait_for(lock, kPollInterval,
-                 [&]() { return closed_ || catalog_dirty_ || !queue_.empty(); });
+                 [&]() { return closed_ || !encoding_error_.empty() || catalog_dirty_ || !queue_.empty(); });
+    if (!encoding_error_.empty()) throw std::runtime_error(encoding_error_);
     if (catalog_dirty_ && !tracks_.empty()) {
         // See try_next_object(): clear only after a successful build.
         LiveObject catalog = build_catalog_locked();
@@ -387,6 +392,11 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
                                                std::string_view path,
                                                const StreamingBoxResult& box) {
     if (box.type == "ftyp" || box.type == "moov") {
+        if (media_packaging_ == MediaPackaging::kLoc && path_state.initialized) {
+            encoding_error_ = "LOC DASH does not support initialization changes";
+            closed_ = true;
+            return;
+        }
         path_state.init_bytes.insert(path_state.init_bytes.end(), box.bytes.begin(), box.bytes.end());
         if (box.type == "moov" && !path_state.initialized) {
             // The announced track set is frozen once publishing starts; a path
@@ -398,6 +408,15 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
                 return;
             }
             path_state.tracks = extract_tracks(parse_mp4_boxes(path_state.init_bytes), path_state.init_bytes);
+            if (media_packaging_ == MediaPackaging::kLoc) {
+                try {
+                    validate_loc_init(ParsedMp4{path_state.init_bytes, parse_mp4_boxes(path_state.init_bytes), path_state.tracks}, true);
+                } catch (const std::exception& error) {
+                    encoding_error_ = std::string("LOC DASH initialization failed: ") + error.what();
+                    closed_ = true;
+                    return;
+                }
+            }
             const std::string prefix = path_slug(path);
             // pssh boxes are siblings of trak under moov, so they live in the
             // full init segment kept in path_state.init_bytes. Parse them here,
@@ -411,6 +430,17 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
             const std::vector<CencSystem> path_pssh_systems =
                 path_has_protection ? collect_pssh_systems(path_state.init_bytes)
                                     : std::vector<CencSystem>{};
+            std::vector<TrackInitialization> locmaf_initializations;
+            if (media_packaging_ == MediaPackaging::kLocmaf) {
+                try {
+                    locmaf_initializations = build_live_catalog(
+                        path_state.tracks, path_state.init_bytes, true).track_initializations;
+                } catch (const std::exception& error) {
+                    encoding_error_ = std::string("LOCMAF DASH catalog failed: ") + error.what();
+                    closed_ = true;
+                    return;
+                }
+            }
             for (std::size_t index = 0; index < path_state.tracks.size(); ++index) {
                 TrackDescription& track = path_state.tracks[index];
                 track.track_name = prefix + "_" + track.track_name;
@@ -420,6 +450,32 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
                 } catch (const std::exception& error) {
                     std::cerr << "[dash-ingest] track '" << track.track_name
                               << "' has no usable init segment: " << error.what() << std::endl;
+                }
+                track.packaging = "cmaf";
+                if (media_packaging_ == MediaPackaging::kLocmaf && index < locmaf_initializations.size()) {
+                    try {
+                        locmaf_encoders_.emplace(track.track_name,
+                            std::make_unique<LocmafEncoder>(locmaf_initializations[index].init_segment));
+                        track.packaging = "locmaf";
+                    } catch (const LocmafIneligible& error) {
+                        std::cerr << "[dash-ingest] LOCMAF init ineligible for " << track.track_name
+                                  << ": " << error.what() << std::endl;
+                    } catch (const std::exception& error) {
+                        encoding_error_ = std::string("LOCMAF DASH initialization failed: ") + error.what();
+                        closed_ = true;
+                        return;
+                    }
+                }
+                if (media_packaging_ == MediaPackaging::kLoc) {
+                    try {
+                        loc_encoders_.emplace(track.track_name, std::make_shared<LocTrackEncoder>(track));
+                        track.packaging = "loc";
+                        init_data = track_init_data_base64(path_state.init_bytes, track, index);
+                    } catch (const std::exception& error) {
+                        encoding_error_ = std::string("LOC DASH initialization failed: ") + error.what();
+                        closed_ = true;
+                        return;
+                    }
                 }
                 tracks_.push_back(RegisteredTrack{.description = track,
                                                   .init_data_base64 = std::move(init_data),
@@ -433,6 +489,21 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
     if (!path_state.initialized) {
         return;
     }
+    if (media_packaging_ == MediaPackaging::kLocmaf) {
+        if (box.bytes.size() > 16 * 1024 * 1024 - path_state.pending_chunk.size()) {
+            encoding_error_ = "LOCMAF DASH chunk exceeds 16 MiB";
+            closed_ = true;
+            return;
+        }
+        if (box.type != "mdat") {
+            path_state.pending_chunk.insert(path_state.pending_chunk.end(), box.bytes.begin(), box.bytes.end());
+        }
+    }
+    if (media_packaging_ == MediaPackaging::kLoc && box.bytes.size() > 16 * 1024 * 1024) {
+        encoding_error_ = "LOC DASH input box exceeds 16 MiB";
+        closed_ = true;
+        return;
+    }
     if (box.type == "moof") {
         path_state.pending_moof = box.bytes;
         return;
@@ -441,10 +512,52 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         return;
     }
 
+    if (media_packaging_ == MediaPackaging::kLoc) {
+        try {
+            const auto samples = read_fragment_samples(path_state.pending_moof, box.bytes, path_state.tracks);
+            for (const auto& sample : samples) {
+                if (!track_published_locked(sample.track_name)) continue;
+                auto fragments = loc_encoders_.at(sample.track_name)->encode(std::span(&sample, 1));
+                for (auto& fragment : fragments) {
+                    enqueue_locked(LiveObject{
+                        .track_name = fragment.track_name,
+                        .group_id = fragment.group_id,
+                        .object_id = fragment.object_id,
+                        .media_time_us = fragment.start_time_us,
+                        .media_duration_us = fragment.duration_us,
+                        .payload = std::move(fragment.payload.owned_bytes),
+                        .final_in_subgroup = false,
+                        .properties = std::move(fragment.properties),
+                    });
+                }
+            }
+        } catch (const std::exception& error) {
+            encoding_error_ = std::string("LOC DASH sample encoding failed: ") + error.what();
+            closed_ = true;
+            queue_.clear();
+        }
+        path_state.pending_moof.clear();
+        return;
+    }
+
     MediaFragment fragment;
     try {
+        if (media_packaging_ == MediaPackaging::kLocmaf) {
+            const auto boxes = parse_mp4_boxes(path_state.pending_moof);
+            if (boxes.size() != 1 || std::count_if(
+                    boxes.front().children.begin(), boxes.front().children.end(),
+                    [](const auto& child) { return child.type == "traf"; }) != 1) {
+                throw std::runtime_error(
+                    "LOCMAF requires one traf per moof; demux or use separate_moof");
+            }
+        }
         fragment = build_live_fragment(path_state.pending_moof, box.bytes, path_state.tracks, 0);
     } catch (const std::exception& error) {
+        if (media_packaging_ == MediaPackaging::kLocmaf) {
+            encoding_error_ = std::string("LOCMAF DASH fragment parse failed: ") + error.what();
+            closed_ = true;
+            return;
+        }
         // A malformed fragment (e.g. a moof referencing an unknown track) must
         // not take down the ingest thread; drop it and keep serving the path.
         std::cerr << "[dash-ingest] dropping fragment on path '" << path
@@ -453,6 +566,8 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         return;
     }
     path_state.pending_moof.clear();
+    auto original_chunk = std::move(path_state.pending_chunk);
+    path_state.pending_chunk.clear();
     if (!track_published_locked(fragment.track_name)) {
         return;
     }
@@ -490,6 +605,19 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         fragment.group_id = path_state.next_group_by_track[fragment.track_name]++;
         fragment.object_id = 0;
     }
+    const auto encoder = locmaf_encoders_.find(fragment.track_name);
+    if (encoder != locmaf_encoders_.end()) {
+        original_chunk.insert(original_chunk.end(), box.bytes.begin(), box.bytes.end());
+        try {
+            fragment.payload.owned_bytes = encoder->second->encode(
+                original_chunk, fragment.group_id, fragment.object_id, true);
+        } catch (const std::exception& error) {
+            encoding_error_ = "LOCMAF DASH encoding failed for " + fragment.track_name + ": " + error.what();
+            closed_ = true;
+            queue_.clear();
+            return;
+        }
+    }
     enqueue_locked(LiveObject{
         .track_name = fragment.track_name,
         .group_id = fragment.group_id,
@@ -512,10 +640,32 @@ bool LiveDashIngestSession::track_published_locked(std::string_view track_name) 
 }
 
 void LiveDashIngestSession::enqueue_locked(LiveObject object) {
-    while (queue_.size() >= queue_depth_) {
-        queue_.pop_front();
+    if (media_packaging_ != MediaPackaging::kLoc) {
+        while (queue_.size() >= queue_depth_) queue_.pop_front();
+        queue_.push_back(std::move(object));
+        return;
+    }
+    const auto dropped = loc_dropped_group_.find(object.track_name);
+    if (dropped != loc_dropped_group_.end() && object.group_id <= dropped->second) return;
+    if (object.payload.size() > 16 * 1024 * 1024) {
+        encoding_error_ = "LOC DASH sample exceeds 16 MiB";
+        closed_ = true;
+        return;
     }
     queue_.push_back(std::move(object));
+    auto byte_count = [&]() {
+        std::size_t size = 0;
+        for (const auto& queued : queue_) size += queued.payload.size();
+        return size;
+    };
+    while (queue_.size() > queue_depth_ || byte_count() > 16 * 1024 * 1024) {
+        const auto name = queue_.front().track_name;
+        const auto group = queue_.front().group_id;
+        loc_dropped_group_[name] = group;
+        std::erase_if(queue_, [&](const LiveObject& queued) {
+            return queued.track_name == name && queued.group_id == group;
+        });
+    }
 }
 
 std::vector<LiveTrack> LiveDashIngestSession::snapshot_tracks_locked() const {
@@ -524,7 +674,14 @@ std::vector<LiveTrack> LiveDashIngestSession::snapshot_tracks_locked() const {
         out.push_back(LiveTrack{.track_name = "catalog"});
     }
     for (const auto& track : tracks_) {
-        out.push_back(LiveTrack{.track_name = track.description.track_name});
+        const auto& description = track.description;
+        LiveTrack live_track{.track_name = description.track_name,
+            .media_type = description.handler_type == "vide" ? LiveMediaType::kVideo : LiveMediaType::kAudio,
+            .packaging = description.packaging == "loc" ? LivePackaging::kLoc :
+                         description.packaging == "locmaf" ? LivePackaging::kLocmaf : LivePackaging::kCmaf,
+            .codec = description.codec};
+        if (description.packaging == "loc") live_track.init_data = loc_codec_config(description);
+        out.push_back(std::move(live_track));
     }
     return out;
 }
@@ -541,12 +698,7 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
         });
 
     for (const auto& registered : tracks_) {
-        // CTE ingest always produces CMAF regardless of the parsed value;
-        // coerce before make_msf_track so the role it derives from
-        // track.packaging cannot end up mismatched with the packaging value
-        // actually published.
-        TrackDescription track = registered.description;
-        track.packaging = "cmaf";
+        const TrackDescription& track = registered.description;
         MsfTrack msf_track = make_msf_track(track, /*is_live=*/true);
         if (video_track_count > 1 && track.handler_type == "vide") {
             msf_track.alt_group = 1;
@@ -583,7 +735,7 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
 struct LiveDashIngestServer::Impl {
     explicit Impl(LiveDashIngestConfig server_config)
         : config(std::move(server_config)),
-          session(config.queue_depth) {}
+          session(config.queue_depth, config.media_packaging) {}
 
     LiveDashIngestConfig config;
     LiveDashIngestSession session;

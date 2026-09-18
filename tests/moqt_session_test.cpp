@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -43,6 +45,10 @@ TransportStatus exercise_terminal_completion_overflow_for_testing(
 
 namespace openmoq::publisher::transport::live_srt_internal {
 
+std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
+    std::span<const openmoq::publisher::MediaFragment> fragments,
+    const std::vector<openmoq::publisher::TrackDescription>& tracks);
+
 TransportStatus exercise_live_srt_publish_flow_for_testing(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
@@ -65,6 +71,7 @@ using openmoq::publisher::LiveCatalogMode;
 using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
 using openmoq::publisher::LiveTrack;
+using openmoq::publisher::MediaPackaging;
 using openmoq::publisher::PublishPlan;
 using openmoq::publisher::TrackDescription;
 using openmoq::publisher::materialize_publish_plan;
@@ -1581,6 +1588,51 @@ int main() {
     std::string authority;
     std::string path;
     std::uint64_t max_request_id = 1;
+
+    for (int property_case = 0; property_case < 4; ++property_case) {
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 1, DraftVersion::kDraft18));
+        auto plan = make_multi_object_subgroup_plan();
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+        plan.objects[1].properties = {{8, std::uint64_t{1000}}, {16, std::uint64_t{42}}};
+        if (property_case == 1) {
+            plan.objects[1].properties.clear();
+            plan.objects[2].properties = {{16, std::uint64_t{43}}};
+        } else if (property_case == 2) {
+            plan.objects[1].properties = {{9, std::uint64_t{1}}};
+        } else if (property_case == 3) {
+            plan.objects[1].properties.clear();
+        }
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        auto property_status = session.connect(endpoint, tls);
+        if (property_status.ok) property_status = session.publish(plan);
+        ok &= expect(property_status.ok == (property_case == 0 || property_case == 3), "property stream validation status");
+        std::vector<std::vector<std::uint8_t>> data;
+        std::set<std::uint64_t> data_streams;
+        for (const auto& write : transport.writes) {
+            if (is_data_stream_write(write)) data_streams.insert(write.stream_id);
+            if (data_streams.contains(write.stream_id) && !write.bytes.empty()) data.push_back(write.bytes);
+        }
+        if (property_case == 0 || property_case == 3) {
+            ok &= expect(data.size() == 3, "three captured objects in property subgroup");
+            if (data.size() == 3) {
+                ok &= expect(data[0][0] == (property_case == 0 ? 0x39 : 0x38), "captured subgroup property mode");
+                const std::vector<std::uint8_t> expected = property_case == 0
+                    ? std::vector<std::uint8_t>{0, 0, 2, 'V', '1'}
+                    : std::vector<std::uint8_t>{0, 2, 'V', '1'};
+                ok &= expect(data[1] == expected, "captured empty property object or unchanged baseline");
+                if (property_case == 0) {
+                    const std::vector<std::uint8_t> suffix{0, 5, 8, 0x83, 0xe8, 8, 42, 2, 'V', '0'};
+                    ok &= expect(data[0].size() >= suffix.size() && std::equal(suffix.begin(), suffix.end(), data[0].end() - suffix.size()), "captured LOC property golden object");
+                }
+            }
+        } else {
+            ok &= expect(data.size() == (property_case == 1 ? 1 : 0), "invalid properties are rejected before writing object");
+        }
+    }
 
     ok &= expect(
         openmoq::publisher::transport::priority_scheduler_internal::
@@ -8322,6 +8374,170 @@ int main() {
     }
 
     {
+        using openmoq::publisher::MediaFragment;
+        using openmoq::publisher::SourceSampleTiming;
+        using openmoq::publisher::transport::live_srt_internal::encode_loc_fragments_for_testing;
+        TrackDescription track{.track_id = 1, .handler_type = "vide", .codec = "avc1.42001e", .sample_entry_type = "avc1", .track_name = "video"};
+        track.timescale = 90000;
+        track.codec_private = make_box("avcC", {1, 66, 0, 30, 0xff, 0xe1, 0, 2, 0x67, 0x42, 1, 0, 2, 0x68, 0xce});
+        auto be32 = [](std::uint32_t value) { std::vector<std::uint8_t> bytes; append_be32(bytes, value); return bytes; };
+        auto full_box = [&](std::string_view type, std::uint8_t version, std::uint32_t flags, std::vector<std::uint8_t> payload) {
+            auto prefix = be32((static_cast<std::uint32_t>(version) << 24) | flags);
+            return make_box(type, concat({prefix, payload}));
+        };
+        auto make_fragment = [&](std::uint64_t dts, std::int64_t pts, std::uint64_t sequence, bool independent) {
+            const auto tfhd = full_box("tfhd", 0, 0x020038, concat({be32(1), be32(3000), be32(6), be32(independent ? 0x02000000 : 0x01010000)}));
+            const auto tfdt = full_box("tfdt", 0, 0, be32(0));
+            auto trun = full_box("trun", 0, 1, concat({be32(1), be32(0)}));
+            auto moof = make_box("moof", make_box("traf", concat({tfhd, tfdt, trun})));
+            trun = full_box("trun", 0, 1, concat({be32(1), be32(static_cast<std::uint32_t>(moof.size() + 8))}));
+            moof = make_box("moof", make_box("traf", concat({tfhd, tfdt, trun})));
+            MediaFragment fragment;
+            fragment.track_name = "video";
+            fragment.payload.owned_bytes = concat({moof, make_box("mdat", {0, 0, 0, 2, static_cast<std::uint8_t>(independent ? 0x65 : 0x41), 0x88})});
+            fragment.source_timing = SourceSampleTiming{dts, pts, 0, 90000, sequence};
+            return fragment;
+        };
+        const std::vector<MediaFragment> fragments{make_fragment(90000, 93000, 0, true), make_fragment(93000, 90000, 1, false), make_fragment(96000, 96000, 2, true)};
+        const auto encoded = encode_loc_fragments_for_testing(fragments, {track});
+        ok &= expect(encoded.size() == 3 && encoded[0].earliest_presentation_time_us == 1033333 && encoded[1].earliest_presentation_time_us == 1000000 && encoded[2].group_id == 1, "LOC SRT preserves original PTS including reordered video");
+        ok &= expect(encoded.size() == 3 && encoded[0].start_time_us == 1000000 && encoded[1].start_time_us == 1033333, "LOC SRT schedules in source decode order");
+        ok &= expect(encoded.size() == 3 && encoded[0].duration_us == 33333 && encoded[2].duration_us == 33333, "LOC SRT uses measured DTS durations and final tail estimate");
+        const std::vector<MediaFragment> gap{make_fragment(90000, 90000, 0, true), make_fragment(96000, 96000, 2, false), make_fragment(99000, 99000, 3, true), make_fragment(102000, 102000, 4, false)};
+        const auto recovered = encode_loc_fragments_for_testing(gap, {track});
+        ok &= expect(recovered.size() == 2 && recovered[0].is_video_keyframe && recovered[0].object_id == 0, "LOC SRT queue sequence gap suppresses dependent video until next independent sample");
+    }
+
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[4].push_back(encode_publish_ok_message(DraftVersion::kDraft18, 2, 1));
+        const std::vector<std::uint8_t> config{1, 66, 0, 30, 0xff, 0xe1, 0, 2, 0x67, 0x42, 1, 0, 2, 0x68, 0xce};
+        LiveTrack track{.track_name = "video", .media_type = openmoq::publisher::LiveMediaType::kVideo,
+                        .packaging = openmoq::publisher::LivePackaging::kLoc, .codec = "avc1.42001e", .init_data = config};
+        if (invalid == 3) track.media_type = openmoq::publisher::LiveMediaType::kUnset;
+        bool emitted = false;
+        LiveObjectSource source{.tracks = {track}, .next_object = [&]() -> std::optional<LiveObject> {
+            if (emitted) return std::nullopt;
+            emitted = true;
+            auto object_config = config;
+            if (invalid == 2) object_config.back() ^= 1;
+            return LiveObject{.track_name = "video", .payload = {0, 0, 0, 2, 0x65, 0x88},
+                .properties = {{8, std::uint64_t{1000}}, {16, std::uint64_t{42}},
+                               {9, std::vector<std::uint8_t>{static_cast<std::uint8_t>(invalid == 1 ? 0xc0 : 0xe0)}},
+                               {13, object_config}}};
+        }};
+        MoqtSession session(transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = session.connect(endpoint, tls);
+        if (status.ok) status = session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(status.ok == (invalid == 0), "LOC arbitrary source validates independent start and matching configuration: " + status.message);
+        ok &= expect(session.publish_stats().objects_published == (invalid == 0 ? 1 : 0), "invalid LOC source never publishes media");
+    }
+
+    {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        MoqtSession session(transport);
+        session.set_media_packaging(MediaPackaging::kLoc);
+        status = session.connect(endpoint, tls);
+        std::ifstream fixture(std::filesystem::path(__FILE__).parent_path() / "fixtures/locmaf-publisher.mp4", std::ios::binary);
+        std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(fixture)), std::istreambuf_iterator<char>());
+        const std::vector<std::uint8_t> stsd{'s', 't', 's', 'd'};
+        const auto type = std::search(bytes.begin(), bytes.end(), stsd.begin(), stsd.end());
+        if (type != bytes.end()) *(type + 11) = 2;
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        status = session.publish_live(input, DraftVersion::kDraft18, true);
+        ok &= expect(!status.ok && status.message.find("description") != std::string::npos, "LOC stdin validates init before catalog: " + status.message);
+        ok &= expect(session.publish_stats().objects_published == 0, "invalid LOC stdin init emits no objects");
+    }
+
+    for (const bool audio_only : {false, true}) {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 2));
+        transport.reads[8].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 4));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        session.set_media_packaging(MediaPackaging::kLoc);
+        status = session.connect(endpoint, tls);
+        std::ifstream input(std::filesystem::path(__FILE__).parent_path() /
+                            (audio_only ? "fixtures/locmaf-audio.mp4" : "fixtures/locmaf-publisher.mp4"), std::ios::binary);
+        status = session.publish_live(input, DraftVersion::kDraft18, true);
+        ok &= expect(status.ok, "LOC stdin fixture publish: " + status.message);
+        std::size_t property_streams = 0;
+        std::set<std::uint64_t> seen;
+        for (const auto& write : transport.writes) {
+            if (!is_data_stream_write(write) || !seen.insert(write.stream_id).second) continue;
+            ok &= expect((write.bytes.front() & 1) == 1, "LOC stdin opens streams with PROPERTIES");
+            ++property_streams;
+        }
+        ok &= expect(property_streams > 0 && session.publish_stats().objects_published >= 2, "LOC stdin emits multiple encoded media samples");
+    }
+
+    for (const bool audio_only : {false, true}) {
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16, .max_request_id = 8,
+        }));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), true, false, false,
+                            std::chrono::seconds(1));
+        session.set_media_packaging(MediaPackaging::kLocmaf);
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected LOCMAF stdin session connect");
+        std::ifstream input(std::filesystem::path(__FILE__).parent_path() /
+                            (audio_only ? "fixtures/locmaf-audio.mp4" : "fixtures/locmaf-publisher.mp4"),
+                            std::ios::binary);
+        ok &= expect(input.good(), "expected real LOCMAF stdin fixture");
+        status = session.publish_live(input, DraftVersion::kDraft16, false);
+        ok &= expect(status.ok, "expected LOCMAF stdin publish: " + status.message);
+        std::size_t full_objects = 0;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 0 || write.bytes.empty()) continue;
+            std::uint64_t type, alias, group, object, length;
+            std::vector<std::uint8_t> payload;
+            if (decode_object_stream_fields(write.bytes, type, alias, group, object, length, payload)) {
+                ok &= expect(!payload.empty() && payload.front() == 2,
+                             "expected each stdin media group to carry a full LOCMAF object");
+                ++full_objects;
+            }
+        }
+        ok &= expect(full_objects >= 2 && session.publish_stats().objects_published == full_objects,
+                     "expected LOCMAF stdin media objects without prefix markers");
+    }
+
+    {
+        MockTransport locmaf_transport;
+        MoqtSession session(locmaf_transport);
+        session.set_media_packaging(MediaPackaging::kLocmaf);
+        status = session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected LOCMAF constraint session connect");
+        std::istringstream input;
+        status = session.publish_live(input, DraftVersion::kDraft16, true, true);
+        ok &= expect(!status.ok && status.message.find("single subgroup") != std::string::npos,
+                     "expected LOCMAF per-object stream rejection before input/setup");
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = []() -> std::optional<LiveObject> { return std::nullopt; },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        status = session.publish_live_objects(source, DraftVersion::kDraft16);
+        ok &= expect(!status.ok && status.message.find("source-owned catalog") != std::string::npos,
+                     "expected LOCMAF opaque source catalog rejection before setup");
+        PublishPlan invalid_plan;
+        invalid_plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft16);
+        invalid_plan.tracks.push_back(TrackDescription{.track_name = "video", .packaging = "locmaf"});
+        invalid_plan.objects.push_back(CmsfObject{.kind = CmsfObjectKind::kMedia,
+            .track_name = "video", .subgroup_id = 1, .owned_payload = {2}});
+        status = session.publish(invalid_plan);
+        ok &= expect(!status.ok && status.message.find("single subgroup") != std::string::npos,
+                     "expected LOCMAF batch nonzero subgroup rejection before setup");
+        ok &= expect(locmaf_transport.writes.empty(),
+                     "expected invalid LOCMAF options to emit no setup or media");
+    }
+
+    for (const bool locmaf : {false, true}) {
         MockTransport grouped_live_transport;
         grouped_live_transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
@@ -8337,15 +8553,16 @@ int main() {
 
         std::vector<LiveObject> objects = {
             LiveObject{.track_name = "video", .group_id = 0, .object_id = 0,
-                       .payload = {'V', '0'}, .final_in_subgroup = false},
+                       .payload = {'V', '0'}, .final_in_subgroup = locmaf},
             LiveObject{.track_name = "video", .group_id = 0, .object_id = 1,
-                       .payload = {'V', '1'}, .final_in_subgroup = false},
+                       .payload = {'V', '1'}, .final_in_subgroup = locmaf},
             LiveObject{.track_name = "video", .group_id = 1, .object_id = 0,
-                       .payload = {'V', '2'}, .final_in_subgroup = false},
+                       .payload = {'V', '2'}, .final_in_subgroup = locmaf},
         };
         std::size_t object_index = 0;
         LiveObjectSource source{
-            .tracks = {LiveTrack{.track_name = "video"}},
+            .tracks = {LiveTrack{.track_name = "video", .packaging = locmaf
+                ? openmoq::publisher::LivePackaging::kLocmaf : openmoq::publisher::LivePackaging::kRaw}},
             .next_object = [&]() -> std::optional<LiveObject> {
                 if (object_index >= objects.size()) {
                     return std::nullopt;

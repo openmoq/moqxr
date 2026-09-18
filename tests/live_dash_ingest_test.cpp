@@ -97,7 +97,8 @@ std::uint32_t read_be32(std::span<const std::uint8_t> bytes, std::size_t offset)
 }
 
 std::vector<std::uint8_t> make_init_segment(std::uint32_t track_id,
-                                            std::string_view handler_type = "vide") {
+                                            std::string_view handler_type = "vide",
+                                            bool loc_config = false) {
     const bool is_audio = handler_type == "soun";
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
     const auto tkhd = full_box("tkhd", 0, 0, concat({std::vector<std::uint8_t>(8, 0), be32(track_id), std::vector<std::uint8_t>(4, 0)}));
@@ -125,10 +126,15 @@ std::vector<std::uint8_t> make_init_segment(std::uint32_t track_id,
         visual_header[25] = 0x40;
         visual_header[26] = 0x00;
         visual_header[27] = 0xf0;
-        sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+        sample_entry = make_box("avc1", concat({visual_header, make_box("avcC", loc_config ? std::vector<std::uint8_t>{1, 66, 0, 30, 0xff, 0xe1, 0, 2, 0x67, 0x42, 1, 0, 2, 0x68, 0xce} : std::vector<std::uint8_t>{1, 100, 0, 12, 0xff})}));
     }
     const auto stsd = full_box("stsd", 0, 0, concat({be32(1), sample_entry}));
-    const auto stbl = make_box("stbl", stsd);
+    const auto empty_tables = loc_config
+        ? concat({full_box("stsz", 0, 0, concat({be32(0), be32(0)})),
+                  full_box("stts", 0, 0, be32(0)), full_box("stsc", 0, 0, be32(0)),
+                  full_box("stco", 0, 0, be32(0))})
+        : std::vector<std::uint8_t>{};
+    const auto stbl = make_box("stbl", concat({stsd, empty_tables}));
     const auto minf = make_box("minf", stbl);
     const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
     const auto trak = make_box("trak", concat({tkhd, mdia}));
@@ -154,7 +160,8 @@ std::vector<std::uint8_t> make_media_fragment(std::uint32_t track_id,
 
 std::vector<std::uint8_t> make_dash_media_fragment(std::uint32_t track_id,
                                                    std::uint64_t decode_time,
-                                                   std::vector<std::uint8_t> sample) {
+                                                   std::vector<std::uint8_t> sample,
+                                                   bool independent = true) {
     const auto tfhd = full_box(
         "tfhd", 0, 0x020038,
         concat({be32(track_id), be32(512), be32(static_cast<std::uint32_t>(sample.size())),
@@ -162,7 +169,7 @@ std::vector<std::uint8_t> make_dash_media_fragment(std::uint32_t track_id,
     const auto tfdt = full_box("tfdt", 1, 0, be64(decode_time));
     const auto trun = full_box(
         "trun", 0, 0x000005,
-        concat({be32(1), be32(112), be32(0x02000000)}));
+        concat({be32(1), be32(112), be32(independent ? 0x02000000 : 0x01010000)}));
     const auto traf = make_box("traf", concat({tfhd, tfdt, trun}));
     const auto moof = make_box("moof", concat({full_box("mfhd", 0, 0, be32(1)), traf}));
     const auto mdat = make_box("mdat", sample);
@@ -368,9 +375,88 @@ void close_socket(int fd) {
 int main() {
     bool ok = true;
 
+    {
+        LiveDashIngestSession session(2, openmoq::publisher::MediaPackaging::kLoc);
+        session.ingest("/ingest/loc", make_init_segment(1, "vide", true));
+        const std::vector<std::uint8_t> sample{0, 0, 0, 2, 0x65, 0x88};
+        for (std::uint64_t i = 0; i < 3; ++i) {
+            session.ingest("/ingest/loc", make_dash_media_fragment(1, i * 512, sample));
+        }
+        const auto source = session.source();
+        ok &= expect(source.tracks.size() == 2 && source.tracks.back().packaging == openmoq::publisher::LivePackaging::kLoc, "LOC DASH source signaling");
+        const auto catalog = session.try_next_object();
+        const auto media = session.try_next_object();
+        ok &= expect(catalog && as_string(catalog->payload).find("\"packaging\":\"loc\"") != std::string::npos, "LOC DASH catalog packaging");
+        ok &= expect(media && media->payload == sample && !media->properties.empty() && media->group_id == 1 && media->object_id == 0, "LOC DASH preserves samples/properties and drops complete oldest group");
+        session.ingest("/ingest/loc", make_init_segment(1, "vide", true));
+        bool rejected = false;
+        try { session.try_next_object(); } catch (const std::runtime_error&) { rejected = true; }
+        ok &= expect(rejected, "LOC DASH fails unsupported reinitialization");
+    }
+
+    {
+        LiveDashIngestSession session(2, openmoq::publisher::MediaPackaging::kLoc);
+        session.ingest("/ingest/recovery", make_init_segment(1, "vide", true));
+        const std::vector<std::uint8_t> sample{0, 0, 0, 2, 0x65, 0x88};
+        for (std::uint64_t i = 0; i < 4; ++i) session.ingest("/ingest/recovery", make_dash_media_fragment(1, i * 512, sample, i == 0));
+        session.try_next_object(); // catalog
+        ok &= expect(!session.try_next_object(), "LOC eviction suppresses remainder of dropped GOP");
+        session.ingest("/ingest/recovery", make_dash_media_fragment(1, 2048, sample));
+        const auto recovered = session.try_next_object();
+        ok &= expect(recovered && recovered->group_id == 1 && recovered->object_id == 0, "LOC resumes only at new independent group");
+    }
+
+    {
+        auto invalid_init = make_init_segment(1, "vide", true);
+        const std::vector<std::uint8_t> stsd{'s', 't', 's', 'd'};
+        const auto type = std::search(invalid_init.begin(), invalid_init.end(), stsd.begin(), stsd.end());
+        if (type != invalid_init.end()) *(type + 11) = 2;
+        LiveDashIngestSession session(8, openmoq::publisher::MediaPackaging::kLoc);
+        session.ingest("/ingest/invalid-init", invalid_init);
+        bool rejected = false;
+        try { session.try_next_object(); } catch (const std::runtime_error&) { rejected = true; }
+        ok &= expect(rejected, "LOC DASH rejects multiple sample descriptions before catalog");
+    }
+
     ok &= expect_chunked_decodes("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", "Wikipedia");
     ok &= expect_chunked_decodes("4;token=value\r\nWiki\r\n0\r\n\r\n", "Wiki");
     ok &= expect_chunked_rejects("FFFFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n");
+
+    {
+        LiveDashIngestSession session(8, openmoq::publisher::MediaPackaging::kLocmaf);
+        const auto init = make_init_segment(1);
+        session.ingest("/ingest/video", init);
+        const auto source = session.source();
+        ok &= expect(source.tracks.size() == 2 &&
+                         source.tracks.back().packaging == openmoq::publisher::LivePackaging::kLocmaf,
+                     "expected DASH LOCMAF track metadata");
+        session.ingest("/ingest/video", make_dash_media_fragment(1, 0, {0x11, 0x22, 0x33}));
+        const auto catalog = session.try_next_object();
+        const auto media = session.try_next_object();
+        ok &= expect(catalog.has_value() && media.has_value(), "expected DASH LOCMAF catalog and media");
+        if (catalog) {
+            const std::string json(catalog->payload.begin(), catalog->payload.end());
+            ok &= expect(json.find("\"packaging\":\"locmaf\"") != std::string::npos &&
+                             json.find("\"locmafVersion\":\"0.3\"") != std::string::npos,
+                         "expected DASH catalog LOCMAF signaling");
+        }
+        if (media) {
+            ok &= expect(!media->payload.empty() && media->payload.front() == 2 &&
+                             !media->final_in_subgroup && media->subgroup_id == 0,
+                         "expected LOCMAF bytes on single open subgroup");
+        }
+        auto malformed = make_dash_media_fragment(1, 512, {0x11, 0x22, 0x33});
+        malformed.resize(malformed.size() - 11);
+        const auto short_mdat = make_box("mdat", {0x11});
+        malformed.insert(malformed.end(), short_mdat.begin(), short_mdat.end());
+        session.ingest("/ingest/video", malformed);
+        bool failed_cleanly = false;
+        try { (void)session.try_next_object(); }
+        catch (const std::runtime_error& error) {
+            failed_cleanly = std::string(error.what()).find("LOCMAF") != std::string::npos;
+        }
+        ok &= expect(failed_cleanly, "expected later LOCMAF encoding failure without CMAF substitution");
+    }
 
     {
         // FFmpeg's DASH muxer stores duration, size, and default flags in

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -1742,7 +1743,11 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
                                                  std::uint64_t track_alias,
                                                  std::uint64_t group_id,
                                                  std::uint64_t subgroup_id,
-                                                 bool end_of_group) {
+                                                 bool end_of_group,
+                                                 bool properties_present) {
+    if (properties_present && draft != DraftVersion::kDraft18) {
+        throw std::invalid_argument("object properties require draft 18");
+    }
     // Current callers always serve subgroup_id = 0 and the publisher default
     // priority, which matches SubgroupIDMode=0 + DefaultPriority=1. That shape
     // is on the wire what most interop partners (mojito, the Akamai test
@@ -1751,7 +1756,8 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
     static_cast<void>(subgroup_id);
     const std::uint64_t base_type =
         draft == DraftVersion::kDraft14 ? kObjectDatagramTypeDraft14 : kSubgroupHeaderType;
-    const std::uint64_t stream_type = base_type | (end_of_group ? kSubgroupHeaderEndOfGroupBit : 0);
+    const std::uint64_t stream_type = base_type | (end_of_group ? kSubgroupHeaderEndOfGroupBit : 0) |
+        (properties_present ? 0x01 : 0);
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, stream_type);
     append_moqint(bytes, draft, track_alias);
@@ -1762,7 +1768,17 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
 std::vector<std::uint8_t> encode_subgroup_object(DraftVersion draft,
                                                  std::optional<std::uint64_t> previous_object_id,
                                                  std::uint64_t object_id,
-                                                 std::span<const std::uint8_t> payload) {
+                                                 std::span<const std::uint8_t> payload,
+                                                 std::span<const ObjectProperty> properties,
+                                                 bool properties_present) {
+    properties_present = properties_present || !properties.empty();
+    if (properties_present && draft != DraftVersion::kDraft18) {
+        throw std::invalid_argument("object properties require draft 18");
+    }
+    if (previous_object_id && object_id <= *previous_object_id) {
+        throw std::invalid_argument("subgroup object IDs must increase");
+    }
+    const auto property_bytes = serialize_object_properties(properties);
     // Spec §10.4.2: the first Object on a Subgroup stream carries its
     // absolute Object ID; subsequent Objects encode an Object ID Delta
     // such that next.object_id = previous.object_id + delta + 1.
@@ -1770,6 +1786,10 @@ std::vector<std::uint8_t> encode_subgroup_object(DraftVersion draft,
         previous_object_id.has_value() ? (object_id - *previous_object_id - 1) : object_id;
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, object_id_delta);
+    if (properties_present) {
+        append_moqint(bytes, draft, property_bytes.size());
+        bytes.insert(bytes.end(), property_bytes.begin(), property_bytes.end());
+    }
     append_moqint(bytes, draft, payload.size());
     if (uses_moq_vi64(draft) && payload.empty()) {
         // draft-18 only carries Object Status after a zero payload length.
@@ -1960,3 +1980,51 @@ bool decode_publish_error(std::span<const std::uint8_t> bytes, DraftVersion draf
 }
 
 }  // namespace openmoq::publisher::transport
+
+namespace openmoq::publisher {
+
+std::vector<std::uint8_t> serialize_object_properties(std::span<const ObjectProperty> properties) {
+    if (properties.size() > 32768) {
+        throw std::invalid_argument("object property block exceeds 64 KiB");
+    }
+    std::vector<const ObjectProperty*> sorted;
+    sorted.reserve(properties.size());
+    for (const auto& property : properties) {
+        sorted.push_back(&property);
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) { return a->id < b->id; });
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t previous = 0;
+    bool first = true;
+    for (const auto* property : sorted) {
+        if (!first && property->id == previous) {
+            throw std::invalid_argument("duplicate object property ID");
+        }
+        transport::append_vi64(bytes, property->id - previous);
+        if (property->id % 2 == 0) {
+            const auto* value = std::get_if<std::uint64_t>(&property->value);
+            if (!value) {
+                throw std::invalid_argument("even object property ID requires integer value");
+            }
+            transport::append_vi64(bytes, *value);
+        } else {
+            const auto* value = std::get_if<std::vector<std::uint8_t>>(&property->value);
+            if (!value || value->size() > 65535) {
+                throw std::invalid_argument("odd object property ID requires at most 65535 bytes");
+            }
+            transport::append_vi64(bytes, value->size());
+            if (bytes.size() > 65536 || value->size() > 65536 - bytes.size()) {
+                throw std::invalid_argument("object property block exceeds 64 KiB");
+            }
+            bytes.insert(bytes.end(), value->begin(), value->end());
+        }
+        if (bytes.size() > 65536) {
+            throw std::invalid_argument("object property block exceeds 64 KiB");
+        }
+        previous = property->id;
+        first = false;
+    }
+    return bytes;
+}
+
+}  // namespace openmoq::publisher

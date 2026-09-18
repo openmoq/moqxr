@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "openmoq/publisher/drm_config.h"
+#include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -87,6 +88,7 @@ struct CliOptions {
     // reported before publishing begins, rather than publishing with partial
     // DRM configuration.
     std::vector<DrmSystemConfig> drm_systems;
+    MediaPackaging media_packaging = MediaPackaging::kCmaf;
 };
 
 CliOptions parse_cli_options(int argc, char** argv);

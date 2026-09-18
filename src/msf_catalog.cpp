@@ -179,6 +179,13 @@ void validate_track(const MsfTrack& track) {
     if (track.packaging.empty()) {
         throw std::runtime_error("MSF catalog requires a packaging value" + where);
     }
+    if (track.packaging == "locmaf") {
+        if (track.locmaf_version != "0.3") {
+            throw std::runtime_error("LOCMAF requires locmafVersion 0.3" + where);
+        }
+    } else if (track.locmaf_version.has_value()) {
+        throw std::runtime_error("locmafVersion is forbidden outside locmaf packaging" + where);
+    }
     // Section 5.2.22: bitrate MUST be specified for audio and video tracks.
     if (is_media_role(track) && !track.bitrate.has_value()) {
         throw std::runtime_error("MSF catalog requires bitrate for audio and video tracks" + where);
@@ -206,7 +213,7 @@ void validate_track(const MsfTrack& track) {
     }
     // Section 5: custom field names MUST NOT collide with spec field names.
     static const std::set<std::string> kSpecFieldNames = {
-        "name", "namespace", "packaging", "eventType", "role", "isLive",
+        "name", "namespace", "packaging", "locmafVersion", "eventType", "role", "isLive",
         "targetLatency", "buffers", "label", "renderGroup", "altGroup",
         "initRef", "depends", "codec", "mimeType", "framerate", "timescale",
         "bitrate", "avgBitrate", "maxGopDuration", "maxGroupDuration", "width",
@@ -401,6 +408,9 @@ void write_track(std::ostringstream& out, const MsfTrack& track) {
         write_string(out, seq, "namespace", *track.name_space);
     }
     write_string(out, seq, "packaging", track.packaging);
+    if (track.locmaf_version.has_value()) {
+        write_string(out, seq, "locmafVersion", *track.locmaf_version);
+    }
     if (track.event_type.has_value()) {
         write_string(out, seq, "eventType", *track.event_type);
     }
@@ -698,6 +708,9 @@ MsfTrack make_msf_track(const TrackDescription& track,
     MsfTrack out;
     out.name = track.track_name;
     out.packaging = track.packaging;
+    if (track.packaging == "locmaf") {
+        out.locmaf_version = "0.3";
+    }
     out.is_live = is_live;
 
     if (track.handler_type == "vide") {
@@ -878,6 +891,7 @@ bool tracks_equal(const MsfTrack& a, const MsfTrack& b) {
     // MsfTrack without being added here would make a real change look like a
     // no-op, so keep this in step with write_track.
     return a.name == b.name && a.name_space == b.name_space && a.packaging == b.packaging &&
+           a.locmaf_version == b.locmaf_version &&
            a.role == b.role && a.is_live == b.is_live && a.target_latency_ms == b.target_latency_ms &&
            a.label == b.label && a.render_group == b.render_group && a.alt_group == b.alt_group &&
            a.init_ref == b.init_ref && a.depends == b.depends && a.codec == b.codec &&

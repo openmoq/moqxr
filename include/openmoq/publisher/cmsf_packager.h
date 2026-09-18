@@ -1,5 +1,7 @@
 #pragma once
 
+#include "openmoq/publisher/object_properties.h"
+
 #include <filesystem>
 #include <span>
 #include <string>
@@ -36,6 +38,7 @@ struct CmsfObject {
     bool has_sap_type = false;   // true: sap_type was computed (carried from MediaFragment)
     ByteSpan payload;
     std::vector<std::uint8_t> owned_payload;
+    std::vector<ObjectProperty> properties{};
 };
 
 struct TrackInitialization {
