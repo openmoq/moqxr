@@ -261,6 +261,12 @@ ctest --test-dir build-libmoq --output-on-failure
 
 The default build keeps the built-in transport path. See [docs/build.md](docs/build.md) for backend status, dependency discovery, and configuration details.
 
+CAT4MoQ on this backend requires moq5's `MOQ_SERVICE_AUTH_API_VERSION >= 1`.
+Use `-DOPENMOQ_LIBMOQ_SOURCE_DIR=../moq5` with the corresponding
+`feature/cat4moq` checkout while testing the coordinated change. Older moq5
+dependencies reject configured credentials before connecting. See the
+[auth design](docs/cat4moq-design.md) for backend limits and compatibility profiles.
+
 ## Examples
 
 Enable examples explicitly with `cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON`,

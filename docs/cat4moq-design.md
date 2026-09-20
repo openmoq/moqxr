@@ -32,10 +32,21 @@ sources are errors. Secrets are never included in diagnostics or output URLs.
 
 ## Backend and interoperability boundaries
 
-The native MoqtSession route carries configured credentials. The current moq5
-managed endpoint/media-sender API cannot carry them, so the libmoq route
-rejects configured authorization before connecting. Every publishing input
-path uses the same authorization configuration.
+The native MoqtSession route carries configured credentials. The libmoq route
+also carries them when its dependency advertises `MOQ_SERVICE_AUTH_API_VERSION`
+1 or newer: owned endpoint credentials cover setup, and sender sources select
+credentials for the actual namespace, catalog and media requests. Older
+dependencies reject configured authorization before connecting. Every publishing
+input path uses the same authorization configuration; the managed route supports
+transport drafts 16 and 18. Legacy token envelopes must use USE_VALUE and are
+unwrapped exactly once before passing raw bytes to libmoq.
+
+Managed runtime coverage includes raw picoquic, PicoWT and raw MsQuic. Raw mvfst
+is implemented in moq5 but its local validation is dependency-blocked; Proxygen
+and WTquic managed backends explicitly reject configured credentials. Live relay
+media tests use stdin and picoquic/PicoWT. The controlled C4M-01 fixture verifies
+MAC/type/claim cases with private provisional labels; it is not a production
+verifier or proof of current-relay C4M-01 conformance.
 
 Current relays are compatibility targets, not proof of C4M-01 compliance.
 C4M-01's namespace component matching and final nil differ from both existing

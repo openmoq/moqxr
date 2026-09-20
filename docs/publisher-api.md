@@ -100,9 +100,11 @@ when `--packaging locmaf` is selected.
 
 Applications configure externally issued credentials at the public API layer.
 The native publisher carries them on setup, namespace, and track publication
-requests. The managed libmoq backend rejects authorization before connecting
-because its endpoint/media-sender API cannot carry credentials; build with
-`OPENMOQ_USE_LIBMOQ_PUBLISHER=OFF` for authenticated publishing.
+requests. The managed libmoq backend carries credentials with moq5's
+`MOQ_SERVICE_AUTH_API_VERSION >= 1`, using owned endpoint and sender sources.
+Older dependencies reject configured authorization before connecting. See the
+[CAT4MoQ design](cat4moq-design.md#backend-and-interoperability-boundaries)
+for supported backends and validation limits.
 
 New applications should use structured credentials with an explicit profile:
 

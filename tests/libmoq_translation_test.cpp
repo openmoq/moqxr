@@ -186,6 +186,93 @@ int main() {
         ok &= expect(provider_calls == 0, "unsupported backend must not invoke credential provider");
     }
 
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+    for (const auto code : {MOQ_MEDIA_SENDER_FATAL_AUTHORIZATION,
+                           MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED,
+                           MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED}) {
+        ok &= expect(libmoq_sender_failure_kind(code, FailureKind::kRetryable) == FailureKind::kFatal,
+                     "source denial and explicit peer refusals must not reconnect");
+    }
+    ok &= expect(libmoq_sender_failure_kind(MOQ_MEDIA_SENDER_FATAL_NAMESPACE_CANCELLED,
+                    FailureKind::kRetryable) == FailureKind::kRetryable,
+                 "withdrawal of an accepted namespace preserves reconnect policy");
+    for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+        for (const auto profile : {cat4moq::Profile::kC4m01, cat4moq::Profile::kMoqxCompat,
+                                  cat4moq::Profile::kRed5CoseCompat}) {
+            cat4moq::AuthorizationConfig config;
+            const std::vector<std::uint8_t> bytes{0xd2, 0, 0x84, 0xff};
+            config.setup_credential = cat4moq::Credential{bytes, profile};
+            config.action_credential = cat4moq::Credential{bytes, profile};
+            LibmoqAuthorization auth;
+            ok &= expect(auth.prepare(config, draft).ok, "structured credentials translate");
+            const auto* source = auth.setup_source();
+            const std::uint64_t type = profile == cat4moq::Profile::kC4m01 ? 1 : 16;
+            ok &= expect(source && source->token_count == 1 && source->tokens[0].token_type == type,
+                         "setup token type follows explicit profile");
+            config.setup_credential->cwt.assign(4, 0xaa);
+            if (source) {
+                const auto value = source->tokens[0].token_value;
+                ok &= expect(value.len == bytes.size() &&
+                    std::equal(bytes.begin(), bytes.end(), value.data), "translation owns raw bytes");
+            }
+            const auto* action = auth.request_source();
+            ok &= expect(action && action->token_count == 1 && action->tokens[0].token_type == type,
+                         "static action credential translates");
+            // Legacy envelopes must decode once, never become a nested value.
+            cat4moq::AuthorizationConfig legacy;
+            legacy.action_token = cat4moq::encode_credential({bytes, profile}, draft);
+            LibmoqAuthorization decoded;
+            ok &= expect(decoded.prepare(legacy, draft).ok, "legacy USE_VALUE accepted");
+            const auto* decoded_source = decoded.request_source();
+            ok &= expect(decoded_source && decoded_source->tokens[0].token_value.len == bytes.size(),
+                         "legacy envelope stripped exactly once");
+        }
+        cat4moq::AuthorizationConfig provider;
+        unsigned calls = 0;
+        bool deny = false;
+        provider.setup_credential = cat4moq::Credential{{0xa0}};
+        provider.credential_provider = [&](const cat4moq::Resource& resource) {
+            ++calls;
+            if (deny) throw std::runtime_error("secret provider detail");
+            ok &= expect(resource.track_namespace == std::vector<std::string>({"a/b", "c"}),
+                         "provider sees tuple components without splitting");
+            ok &= expect(resource.action == cat4moq::Action::kPublishNamespace
+                             ? !resource.track_name : resource.track_name == "catalog",
+                         "namespace and catalog resources remain distinct");
+            return cat4moq::Credential{{0, static_cast<std::uint8_t>(resource.action), 0xff},
+                                      cat4moq::Profile::kMoqxCompat, 16384};
+        };
+        LibmoqAuthorization selected;
+        ok &= expect(selected.prepare(provider, draft).ok && calls == 0,
+                     "setup never invokes action provider");
+        moq_bytes_t parts[] = {MOQ_BYTES_LITERAL("a/b"), MOQ_BYTES_LITERAL("c")};
+        moq_auth_request_t request{MOQ_AUTH_PUBLISH_NAMESPACE, {parts, 2}, {nullptr, 0}};
+        const auto* source = selected.request_source();
+        moq_auth_token_t token{};
+        std::size_t count = 0;
+        for (const auto action : {MOQ_AUTH_PUBLISH_NAMESPACE, MOQ_AUTH_PUBLISH}) {
+            request.action = action;
+            request.name = action == MOQ_AUTH_PUBLISH ? MOQ_BYTES_LITERAL("catalog") : moq_bytes_t{};
+            ok &= expect(source->select(source->ctx, &request, &token, 1, &count) == MOQ_OK &&
+                count == 1 && token.token_type == 16384 && token.token_value.len == 3 &&
+                token.token_value.data[1] == action, "resource selector returns unwrapped typed bytes");
+            deny = true;
+            ok &= expect(source->select(source->ctx, &request, &token, 1, &count) == MOQ_ERR_INVAL &&
+                         count == 0, "provider exception cannot cross C callback or yield a token");
+            deny = false;
+        }
+        for (const std::vector<std::uint8_t>& bytes :
+             {std::vector<std::uint8_t>{1, 0}, {3}, {3, 16}, {0, 16, 0xa0}}) {
+            cat4moq::AuthorizationConfig bad;
+            bad.action_token = cat4moq::AuthorizationToken{bytes};
+            LibmoqAuthorization unsupported;
+            const auto status = unsupported.prepare(bad, draft);
+            ok &= expect(!status.ok && status.failure_kind == FailureKind::kFatal,
+                         "malformed or alias-cache envelopes fail before I/O");
+        }
+    }
+#endif
+
     // LOCMAF needs catalog locmafVersion signaling absent from libmoq's API.
     {
         const auto rejects_locmaf = [&](auto operation, const std::string& label) {
@@ -767,6 +854,13 @@ int main() {
                                   [](std::uint64_t) { return MOQ_ERR_CLOSED; }};
         ok &= expect(libmoq_wait_ready(nullptr, 0, 1000, closed_ops) == LibmoqReadyOutcome::kClosed,
                      "expected kClosed when the endpoint wait reports closed");
+        int closed_waits = 0;
+        LibmoqReadyOps core_closed{[] { return false; }, [] { return false; },
+            [&closed_waits](std::uint64_t) { ++closed_waits; return MOQ_DONE; },
+            [] { return true; }};
+        ok &= expect(libmoq_wait_ready(nullptr, 3000, 1000, core_closed) == LibmoqReadyOutcome::kClosed &&
+                         closed_waits == 0,
+                     "a closed session must end readiness even while the transport waits time out");
     }
 
     // -- Demand-wait primitive (libmoq_wait_demand) --------------------------

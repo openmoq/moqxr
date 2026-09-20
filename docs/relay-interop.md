@@ -112,7 +112,11 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
 
 ## CAT4MOQ Authorization with moqx
 
-For moqx services with auth enabled, use the auth example instead of the generic CLI. It obtains CAT4MOQ token bytes from a file or Catapult command, configures `PublisherConfig::authorization`, and publishes a deterministic live-object track.
+For moqx services with auth enabled, the publisher CLI accepts
+`--auth-profile moqx-compat --auth-token-file /path/to/token.cwt`.
+The auth example obtains credential bytes from a file or Catapult command,
+configures `PublisherConfig::authorization`, and publishes a deterministic
+live-object track. See its [profile and build instructions](../examples/auth/README.md).
 
 Build the example:
 

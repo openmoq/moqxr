@@ -28,6 +28,33 @@
 
 namespace openmoq::publisher::transport {
 
+// Owns credentials and callback context until the sender and endpoint have
+// stopped. prepare() validates static input before any media or network I/O.
+class LibmoqAuthorization {
+public:
+    LibmoqAuthorization() = default;
+    LibmoqAuthorization(const LibmoqAuthorization&) = delete;
+    LibmoqAuthorization& operator=(const LibmoqAuthorization&) = delete;
+    TransportStatus prepare(const cat4moq::AuthorizationConfig& config, DraftVersion draft);
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+    const moq_auth_source_t* setup_source() const;
+    const moq_auth_source_t* request_source() const;
+
+private:
+    static moq_result_t select(void* ctx, const moq_auth_request_t* request,
+                               moq_auth_token_t* out, std::size_t capacity,
+                               std::size_t* count) noexcept;
+    cat4moq::AuthorizationConfig config_;
+    DraftVersion draft_ = DraftVersion::kDraft16;
+    moq_auth_source_t setup_{};
+    moq_auth_source_t requests_{};
+    moq_auth_token_t setup_token_{};
+    moq_auth_token_t action_token_{};
+    std::vector<std::uint8_t> setup_bytes_;
+    std::vector<std::uint8_t> action_bytes_;
+#endif
+};
+
 // -- Translation (pure; unit-tested without a network) -------------------
 //
 // One libmoq media track per PublishPlan media track. Owns the backing
@@ -192,11 +219,14 @@ struct LibmoqLiveHandle {
 // returns a moq_result_t (e.g. MOQ_ERR_CLOSED). With the endpoint interrupt
 // latch set by request_cancel(), the real wait() returns at once, so the loop
 // observes the cancel flag promptly.
+// Map a fatal sender outcome to the publisher's reconnect policy.
+FailureKind libmoq_sender_failure_kind(std::uint64_t code, FailureKind fallback);
 enum class LibmoqReadyOutcome { kReady, kCancelled, kFatal, kTimeout, kClosed };
 struct LibmoqReadyOps {
     std::function<bool()> is_ready;
     std::function<bool()> is_fatal;
     std::function<int(std::uint64_t)> wait;
+    std::function<bool()> is_closed;
 };
 LibmoqReadyOutcome libmoq_wait_ready(std::atomic<bool>* cancel,
                                      std::uint64_t timeout_us, std::uint64_t step_us,

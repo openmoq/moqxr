@@ -11,7 +11,9 @@
 #include <deque>
 #include <exception>
 #include <istream>
+#include <iostream>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -37,7 +39,7 @@ constexpr std::string_view kLocUnsupported =
     "use the native publisher backend";
 constexpr std::string_view kPropertiesUnsupported =
     "object properties are unsupported by the libmoq publisher; use the native publisher backend";
-constexpr std::string_view kAuthorizationUnsupported =
+[[maybe_unused]] constexpr std::string_view kAuthorizationUnsupported =
     "CAT4MoQ authorization is unavailable in the libmoq managed publisher API; "
     "use a build with OPENMOQ_USE_LIBMOQ_PUBLISHER=OFF";
 
@@ -129,6 +131,134 @@ LibmoqTrackTranslation make_track_translation(const TrackDescription& td,
 }
 
 }  // namespace
+
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+namespace {
+// Legacy inputs already contain the selected draft's Token envelope. Decode
+// only USE_VALUE; alias cache operations cannot be represented by this API.
+void decode_auth_value(const cat4moq::AuthorizationToken& encoded, DraftVersion draft,
+                       moq_auth_token_t& token, std::vector<std::uint8_t>& storage) {
+    std::size_t offset = 0;
+    const auto read = [&]() -> std::uint64_t {
+        if (offset == encoded.bytes.size()) throw cat4moq::AuthorizationError("truncated token");
+        const auto first = encoded.bytes[offset];
+        unsigned length = 1;
+        std::uint64_t value;
+        if (draft == DraftVersion::kDraft16) {
+            length = 1u << (first >> 6);
+            value = first & 0x3fu;
+        } else {
+            for (unsigned mask = 0x80; mask && (first & mask); mask >>= 1) ++length;
+            value = length >= 8 ? 0 : first & (0xffu >> length);
+        }
+        if (encoded.bytes.size() - offset < length)
+            throw cat4moq::AuthorizationError("truncated token integer");
+        ++offset;
+        for (unsigned i = 1; i < length; ++i) value = (value << 8) | encoded.bytes[offset++];
+        return value;
+    };
+    if (read() != 3) throw cat4moq::AuthorizationError("unsupported token alias operation");
+    const auto type = read();
+    if (type > ((std::uint64_t{1} << 62) - 1) || offset == encoded.bytes.size() ||
+        encoded.bytes.size() - offset > cat4moq::kMaxCredentialBytes)
+        throw cat4moq::AuthorizationError("invalid token value");
+    storage.assign(encoded.bytes.begin() + static_cast<std::ptrdiff_t>(offset), encoded.bytes.end());
+    token = {type, bytes_of(storage)};
+}
+}  // namespace
+#endif
+
+TransportStatus LibmoqAuthorization::prepare(const cat4moq::AuthorizationConfig& config,
+                                            DraftVersion draft) {
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+    moq_auth_source_init_sized(&setup_, sizeof(setup_));
+    moq_auth_source_init_sized(&requests_, sizeof(requests_));
+    setup_bytes_.clear();
+    action_bytes_.clear();
+    if (!config.configured()) return TransportStatus::success();
+    if (draft != DraftVersion::kDraft16 && draft != DraftVersion::kDraft18)
+        return TransportStatus::failure("CAT4MoQ authorization requires libmoq draft 16 or 18");
+    try {
+        cat4moq::validate_authorization(config, draft);
+        config_ = config;
+        draft_ = draft;
+        const auto setup = cat4moq::resolve_authorization(config,
+            {cat4moq::Action::kClientSetup, {}, std::nullopt}, draft);
+        if (setup) {
+            decode_auth_value(*setup, draft, setup_token_, setup_bytes_);
+            setup_.tokens = &setup_token_;
+            setup_.token_count = 1;
+        }
+        // Validate the static action envelope even when a provider overrides it.
+        auto static_config = config;
+        static_config.credential_provider = {};
+        const auto action = cat4moq::resolve_authorization(static_config,
+            {cat4moq::Action::kPublishNamespace, {}, std::nullopt}, draft);
+        if (action) {
+            decode_auth_value(*action, draft, action_token_, action_bytes_);
+            requests_.tokens = &action_token_;
+            requests_.token_count = 1;
+        }
+        if (config.credential_provider) {
+            requests_.tokens = nullptr;
+            requests_.token_count = 0;
+            requests_.select = select;
+            requests_.ctx = this;
+        }
+        return TransportStatus::success();
+    } catch (...) {
+        // Never expose provider diagnostics or bearer bytes.
+        return TransportStatus::failure("CAT4MoQ authorization configuration is invalid or unsupported");
+    }
+#else
+    (void)draft;
+    return config.configured() ? TransportStatus::failure(kAuthorizationUnsupported)
+                               : TransportStatus::success();
+#endif
+}
+
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+const moq_auth_source_t* LibmoqAuthorization::setup_source() const {
+    return setup_.token_count ? &setup_ : nullptr;
+}
+const moq_auth_source_t* LibmoqAuthorization::request_source() const {
+    return requests_.token_count || requests_.select ? &requests_ : nullptr;
+}
+moq_result_t LibmoqAuthorization::select(void* ctx, const moq_auth_request_t* request,
+                                       moq_auth_token_t* out, std::size_t capacity,
+                                       std::size_t* count) noexcept {
+    if (!ctx || !request || !out || !capacity || !count) return MOQ_ERR_INVAL;
+    *count = 0;
+    try {
+        auto& self = *static_cast<LibmoqAuthorization*>(ctx);
+        cat4moq::Resource resource;
+        if (request->action == MOQ_AUTH_PUBLISH_NAMESPACE) {
+            resource.action = cat4moq::Action::kPublishNamespace;
+        } else if (request->action == MOQ_AUTH_PUBLISH) {
+            resource.action = cat4moq::Action::kPublish;
+            resource.track_name = request->name.len
+                ? std::string(reinterpret_cast<const char*>(request->name.data), request->name.len)
+                : std::string{};
+        } else {
+            return MOQ_ERR_UNSUPPORTED;
+        }
+        for (std::size_t i = 0; i < request->ns.count; ++i) {
+            const auto part = request->ns.parts[i];
+            resource.track_namespace.push_back(part.len
+                ? std::string(reinterpret_cast<const char*>(part.data), part.len)
+                : std::string{});
+        }
+        const auto encoded = cat4moq::resolve_authorization(self.config_, resource, self.draft_);
+        if (!encoded) return MOQ_ERR_INVAL;
+        decode_auth_value(*encoded, self.draft_, self.action_token_, self.action_bytes_);
+        out[0] = self.action_token_;
+        *count = 1;
+        return MOQ_OK;
+    } catch (...) {
+        return MOQ_ERR_INVAL;
+    }
+}
+#endif
 
 moq_media_track_cfg_t LibmoqTrackTranslation::cfg() const {
     moq_media_track_cfg_t c;
@@ -447,15 +577,30 @@ TransportStatus teardown(moq_media_sender_t* sender,
                          moq_endpoint_t* ep,
                          const std::string& error,
                          FailureKind failure_kind = FailureKind::kFatal) {
+    std::string diagnostic = error;
     if (sender) {
+        if (moq_media_sender_is_fatal(sender)) {
+            failure_kind = libmoq_sender_failure_kind(moq_media_sender_fatal_code(sender), failure_kind);
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+            moq_request_error_t peer_error = 0;
+            if (moq_media_sender_peer_request_error(sender, &peer_error)) {
+                if (peer_error == MOQ_REQUEST_ERROR_UNAUTHORIZED ||
+                    peer_error == MOQ_REQUEST_ERROR_MALFORMED_AUTH_TOKEN ||
+                    peer_error == MOQ_REQUEST_ERROR_EXPIRED_AUTH_TOKEN)
+                    diagnostic = "peer rejected publication authorization";
+            } else if (moq_media_sender_fatal_code(sender) == MOQ_MEDIA_SENDER_FATAL_AUTHORIZATION) {
+                diagnostic = "authorization credential selection failed";
+            }
+#endif
+        }
         moq_media_sender_destroy(sender);
     }
     if (ep) {
         moq_endpoint_stop(ep);
         moq_endpoint_destroy(ep);
     }
-    return error.empty() ? TransportStatus::success()
-                         : TransportStatus::failure(error, failure_kind);
+    return diagnostic.empty() ? TransportStatus::success()
+                              : TransportStatus::failure(diagnostic, failure_kind);
 }
 
 // Tear down a live publish, first unregistering the endpoint from the shared
@@ -510,6 +655,7 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
                                    const TlsConfig& tls,
                                    bool live,
                                    DemandMonitor* demand,
+                                   LibmoqAuthorization& authorization,
                                    moq_endpoint_t** out_ep,
                                    moq_media_sender_t** out_sender) {
     *out_ep = nullptr;
@@ -520,6 +666,11 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
         return TransportStatus::failure(
             "libmoq publish supports only draft 16 and draft 18");
     }
+
+    const auto refresh_seconds = config.catalog_republish_interval.count();
+    if (refresh_seconds < 0 || static_cast<std::uint64_t>(refresh_seconds) >
+            std::numeric_limits<std::uint64_t>::max() / 1000000ull)
+        return TransportStatus::failure("catalog refresh interval is out of range");
 
     const std::string url = libmoq_endpoint_url(endpoint);
     const std::string sni = endpoint.sni;
@@ -542,7 +693,13 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
     }
 
     moq_endpoint_cfg_t ep_cfg;
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+    moq_endpoint_cfg_init_sized(&ep_cfg, sizeof(ep_cfg));
+    ep_cfg.setup_auth = authorization.setup_source();
+#else
+    (void)authorization;
     moq_endpoint_cfg_init(&ep_cfg);
+#endif
     ep_cfg.url = moq_bytes_t{reinterpret_cast<const std::uint8_t*>(url.data()), url.size()};
     ep_cfg.protocol = endpoint.transport == TransportKind::kWebTransport
                           ? MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT
@@ -616,7 +773,8 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
     if (rc != MOQ_OK || ep == nullptr) {
         return TransportStatus::failure(
             std::string("endpoint connect failed: ") + moq_strerror(rc),
-            FailureKind::kRetryable);
+            rc == MOQ_ERR_INVAL || rc == MOQ_ERR_UNSUPPORTED || rc == MOQ_ERR_BUFFER
+                ? FailureKind::kFatal : FailureKind::kRetryable);
     }
 
     std::vector<moq_bytes_t> ns_bytes;
@@ -627,11 +785,19 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
     moq_namespace_t ns{ns_bytes.data(), ns_bytes.size()};
 
     moq_media_sender_cfg_t s_cfg;
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+    if (live) moq_media_sender_cfg_init_live_sized(&s_cfg, sizeof(s_cfg));
+    else moq_media_sender_cfg_init_lossless_sized(&s_cfg, sizeof(s_cfg));
+    s_cfg.request_auth = authorization.request_source();
+    s_cfg.publish_tracks = config.forward || config.preannounce_tracks;
+    s_cfg.catalog_refresh_interval_us = static_cast<std::uint64_t>(refresh_seconds) * 1000000ull;
+#else
     if (live) {
         moq_media_sender_cfg_init_live(&s_cfg);  // never block the encoder
     } else {
         moq_media_sender_cfg_init_lossless(&s_cfg);  // batch/VOD: never drop on our own
     }
+#endif
     s_cfg.endpoint = nullptr;  // attach mode borrows the endpoint
     s_cfg.namespace_ = ns;
     if (demand != nullptr) {
@@ -661,14 +827,41 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
 // the wait returns kCancelled promptly: request_cancel() set the endpoint
 // interrupt latch, so the underlying moq_endpoint_wait() returns at once.
 LibmoqReadyOutcome wait_ready(moq_endpoint_t* ep, moq_media_sender_t* sender,
-                              std::atomic<bool>* cancel, std::uint64_t timeout_us) {
+                              std::atomic<bool>* cancel, std::uint64_t timeout_us,
+                              const std::unordered_map<std::string, moq_media_track_t*>& tracks,
+                              bool publish_tracks) {
     LibmoqReadyOps ops;
-    ops.is_ready = [sender] { return moq_media_sender_is_ready(sender); };
+    ops.is_ready = [sender, &tracks, publish_tracks] {
+        if (!moq_media_sender_is_ready(sender)) return false;
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+        if (publish_tracks)
+            for (const auto& [name, track] : tracks)
+                if (!moq_media_sender_track_is_published(sender, track)) return false;
+#else
+        (void)tracks;
+        (void)publish_tracks;
+#endif
+        return true;
+    };
     ops.is_fatal = [sender, ep] {
         return moq_media_sender_is_fatal(sender) || moq_endpoint_is_fatal(ep);
     };
+    ops.is_closed = [sender, ep] {
+        return moq_media_sender_is_closed(sender) || moq_endpoint_is_closed(ep);
+    };
     ops.wait = [ep](std::uint64_t step) { return static_cast<int>(moq_endpoint_wait(ep, step)); };
-    return libmoq_wait_ready(cancel, timeout_us, /*step_us=*/100000, ops);
+    const auto outcome = libmoq_wait_ready(cancel, timeout_us, /*step_us=*/100000, ops);
+    if (outcome == LibmoqReadyOutcome::kReady) {
+        std::clog << "libmoq: sender ready\n";
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+        if (publish_tracks)
+            for (const auto& [name, track] : tracks) {
+                (void)track;
+                std::clog << "libmoq: publication accepted track=" << name << '\n';
+            }
+#endif
+    }
+    return outcome;
 }
 
 // Map a non-ready readiness outcome to a teardown. Precondition: outcome is not
@@ -867,6 +1060,22 @@ moq_result_t write_live_object(moq_media_sender_t* sender, moq_media_track_t* tr
 
 }  // namespace
 
+FailureKind libmoq_sender_failure_kind(std::uint64_t code, FailureKind fallback) {
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+    switch (code) {
+        case MOQ_MEDIA_SENDER_FATAL_AUTHORIZATION:
+        case MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED:
+        case MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED:
+            return FailureKind::kFatal;
+        default:
+            break;
+    }
+#else
+    (void)code;
+#endif
+    return fallback;
+}
+
 LibmoqReadyOutcome libmoq_wait_ready(std::atomic<bool>* cancel,
                                      std::uint64_t timeout_us, std::uint64_t step_us,
                                      const LibmoqReadyOps& ops) {
@@ -877,6 +1086,9 @@ LibmoqReadyOutcome libmoq_wait_ready(std::atomic<bool>* cancel,
         }
         if (ops.is_fatal()) {
             return LibmoqReadyOutcome::kFatal;
+        }
+        if (ops.is_closed && ops.is_closed()) {
+            return LibmoqReadyOutcome::kClosed;
         }
         if (timeout_us != 0 && waited >= timeout_us) {
             return LibmoqReadyOutcome::kTimeout;
@@ -955,9 +1167,9 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
                                         const EndpointConfig& endpoint,
                                         const TlsConfig& tls,
                                         LibmoqPublishStats& out_stats) {
-    if (config.authorization.configured()) {
-        return TransportStatus::failure(kAuthorizationUnsupported);
-    }
+    LibmoqAuthorization authorization;
+    const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
+    if (!authorization_status.ok) return authorization_status;
     if (config.media_packaging == MediaPackaging::kLoc || has_loc_tracks(materialized_plan)) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -971,7 +1183,7 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
     moq_endpoint_t* ep = nullptr;
     moq_media_sender_t* sender = nullptr;
     const TransportStatus setup =
-        connect_and_attach(config, endpoint, tls, /*live=*/false, &demand, &ep, &sender);
+        connect_and_attach(config, endpoint, tls, /*live=*/false, &demand, authorization, &ep, &sender);
     if (!setup.ok) {
         return setup;
     }
@@ -995,7 +1207,8 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
     }
 
     // Tracks are configured: now wait for the initial catalog to publish.
-    const LibmoqReadyOutcome ready = wait_ready(ep, sender, /*cancel=*/nullptr, timeout_us);
+    const LibmoqReadyOutcome ready = wait_ready(ep, sender, /*cancel=*/nullptr, timeout_us, handles,
+        config.forward || config.preannounce_tracks);
     if (ready != LibmoqReadyOutcome::kReady) {
         return ready_failure_teardown(/*live=*/nullptr, sender, ep, ready);
     }
@@ -1115,9 +1328,9 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
                                               const TlsConfig& tls,
                                               LibmoqPublishStats& out_stats,
                                               LibmoqLiveHandle* live) {
-    if (config.authorization.configured()) {
-        return TransportStatus::failure(kAuthorizationUnsupported);
-    }
+    LibmoqAuthorization authorization;
+    const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
+    if (!authorization_status.ok) return authorization_status;
     if (config.media_packaging == MediaPackaging::kLoc) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1180,7 +1393,7 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
     moq_endpoint_t* ep = nullptr;
     moq_media_sender_t* sender = nullptr;
     const TransportStatus setup =
-        connect_and_attach(config, endpoint, tls, /*live=*/true, &demand, &ep, &sender);
+        connect_and_attach(config, endpoint, tls, /*live=*/true, &demand, authorization, &ep, &sender);
     if (!setup.ok) {
         return setup;
     }
@@ -1210,7 +1423,8 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
     }
 
     // Tracks are configured: wait for the initial catalog before streaming.
-    const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us);
+    const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
+        config.forward || config.preannounce_tracks);
     if (ready == LibmoqReadyOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
@@ -1337,9 +1551,9 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
                                             const TlsConfig& tls,
                                             LibmoqPublishStats& out_stats,
                                             LibmoqLiveHandle* live) {
-    if (config.authorization.configured()) {
-        return TransportStatus::failure(kAuthorizationUnsupported);
-    }
+    LibmoqAuthorization authorization;
+    const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
+    if (!authorization_status.ok) return authorization_status;
     if (config.media_packaging == MediaPackaging::kLoc) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1430,7 +1644,7 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
     moq_endpoint_t* ep = nullptr;
     moq_media_sender_t* sender = nullptr;
     const TransportStatus setup =
-        connect_and_attach(config, endpoint, tls, /*live=*/true, &demand, &ep, &sender);
+        connect_and_attach(config, endpoint, tls, /*live=*/true, &demand, authorization, &ep, &sender);
     if (!setup.ok) {
         return setup;  // srt_guard stops + joins the manager
     }
@@ -1458,7 +1672,8 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
     }
 
     // Tracks are configured: wait for the initial catalog before streaming.
-    const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us);
+    const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
+        config.forward || config.preannounce_tracks);
     if (ready == LibmoqReadyOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
@@ -1557,9 +1772,9 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
                                                 const TlsConfig& tls,
                                                 LibmoqPublishStats& out_stats,
                                                 LibmoqLiveHandle* live) {
-    if (config.authorization.configured()) {
-        return TransportStatus::failure(kAuthorizationUnsupported);
-    }
+    LibmoqAuthorization authorization;
+    const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
+    if (!authorization_status.ok) return authorization_status;
     if (config.media_packaging == MediaPackaging::kLoc ||
         std::any_of(source.tracks.begin(), source.tracks.end(), [](const LiveTrack& track) {
             return track.packaging == LivePackaging::kLoc;
@@ -1587,7 +1802,7 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
     moq_endpoint_t* ep = nullptr;
     moq_media_sender_t* sender = nullptr;
     const TransportStatus setup =
-        connect_and_attach(config, endpoint, tls, /*live=*/true, &demand, &ep, &sender);
+        connect_and_attach(config, endpoint, tls, /*live=*/true, &demand, authorization, &ep, &sender);
     if (!setup.ok) {
         return setup;
     }
@@ -1612,7 +1827,8 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
     }
 
     // Tracks are configured: wait for the initial catalog before writing.
-    const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us);
+    const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
+        config.forward || config.preannounce_tracks);
     if (ready == LibmoqReadyOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }

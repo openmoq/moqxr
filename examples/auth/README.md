@@ -16,9 +16,11 @@ cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON -DOPENMOQ_BUILD_TESTS=ON \
 cmake --build build --target openmoq-publisher-auth-example
 ```
 
-The native backend is required: the managed libmoq API currently cannot carry
-authorization. The helper script enables examples in its selected build tree
-before building the target; it preserves the selected backend.
+This example is validated with the native backend. Managed authorization is
+available with moq5's `MOQ_SERVICE_AUTH_API_VERSION >= 1`; its measured CMAF
+coverage is described in the [implementation record](../../docs/cat4moq-plan.md#managed-moq5-client-integration).
+The helper script enables examples in its selected build tree before building
+the target; it preserves the selected backend.
 
 ## Profiles and credentials
 
@@ -191,7 +193,19 @@ python3 scripts/test-cat4moq-interop.py
 
 # One peer/profile; override binaries for another build directory as needed.
 python3 scripts/test-cat4moq-interop.py --targets red5-cose --cases valid
+
+# Managed publisher transport delivery, bypassing the known Playa player alias bug.
+python3 scripts/test-cat4moq-interop.py \
+  --targets red5-moqx red5-cose \
+  --publisher build-libmoq-cat4moq/openmoq-publisher \
+  --publisher-backend libmoq --publisher-transport webtransport \
+  --subscriber-api connection
 ```
+
+Player mode remains the default. Connection mode proves received catalog,
+initialization and progressing audio/video payloads through Playa's connection
+API; it does not prove player routing or rendering. The player alias collision
+is tracked in [moq-playa issue 17](https://github.com/openmoq/moq-playa/issues/17).
 
 Prerequisites are a built publisher with the new CLI, the sibling moqx relay and
 standalone issuer, built Red5 classes/picoquic JNI libraries, built Playa packages,

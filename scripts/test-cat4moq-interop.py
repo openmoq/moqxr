@@ -9,6 +9,7 @@ relay compatibility coverage, not C4M-01 conformance or secure-peering coverage.
 import argparse
 import base64
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,11 +23,18 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/cat4moq"
 SECRET = "interop-test-only-signing-secret-0001"
-CASES = ("valid", "valid-publish", "missing", "expired", "tampered", "wrong-key", "wrong-action", "wrong-namespace", "wrong-track")
+CASES = ("valid", "valid-publish", "missing", "expired", "tampered", "wrong-key", "wrong-action", "wrong-namespace", "wrong-track", "profile-mismatch")
 
 
 def run(argv, **kwargs):
     return subprocess.run([str(x) for x in argv], check=True, timeout=30, **kwargs)
+
+
+def revision(path):
+    try:
+        return run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True).stdout.decode().strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 @contextlib.contextmanager
@@ -96,10 +104,17 @@ def issue(args, directory, issuer, case, namespace, *, subscriber=False):
 def verify_issuers(args, directory):
     classpath = f"{args.red5}/target/classes:{args.red5}/target/lib/*"
     run(["javac", "-cp", classpath, "-d", directory, FIXTURES / "VerifyToken.java"], capture_output=True)
+    run(["javac", "-cp", classpath, "-d", directory, FIXTURES / "VerifyC4m01.java"], capture_output=True)
+    checked = run(["java", "-cp", f"{directory}:{classpath}", "VerifyC4m01",
+                   directory / "c4m01-controlled.cwt"], capture_output=True)
+    print(checked.stdout.decode().strip(), flush=True)
+    args.results.append({"target": "c4m01-controlled", "phase": "claim-fixture", "decisions": 18,
+                         "result": "pass", "claim_label": -65537, "token_type": 1})
     for issuer in args.targets:
         group = directory / (issuer + "-issuer")
         group.mkdir()
-        tokens = {case: issue(args, group, issuer, case, "cat4moq/issuer") for case in CASES if case not in ("missing", "valid-publish")}
+        tokens = {case: issue(args, group, issuer, case, "cat4moq/issuer") for case in CASES
+                  if case not in ("missing", "valid-publish", "profile-mismatch")}
         time.sleep(2)  # Expired tokens are genuinely signed with the issuer's minimum TTL.
         profile = "cose" if issuer == "red5-cose" else "moqx"
         secret = group / f"{issuer}-valid-secret"
@@ -202,11 +217,13 @@ auth.cat.key.interop.secret.file={secret}
                                   "-movflags", "+frag_keyframe+empty_moov+default_base_moof+separate_moof",
                                   "-f", "mp4", "pipe:1"]
                 publisher = [args.publisher, "--input", "-",
-                             "--namespace", namespace, "--draft", "18", "--endpoint", f"moqt://127.0.0.1:{port}/moq",
+                             "--namespace", namespace, "--draft", "18", "--endpoint", f"{'https' if args.publisher_transport == 'webtransport' else 'moqt'}://127.0.0.1:{port}/moq",
                              "--insecure", "--forward", "1" if case in ("valid-publish", "wrong-action", "wrong-track") else "0", "--coalesce-cmaf-chunks", "--publish-catalog", "--catalog-republish-interval", "1",
                              "--timeout", "30"]
                 if token:
-                    publisher += ["--auth-profile", "red5-cose-compat" if profile == "cose" else "moqx-compat",
+                    auth_profile = "c4m-01" if case == "profile-mismatch" else (
+                        "red5-cose-compat" if profile == "cose" else "moqx-compat")
+                    publisher += ["--auth-profile", auth_profile,
                                   "--auth-token-file", token]
                 relay_offset = log.stat().st_size
                 with process(source_command, group / f"{case}-ffmpeg.log", stdout=subprocess.PIPE) as source, \
@@ -214,20 +231,21 @@ auth.cat.key.interop.secret.file={secret}
                     source.stdout.close()
                     if case == "valid-publish":
                         # On draft 18 these markers follow a decoded PUBLISH_OK,
-                        # not just a send; see publish_live_tracks in moqt_session.cpp.
+                        # not just a send; both publisher implementations check acceptance.
                         for track in ("vide_1", "soun_2"):
-                            wait_log(pub, publog, rf"live: PUBLISH track={track} .*\(request stream\)", timeout=args.timeout)
+                            wait_log(pub, publog, rf"live: PUBLISH track={track} .*\(request stream\)|libmoq: publication accepted track={track}(?:\s|$)", timeout=args.timeout)
                         args.results.append({"target": issuer, "phase": "runtime", "case": case, "result": "pass", "evidence": "PUBLISH_OK for both media tracks; control only"})
                         print(f"PASS: {issuer}/{case}: explicit PUBLISH_OK for audio/video (control only)", flush=True)
                         continue
                     if case == "valid":
-                        wait_log(pub, publog, r"namespace published|live: awaiting subscriptions", timeout=args.timeout)
+                        wait_log(pub, publog, r"namespace published|live: awaiting subscriptions|libmoq: sender ready", timeout=args.timeout)
                     else:
-                        # Let namespace registration finish before observing this case.
-                        # Keep subscriber concurrent with any pending track publication.
-                        deadline = time.monotonic() + 2
+                        # Input discovery can take several seconds before SETUP.
+                        # Wait for readiness or rejection before snapshotting the
+                        # relay log, so setup evidence still belongs to this publisher.
+                        deadline = time.monotonic() + args.timeout
                         while pub.poll() is None and time.monotonic() < deadline:
-                            if re.search(r"namespace published|live: awaiting subscriptions", publog.read_text(errors="replace")):
+                            if re.search(r"namespace published|live: awaiting subscriptions|libmoq: sender ready", publog.read_text(errors="replace")):
                                 break
                             time.sleep(0.05)
                     timeout = args.timeout if case == "valid" else 8
@@ -236,7 +254,7 @@ auth.cat.key.interop.secret.file={secret}
                         command += ["--experimental-quic"]
                     command += [FIXTURES / "subscribe.mjs", args.playa, args.node_modules,
                                 f"{'moqt' if args.quic_package else 'https'}://127.0.0.1:{port}/moq",
-                                namespace, cert, subscriber, str(timeout), args.quic_package or ""]
+                                namespace, cert, subscriber, str(timeout), args.quic_package or "", args.subscriber_api]
                     # Only pre-subscriber relay evidence can attribute a setup rejection
                     # to the publisher without relying on implementation-specific IDs.
                     publisher_relay_text = log.read_bytes()[relay_offset:].decode(errors="replace")
@@ -250,7 +268,7 @@ auth.cat.key.interop.secret.file={secret}
                             if pub.poll() is None:
                                 raise RuntimeError(f"{issuer}/{case}: no bounded publisher rejection; inspect {publog}")
                             text = publog.read_text(errors="replace")
-                            rejection = r"(?i)unauthoriz|forbidden|denied|not permitted|authorization token does not permit|auth.*fail"
+                            rejection = r"(?i)unauthoriz|forbidden|denied|not permitted|authorization token does not permit|auth.*fail|peer rejected publication authorization"
                             if pub.returncode == 0 or not re.search(rejection, text + "\n" + publisher_relay_text):
                                 raise RuntimeError(f"{issuer}/{case}: missing publisher-attributed authorization rejection; inspect {publog}")
                         result = sub.wait(timeout=timeout + 10)
@@ -292,6 +310,11 @@ def main():
     parser.add_argument("--playa", type=Path, default=ROOT.parent / "moq-playa")
     parser.add_argument("--node-modules", type=Path, default=ROOT.parent / "moqx/test/playa", help="directory whose node_modules contains @fails-components/webtransport")
     parser.add_argument("--publisher", type=Path, default=ROOT / "build/openmoq-publisher")
+    parser.add_argument("--publisher-transport", choices=("raw", "webtransport"), default="raw")
+    parser.add_argument("--publisher-backend", choices=("native", "libmoq", "unspecified"), default="unspecified",
+                        help="record the selected build backend; this does not change the executable")
+    parser.add_argument("--subscriber-api", choices=("player", "connection"), default="player",
+                        help="Playa player delivery or direct per-track connection delivery")
     parser.add_argument("--node", default="node")
     parser.add_argument("--quic-package", type=Path, help="built Playa quic/index.js; use raw QUIC receiver and Node >=26.8.1")
     parser.add_argument("--timeout", type=int, default=25)
@@ -331,6 +354,18 @@ def main():
         print(f"FAIL: {error}", flush=True)
         return 1
     finally:
+        metadata = {"publisher": str(args.publisher), "publisher_backend": args.publisher_backend,
+                    "publisher_transport": args.publisher_transport, "draft": 18,
+                    "subscriber_transport": "raw" if args.quic_package else "webtransport",
+                    "subscriber_api": args.subscriber_api,
+                    "red5_backend": args.red5_quic,
+                    "revisions": {"moqxr": revision(ROOT), "moq5": revision(ROOT.parent / "moq5"),
+                                  "moqx": revision(ROOT.parent / "moqx"), "red5": revision(args.red5),
+                                  "playa": revision(args.playa)}}
+        if not args.issuer_only and args.publisher.is_file():
+            with args.publisher.open("rb") as binary:
+                metadata["publisher_sha256"] = hashlib.file_digest(binary, "sha256").hexdigest()
+        (directory / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         (directory / "results.json").write_text(json.dumps(args.results, indent=2) + "\n")
     return 0
 

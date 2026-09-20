@@ -126,3 +126,110 @@ by adding a profile selector to moqxr.
   subgroups through protected moqx to an authenticated subscriber. A tampered
   credential was rejected. Logs: `/tmp/auth-example-live-ygxjqo5t/`. This smoke
   test is separate from the earlier real CMAF interoperability matrix.
+
+## Managed moq5 client integration
+
+The coordinated dependency is moq5 `35b3d31` on `feature/cat4moq`, exposing
+`MOQ_SERVICE_AUTH_API_VERSION >= 1`. The earlier unsupported-backend results
+above describe the old dependency; the new API enables owned setup and request
+sources. Older headers still compile and retain rejection before connection.
+
+- Structured profile credentials become raw typed tokens. Legacy USE_VALUE
+  envelopes are strictly unwrapped once for the selected transport draft;
+  aliases and malformed envelopes are rejected. Providers receive the actual
+  namespace components and catalog/media track names. Exceptions and selection
+  failures remain terminal without anonymous fallback.
+- Batch, stdin, SRT and live-object publication all configure the same owned
+  authorization bridge. Translation tests capture setup/request bytes for both
+  supported drafts and all profiles; source inspection verifies all four call
+  sites. Authenticated live media validation uses stdin. Separate authenticated
+  live SRT, batch and live-object capture runs are not claimed.
+- Publication readiness uses actual peer acceptance, including Forward=0.
+  Namespace/PUBLISH refusals and session closure terminate the wait; known peer
+  authorization codes produce a specific diagnostic without peer reason text
+  or credentials.
+- The actual dependency build passed **24/24 MoQXR CTests**. Adapter and
+  translation tests also compile against original moq5 `c2900aa` headers.
+  moq5 core/service passed **152/152 under ASan/UBSan** with leak detection
+  disabled, and focused raw picoquic/PicoWT/endpoint auth tests passed **3/3**.
+- Managed adapter peer captures cover raw picoquic, PicoWT and raw MsQuic,
+  including asymmetric 16 KiB SETUP credentials. Raw mvfst remains unverified
+  because of an installed Fizz API mismatch. Proxygen and both WTquic backends
+  reject configured credentials before I/O; their runtime dependencies and
+  Apple CI were unavailable. The 16 KiB source bound does not remove the
+  existing draft-18 per-request receive limit of 4096 bytes.
+- Broader moq5 adapter suites passed **49/53** picoquic/PicoWT and **29/31**
+  MsQuic tests. All six failures reproduce on baseline adapters: capsule parser
+  progress, draft-18 announce expectation, receive lifecycle, managed close,
+  and two nested MsQuic consumer links missing `QuicAddr*` functions. These
+  suites are not clean; logs are `/tmp/managed-regressions-final.log` and
+  `/tmp/managed-msquic-regressions-final.log`.
+- Playa's full player drops video when confirmed alias 4 overlaps pending
+  audio request 4. The received subgroup payloads and routing sequence are
+  reported in [moq-playa issue 17](https://github.com/openmoq/moq-playa/issues/17).
+  The harness keeps player mode as its default and offers explicit
+  `--subscriber-api connection` for transport delivery checks. Connection mode
+  validates the same catalog, initialization and progressing CMAF payloads,
+  but does not prove player routing or rendering.
+
+Reproduce the managed matrix from this repository, with built sibling relays
+and Playa dependencies available:
+
+```sh
+python3 scripts/test-cat4moq-interop.py \
+  --targets moqx \
+  --publisher build-libmoq-cat4moq/openmoq-publisher \
+  --publisher-backend libmoq --publisher-transport raw
+python3 scripts/test-cat4moq-interop.py \
+  --targets red5-moqx red5-cose \
+  --publisher build-libmoq-cat4moq/openmoq-publisher \
+  --publisher-backend libmoq --publisher-transport raw \
+  --subscriber-api connection
+# Repeat both with --publisher-transport webtransport.
+```
+
+Each run records the publisher binary hash, dependency and relay revisions,
+transport, subscriber API and per-case results in its private artifact directory.
+The type-1 C4M-01 fixture covers 18 MAC/type/claim decisions with private labels;
+it is not a production verifier. Current issuer validation covers 30 decisions.
+
+The subscriber API choice matters for negative observations too: direct
+connection mode with moqx receives an upstream-session-closed request error in
+the wrong-action and wrong-track cases. Those exploratory cases fail the
+observation check even though the publisher independently reports authorization
+rejection. The fixture deliberately does not turn that error into denial proof;
+use the player-mode moqx matrix above.
+
+
+### Final managed relay matrix
+
+The selected topologies passed **60/60 cases**: ten cases for each of moqx,
+Red5 `moqx` and Red5 `cose`, over both raw-QUIC and WebTransport publishing,
+transport draft 18. Subscribers used WebTransport: full Playa player for moqx,
+and Playa connection API for Red5. Each positive media case received video
+initialization (790 bytes), audio initialization (728 bytes), video groups 0/1
+(150,593 bytes), and audio groups 0/1 (17,791 bytes). Each topology also accepted
+both explicit PUBLISH requests. All eight denial cases per topology independently
+rejected the publisher and observed no catalog/media for eight seconds.
+
+| Publisher transport | Subscriber API and selected targets | Selected cases | Artifacts |
+| --- | --- | --- | --- |
+| Raw QUIC | Player, moqx | 10/10 | `/tmp/cat4moq-interop-mhkpxba7` |
+| WebTransport | Player, moqx | 10/10 | `/tmp/cat4moq-interop-tevsvrbf` |
+| Raw QUIC | Connection, both Red5 profiles | 20/20 | `/tmp/cat4moq-interop-5nuppi7o` |
+| WebTransport | Connection, both Red5 profiles | 20/20 | `/tmp/cat4moq-interop-d1lev_5v` |
+
+The last two runs also tried moqx in connection mode: wrong-action/wrong-track
+observations failed on each transport with an upstream-session-closed request
+error. Those combined runs exited 1 and are not clean all-target runs. Their
+Red5 cases passed individually; the separate moqx player runs exited 0. The
+connection fixture accepts only catalog-absent code 16 as retryable, preserving
+other errors as failed observation rather than evidence of authorization denial.
+
+Revisions: moqx `e988f967`, Red5 `43d1e97`, Playa `7b41d74`, moq5 `35b3d31`.
+The publisher was MoQXR `8a69380` plus this integration change; tested binary
+SHA-256 `c93f528249208972148d916d400e53537572be36a1d24fc2153174c8b96c6a23`.
+The type-1 fixture passed 18 decisions and current issuers passed 30 decisions.
+These are client compatibility and transport-delivery results, not production
+C4M-01 verification, authenticated SRT delivery, rendered frames or secure peering.
+Player routing loss is filed as [moq-playa #17](https://github.com/openmoq/moq-playa/issues/17).
