@@ -98,7 +98,49 @@ when `--packaging locmaf` is selected.
 
 ## 4. Optional CAT4MOQ Authorization
 
-Applications that need CAT4MOQ or other MoQ authorization-token carriage configure tokens at the public API layer. Transport internals consume this config when encoding setup, namespace, and publish request messages.
+Applications configure externally issued credentials at the public API layer.
+The native publisher carries them on setup, namespace, and track publication
+requests. The managed libmoq backend rejects authorization before connecting
+because its endpoint/media-sender API cannot carry credentials; build with
+`OPENMOQ_USE_LIBMOQ_PUBLISHER=OFF` for authenticated publishing.
+
+New applications should use structured credentials with an explicit profile:
+
+```cpp
+using namespace openmoq::publisher;
+PublisherConfig config;
+config.authorization.setup_credential = cat4moq::Credential{
+    .cwt = setup_cwt,
+    .profile = cat4moq::Profile::kMoqxCompat,
+};
+config.authorization.action_credential = cat4moq::Credential{
+    .cwt = publish_cwt,
+    .profile = cat4moq::Profile::kMoqxCompat,
+};
+```
+
+`kC4m01` is the new API default and sends token type 1. `kMoqxCompat` sends
+type 16 for current moqx and Red5's `moqx` profile. `kRed5CoseCompat` carries
+credentials issued for Red5's `cose` profile, also type 16 by default. A
+compatibility credential may override `token_type` to match an explicitly
+configured receiver. Profile selection does not transcode or re-sign CWTs.
+The current relays' scope formats differ from C4M-01; selecting `kC4m01`
+does not upgrade a receiver. See the [design](cat4moq-design.md).
+
+For per-resource credentials, set `authorization.credential_provider` to a
+callable accepting `const cat4moq::Resource&` and returning a `Credential`.
+The resource contains the action, the wire namespace components and an
+optional track name. The provider selects credentials for emitted namespace
+and PUBLISH requests; it is not a local media access-control filter.
+Subscribe-driven responses have no publisher credential field, so the relay
+must already hold the applicable grant from setup or namespace publication.
+The provider handles actions only; setup uses the static
+setup credential. It must cover catalog and initialization tracks as well as
+media. Throwing rejects the operation with a sanitized authorization error;
+there is no fallback to a static credential or anonymous publishing. Callbacks
+must return promptly and manage any shared state safely.
+
+Legacy preencoded wrappers remain available for existing applications:
 
 ```cpp
 #include "openmoq/publisher/cat4moq.h"
@@ -118,7 +160,8 @@ config.authorization.action_token =
 
 Helper wrappers:
 
-- `wrap_cat_token(...)`: wraps raw Catapult/CAT CWT bytes as a CAT authorization-token value.
+- `wrap_cat_token(...)`: retains the historical type-16 compatibility wrapper;
+  it does not select C4M-01.
 - `wrap_out_of_band_token(...)`: wraps raw private token bytes with the out-of-band token type.
 - `AuthorizationToken`: stores the encoded authorization-token value sent on the wire.
 - `AuthorizationConfig`: groups setup-level and action-level tokens for `PublisherConfig`.

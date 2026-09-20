@@ -11,13 +11,11 @@
 #include <cstring>
 #include <deque>
 #include <cstdlib>
-#include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -141,18 +139,6 @@ void trace(const std::string& message) {
     if (trace_enabled()) {
         std::cerr << "[picoquic-client] " << message << std::endl;
     }
-}
-
-std::string hex_dump(std::span<const std::uint8_t> bytes) {
-    std::ostringstream out;
-    out << std::hex << std::setfill('0');
-    for (std::size_t index = 0; index < bytes.size(); ++index) {
-        if (index != 0) {
-            out << ' ';
-        }
-        out << std::setw(2) << static_cast<unsigned int>(bytes[index]);
-    }
-    return out.str();
 }
 
 bool queue_delivery_timeout_locked(PicoquicClient::Impl& impl,
@@ -349,7 +335,7 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
         const auto now = std::chrono::steady_clock::now();
         const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - write.enqueued_at).count();
         trace("stream " + std::to_string(write.stream_id) +
-              " bytes=[" + hex_dump(write.bytes) + "]" +
+              " byte_count=" + std::to_string(write.bytes.size()) +
               " queue_age_ms=" + std::to_string(age_ms) +
               " defer_count=" + std::to_string(write.defer_count) +
               " now_ms=" + std::to_string(trace_elapsed_ms(now)));

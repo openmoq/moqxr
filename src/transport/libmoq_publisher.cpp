@@ -37,6 +37,9 @@ constexpr std::string_view kLocUnsupported =
     "use the native publisher backend";
 constexpr std::string_view kPropertiesUnsupported =
     "object properties are unsupported by the libmoq publisher; use the native publisher backend";
+constexpr std::string_view kAuthorizationUnsupported =
+    "CAT4MoQ authorization is unavailable in the libmoq managed publisher API; "
+    "use a build with OPENMOQ_USE_LIBMOQ_PUBLISHER=OFF";
 
 bool has_loc_tracks(const PublishPlan& plan) {
     return std::any_of(plan.tracks.begin(), plan.tracks.end(), [](const TrackDescription& track) {
@@ -952,6 +955,9 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
                                         const EndpointConfig& endpoint,
                                         const TlsConfig& tls,
                                         LibmoqPublishStats& out_stats) {
+    if (config.authorization.configured()) {
+        return TransportStatus::failure(kAuthorizationUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc || has_loc_tracks(materialized_plan)) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1109,6 +1115,9 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
                                               const TlsConfig& tls,
                                               LibmoqPublishStats& out_stats,
                                               LibmoqLiveHandle* live) {
+    if (config.authorization.configured()) {
+        return TransportStatus::failure(kAuthorizationUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1328,6 +1337,9 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
                                             const TlsConfig& tls,
                                             LibmoqPublishStats& out_stats,
                                             LibmoqLiveHandle* live) {
+    if (config.authorization.configured()) {
+        return TransportStatus::failure(kAuthorizationUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1545,6 +1557,9 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
                                                 const TlsConfig& tls,
                                                 LibmoqPublishStats& out_stats,
                                                 LibmoqLiveHandle* live) {
+    if (config.authorization.configured()) {
+        return TransportStatus::failure(kAuthorizationUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc ||
         std::any_of(source.tracks.begin(), source.tracks.end(), [](const LiveTrack& track) {
             return track.packaging == LivePackaging::kLoc;

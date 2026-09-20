@@ -1,6 +1,6 @@
 # CAT4MOQ Auth Example
 
-This example publishes a deterministic live-object stream with CAT4MOQ authorization tokens carried through the public `openmoq::publisher` API. It is intended for local testing with the sibling `moqx` relay and its existing Catapult/CAT4MOQ verifier logic.
+This legacy type-16 compatibility example publishes a deterministic live-object stream with CAT4MOQ authorization tokens carried through the public `openmoq::publisher` API. It is intended for local testing with the sibling `moqx` relay and its existing Catapult/CAT4MOQ verifier logic.
 
 The example does not implement relay-side validation. It acquires token bytes from a file or command, wraps them as a MoQ `AUTHORIZATION_TOKEN` value, configures `PublisherConfig::authorization`, and publishes through `Publisher::publish_live_objects(...)`.
 
@@ -37,7 +37,7 @@ The command may include placeholders. The example shell-quotes replacements befo
 Example:
 
 ```bash
-CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx-issuer --config /tmp/moqx-auth.yaml --auth_service live --auth_key_id cat-dev --auth_actions client_setup,publish_namespace,publish --auth_namespace {namespace} --auth_track {track}' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
 
@@ -52,7 +52,7 @@ Override with `CAT4MOQ_TOKEN_ENCODING=raw|base64|hex|auto`.
 
 ## Generating Tokens with moqx
 
-The sibling `moqx` relay can issue CAT4MOQ CWT bytes with `moqx issue-cat-token`.
+The sibling `moqx` relay can issue CAT4MOQ CWT bytes with the standalone `moqx-issuer` executable.
 The command prints `base64:<token>` by default, which this example decodes when
 `CAT4MOQ_TOKEN_ENCODING=auto` is used. Keep the default
 `CAT4MOQ_TOKEN_WRAPPER=cat` so those CWT bytes are wrapped as a MoQ
@@ -61,13 +61,13 @@ The command prints `base64:<token>` by default, which this example decodes when
 Generate a token directly:
 
 ```bash
-../moqx/build/moqx issue-cat-token \
+../moqx/build/moqx-issuer \
   --config /tmp/moqx-auth.yaml \
-  --auth-service live \
-  --auth-key-id cat-dev \
-  --auth-actions client_setup,publish_namespace,publish \
-  --auth-namespace cat4moq.example \
-  --auth-track video
+  --auth_service live \
+  --auth_key_id cat-dev \
+  --auth_actions client_setup,publish_namespace,publish \
+  --auth_namespace cat4moq.example \
+  --auth_track video
 ```
 
 For this publisher example, the broad publisher grant above is the simplest
@@ -136,7 +136,7 @@ Save that as `/tmp/moqx-auth.yaml`, then run the relay:
 Run the auth example against the relay with moqx as the token issuer:
 
 ```bash
-CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx-issuer --config /tmp/moqx-auth.yaml --auth_service live --auth_key_id cat-dev --auth_actions client_setup,publish_namespace,publish --auth_namespace {namespace} --auth_track {track}' \
 CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
@@ -145,7 +145,7 @@ Or let the script start the relay for the run:
 
 ```bash
 MOQX_RELAY_CMD='../moqx/build/moqx serve --config /tmp/moqx-auth.yaml' \
-CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx-issuer --config /tmp/moqx-auth.yaml --auth_service live --auth_key_id cat-dev --auth_actions client_setup,publish_namespace,publish --auth_namespace {namespace} --auth_track {track}' \
 CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
@@ -224,11 +224,14 @@ Expected result:
 - setup, namespace, and publish request token-encoding tests pass
 - session propagation tests confirm configured setup/action tokens reach encoded transport messages
 
-For a live relay run, expected success output includes:
+For a live relay run, sender-side completion output includes:
 
 ```text
 [cat4moq-auth] published bytes=...
 ```
+
+This sender counter does not prove subscriber delivery. Use the interoperability
+harness below for that evidence.
 
 If the relay rejects the credentials, the executable exits non-zero and prints the publisher or transport error message.
 
@@ -243,3 +246,63 @@ The reusable pieces live in the public API:
 - `openmoq::publisher::PublisherConfig::authorization`
 
 The example directory only contains token acquisition and executable orchestration.
+
+## Current-relay interoperability harness
+
+The main publisher now accepts raw externally issued credentials through
+`--auth-profile moqx-compat|red5-cose-compat|c4m-01` and `--auth-token-file`.
+Use `moqx-compat` with moqx/Catapult or Red5's `auth.cat.profile=moqx`; use
+`red5-cose-compat` with Red5's `auth.cat.profile=cose`. Both compatibility profiles
+use token type 16 by default. `c4m-01` uses type 1 and does not convert existing
+relay claims into the C4M-01 namespace-matching format. The legacy example above
+continues to use type 16 through `wrap_cat_token`.
+
+Run the opt-in harness from the repository root:
+
+```bash
+# No sockets: both actual issuers checked against Red5's actual validator.
+python3 scripts/test-cat4moq-interop.py --issuer-only
+
+# Protected local relay + publisher + authenticated Playa receiver.
+python3 scripts/test-cat4moq-interop.py
+
+# One peer/profile; override binaries for another build directory as needed.
+python3 scripts/test-cat4moq-interop.py --targets red5-cose --cases valid
+```
+
+Prerequisites are a built publisher with the new CLI, the sibling moqx relay and
+standalone issuer, built Red5 classes/picoquic JNI libraries, built Playa packages,
+JDK, Node, OpenSSL and FFmpeg with H.264/AAC encoders. The default moqx binaries are
+`../moqx/build-san/moqx` and `moqx-issuer`; override `--moqx` and `--moqx-issuer`
+for a different build. Red5 defaults to the picoquic backend; use
+`--red5-quic quiche` to test that backend independently. The WebTransport Node package is resolved from
+`../moqx/test/playa/node_modules`; override its parent with `--node-modules`.
+For a raw QUIC subscriber, pass `--quic-package /path/to/quic/dist/index.js`
+and `--node /path/to/node` with a **QUIC-enabled build** of Node >=26.8.1.
+The harness adds `--experimental-quic`; the standard Node binary can lack the
+`node:quic` module even when that flag is accepted.
+
+The sanitizer runtime uses `detect_leaks=0` because LeakSanitizer cannot inspect
+processes under ptrace. This is not a sanitizer-clean claim.
+
+The harness creates private temporary directories and retains their paths and
+logs. It launches only its own relay processes, requires setup credentials,
+disables anonymous access, and never modifies sibling checkouts. Test signing
+keys are disposable, generated config uses a clearly marked test-only secret,
+and tokens are never printed. Namespace grants contain multiple components.
+
+FFmpeg remuxes the sample as one live stdin timeline. Each live target first
+requires accepted namespace publication and receiver-side
+catalog plus two progressing CMAF groups for both audio and video. A separate
+`valid-publish` control requires decoded PUBLISH_OK replies for both media tracks
+with `--forward 1`; it does not claim payload delivery in that mode. The harness
+then tests missing, expired, tampered, wrong-key, wrong-action, wrong-namespace and
+wrong-track publisher credentials, requiring a nonzero publisher exit, explicit
+publisher-attributed rejection, accepted subscriber setup, and no subscriber
+catalog/media. Wrong-action and wrong-track cases use `--forward 1` to exercise
+explicit PUBLISH authorization. Normal delivery uses `--forward 0`, where the
+namespace grant allows publication in response to SUBSCRIBE; absence of a
+PUBLISH grant alone does not prohibit that alternate publication flow. Failures exit nonzero and keep
+logs; a sender byte counter never satisfies the positive case. Runtime coverage
+is draft 18 and current compatibility profiles only, with no cross-relay peering,
+C4M-01 enforcement, DPoP, or periodic revalidation claim.

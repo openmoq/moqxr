@@ -1,7 +1,9 @@
 #include "openmoq/publisher/cli_options.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
@@ -12,6 +14,47 @@
 namespace openmoq::publisher {
 
 namespace {
+
+cat4moq::Profile parse_auth_profile(std::string_view value) {
+    if (value == "c4m-01") return cat4moq::Profile::kC4m01;
+    if (value == "moqx-compat") return cat4moq::Profile::kMoqxCompat;
+    if (value == "red5-cose-compat") return cat4moq::Profile::kRed5CoseCompat;
+    throw std::runtime_error("--auth-profile must be c4m-01, moqx-compat, or red5-cose-compat");
+}
+
+std::uint64_t parse_auth_token_type(std::string_view value) {
+    std::uint64_t type = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), type);
+    if (value.empty() || result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        throw std::runtime_error("--auth-token-type must be an unsigned 64-bit integer");
+    }
+    return type;
+}
+
+std::vector<std::uint8_t> read_credential_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open credential file");
+    }
+    // Read at most the limit plus one byte even for a special file or a file
+    // changed after opening. A size check followed by an unbounded read races.
+    std::vector<std::uint8_t> bytes(cat4moq::kMaxEncodedCredentialBytes + 1);
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    const auto size = static_cast<std::size_t>(input.gcount());
+    if (input.bad() || size > cat4moq::kMaxEncodedCredentialBytes) {
+        throw std::runtime_error("credential file cannot be read or exceeds 65536 bytes");
+    }
+    bytes.resize(size);
+    try {
+        bytes = cat4moq::decode_credential_bytes(bytes);
+    } catch (const std::exception&) {
+        throw std::runtime_error("credential file contains empty, malformed, or oversized data");
+    }
+    if (bytes.empty() || bytes.size() > cat4moq::kMaxCredentialBytes) {
+        throw std::runtime_error("credential must contain 1 to 16384 bytes");
+    }
+    return bytes;
+}
 
 InputSource parse_input_source(std::string_view value) {
     if (value == "-") {
@@ -211,6 +254,11 @@ CliOptions parse_cli_options(int argc, char** argv) {
     bool dash_queue_depth_set = false;
     bool transport_set = false;
     bool retry_set = false;
+    std::optional<cat4moq::Profile> auth_profile;
+    std::optional<std::uint64_t> auth_token_type;
+    std::optional<std::filesystem::path> auth_token_file;
+    std::optional<std::filesystem::path> auth_setup_token_file;
+    std::optional<std::filesystem::path> auth_action_token_file;
     // Tracks whether --endpoint / --url were themselves given on the command
     // line, as opposed to options.endpoint simply having a value (--alpn and
     // --sni also construct an EndpointConfig when none exists yet). Guarding
@@ -239,7 +287,21 @@ CliOptions parse_cli_options(int argc, char** argv) {
             return argv[index];
         };
 
-        if (argument == "--input") {
+        if (argument == "--auth-profile") {
+            if (auth_profile) throw std::runtime_error("--auth-profile was already given");
+            auth_profile = parse_auth_profile(require_value("--auth-profile"));
+        } else if (argument == "--auth-token-type") {
+            if (auth_token_type) throw std::runtime_error("--auth-token-type was already given");
+            auth_token_type = parse_auth_token_type(require_value("--auth-token-type"));
+        } else if (argument == "--auth-token-file" || argument == "--auth-setup-token-file" ||
+                   argument == "--auth-action-token-file") {
+            auto& file = argument == "--auth-token-file" ? auth_token_file
+                       : argument == "--auth-setup-token-file" ? auth_setup_token_file
+                       : auth_action_token_file;
+            const std::string flag(argument);
+            if (file) throw std::runtime_error(flag + " was already given");
+            file = std::filesystem::path(require_value(flag.c_str()));
+        } else if (argument == "--input") {
             options.input_source = parse_input_source(require_value("--input"));
         } else if (argument == "--live-source") {
             options.live_source = parse_live_source(require_value("--live-source"));
@@ -292,7 +354,15 @@ CliOptions parse_cli_options(int argc, char** argv) {
             if (namespace_set) {
                 throw std::runtime_error("--url and --namespace are mutually exclusive");
             }
-            const auto url = parse_msf_url(require_value("--url"));
+            const auto url_value = require_value("--url");
+            MsfUrl url;
+            try {
+                url = parse_msf_url(url_value);
+            } catch (const std::exception&) {
+                // The generic parser includes invalid parameter values in
+                // some errors; a malformed URL may contain a bearer secret.
+                throw std::runtime_error("invalid --url MSF URL or credential parameter");
+            }
 
             // track_namespace is a flat string the transport layer splits on
             // '/', so a namespace tuple element containing a literal slash
@@ -357,8 +427,6 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
             if (url.c4m_token.has_value()) {
                 options.msf_c4m_token = *url.c4m_token;
-                std::cerr << "msf_c4m_token present; this publisher does not consume CAT tokens"
-                          << std::endl;
             }
             if (url.track.track_name != "catalog") {
                 std::cerr << "--url track name \"" << url.track.track_name
@@ -454,6 +522,54 @@ CliOptions parse_cli_options(int argc, char** argv) {
             throw std::runtime_error("");
         } else {
             throw std::runtime_error(std::string("unknown argument: ") + std::string(argument));
+        }
+    }
+
+    const auto profile = auth_profile.value_or(cat4moq::Profile::kC4m01);
+    if (auth_token_type && profile == cat4moq::Profile::kC4m01) {
+        throw std::runtime_error("--auth-token-type requires an explicit compatibility --auth-profile");
+    }
+    if (auth_token_type && options.draft_version == DraftVersion::kDraft16 &&
+        *auth_token_type > ((std::uint64_t{1} << 62) - 1)) {
+        throw std::runtime_error("--auth-token-type exceeds the selected draft's integer range");
+    }
+    if ((auth_profile || auth_token_type) && !options.msf_c4m_token &&
+        !auth_token_file && !auth_setup_token_file && !auth_action_token_file) {
+        throw std::runtime_error("explicit authorization configuration requires a credential file or MSF c4m token");
+    }
+    if (auth_token_file && (auth_setup_token_file || auth_action_token_file)) {
+        throw std::runtime_error("--auth-token-file conflicts with separate setup/action credential files");
+    }
+    if (options.msf_c4m_token && (auth_token_file || auth_setup_token_file || auth_action_token_file)) {
+        throw std::runtime_error("MSF c4m credential conflicts with credential files");
+    }
+    auto make_credential = [&](std::vector<std::uint8_t> bytes) {
+        return cat4moq::Credential{.cwt = std::move(bytes), .profile = profile, .token_type = auth_token_type};
+    };
+    if (options.msf_c4m_token) {
+        std::vector<std::uint8_t> bytes;
+        try {
+            // MSF specifies base64. Also accept the base64url extension, but
+            // choose one alphabet before decoding so mixed input still fails.
+            const bool url_safe = options.msf_c4m_token->find_first_of("+/") == std::string::npos;
+            bytes = cat4moq::decode_base64_token(*options.msf_c4m_token, url_safe);
+        } catch (const std::exception&) {
+            throw std::runtime_error("MSF c4m credential is empty, malformed, or oversized");
+        }
+        if (bytes.empty() || bytes.size() > cat4moq::kMaxCredentialBytes) {
+            throw std::runtime_error("MSF c4m credential must contain 1 to 16384 bytes");
+        }
+        options.authorization.setup_credential = make_credential(std::move(bytes));
+        options.authorization.action_credential = options.authorization.setup_credential;
+    } else if (auth_token_file) {
+        options.authorization.setup_credential = make_credential(read_credential_file(*auth_token_file));
+        options.authorization.action_credential = options.authorization.setup_credential;
+    } else {
+        if (auth_setup_token_file) {
+            options.authorization.setup_credential = make_credential(read_credential_file(*auth_setup_token_file));
+        }
+        if (auth_action_token_file) {
+            options.authorization.action_credential = make_credential(read_credential_file(*auth_action_token_file));
         }
     }
 
@@ -589,6 +705,8 @@ std::string build_usage(const char* argv0) {
            " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--retry <count>]"
+           " [--auth-profile c4m-01|moqx-compat|red5-cose-compat] [--auth-token-file <path>]"
+           " [--auth-setup-token-file <path>] [--auth-action-token-file <path>] [--auth-token-type <uint>]"
            " [--cert file] [--key file] [--ca file] [--insecure]"
            " [--version] [--help]";
 }

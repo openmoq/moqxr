@@ -107,6 +107,7 @@ Publisher::Publisher(PublisherConfig config, TransportFactory transport_factory)
     : config_(std::move(config)),
       transport_factory_(std::move(transport_factory)) {
     validate_packaging(config_);
+    cat4moq::validate_authorization(config_.authorization, config_.draft_version);
     transport_factory_injected_ = static_cast<bool>(transport_factory_);
     if (!transport_factory_) {
         transport_factory_ = default_transport_factory();
@@ -119,6 +120,7 @@ const PublisherConfig& Publisher::config() const {
 
 void Publisher::set_config(const PublisherConfig& config) {
     validate_packaging(config);
+    cat4moq::validate_authorization(config.authorization, config.draft_version);
     config_ = config;
 }
 

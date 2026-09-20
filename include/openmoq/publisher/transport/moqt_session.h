@@ -136,8 +136,9 @@ private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
     void record_published_object(const std::string& track_name, std::uint64_t group_id, std::size_t payload_bytes);
-    std::optional<std::vector<std::uint8_t>> setup_authorization_token() const;
-    std::optional<std::vector<std::uint8_t>> action_authorization_token() const;
+    std::optional<std::vector<std::uint8_t>> setup_authorization_token(DraftVersion draft) const;
+    std::optional<std::vector<std::uint8_t>> action_authorization_token(
+        DraftVersion draft, cat4moq::Action action, std::optional<std::string> track_name = std::nullopt) const;
 
     TransportStatus ensure_setup(openmoq::publisher::DraftVersion draft);
     TransportStatus ensure_control_stream(openmoq::publisher::DraftVersion draft);

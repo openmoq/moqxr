@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/drm_config.h"
 #include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/moq_draft.h"
@@ -49,9 +50,10 @@ struct CliOptions {
     transport::TlsConfig tls;
     DraftVersion draft_version = DraftVersion::kDraft16;
     std::string track_namespace = "media";
-    // MSF 11.1.1 c4m token from a --url fragment. Parsed and reported; nothing
-    // on the publish path consumes a CAT token today.
+    // Retained for source compatibility; decoded into authorization before
+    // parse_cli_options returns. Never include this value in diagnostics.
     std::optional<std::string> msf_c4m_token;
+    cat4moq::AuthorizationConfig authorization;
     bool endpoint_alpn_overridden = false;
     // True when the operator chose a transport explicitly, either via
     // --transport or via a --url connection requirement (e.g. &connection=wt).

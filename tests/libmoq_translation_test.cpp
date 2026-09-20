@@ -150,6 +150,42 @@ PublishPlan make_plan() {
 int main() {
     bool ok = true;
 
+    // Configured credentials must never disappear when selecting a backend.
+    // Draft 14 and empty inputs make the unguarded implementation fail locally,
+    // so this regression does not need a network connection even in its RED run.
+    for (int credential_source = 0; credential_source < 5; ++credential_source) {
+        PublisherConfig config;
+        config.draft_version = DraftVersion::kDraft14;
+        const cat4moq::AuthorizationToken token{{3, 16, 0xa0}};
+        int provider_calls = 0;
+        if (credential_source == 0) {
+            config.authorization.setup_token = token;
+        } else if (credential_source == 1) {
+            config.authorization.action_token = token;
+        } else if (credential_source == 2) {
+            config.authorization.setup_credential = cat4moq::Credential{{0xa0}};
+        } else if (credential_source == 3) {
+            config.authorization.action_credential = cat4moq::Credential{{0xa0}};
+        } else {
+            config.authorization.credential_provider = [&](const cat4moq::Resource&) {
+                ++provider_calls;
+                return cat4moq::Credential{{0xa0}};
+            };
+        }
+        LibmoqPublishStats stats;
+        const auto refused = [&](const TransportStatus& status, std::string_view path) {
+            return expect(!status.ok && status.failure_kind == FailureKind::kFatal &&
+                              status.message.find("CAT4MoQ authorization") != std::string::npos,
+                          std::string(path) + " must reject unsupported authorization before I/O");
+        };
+        ok &= refused(publish_plan_via_libmoq({}, config, {}, {}, stats), "batch");
+        std::istringstream input;
+        ok &= refused(publish_live_stdin_via_libmoq(input, config, {}, {}, stats, nullptr), "stdin");
+        ok &= refused(publish_live_srt_via_libmoq({}, config, {}, {}, stats, nullptr), "SRT");
+        ok &= refused(publish_live_objects_via_libmoq({}, config, {}, {}, stats, nullptr), "objects");
+        ok &= expect(provider_calls == 0, "unsupported backend must not invoke credential provider");
+    }
+
     // LOCMAF needs catalog locmafVersion signaling absent from libmoq's API.
     {
         const auto rejects_locmaf = [&](auto operation, const std::string& label) {

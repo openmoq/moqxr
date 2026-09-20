@@ -1,5 +1,6 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cat4moq.h"
+#include "cat4moq_wire_test_utils.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/moqt_session.h"
@@ -1583,6 +1584,37 @@ int main() {
         .ca_path = {},
         .insecure_skip_verify = true,
     };
+    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18}) {
+        const bool modern = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+        for (const bool provider_denial : {false, true}) {
+            if (provider_denial && !modern) continue;
+            MockTransport denied;
+            denied.reads[modern ? 3 : 0].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 8}));
+            denied.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            if (!provider_denial) {
+                denied.reads[modern ? 4 : 0].push_back(draft == DraftVersion::kDraft14
+                    ? std::vector<std::uint8_t>{0x1f, 4, 2, 2, 1, 'x'}
+                    : openmoq::publisher::transport::encode_request_error_message(draft, 2, 2, 0, "denied"));
+            }
+            openmoq::publisher::cat4moq::AuthorizationConfig auth;
+            if (provider_denial) {
+                auth.credential_provider = [](const auto& resource) {
+                    if (resource.track_name) throw std::runtime_error("secret credential");
+                    return openmoq::publisher::cat4moq::Credential{{0xa1}};
+                };
+            }
+            MoqtSession denied_session(denied, "interop", true, false, false, std::chrono::seconds(1), auth);
+            ok &= expect(denied_session.connect(endpoint, tls).ok, "denied live forward transport connects");
+            const auto input_bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+            std::istringstream input(std::string(input_bytes.begin(), input_bytes.end()));
+            const auto denied_status = denied_session.publish_live(input, draft, true);
+            ok &= expect(!denied_status.ok && denied_status.message.find("secret") == std::string::npos,
+                         provider_denial ? "live provider denial must fail closed" : "live relay publication denial must fail closed");
+            ok &= expect(denied_session.publish_stats().objects_published == 0,
+                         "live denial available before media must prevent payload writes");
+        }
+    }
+
     const std::vector<std::uint8_t> source_bytes = {'I', 'N', 'I', 'T', 'M', 'S', 'G'};
     auto status = TransportStatus::success();
     std::string authority;
@@ -5784,6 +5816,72 @@ int main() {
     ok &= expect(max_request_id == kExpectedClientMaxRequestId, "expected draft-16 CLIENT_SETUP max_request_id");
 
     {
+        using namespace openmoq::publisher::cat4moq;
+        AuthorizationConfig auth;
+        auth.setup_credential = Credential{{0xa1}};
+        auth.action_credential = Credential{{0xee}};
+        std::vector<Resource> resources;
+        auth.credential_provider = [&](const Resource& resource) {
+            resources.push_back(resource);
+            if (resource.action == Action::kPublishNamespace) return Credential{{0xa2}};
+            if (resource.track_name == "catalog") return Credential{{0xa3}};
+            if (resource.track_name == "vide_1") return Credential{{0xa4}};
+            throw std::runtime_error("secret credential must not be logged");
+        };
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+        queue_publish_ok_responses(transport, DraftVersion::kDraft16, {2, 4});
+        MoqtSession session(transport, "org/stream", true, false, false, false, std::chrono::seconds(30), auth);
+        ok &= expect(session.connect(endpoint, tls).ok, "credential provider session connects");
+        status = session.publish(draft16_materialized);
+        ok &= expect(status.ok, "credential provider publication succeeds");
+        ok &= expect(resources.size() == 3, "provider must select namespace and each published track independently");
+        for (const auto& resource : resources) {
+            ok &= expect(resource.track_namespace == std::vector<std::string>{"org", "stream"}, "provider receives namespace components");
+        }
+        if (transport.writes.size() >= 4) {
+            ok &= expect(transport.writes[1].bytes == openmoq::publisher::transport::encode_namespace_message({
+                .draft = DraftVersion::kDraft16, .track_namespace = "org/stream", .request_id = 0,
+                .authorization_token = std::vector<std::uint8_t>{3, 1, 0xa2}}), "namespace uses selected credential");
+            ok &= expect(cat4moq_test::decode(transport.writes[0].bytes, DraftVersion::kDraft16).parameters.at(3) ==
+                std::vector<std::uint8_t>{3, 1, 0xa1}, "setup uses separate structured credential");
+            for (std::size_t i = 2; i < 4; ++i) {
+                const auto frame = cat4moq_test::decode(transport.writes[i].bytes, DraftVersion::kDraft16);
+                const auto expected = frame.track_name == "catalog" ? std::uint8_t{0xa3} : std::uint8_t{0xa4};
+                ok &= expect(frame.parameters.at(3) == std::vector<std::uint8_t>{3, 1, expected}, "track uses resource-specific credential");
+            }
+        } else ok &= expect(false, "provider publication writes setup and requests");
+
+        for (const std::string unusual_namespace : {"", "///"}) {
+            AuthorizationConfig unusual_auth;
+            std::vector<Resource> observed;
+            unusual_auth.credential_provider = [&](const Resource& resource) {
+                observed.push_back(resource);
+                return Credential{{0xa1}};
+            };
+            MockTransport unusual_transport;
+            unusual_transport.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+            queue_publish_ok_responses(unusual_transport, DraftVersion::kDraft16, {2, 4});
+            MoqtSession unusual_session(unusual_transport, unusual_namespace, true, false, false, false,
+                                        std::chrono::seconds(30), unusual_auth);
+            ok &= expect(unusual_session.connect(endpoint, tls).ok, "empty-component namespace connects");
+            ok &= expect(unusual_session.publish(draft16_materialized).ok, "empty-component namespace publishes");
+            const auto frame = cat4moq_test::decode(unusual_transport.writes.at(1).bytes, DraftVersion::kDraft16);
+            ok &= expect(!observed.empty() && observed[0].track_namespace == frame.track_namespace,
+                         "provider namespace exactly matches wire components for empty/slash-only names");
+        }
+
+        auth.credential_provider = [](const Resource&) -> Credential { throw std::runtime_error("secret credential"); };
+        MockTransport denied;
+        denied.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+        MoqtSession denied_session(denied, "org/stream", true, false, false, false, std::chrono::seconds(30), auth);
+        ok &= expect(denied_session.connect(endpoint, tls).ok, "denied provider transport connects");
+        status = denied_session.publish(draft16_materialized);
+        ok &= expect(!status.ok && status.message.find("secret") == std::string::npos && denied.writes.size() == 1,
+                     "provider failure aborts before unauthorized namespace and sanitizes diagnostics");
+    }
+
+    {
         const std::vector<std::uint8_t> raw_cwt{0xa1, 0x18, 0x64, 0x81, 0x83};
         const auto auth_token = openmoq::publisher::cat4moq::wrap_cat_token(raw_cwt);
         openmoq::publisher::cat4moq::AuthorizationConfig auth_config;
@@ -5816,9 +5914,9 @@ int main() {
         ok &= expect(auth_transport.writes.size() >= 2,
                      "expected auth session to write setup and namespace messages");
         if (auth_transport.writes.size() >= 2) {
-            ok &= expect(contains_subsequence(auth_transport.writes[0].bytes, auth_token.bytes),
+            ok &= expect(cat4moq_test::decode(auth_transport.writes[0].bytes, DraftVersion::kDraft16).parameters.at(3) == auth_token.bytes,
                          "expected setup message to include configured CAT token");
-            ok &= expect(contains_subsequence(auth_transport.writes[1].bytes, auth_token.bytes),
+            ok &= expect(cat4moq_test::decode(auth_transport.writes[1].bytes, DraftVersion::kDraft16).parameters.at(3) == auth_token.bytes,
                          "expected namespace publish to include configured CAT token");
         }
 
@@ -5843,7 +5941,7 @@ int main() {
         ok &= expect(auth_forward_transport.writes.size() >= 3,
                      "expected auth forward session to write setup, namespace, and publish messages");
         if (auth_forward_transport.writes.size() >= 3) {
-            ok &= expect(contains_subsequence(auth_forward_transport.writes[2].bytes, auth_token.bytes),
+            ok &= expect(cat4moq_test::decode(auth_forward_transport.writes[2].bytes, DraftVersion::kDraft16).parameters.at(3) == auth_token.bytes,
                          "expected publish track request to include configured CAT token");
         }
     }
@@ -6733,8 +6831,14 @@ int main() {
         }));
         live_transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
 
+        openmoq::publisher::cat4moq::AuthorizationConfig live_auth;
+        std::vector<openmoq::publisher::cat4moq::Resource> live_resources;
+        live_auth.credential_provider = [&](const auto& resource) {
+            live_resources.push_back(resource);
+            return openmoq::publisher::cat4moq::Credential{{static_cast<std::uint8_t>(resource.track_name ? 0xa4 : 0xa2)}};
+        };
         MoqtSession live_session(
-            live_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+            live_transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1), live_auth);
         status = live_session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected live session connect to succeed");
 
@@ -6743,6 +6847,14 @@ int main() {
         std::istringstream live_input(live_input_bytes);
         status = live_session.publish_live(live_input, draft, false);
         ok &= expect(status.ok, "expected live publish to avoid blocking on preannounce PUBLISH_OK");
+        ok &= expect(live_resources.size() == 2 && live_resources[1].track_name == "vide_1",
+                     "live stdin selects namespace and media credentials independently");
+        for (const auto& write : live_transport.writes) {
+            if (message_type(write.bytes) == 0x1d) {
+                ok &= expect(cat4moq_test::decode(write.bytes, draft).parameters.at(3) ==
+                    std::vector<std::uint8_t>{3, 1, 0xa4}, "live stdin PUBLISH uses selected media credential");
+            }
+        }
         ok &= expect(control_message_count(live_transport, 0x1d) == 1,
                      "expected live publish to preannounce one media track");
         ok &= expect(!live_transport.writes.empty() &&
@@ -7017,6 +7129,7 @@ int main() {
         Clock::time_point now{};
         bool final_catalog_phase = false;
         MockTransport transport;
+        transport.missing_read_error = "timed out waiting for stream data";
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));

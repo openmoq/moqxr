@@ -366,7 +366,52 @@ When `--forward 0` is used, `connection_id=` confirms that the transport connect
 
 The DASH ingest listener is currently supported on Unix-like platforms. Windows builds compile the CLI but report DASH ingest server startup as unsupported. The listener and live stdin reader use bounded polling so shutdown does not hang on idle input; see [macos-accept-shutdown-quirk.txt](macos-accept-shutdown-quirk.txt) for the macOS listener details.
 
-## CAT4MOQ Auth Example
+## CAT4MoQ authorization
+
+The main CLI accepts an externally issued CWT credential for setup and all
+publishing requests, including catalog and initialization tracks:
+
+```bash
+./build/openmoq-publisher --input sample.mp4 \
+  --endpoint relay.example:4433 --namespace live/demo \
+  --auth-profile moqx-compat --auth-token-file /tmp/publish-token.cwt
+```
+
+Choose a profile that matches the issuer and relay:
+
+| Profile | Token type | Use |
+| --- | --- | --- |
+| `c4m-01` (default) | 1 | Published C4M-01 credentials and claims |
+| `moqx-compat` | 16 | Current moqx/Catapult credentials; also Red5's `moqx` profile |
+| `red5-cose-compat` | 16 by default | Externally issued Red5 COSE credentials |
+
+`--auth-token-type <uint>` overrides the type only with an explicit compatibility
+profile. Selecting a profile preserves the signed bytes; it does not translate
+claims or retry with a weaker profile after rejection. Current compatibility
+profiles do not establish C4M-01 compliance.
+
+Files contain raw CWT bytes, `base64:<standard padded base64>`, or
+`hex:<hexadecimal bytes>`. Prefixes are required for text encodings. Outer
+whitespace after the prefix is accepted; raw bytes are preserved. Files are
+limited to 65,536 bytes and decoded credentials to 16,384 bytes. Empty,
+malformed, oversized, or unreadable files fail before connecting.
+
+Use `--auth-setup-token-file` and `--auth-action-token-file` for distinct grants;
+either can be supplied independently. These flags conflict with
+`--auth-token-file`. An MSF `--url` containing `&c4m=<base64>` applies its
+decoded credential to both roles and conflicts with all credential file flags.
+Standard padded base64 and the base64url extension (padded or unpadded) are
+accepted; mixed alphabets are rejected.
+Duplicate authorization flags are errors. `--print-msf-urls` omits the `c4m`
+credential. Every explicitly configured failover endpoint receives the same
+configured credentials, so all endpoints must be intended credential recipients.
+
+Authorization applies to file, stdin, SRT, and DASH publishing. The legacy
+MoqtSession backend carries the credentials; the current managed libmoq backend
+rejects configured authorization before connecting because its public API cannot
+carry it.
+
+### Auth example
 
 Build the CAT4MOQ auth example when testing a relay that requires MoQ authorization tokens:
 
@@ -385,7 +430,7 @@ CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 Or run it with moqx as the Catapult/CAT4MOQ issuer command:
 
 ```bash
-CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx-issuer --config /tmp/moqx-auth.yaml --auth_service live --auth_key_id cat-dev --auth_actions client_setup,publish_namespace,publish --auth_namespace {namespace} --auth_track {track}' \
 CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
