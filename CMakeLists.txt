@@ -601,11 +601,9 @@ endif()
 
 include(CTest)
 
-# Example executables (and the MSFTS example's companion test, which compiles
-# example sources) are part of the default build but can be omitted entirely
-# with -DOPENMOQ_BUILD_EXAMPLES=OFF. The project defines no install() rules,
-# so this gate also keeps examples out of any downstream packaging that stages
-# built artifacts.
+# Example executables and their companion tests are enabled with
+# -DOPENMOQ_BUILD_EXAMPLES=ON. This gate also keeps examples out of downstream
+# packaging that stages built artifacts.
 if(OPENMOQ_BUILD_EXAMPLES)
     add_executable(openmoq-publisher-psychedelic-example
         examples/psychedelic/Psychedelic.cpp
@@ -617,6 +615,28 @@ if(OPENMOQ_BUILD_EXAMPLES)
         examples/auth/catapult_client.cpp
     )
     target_link_libraries(openmoq-publisher-auth-example PRIVATE openmoq_publisher_lib)
+
+    if(OPENMOQ_BUILD_TESTS)
+        add_executable(openmoq-publisher-auth-example-tests
+            tests/auth_example_test.cpp
+            examples/auth/catapult_client.cpp
+        )
+        target_link_libraries(openmoq-publisher-auth-example-tests PRIVATE openmoq_publisher_lib)
+        add_test(NAME openmoq-publisher-auth-example-tests COMMAND openmoq-publisher-auth-example-tests)
+
+        add_executable(openmoq-publisher-auth-client-tests
+            tests/auth_catapult_client_test.cpp
+            examples/auth/catapult_client.cpp
+        )
+        target_link_libraries(openmoq-publisher-auth-client-tests PRIVATE openmoq_publisher_lib)
+        add_test(NAME openmoq-publisher-auth-client-tests COMMAND openmoq-publisher-auth-client-tests)
+
+        add_executable(openmoq-publisher-psychedelic-tests
+            examples/psychedelic/tests/psychedelic_test.cpp
+        )
+        target_link_libraries(openmoq-publisher-psychedelic-tests PRIVATE openmoq_publisher_lib)
+        add_test(NAME openmoq-publisher-psychedelic-tests COMMAND openmoq-publisher-psychedelic-tests)
+    endif()
 
     add_subdirectory(examples/msfts-publisher)
 else()

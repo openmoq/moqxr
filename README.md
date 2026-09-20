@@ -263,6 +263,9 @@ The default build keeps the built-in transport path. See [docs/build.md](docs/bu
 
 ## Examples
 
+Enable examples explicitly with `cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON`,
+then build them with `cmake --build build`.
+
 | Example | Target | Purpose |
 | --- | --- | --- |
 | Psychedelic live publisher | `openmoq-publisher-psychedelic-example` | Runs one FFmpeg audio/video pipeline through `Publisher::publish_live(...)` |
@@ -270,6 +273,11 @@ The default build keeps the built-in transport path. See [docs/build.md](docs/bu
 | MSFTS publisher | `openmoq-publisher-msfts-example` | Publishes packet-aligned MPEG-2 TS or M2TS objects through `Publisher::publish_live_objects(...)` |
 
 The MSFTS example follows the local text draft in `examples/msfts-publisher/docs/`, discovers PAT/PMT data, selects one program, filters unrelated PIDs, and emits an MSF version 1 catalog with `packaging: "m2ts"`.
+
+This example discovers single-packet PAT/PMT sections within the first 4096
+source packets. It uses fixed 10 ms object pacing rather than PCR-derived
+timing, publishes one group, and declares `m2tsRandomAccess: false`; it does
+not identify random-access boundaries or track program changes.
 
 ```bash
 ./build/examples/msfts-publisher/openmoq-publisher-msfts-example \

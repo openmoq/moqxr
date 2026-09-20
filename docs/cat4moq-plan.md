@@ -107,3 +107,22 @@ by adding a profile selector to moqxr.
   logs: `/tmp/cat4moq-interop-w1pdmk9m/results.json`.
 - Red5 issuer tooling tests passed 5/5; harness Python/Node syntax,
   documentation links, and `git diff --check` passed.
+
+## Example review follow-up
+
+- Updated the auth executable to structured profile-aware credentials with
+  explicit legacy wrapper options. Shared strict token decoding replaces the
+  permissive example decoder; source conflicts and oversized input are rejected.
+- Fixed premature subgroup closure and duration arithmetic, enabled pacing and
+  legacy track preannouncement, and made zero-object publication an error.
+- Auth and psychedelic examples verify TLS by default. A shared strict endpoint
+  parser covers all three examples, including IPv6 and port range validation.
+- Corrected build flags, launcher duration handling, and obsolete documentation;
+  documented the MSFTS demo's existing limits without changing its wire format.
+- Native build with examples enabled succeeded; full CTest passed **31/31**.
+  Token-client tests also passed ASan/UBSan. A launcher check preserved the
+  requested three seconds across configure/build delays.
+- The updated auth executable delivered all 20 opaque test objects over two
+  subgroups through protected moqx to an authenticated subscriber. A tampered
+  credential was rejected. Logs: `/tmp/auth-example-live-ygxjqo5t/`. This smoke
+  test is separate from the earlier real CMAF interoperability matrix.

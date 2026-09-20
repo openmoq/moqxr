@@ -416,6 +416,7 @@ carry it.
 Build the CAT4MOQ auth example when testing a relay that requires MoQ authorization tokens:
 
 ```bash
+cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON -DOPENMOQ_USE_LIBMOQ_PUBLISHER=OFF
 cmake --build build --target openmoq-publisher-auth-example
 ```
 
@@ -423,7 +424,7 @@ Run it with a token file:
 
 ```bash
 CAT4MOQ_TOKEN_FILE=/tmp/publish-token.cwt \
-CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' CAT4MOQ_INSECURE=1 \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
 
@@ -431,7 +432,7 @@ Or run it with moqx as the Catapult/CAT4MOQ issuer command:
 
 ```bash
 CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx-issuer --config /tmp/moqx-auth.yaml --auth_service live --auth_key_id cat-dev --auth_actions client_setup,publish_namespace,publish --auth_namespace {namespace} --auth_track {track}' \
-CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
+CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' CAT4MOQ_INSECURE=1 \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
 

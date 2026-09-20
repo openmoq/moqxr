@@ -1,4 +1,5 @@
 #include "msfts_options.h"
+#include "../common/endpoint.h"
 
 #include <charconv>
 #include <limits>
@@ -100,59 +101,7 @@ MsftsPublisherOptions parse_msfts_options(
 
 publisher::transport::EndpointConfig parse_msfts_endpoint(
     const std::string& value) {
-    using publisher::transport::EndpointConfig;
-    using publisher::transport::TransportKind;
-
-    EndpointConfig endpoint;
-    std::string authority = value;
-    if (authority.starts_with("https://")) {
-        endpoint.transport = TransportKind::kWebTransport;
-        authority.erase(0, 8);
-    } else if (authority.starts_with("moqt://")) {
-        endpoint.transport = TransportKind::kRawQuic;
-        authority.erase(0, 7);
-    } else {
-        endpoint.transport = TransportKind::kRawQuic;
-    }
-
-    const std::size_t slash = authority.find('/');
-    if (slash != std::string::npos) {
-        endpoint.path = authority.substr(slash);
-        endpoint.path_explicit = true;
-        authority.erase(slash);
-    } else if (endpoint.transport == TransportKind::kWebTransport) {
-        endpoint.path = "/";
-        endpoint.path_explicit = true;
-    }
-
-    std::size_t port_separator = std::string::npos;
-    if (authority.starts_with('[')) {
-        const std::size_t bracket = authority.find(']');
-        if (bracket == std::string::npos || bracket + 1 >= authority.size() ||
-            authority[bracket + 1] != ':') {
-            throw std::runtime_error(
-                "endpoint IPv6 literals must use [address]:port");
-        }
-        endpoint.host = authority.substr(1, bracket - 1);
-        port_separator = bracket + 1;
-    } else {
-        port_separator = authority.rfind(':');
-        if (port_separator == std::string::npos) {
-            throw std::runtime_error("endpoint must include host:port");
-        }
-        endpoint.host = authority.substr(0, port_separator);
-    }
-    if (endpoint.host.empty() || port_separator + 1 >= authority.size()) {
-        throw std::runtime_error("endpoint must include a non-empty host and port");
-    }
-    endpoint.port = static_cast<std::uint16_t>(
-        parse_unsigned(std::string_view(authority).substr(port_separator + 1),
-                       std::numeric_limits<std::uint16_t>::max(),
-                       "endpoint port"));
-    if (endpoint.port == 0) {
-        throw std::runtime_error("endpoint port must be greater than zero");
-    }
-    return endpoint;
+    return openmoq::examples::parse_endpoint(value, "/");
 }
 
 std::string msfts_usage(const char* executable) {

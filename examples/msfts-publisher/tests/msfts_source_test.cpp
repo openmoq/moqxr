@@ -487,6 +487,30 @@ void test_command_line_contract() {
     expect(webtransport.path_explicit && webtransport.path == "/moq",
            "expected explicit WebTransport path");
 
+    const auto ipv6 = parse_msfts_endpoint("https://[::1]:4433/moq?token=value");
+    expect(ipv6.host == "::1" && ipv6.port == 4433 &&
+               ipv6.path == "/moq?token=value",
+           "expected bracket-free IPv6 host and intact request query");
+    const auto raw = parse_msfts_endpoint("relay.example.com:65535");
+    expect(raw.transport == TransportKind::kRawQuic && raw.port == 65535 &&
+               !raw.path_explicit && raw.path == "/",
+           "expected raw QUIC without an explicit path");
+    const auto root_path = parse_msfts_endpoint("https://relay.example.com:443");
+    expect(root_path.path_explicit && root_path.path == "/",
+           "expected existing MSFTS HTTPS root path default");
+    for (const std::string invalid : {"host:65536", "host:0", "host:-1",
+                                     "host:443junk", "::1:4433", "host:443#frag",
+                                     "https://user@host:443/moq", "http://host:443",
+                                     "host name:443", "[::1]junk:443"}) {
+        bool rejected_endpoint = false;
+        try {
+            static_cast<void>(parse_msfts_endpoint(invalid));
+        } catch (const std::runtime_error&) {
+            rejected_endpoint = true;
+        }
+        expect(rejected_endpoint, "expected malformed endpoint to be rejected: " + invalid);
+    }
+
     bool rejected = false;
     try {
         static_cast<void>(parse_msfts_options({"--input", "sample.ts", "--draft", "15"}));

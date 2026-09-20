@@ -9,15 +9,24 @@ ENDPOINT="${CAT4MOQ_ENDPOINT:-https://127.0.0.1:4433/moq}"
 NAMESPACE="${CAT4MOQ_NAMESPACE:-cat4moq.example}"
 TRACK="${CAT4MOQ_TRACK:-video}"
 DRAFT="${CAT4MOQ_DRAFT:-16}"
-SECONDS="${CAT4MOQ_SECONDS:-3}"
+DURATION_SECONDS="${CAT4MOQ_SECONDS:-3}"
 TOKEN_ENCODING="${CAT4MOQ_TOKEN_ENCODING:-auto}"
-TOKEN_WRAPPER="${CAT4MOQ_TOKEN_WRAPPER:-cat}"
+TOKEN_WRAPPER="${CAT4MOQ_TOKEN_WRAPPER:-}"
+AUTH_PROFILE="${CAT4MOQ_AUTH_PROFILE:-}"
+AUTH_TOKEN_TYPE="${CAT4MOQ_AUTH_TOKEN_TYPE:-}"
+INSECURE="${CAT4MOQ_INSECURE:-0}"
 
 TOKEN_FILE="${CAT4MOQ_TOKEN_FILE:-}"
 SETUP_TOKEN_FILE="${CAT4MOQ_SETUP_TOKEN_FILE:-}"
 ACTION_TOKEN_FILE="${CAT4MOQ_ACTION_TOKEN_FILE:-}"
 TOKEN_COMMAND="${CATAPULT_CAT4MOQ_COMMAND:-${CAT4MOQ_TOKEN_COMMAND:-}}"
 RELAY_COMMAND="${MOQX_RELAY_CMD:-}"
+
+if [[ -z "${TOKEN_FILE}${SETUP_TOKEN_FILE}${ACTION_TOKEN_FILE}${TOKEN_COMMAND}" ]]; then
+    echo "Set CAT4MOQ_TOKEN_FILE, CAT4MOQ_SETUP_TOKEN_FILE/CAT4MOQ_ACTION_TOKEN_FILE, or CATAPULT_CAT4MOQ_COMMAND." >&2
+    exit 2
+fi
+
 
 relay_pid=""
 cleanup() {
@@ -28,6 +37,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DOPENMOQ_BUILD_EXAMPLES=ON
 cmake --build "${BUILD_DIR}" --target openmoq-publisher-auth-example
 
 if [[ -n "${RELAY_COMMAND}" ]]; then
@@ -41,10 +51,22 @@ args=(
     "--namespace" "${NAMESPACE}"
     "--track" "${TRACK}"
     "--draft" "${DRAFT}"
-    "--seconds" "${SECONDS}"
+    "--seconds" "${DURATION_SECONDS}"
     "--token-encoding" "${TOKEN_ENCODING}"
-    "--token-wrapper" "${TOKEN_WRAPPER}"
+    "--insecure-skip-verify" "${INSECURE}"
 )
+
+if [[ -n "${TOKEN_WRAPPER}" ]]; then
+    args+=("--token-wrapper" "${TOKEN_WRAPPER}")
+elif [[ -z "${AUTH_PROFILE}" ]]; then
+    AUTH_PROFILE="moqx-compat"
+fi
+if [[ -n "${AUTH_PROFILE}" ]]; then
+    args+=("--auth-profile" "${AUTH_PROFILE}")
+fi
+if [[ -n "${AUTH_TOKEN_TYPE}" ]]; then
+    args+=("--auth-token-type" "${AUTH_TOKEN_TYPE}")
+fi
 
 if [[ -n "${TOKEN_FILE}" ]]; then
     args+=("--token-file" "${TOKEN_FILE}")
@@ -59,9 +81,5 @@ if [[ -n "${TOKEN_COMMAND}" ]]; then
     args+=("--catapult-command" "${TOKEN_COMMAND}")
 fi
 
-if [[ -z "${TOKEN_FILE}${SETUP_TOKEN_FILE}${ACTION_TOKEN_FILE}${TOKEN_COMMAND}" ]]; then
-    echo "Set CAT4MOQ_TOKEN_FILE, CAT4MOQ_SETUP_TOKEN_FILE/CAT4MOQ_ACTION_TOKEN_FILE, or CATAPULT_CAT4MOQ_COMMAND." >&2
-    exit 2
-fi
 
 "${BUILD_DIR}/openmoq-publisher-auth-example" "${args[@]}"

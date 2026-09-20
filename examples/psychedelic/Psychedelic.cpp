@@ -1,6 +1,7 @@
 #include "openmoq/publisher/publisher_api.h"
+#include "../common/endpoint.h"
 
-#include <chrono>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -60,6 +61,8 @@ struct Args {
     std::string endpoint = "https://127.0.0.1:4433/moq";
     std::string namespace_name = "live.psychedelic.stream";
     int seconds = 15;
+    bool insecure = false;
+    bool help = false;
     openmoq::publisher::DraftVersion draft = openmoq::publisher::DraftVersion::kDraft16;
 };
 
@@ -79,9 +82,10 @@ Args parse_args(int argc, char** argv) {
         } else if (flag == "--namespace") {
             args.namespace_name = require_value("--namespace");
         } else if (flag == "--seconds") {
-            args.seconds = std::stoi(require_value("--seconds"));
-            if (args.seconds <= 0) {
-                throw std::runtime_error("--seconds must be > 0");
+            const std::string value = require_value("--seconds");
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), args.seconds);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || args.seconds <= 0) {
+                throw std::runtime_error("--seconds must be a positive integer");
             }
         } else if (flag == "--draft") {
             const std::string value = require_value("--draft");
@@ -96,9 +100,16 @@ Args parse_args(int argc, char** argv) {
             } else {
                 throw std::runtime_error("--draft must be one of: 14, 16, 17, 18");
             }
+        } else if (flag == "--insecure") {
+            args.insecure = true;
+        } else if (flag == "--help" || flag == "-h") {
+            args.help = true;
         } else {
             throw std::runtime_error("unknown argument: " + flag);
         }
+    }
+    if (args.namespace_name.empty()) {
+        throw std::runtime_error("--namespace must not be empty");
     }
     return args;
 }
@@ -129,7 +140,7 @@ std::string build_ffmpeg_video_command(int seconds) {
 
 void print_usage(const char* argv0) {
     std::cout << "Usage: " << argv0
-              << " [--endpoint https://host:port/moq] [--namespace name] [--draft 14|16|17|18] [--seconds N]\n";
+              << " [--endpoint https://host:port/moq] [--namespace name] [--draft 14|16|17|18] [--seconds N] [--insecure] [--help]\n";
 }
 
 }  // namespace
@@ -140,6 +151,10 @@ int main(int argc, char** argv) {
 
     try {
         const Args args = parse_args(argc, argv);
+        if (args.help) {
+            print_usage(argv[0]);
+            return 0;
+        }
 
         PublisherConfig base_config;
         base_config.draft_version = args.draft;
@@ -148,63 +163,14 @@ int main(int argc, char** argv) {
         base_config.paced = false;
         base_config.loop = false;
 
-        EndpointConfig endpoint;
-        endpoint.transport = TransportKind::kWebTransport;
-        endpoint.host = "127.0.0.1";
-        endpoint.port = 4433;
-        endpoint.path = "/moq";
-        endpoint.path_explicit = true;
-
-        // Parse endpoint through the same supported forms as CLI by using a tiny bridge:
-        // host:port, moqt://host:port/path, or https://host:port/path.
-        {
-            const std::string& raw = args.endpoint;
-            std::string authority = raw;
-            const auto consume_scheme = [&](const char* prefix) {
-                const std::string p(prefix);
-                if (authority.rfind(p, 0) == 0) {
-                    authority = authority.substr(p.size());
-                    return true;
-                }
-                return false;
-            };
-            const bool had_moqt = consume_scheme("moqt://");
-            const bool had_https = consume_scheme("https://");
-            if (had_moqt || had_https) {
-                const std::size_t slash = authority.find('/');
-                if (slash != std::string::npos) {
-                    endpoint.path = authority.substr(slash);
-                    endpoint.path_explicit = true;
-                    authority = authority.substr(0, slash);
-                } else if (had_https) {
-                    endpoint.path = "/";
-                    endpoint.path_explicit = true;
-                }
-                endpoint.transport = had_https ? TransportKind::kWebTransport : TransportKind::kRawQuic;
-            } else {
-                endpoint.transport = TransportKind::kRawQuic;
-                endpoint.path = "/";
-                endpoint.path_explicit = false;
-            }
-
-            const std::size_t colon = authority.rfind(':');
-            if (colon == std::string::npos || colon == 0 || colon + 1 >= authority.size()) {
-                throw std::runtime_error("endpoint must be host:port, moqt://host:port/path, or https://host:port/path");
-            }
-            endpoint.host = authority.substr(0, colon);
-            endpoint.port = static_cast<std::uint16_t>(std::stoi(authority.substr(colon + 1)));
-            if (endpoint.transport == TransportKind::kWebTransport && !endpoint.path_explicit) {
-                endpoint.path = "/moq";
-                endpoint.path_explicit = true;
-            }
-        }
+        const EndpointConfig endpoint = openmoq::examples::parse_endpoint(args.endpoint);
 
         PublisherConfig config = base_config;
         config.track_namespace = args.namespace_name;
         Publisher publisher(config);
 
         TlsConfig tls;
-        tls.insecure_skip_verify = true;
+        tls.insecure_skip_verify = args.insecure;
         const bool endpoint_alpn_overridden = false;
 
         const std::string ffmpeg_cmd = build_ffmpeg_video_command(args.seconds);

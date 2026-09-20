@@ -24,6 +24,8 @@ struct CatapultTokenRequest {
 };
 
 struct CatapultClientOptions {
+    // Exactly one source is required. Command mode uses a trusted POSIX shell
+    // template; placeholders must appear as unquoted shell arguments.
     std::optional<std::filesystem::path> token_file;
     std::optional<std::string> command;
     TokenEncoding encoding = TokenEncoding::kAuto;
