@@ -55,6 +55,24 @@ std::string path_slug(std::string_view path) {
     return slug;
 }
 
+// Segments of one representation must share a session path so media can find
+// its init. FFmpeg can be told to reuse one name per representation, but
+// livesim2 (and the DASH-IF ingest examples) PUT "<rep>/init.cmfv" followed by
+// "<rep>/<n>.cmfv", so a final segment carrying a file extension is dropped and
+// the enclosing directory becomes the representation path. Names without an
+// extension, and the "Streams(rep.cmfv)" form, are used verbatim.
+std::string representation_path(std::string_view path) {
+    const std::size_t slash = path.find_last_of('/');
+    if (slash == std::string_view::npos || slash == 0) {
+        return std::string(path);
+    }
+    const std::string_view file_name = path.substr(slash + 1);
+    if (file_name.find('.') == std::string_view::npos || file_name.find('(') != std::string_view::npos) {
+        return std::string(path);
+    }
+    return std::string(path.substr(0, slash));
+}
+
 bool starts_with(std::string_view value, std::string_view prefix) {
     return value.substr(0, prefix.size()) == prefix;
 }
@@ -120,6 +138,23 @@ struct ParsedRequest {
     std::string path;
     std::map<std::string, std::string> headers;
 };
+
+// Strict Content-Length parse: decimal digits only (RFC 9110 section 8.6),
+// refusing signs, whitespace inside, and values that overflow.
+std::optional<std::uint64_t> parse_content_length(std::string_view text) {
+    text = trim(text);
+    if (text.empty() || text.size() > 19) {
+        return std::nullopt;
+    }
+    std::uint64_t value = 0;
+    for (const char ch : text) {
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+        value = value * 10 + static_cast<std::uint64_t>(ch - '0');
+    }
+    return value;
+}
 
 std::optional<ParsedRequest> parse_request_headers(std::string_view text) {
     const std::size_t line_end = text.find("\r\n");
@@ -1052,40 +1087,89 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
         finish("404 Not Found");
         return;
     }
+    // Body framing (RFC 9112 section 6.3): chunked wins when both headers are
+    // present; otherwise a fixed Content-Length body is accepted, which is how
+    // livesim2 pushes init segments and, without a chunk duration, media too.
     const auto transfer_encoding = parsed->headers.find("transfer-encoding");
-    if (transfer_encoding == parsed->headers.end() ||
-        lower_ascii(transfer_encoding->second).find("chunked") == std::string::npos) {
-        finish("400 Bad Request");
-        return;
+    const bool chunked = transfer_encoding != parsed->headers.end() &&
+                         lower_ascii(transfer_encoding->second).find("chunked") != std::string::npos;
+    std::uint64_t remaining_body = 0;
+    if (!chunked) {
+        const auto content_length = parsed->headers.find("content-length");
+        if (content_length == parsed->headers.end()) {
+            finish("411 Length Required");
+            return;
+        }
+        const std::optional<std::uint64_t> declared = parse_content_length(content_length->second);
+        if (!declared.has_value()) {
+            finish("400 Bad Request");
+            return;
+        }
+        if (*declared > config.max_body_size) {
+            finish("413 Content Too Large");
+            return;
+        }
+        remaining_body = *declared;
     }
 
+    // Clients such as curl wait for an interim response (or a timeout) before
+    // sending the body when they announce Expect: 100-continue.
+    const auto expect_header = parsed->headers.find("expect");
+    if (expect_header != parsed->headers.end() &&
+        lower_ascii(expect_header->second) == "100-continue" && header_end + 4 == received.size()) {
+        if (!send_all(client_fd, "HTTP/1.1 100 Continue\r\n\r\n")) {
+            close_client();
+            return;
+        }
+    }
+
+    const std::string ingest_path = representation_path(parsed->path);
+    // Never let a parse error from client-controlled bytes escape the worker
+    // thread: an uncaught exception here would call std::terminate and take
+    // down the whole publisher.
+    auto ingest_bytes = [&](std::span<const std::uint8_t> bytes) -> bool {
+        try {
+            session.ingest(ingest_path, bytes);
+        } catch (const std::exception& error) {
+            std::cerr << "[dash-ingest] ingest error on '" << parsed->path
+                      << "': " << error.what() << std::endl;
+            return false;
+        }
+        return true;
+    };
+
     ChunkedBodyDecoder decoder(config.max_chunk_size);
-    auto feed_decoder = [&](std::span<const std::uint8_t> bytes) -> bool {
-        decoder.append(bytes);
-        std::vector<std::uint8_t> decoded = decoder.take_decoded();
-        if (!decoded.empty()) {
-            // Never let a parse error from client-controlled bytes escape the
-            // worker thread: an uncaught exception here would call std::terminate
-            // and take down the whole publisher.
-            try {
-                session.ingest(parsed->path, decoded);
-            } catch (const std::exception& error) {
-                std::cerr << "[dash-ingest] ingest error on '" << parsed->path
-                          << "': " << error.what() << std::endl;
+    auto feed_body = [&](std::span<const std::uint8_t> bytes) -> bool {
+        if (chunked) {
+            decoder.append(bytes);
+            const std::vector<std::uint8_t> decoded = decoder.take_decoded();
+            if (!decoded.empty() && !ingest_bytes(decoded)) {
                 return false;
             }
+            return !decoder.failed();
         }
-        return !decoder.failed();
+        // Bytes past the declared length would belong to a pipelined request;
+        // this listener answers one request per connection, so drop them.
+        const std::size_t take =
+            static_cast<std::size_t>(std::min<std::uint64_t>(remaining_body, bytes.size()));
+        if (take > 0 && !ingest_bytes(bytes.first(take))) {
+            return false;
+        }
+        remaining_body -= take;
+        return true;
+    };
+    auto body_complete = [&]() -> bool {
+        return chunked ? decoder.complete() : remaining_body == 0;
     };
 
     if (header_end + 4 < received.size()) {
-        if (!feed_decoder(std::span<const std::uint8_t>(received.data() + header_end + 4,
-                                                        received.size() - header_end - 4))) {
+        if (!feed_body(std::span<const std::uint8_t>(received.data() + header_end + 4,
+                                                     received.size() - header_end - 4))) {
             finish("400 Bad Request");
             return;
         }
     }
-    while (!decoder.complete()) {
+    while (!body_complete()) {
         const ReceiveResult received_chunk = recv_or_stop(buffer);
         if (received_chunk.count <= 0) {
             if (received_chunk.stopped) {
@@ -1095,7 +1179,7 @@ void LiveDashIngestServer::Impl::handle_client(int client_fd) {
             }
             return;
         }
-        if (!feed_decoder(
+        if (!feed_body(
                 std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received_chunk.count)))) {
             finish("400 Bad Request");
             return;

@@ -61,6 +61,9 @@ struct LiveDashIngestConfig {
     std::string path_prefix = "/ingest";
     std::size_t queue_depth = 128;
     std::size_t max_chunk_size = 1024 * 1024;
+    // Upper bound on a fixed-length (Content-Length) request body; larger
+    // declared lengths are refused with 413 before any body bytes are read.
+    std::size_t max_body_size = 256 * 1024 * 1024;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
 };
 

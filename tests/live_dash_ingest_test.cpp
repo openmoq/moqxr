@@ -30,6 +30,14 @@ using openmoq::publisher::LiveDashIngestServer;
 using openmoq::publisher::LiveDashIngestSession;
 using openmoq::publisher::LiveObject;
 
+#if defined(MSG_NOSIGNAL)
+// The server may close early on a rejected request; do not let a late send
+// take the whole test binary down with SIGPIPE.
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+
 bool expect(bool condition, const std::string& message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
@@ -354,7 +362,7 @@ int open_stalled_chunked_put(std::uint16_t port, const std::string& path) {
             << "10\r\n"
             << "abc";
     const std::string bytes = request.str();
-    static_cast<void>(::send(fd, bytes.data(), bytes.size(), 0));
+    static_cast<void>(::send(fd, bytes.data(), bytes.size(), kSendFlags));
     return fd;
 #endif
 }
@@ -368,6 +376,86 @@ void close_socket(int fd) {
 #else
     static_cast<void>(fd);
 #endif
+}
+
+
+int open_client_socket(std::uint16_t port) {
+#if defined(_WIN32)
+    static_cast<void>(port);
+    return -1;
+#else
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    static_cast<void>(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr));
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        static_cast<void>(::close(fd));
+        return -1;
+    }
+    return fd;
+#endif
+}
+
+void send_bytes(int fd, std::string_view bytes) {
+#if !defined(_WIN32)
+    static_cast<void>(::send(fd, bytes.data(), bytes.size(), kSendFlags));
+#else
+    static_cast<void>(fd);
+    static_cast<void>(bytes);
+#endif
+}
+
+void send_bytes(int fd, std::span<const std::uint8_t> bytes) {
+#if !defined(_WIN32)
+    static_cast<void>(::send(fd, bytes.data(), bytes.size(), kSendFlags));
+#else
+    static_cast<void>(fd);
+    static_cast<void>(bytes);
+#endif
+}
+
+// Reads one recv() worth of response bytes (enough for a status line).
+std::string recv_some(int fd) {
+#if !defined(_WIN32)
+    std::array<char, 512> buffer{};
+    const ssize_t received = ::recv(fd, buffer.data(), buffer.size(), 0);
+    if (received > 0) {
+        return std::string(buffer.data(), static_cast<std::size_t>(received));
+    }
+#else
+    static_cast<void>(fd);
+#endif
+    return {};
+}
+
+std::string fixed_length_put_header(const std::string& path, std::size_t content_length) {
+    std::ostringstream request;
+    request << "PUT " << path << " HTTP/1.1\r\n"
+            << "Host: 127.0.0.1\r\n"
+            << "Connection: keep-alive\r\n"
+            << "Content-Type: video/mp4\r\n"
+            << "Content-Length: " << content_length << "\r\n"
+            << "\r\n";
+    return request.str();
+}
+
+// livesim2 style: a plain PUT with Content-Length and no Transfer-Encoding.
+std::string send_fixed_length_put(std::uint16_t port,
+                                  const std::string& path,
+                                  std::span<const std::uint8_t> body) {
+    const int fd = open_client_socket(port);
+    if (fd < 0) {
+        return {};
+    }
+    send_bytes(fd, fixed_length_put_header(path, body.size()));
+    send_bytes(fd, body);
+    const std::string response = recv_some(fd);
+    close_socket(fd);
+    return response;
 }
 
 }  // namespace
@@ -899,6 +987,251 @@ int main() {
             close_socket(stalled_fd);
         }
         ok &= expect(stop_returned, "expected stop to close active stalled clients before joining workers");
+    }
+    {
+        // Issue 39: livesim2 pushes init segments (and, without a chunk
+        // duration, media segments) as fixed-length PUTs rather than chunked.
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for Content-Length test: " + status.message);
+        const std::uint16_t port = server.bound_port();
+
+        const auto init = make_init_segment(1);
+        ok &= expect(send_fixed_length_put(port, "/ingest/video/init.mp4",
+                                           std::span<const std::uint8_t>(init.data(), init.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected fixed-length init PUT to receive 204");
+        ok &= expect(server.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected fixed-length init PUT to discover tracks");
+        auto source = server.source();
+        ok &= expect(source.tracks.size() == 2, "expected catalog plus one track from fixed-length init");
+
+        const auto media = make_media_fragment(1, 0, 0x61);
+        ok &= expect(send_chunked_put(port, "/ingest/video/1.m4s",
+                                      std::span<const std::uint8_t>(media.data(), media.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected chunked media PUT after fixed-length init to receive 204");
+        const auto media2 = make_media_fragment(1, 1, 0x62);
+        ok &= expect(send_fixed_length_put(port, "/ingest/video/2.m4s",
+                                           std::span<const std::uint8_t>(media2.data(), media2.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected fixed-length media PUT to receive 204");
+        const std::optional<LiveObject> catalog = source.next_object();
+        const std::optional<LiveObject> first = source.next_object();
+        const std::optional<LiveObject> second = source.next_object();
+        ok &= expect(catalog.has_value() && catalog->track_name == "catalog",
+                     "expected catalog object after fixed-length init");
+        ok &= expect(first.has_value() && second.has_value() && first->payload != second->payload,
+                     "expected media objects from chunked and fixed-length PUTs");
+        server.stop();
+    }
+
+    {
+        // Fixed-length body arriving across several TCP segments, with part
+        // of the body sharing a segment with the headers.
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for split body test: " + status.message);
+        const std::uint16_t port = server.bound_port();
+
+        const auto init = make_init_segment(1);
+        const auto media = make_media_fragment(1, 0, 0x71);
+        const auto body = concat({init, media});
+        const int fd = open_client_socket(port);
+        ok &= expect(fd >= 0, "expected split body client to connect");
+        if (fd >= 0) {
+            const std::string header = fixed_length_put_header("/ingest/video", body.size());
+            const std::size_t first_cut = body.size() / 3;
+            const std::size_t second_cut = (body.size() * 2) / 3;
+            std::string first_part = header;
+            first_part.append(reinterpret_cast<const char*>(body.data()), first_cut);
+            send_bytes(fd, first_part);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            send_bytes(fd, std::span<const std::uint8_t>(body.data() + first_cut, second_cut - first_cut));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            send_bytes(fd, std::span<const std::uint8_t>(body.data() + second_cut, body.size() - second_cut));
+            ok &= expect(recv_some(fd).find("204 No Content") != std::string::npos,
+                         "expected split fixed-length PUT to receive 204");
+            close_socket(fd);
+        }
+        ok &= expect(server.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected split fixed-length PUT to discover tracks");
+        auto source = server.source();
+        const std::optional<LiveObject> catalog = source.next_object();
+        const std::optional<LiveObject> first = source.next_object();
+        ok &= expect(catalog.has_value() && first.has_value() && first->track_name != "catalog",
+                     "expected media object from split fixed-length PUT");
+        server.stop();
+    }
+
+    {
+        // A client that closes before delivering Content-Length bytes gets 400.
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for truncated body test: " + status.message);
+        const int fd = open_client_socket(server.bound_port());
+        ok &= expect(fd >= 0, "expected truncated body client to connect");
+        if (fd >= 0) {
+            const auto init = make_init_segment(1);
+            send_bytes(fd, fixed_length_put_header("/ingest/video", init.size() + 100));
+            send_bytes(fd, std::span<const std::uint8_t>(init.data(), init.size()));
+#if !defined(_WIN32)
+            static_cast<void>(::shutdown(fd, SHUT_WR));
+#endif
+            ok &= expect(recv_some(fd).find("400 Bad Request") != std::string::npos,
+                         "expected truncated fixed-length PUT to receive 400");
+            close_socket(fd);
+        }
+        server.stop();
+    }
+
+    {
+        // Neither Transfer-Encoding nor Content-Length: 411 Length Required.
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for 411 test: " + status.message);
+        const int fd = open_client_socket(server.bound_port());
+        ok &= expect(fd >= 0, "expected no-length client to connect");
+        if (fd >= 0) {
+            send_bytes(fd, "PUT /ingest/video HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: video/mp4\r\n\r\n");
+            ok &= expect(recv_some(fd).find("411 Length Required") != std::string::npos,
+                         "expected PUT without body framing to receive 411");
+            close_socket(fd);
+        }
+        server.stop();
+    }
+
+    {
+        // Content-Length above the configured cap: 413 before reading the body.
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        config.max_body_size = 1024;
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for 413 test: " + status.message);
+        const int fd = open_client_socket(server.bound_port());
+        ok &= expect(fd >= 0, "expected oversized client to connect");
+        if (fd >= 0) {
+            send_bytes(fd, fixed_length_put_header("/ingest/video", 4096));
+            ok &= expect(recv_some(fd).find("413 Content Too Large") != std::string::npos,
+                         "expected oversized fixed-length PUT to receive 413");
+            close_socket(fd);
+        }
+        server.stop();
+    }
+
+    {
+        // Both headers present: chunked framing wins (RFC 9112 section 6.3).
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for dual framing test: " + status.message);
+        const int fd = open_client_socket(server.bound_port());
+        ok &= expect(fd >= 0, "expected dual framing client to connect");
+        if (fd >= 0) {
+            const auto init = make_init_segment(1);
+            std::ostringstream request;
+            request << "PUT /ingest/video HTTP/1.1\r\n"
+                    << "Host: 127.0.0.1\r\n"
+                    << "Transfer-Encoding: chunked\r\n"
+                    << "Content-Length: 5\r\n"
+                    << "\r\n"
+                    << std::hex << init.size() << "\r\n";
+            send_bytes(fd, request.str());
+            send_bytes(fd, std::span<const std::uint8_t>(init.data(), init.size()));
+            send_bytes(fd, "\r\n0\r\n\r\n");
+            ok &= expect(recv_some(fd).find("204 No Content") != std::string::npos,
+                         "expected chunked framing to win over Content-Length");
+            close_socket(fd);
+        }
+        ok &= expect(server.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected dual framing PUT to discover tracks via chunked body");
+        server.stop();
+    }
+
+    {
+        // Expect: 100-continue gets an interim response before the body is sent.
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for 100-continue test: " + status.message);
+        const int fd = open_client_socket(server.bound_port());
+        ok &= expect(fd >= 0, "expected 100-continue client to connect");
+        if (fd >= 0) {
+            const auto init = make_init_segment(1);
+            std::ostringstream request;
+            request << "PUT /ingest/video HTTP/1.1\r\n"
+                    << "Host: 127.0.0.1\r\n"
+                    << "Expect: 100-continue\r\n"
+                    << "Content-Length: " << init.size() << "\r\n"
+                    << "\r\n";
+            send_bytes(fd, request.str());
+            ok &= expect(recv_some(fd).find("100 Continue") != std::string::npos,
+                         "expected interim 100 Continue before sending body");
+            send_bytes(fd, std::span<const std::uint8_t>(init.data(), init.size()));
+            ok &= expect(recv_some(fd).find("204 No Content") != std::string::npos,
+                         "expected 204 after body following 100 Continue");
+            close_socket(fd);
+        }
+        ok &= expect(server.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected 100-continue PUT to discover tracks");
+        server.stop();
+    }
+    {
+        // livesim2 "Streams(rep.cmfv)" naming: the parenthesised name is not a
+        // file inside a directory, so init and media share it verbatim.
+        LiveDashIngestConfig config;
+        config.host = "127.0.0.1";
+        config.port = 0;
+        config.path_prefix = "/ingest";
+        LiveDashIngestServer server(config);
+        const auto status = server.start();
+        ok &= expect(status.ok, "expected live DASH server to start for Streams() test: " + status.message);
+        const std::uint16_t port = server.bound_port();
+        const auto init = make_init_segment(1);
+        const auto media = make_media_fragment(1, 0, 0x81);
+        ok &= expect(send_fixed_length_put(port, "/ingest/Streams(video.cmfv)",
+                                           std::span<const std::uint8_t>(init.data(), init.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected Streams() init PUT to receive 204");
+        ok &= expect(send_fixed_length_put(port, "/ingest/Streams(video.cmfv)",
+                                           std::span<const std::uint8_t>(media.data(), media.size()))
+                         .find("204 No Content") != std::string::npos,
+                     "expected Streams() media PUT to receive 204");
+        ok &= expect(server.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected Streams() PUTs to discover tracks");
+        auto source = server.source();
+        ok &= expect(source.tracks.size() == 2 && source.tracks[1].track_name == "Streams_video_cmfv__vide_1",
+                     "expected Streams() representation track name");
+        const std::optional<LiveObject> catalog = source.next_object();
+        const std::optional<LiveObject> first = source.next_object();
+        ok &= expect(catalog.has_value() && first.has_value() && first->track_name != "catalog",
+                     "expected media object from Streams() representation");
+        server.stop();
     }
 #endif
 

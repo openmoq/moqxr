@@ -297,7 +297,7 @@ The `mpegts` object can either auto-detect the first program or pin `program_num
 
 ## CTE LL-DASH Live Ingest
 
-Start an HTTP/1.1 chunked CMAF ingest endpoint and publish the resulting live objects to a MoQ relay:
+Start an HTTP/1.1 CMAF ingest endpoint and publish the resulting live objects to a MoQ relay:
 
 ```bash
 ./build/openmoq-publisher \
@@ -323,7 +323,7 @@ curl -X PUT \
   http://127.0.0.1:8080/ingest/video
 ```
 
-The server accepts `PUT` or `POST` requests with HTTP/1.1 chunked transfer encoding. Every path under the prefix keeps its own MP4 parser state, so independent representations can send init segments and media fragments on separate request paths. Track names in the MoQ catalog are prefixed with the final path component; for example, `/ingest/video0` becomes track names such as `video0_vide_1`.
+The server accepts `PUT` or `POST` requests with HTTP/1.1 chunked transfer encoding or a `Content-Length` body, so fixed-length pushes such as livesim2's init segments work without chunking. Every representation path under the prefix keeps its own MP4 parser state, so independent representations can send init segments and media fragments on separate request paths. A final path segment with a file extension is grouped by its directory, so `/ingest/video/init.cmfv` and `/ingest/video/1.cmfv` share the `/ingest/video` representation. Track names in the MoQ catalog are prefixed with the final path component; for example, `/ingest/video0` becomes track names such as `video0_vide_1`.
 
 FFmpeg DASH output can push directly to the ingest endpoint:
 
