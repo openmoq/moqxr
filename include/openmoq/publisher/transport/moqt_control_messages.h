@@ -22,6 +22,9 @@ struct SetupMessage {
     std::string path = "/";
     std::uint64_t max_request_id = 0;
     std::optional<std::vector<std::uint8_t>> authorization_token;
+    // DPoP proof for authorization_token, sent as a second AUTHORIZATION TOKEN
+    // parameter; ignored when there is no credential to accompany.
+    std::optional<std::vector<std::uint8_t>> dpop_proof;
 };
 
 struct ServerSetupMessage {
@@ -38,6 +41,9 @@ struct NamespaceMessage {
     std::string track_namespace = "media";
     std::uint64_t request_id = 0;
     std::optional<std::vector<std::uint8_t>> authorization_token;
+    // DPoP proof for authorization_token, sent as a second AUTHORIZATION TOKEN
+    // parameter; ignored when there is no credential to accompany.
+    std::optional<std::vector<std::uint8_t>> dpop_proof;
 };
 
 struct TrackMessage {
@@ -50,6 +56,9 @@ struct TrackMessage {
     std::size_t largest_object_id = 0;
     bool content_exists = false;
     std::optional<std::vector<std::uint8_t>> authorization_token;
+    // DPoP proof for authorization_token, sent as a second AUTHORIZATION TOKEN
+    // parameter; ignored when there is no credential to accompany.
+    std::optional<std::vector<std::uint8_t>> dpop_proof;
 };
 
 struct PublishNamespaceOk {
