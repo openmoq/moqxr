@@ -103,7 +103,7 @@ inline Message decode(std::span<const std::uint8_t> bytes, DraftVersion draft) {
     std::uint64_t previous = 0;
     for (std::size_t i = 0; i < count && (!uncounted || reader.offset < bytes.size()); ++i) {
         auto type = reader.integer();
-        if (setup && draft != DraftVersion::kDraft14) type += previous;
+        if (draft != DraftVersion::kDraft14) type += previous;  // draft-16+ Key-Value-Pair types are deltas
         previous = type;
         if (type == 3) {
             auto value = reader.blob();
