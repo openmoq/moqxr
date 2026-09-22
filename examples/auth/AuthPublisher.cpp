@@ -12,6 +12,7 @@
 #include <set>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -49,6 +50,9 @@ struct Args {
     std::optional<std::filesystem::path> setup_token_file;
     std::optional<std::filesystem::path> action_token_file;
     std::optional<std::string> catapult_command;
+    std::optional<std::filesystem::path> dpop_key_file;
+    std::optional<std::uint64_t> dpop_token_type;
+    bool print_dpop_jkt = false;
 };
 
 std::string require_value(int& index, int argc, char** argv, const char* flag) {
@@ -156,6 +160,12 @@ Args parse_args(int argc, char** argv) {
             args.token_type = parse_unsigned(require_value(i, argc, argv, "--auth-token-type"), "--auth-token-type");
         } else if (flag == "--token-wrapper") {
             args.token_wrapper = parse_token_wrapper(require_value(i, argc, argv, "--token-wrapper"));
+        } else if (flag == "--dpop-key-file") {
+            args.dpop_key_file = std::filesystem::path(require_value(i, argc, argv, "--dpop-key-file"));
+        } else if (flag == "--dpop-token-type") {
+            args.dpop_token_type = parse_unsigned(require_value(i, argc, argv, "--dpop-token-type"), "--dpop-token-type");
+        } else if (flag == "--print-dpop-jkt") {
+            args.print_dpop_jkt = true;
         } else if (flag == "--help" || flag == "-h") {
             throw std::runtime_error("");
         } else {
@@ -178,8 +188,25 @@ Args parse_args(int argc, char** argv) {
     if (args.token_type && (!seen.contains("--auth-profile") || args.profile == publisher::cat4moq::Profile::kC4m01)) {
         throw std::runtime_error("--auth-token-type requires an explicit compatibility profile");
     }
+    if (args.dpop_key_file && args.dpop_key_file->empty()) throw std::runtime_error("DPoP key file path must not be empty");
+    if (args.dpop_token_type && !args.dpop_key_file) throw std::runtime_error("--dpop-token-type requires --dpop-key-file");
+    if (args.print_dpop_jkt && !args.dpop_key_file) throw std::runtime_error("--print-dpop-jkt requires --dpop-key-file");
     if (args.track_name.empty() || args.track_namespace.empty()) throw std::runtime_error("namespace and track must not be empty");
     return args;
+}
+
+publisher::cat4moq::DpopSigner load_dpop_signer(const Args& args) {
+    std::ifstream input(*args.dpop_key_file, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open DPoP key file");
+    std::string pem(publisher::cat4moq::kMaxCredentialBytes + 1, '\0');
+    input.read(pem.data(), static_cast<std::streamsize>(pem.size()));
+    pem.resize(static_cast<std::size_t>(input.gcount()));
+    if (input.bad() || pem.size() > publisher::cat4moq::kMaxCredentialBytes) {
+        throw std::runtime_error("DPoP key file cannot be read or exceeds 16384 bytes");
+    }
+    auto signer = publisher::cat4moq::DpopSigner::from_pem(pem);
+    if (args.dpop_token_type) signer.token_type = *args.dpop_token_type;
+    return signer;
 }
 
 publisher::cat4moq::AuthorizationToken wrap_token(std::vector<std::uint8_t> bytes, TokenWrapper wrapper) {
@@ -254,6 +281,7 @@ publisher::cat4moq::AuthorizationConfig make_authorization(const Args& args) {
     acquire(true, args.setup_token_file ? args.setup_token_file : args.token_file);
     acquire(false, args.action_token_file ? args.action_token_file : args.token_file);
     if (!authorization.configured()) throw std::runtime_error("no CAT4MOQ token source configured");
+    if (args.dpop_key_file) authorization.dpop_signer = load_dpop_signer(args);
     publisher::cat4moq::validate_authorization(authorization, args.draft);
     return authorization;
 }
@@ -275,6 +303,9 @@ void print_usage(const char* argv0) {
         << "  --auth-profile c4m-01|moqx-compat|red5-cose-compat  Default: moqx-compat\n"
         << "  --auth-token-type N             Override type with explicit compatibility profile\n"
         << "  --token-wrapper cat|out-of-band|none  Legacy preencoded mode (conflicts with profile/type)\n"
+        << "  --dpop-key-file PATH            P-256 PEM key; signs a DPoP proof for a cnf-bound token on every message\n"
+        << "  --dpop-token-type N             Token Type of the proof parameter. Default: 17\n"
+        << "  --print-dpop-jkt                Print the key's RFC 7638 thumbprint (for the issuer's cnf.jkt) and exit\n"
         << "  --insecure-skip-verify 0|1       Default: 0 (verify TLS)\n";
 }
 
@@ -283,6 +314,10 @@ void print_usage(const char* argv0) {
 int main(int argc, char** argv) {
     try {
         const Args args = parse_args(argc, argv);
+        if (args.print_dpop_jkt) {
+            std::cout << load_dpop_signer(args).thumbprint_hex() << '\n';
+            return 0;
+        }
         const transport::EndpointConfig endpoint = openmoq::examples::parse_endpoint(args.endpoint);
 
         auto authorization = make_authorization(args);

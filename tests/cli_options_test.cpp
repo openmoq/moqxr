@@ -114,6 +114,45 @@ int main() {
             ok &= expect(false, std::string("explicit credential profile must parse: ") + error.what());
         }
     }
+    {
+        const auto key_file = std::filesystem::temp_directory_path() /
+            ("moqxr-cli-dpop-key-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        {
+            std::ofstream output(key_file, std::ios::binary);
+            output << "-----BEGIN PRIVATE KEY-----\n"
+                   "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU3h+w6OcQb7NjtQ7\n"
+                   "6aieEEHRnxoVYpDlWpCL05Z90DqhRANCAASPODFHeV2mkUnOM2ZV8dKYrtDudx2H\n"
+                   "3j9HRjWk4R/IkLcCEfFyvYPuTzwqIhB6kV8vu8VnscyTUEw/WNV6tvXV\n"
+                   "-----END PRIVATE KEY-----\n";
+        }
+        try {
+            const auto options = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                                        "--auth-dpop-key-file", key_file.string()});
+            ok &= expect(options.authorization.dpop_signer.has_value(), "DPoP key file configures a signer");
+            ok &= expect(options.authorization.dpop_signer && options.authorization.dpop_signer->token_type == 17,
+                         "proof token type defaults to 17");
+            ok &= expect(options.authorization.dpop_signer && options.authorization.dpop_signer->thumbprint_hex().size() == 64,
+                         "signer exposes its thumbprint");
+            const auto typed = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                                      "--auth-dpop-key-file", key_file.string(), "--auth-dpop-token-type", "33"});
+            ok &= expect(typed.authorization.dpop_signer && typed.authorization.dpop_signer->token_type == 33,
+                         "proof token type override");
+        } catch (const std::runtime_error& error) {
+            ok &= expect(false, std::string("DPoP key file must be accepted: ") + error.what());
+        }
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-dpop-key-file", key_file.string()},
+                          "credential", "a DPoP key without a credential is refused");
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                           "--auth-dpop-token-type", "33"},
+                          "dpop", "a proof token type without a key is refused");
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                           "--auth-dpop-key-file", key_file.string(), "--auth-dpop-key-file", key_file.string()},
+                          "already", "duplicate DPoP key flags are rejected");
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                           "--auth-dpop-key-file", auth_file.string()},
+                          "PEM private key", "a non-key file is refused");
+        std::filesystem::remove(key_file);
+    }
     for (const auto* flag : {"--auth-setup-token-file", "--auth-action-token-file"}) {
         ok &= parse_throws({"prog", "--input", "sample.mp4", flag, auth_file.string(),
                            "--auth-token-file", auth_file.string()},

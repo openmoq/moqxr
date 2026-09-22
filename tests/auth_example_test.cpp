@@ -48,6 +48,29 @@ int main() {
     expect(legacy.setup_token && legacy.setup_token->bytes == std::vector<std::uint8_t>({3, 16, 0xaa, 0xbb}), "legacy wrapper remains explicit");
     auto override_auth = make_authorization(parse({"--auth-profile", "moqx-compat", "--auth-token-type", "300", "--token-file", token_path_string.c_str()}));
     expect(override_auth.setup_credential->token_type == 300, "compatibility token type override");
+    {
+        const auto key_path = std::filesystem::temp_directory_path() /
+            ("moqxr-auth-example-dpop-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        { std::ofstream file(key_path, std::ios::binary); file << "-----BEGIN PRIVATE KEY-----\n"
+                  "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU3h+w6OcQb7NjtQ7\n"
+                  "6aieEEHRnxoVYpDlWpCL05Z90DqhRANCAASPODFHeV2mkUnOM2ZV8dKYrtDudx2H\n"
+                  "3j9HRjWk4R/IkLcCEfFyvYPuTzwqIhB6kV8vu8VnscyTUEw/WNV6tvXV\n"
+                  "-----END PRIVATE KEY-----\n"; }
+        const auto key_path_string = key_path.string();
+        auto bound = make_authorization(parse({"--auth-profile", "c4m-01", "--token-file", token_path_string.c_str(),
+                                               "--dpop-key-file", key_path_string.c_str()}));
+        expect(bound.dpop_signer && bound.dpop_signer->token_type == 17 && bound.dpop_signer->thumbprint_hex().size() == 64,
+               "DPoP key file configures a signer with the default proof type");
+        auto typed = make_authorization(parse({"--auth-profile", "c4m-01", "--token-file", token_path_string.c_str(),
+                                               "--dpop-key-file", key_path_string.c_str(), "--dpop-token-type", "33"}));
+        expect(typed.dpop_signer && typed.dpop_signer->token_type == 33, "proof token type override");
+        expect(rejected({"--dpop-token-type", "33", "--token-file", "a"}), "reject proof type without a key");
+        expect(rejected({"--dpop-key-file", "", "--token-file", "a"}), "reject empty key path");
+        const auto print_only = parse({"--print-dpop-jkt", "--dpop-key-file", key_path_string.c_str()});
+        expect(print_only.print_dpop_jkt && !print_only.token_file, "print mode needs only the key");
+        expect(rejected({"--print-dpop-jkt"}), "print mode requires a key file");
+        std::filesystem::remove(key_path);
+    }
     std::filesystem::remove(token_path);
     auto source = make_source("video", 2);
     for (std::size_t n = 0; n < 20; ++n) {

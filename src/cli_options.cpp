@@ -259,6 +259,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
     std::optional<std::filesystem::path> auth_token_file;
     std::optional<std::filesystem::path> auth_setup_token_file;
     std::optional<std::filesystem::path> auth_action_token_file;
+    std::optional<std::filesystem::path> auth_dpop_key_file;
+    std::optional<std::uint64_t> auth_dpop_token_type;
     // Tracks whether --endpoint / --url were themselves given on the command
     // line, as opposed to options.endpoint simply having a value (--alpn and
     // --sni also construct an EndpointConfig when none exists yet). Guarding
@@ -301,6 +303,12 @@ CliOptions parse_cli_options(int argc, char** argv) {
             const std::string flag(argument);
             if (file) throw std::runtime_error(flag + " was already given");
             file = std::filesystem::path(require_value(flag.c_str()));
+        } else if (argument == "--auth-dpop-key-file") {
+            if (auth_dpop_key_file) throw std::runtime_error("--auth-dpop-key-file was already given");
+            auth_dpop_key_file = std::filesystem::path(require_value("--auth-dpop-key-file"));
+        } else if (argument == "--auth-dpop-token-type") {
+            if (auth_dpop_token_type) throw std::runtime_error("--auth-dpop-token-type was already given");
+            auth_dpop_token_type = parse_auth_token_type(require_value("--auth-dpop-token-type"));
         } else if (argument == "--input") {
             options.input_source = parse_input_source(require_value("--input"));
         } else if (argument == "--live-source") {
@@ -573,6 +581,30 @@ CliOptions parse_cli_options(int argc, char** argv) {
         }
     }
 
+    if (auth_dpop_token_type && !auth_dpop_key_file) {
+        throw std::runtime_error("--auth-dpop-token-type requires --auth-dpop-key-file");
+    }
+    if (auth_dpop_key_file) {
+        if (!options.authorization.configured()) {
+            throw std::runtime_error("--auth-dpop-key-file requires a credential file or MSF c4m token to bind the proof to");
+        }
+        if (auth_dpop_key_file->empty()) throw std::runtime_error("--auth-dpop-key-file path must not be empty");
+        std::ifstream input(*auth_dpop_key_file, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot open DPoP key file");
+        std::string pem(cat4moq::kMaxCredentialBytes + 1, '\0');
+        input.read(pem.data(), static_cast<std::streamsize>(pem.size()));
+        pem.resize(static_cast<std::size_t>(input.gcount()));
+        if (input.bad() || pem.size() > cat4moq::kMaxCredentialBytes) {
+            throw std::runtime_error("DPoP key file cannot be read or exceeds 16384 bytes");
+        }
+        try {
+            options.authorization.dpop_signer = cat4moq::DpopSigner::from_pem(pem);
+        } catch (const cat4moq::AuthorizationError& error) {
+            throw std::runtime_error(std::string("--auth-dpop-key-file: ") + error.what());
+        }
+        if (auth_dpop_token_type) options.authorization.dpop_signer->token_type = *auth_dpop_token_type;
+    }
+
     if (options.media_packaging == MediaPackaging::kLocmaf &&
         (options.stream_per_object || !options.split_cmaf_chunks)) {
         throw std::runtime_error("LOCMAF requires one chunk per object and one subgroup per group; "
@@ -707,6 +739,7 @@ std::string build_usage(const char* argv0) {
            " [--retry <count>]"
            " [--auth-profile c4m-01|moqx-compat|red5-cose-compat] [--auth-token-file <path>]"
            " [--auth-setup-token-file <path>] [--auth-action-token-file <path>] [--auth-token-type <uint>]"
+           " [--auth-dpop-key-file <pem>] [--auth-dpop-token-type <uint>]"
            " [--cert file] [--key file] [--ca file] [--insecure]"
            " [--version] [--help]";
 }

@@ -227,6 +227,41 @@ int main() {
             ok &= expect(decoded_source && decoded_source->tokens[0].token_value.len == bytes.size(),
                          "legacy envelope stripped exactly once");
         }
+        {
+            // A cnf-bound credential hands libmoq two tokens: the credential and its DPoP proof.
+            static constexpr const char* kDpopKeyPem =
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU3h+w6OcQb7NjtQ7\n"
+            "6aieEEHRnxoVYpDlWpCL05Z90DqhRANCAASPODFHeV2mkUnOM2ZV8dKYrtDudx2H\n"
+            "3j9HRjWk4R/IkLcCEfFyvYPuTzwqIhB6kV8vu8VnscyTUEw/WNV6tvXV\n"
+            "-----END PRIVATE KEY-----\n";
+            cat4moq::AuthorizationConfig bound;
+            bound.setup_credential = cat4moq::Credential{{0xd2, 0}};
+            bound.action_credential = cat4moq::Credential{{0xd2, 1}};
+            bound.dpop_signer = cat4moq::DpopSigner::from_pem(kDpopKeyPem);
+            LibmoqAuthorization auth;
+            ok &= expect(auth.prepare(bound, draft).ok, "bound credentials translate");
+            for (const auto* source : {auth.setup_source(), auth.request_source()}) {
+                ok &= expect(source && source->token_count == 2, "credential and proof are two tokens");
+                if (!source || source->token_count != 2) continue;
+                ok &= expect(source->tokens[0].token_type == 1 && source->tokens[1].token_type == 17, "proof follows the credential with its own type");
+                const auto& proof = source->tokens[1].token_value;
+                ok &= expect(proof.len > 3 && std::string_view(reinterpret_cast<const char*>(proof.data), 3) == "eyJ", "proof value is the bare compact JWT");
+            }
+            cat4moq::AuthorizationConfig bound_provider = bound;
+            bound_provider.credential_provider = [](const cat4moq::Resource&) { return cat4moq::Credential{{0xd2, 2}}; };
+            LibmoqAuthorization selected;
+            ok &= expect(selected.prepare(bound_provider, draft).ok, "bound provider translates");
+            moq_bytes_t parts[] = {MOQ_BYTES_LITERAL("live"), MOQ_BYTES_LITERAL("camera1")};
+            moq_auth_request_t request{MOQ_AUTH_PUBLISH, {parts, 2}, MOQ_BYTES_LITERAL("video")};
+            const auto* source = selected.request_source();
+            moq_auth_token_t tokens[2]{};
+            std::size_t count = 0;
+            ok &= expect(source && source->select(source->ctx, &request, tokens, 2, &count) == MOQ_OK && count == 2 &&
+                         tokens[0].token_type == 1 && tokens[1].token_type == 17, "selector returns credential and proof");
+            ok &= expect(source && source->select(source->ctx, &request, tokens, 1, &count) == MOQ_ERR_INVAL && count == 0,
+                         "a bound credential is never sent without room for its proof");
+        }
         cat4moq::AuthorizationConfig provider;
         unsigned calls = 0;
         bool deny = false;
