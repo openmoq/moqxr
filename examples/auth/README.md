@@ -55,6 +55,31 @@ prefix, except optional `0x` in hex mode). Input is bounded to 65,536 bytes;
 decoded credentials are limited to 16,384 bytes. Base64 padding and trailing
 bits are checked by the shared library decoder.
 
+## DPoP proofs for cnf-bound credentials
+
+A credential whose `cnf.jkt` names a client key (draft-ietf-moq-c4m-01
+section 3) is only accepted together with a DPoP proof signed by that key.
+`--dpop-key-file PATH` loads a P-256 private key (PEM, PKCS#8 or SEC1) and the
+publisher then signs one proof per message: an ES256 compact JWT with `typ`
+`dpop-proof+jwt`, the public JWK in its header, `iat`, a random `jti` and an
+`actx` object naming the MOQT action (`SETUP`, `PUB_NS`, `PUBLISH`), the
+namespace components and the track. The proof travels as a second
+AUTHORIZATION TOKEN parameter of Token Type 17 (`--dpop-token-type N` to
+change it) right after the credential, on SETUP, PUBLISH_NAMESPACE and every
+PUBLISH. Nothing is sent when no credential applies to the message.
+
+The issuer needs the key's RFC 7638 thumbprint for `cnf.jkt`:
+
+```bash
+openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out /tmp/dpop.key
+./build/openmoq-publisher-auth-example --dpop-key-file /tmp/dpop.key --print-dpop-jkt
+```
+
+Red5's issuer takes that value as `--cnf-jkt <hex>` (with `--dpop-window` and
+`--dpop-jti`), and the relay must run with `auth.cat.dpop.enabled=true`. The
+key file is bounded to 16,384 bytes and any key that is not EC P-256 is
+refused before connecting.
+
 Legacy `--token-wrapper cat|out-of-band|none` remains available separately:
 `cat` wraps type 16, `out-of-band` wraps type 0, and `none` takes an already
 encoded Token structure. The caller owns draft correctness for `none`.
@@ -160,6 +185,7 @@ file sources; command mode is explicitly unsupported.
 | `CATAPULT_CAT4MOQ_COMMAND` | External issuer command (`CAT4MOQ_TOKEN_COMMAND` alias) |
 | `CAT4MOQ_TOKEN_ENCODING` | `auto` |
 | `CAT4MOQ_TOKEN_WRAPPER` | Unset; optional explicit legacy wrapper |
+| `CAT4MOQ_DPOP_KEY_FILE` / `CAT4MOQ_DPOP_TOKEN_TYPE` | Unset; P-256 PEM key for DPoP proofs / proof Token Type (`17`) |
 | `MOQX_RELAY_CMD` / `MOQX_RELAY_STARTUP_SECONDS` | Optional relay command / `2` |
 
 ## Focused tests

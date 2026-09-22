@@ -1,0 +1,7 @@
+Quick notes for me
+
+1. Preparing a tag/release: 
+ * In CMakeLists.txt:9, change VERSION 0.3.13 to the new number, e.g. VERSION 0.3.14.
+ * Tag post CI build
+
+
