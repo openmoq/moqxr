@@ -18,6 +18,7 @@ using openmoq::publisher::build_track_msf_url;
 using openmoq::publisher::build_usage;
 using openmoq::publisher::build_version_banner;
 using openmoq::publisher::parse_cli_options;
+using openmoq::publisher::cat4moq::Profile;
 
 bool expect(bool condition, const std::string& message) {
     if (!condition) {
@@ -73,6 +74,180 @@ std::filesystem::path write_drm_config_file(std::string_view name) {
 
 int main() {
     bool ok = true;
+
+    const auto auth_file = std::filesystem::temp_directory_path() /
+        ("moqxr-cli-cat-token-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const std::vector<std::uint8_t> expected_cwt{0xd0, 0x83, 0x40, 0xa0, 0x40};
+    {
+        std::ofstream output(auth_file, std::ios::binary);
+        output << "hex:d08340a040";
+    }
+    try {
+        const auto options = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string()});
+        ok &= expect(options.authorization.setup_credential && options.authorization.action_credential,
+                     "common file must configure setup and action authorization");
+        if (options.authorization.setup_credential && options.authorization.action_credential) {
+            ok &= expect(options.authorization.setup_credential->cwt == expected_cwt &&
+                         options.authorization.action_credential->cwt == expected_cwt,
+                         "hex credential must reach setup and action unchanged");
+            ok &= expect(options.authorization.setup_credential->profile == Profile::kC4m01 &&
+                         !options.authorization.setup_credential->token_type,
+                         "new file credentials must use strict profile without override");
+        }
+    } catch (const std::runtime_error& error) {
+        ok &= expect(false, std::string("credential file must be accepted: ") + error.what());
+    }
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--url",
+                       "moqt://h/p#msf:ns--catalog&c4m=not@base64"},
+                      "credential", "malformed MSF credentials must be rejected");
+    for (const auto* profile : {"c4m-01", "moqx-compat", "red5-cose-compat"}) {
+        try {
+            const auto options = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                                        "--auth-profile", profile});
+            const auto expected_profile = std::string_view(profile) == "c4m-01" ? Profile::kC4m01
+                                        : std::string_view(profile) == "moqx-compat" ? Profile::kMoqxCompat
+                                        : Profile::kRed5CoseCompat;
+            ok &= expect(options.authorization.setup_credential &&
+                         options.authorization.setup_credential->profile == expected_profile,
+                         "profile must survive flag ordering without a downgrade");
+        } catch (const std::runtime_error& error) {
+            ok &= expect(false, std::string("explicit credential profile must parse: ") + error.what());
+        }
+    }
+    for (const auto* flag : {"--auth-setup-token-file", "--auth-action-token-file"}) {
+        ok &= parse_throws({"prog", "--input", "sample.mp4", flag, auth_file.string(),
+                           "--auth-token-file", auth_file.string()},
+                          "conflict", "common and separate credential files must conflict");
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                           flag, auth_file.string()},
+                          "conflict", "credential conflicts must be order independent");
+    }
+    for (const auto* flag : {"--auth-token-file", "--auth-setup-token-file", "--auth-action-token-file"}) {
+        ok &= parse_throws({"prog", "--input", "sample.mp4", flag, auth_file.string(), flag, auth_file.string()},
+                          "already", "duplicate credential file flags must be rejected");
+        for (const bool url_first : {false, true}) {
+            std::vector<std::string> args{"prog", "--input", "sample.mp4"};
+            const std::vector<std::string> url{"--url", "moqt://h/p#msf:ns--catalog&c4m=0INAoEA"};
+            const std::vector<std::string> file{flag, auth_file.string()};
+            const auto& first = url_first ? url : file;
+            const auto& second = url_first ? file : url;
+            args.insert(args.end(), first.begin(), first.end());
+            args.insert(args.end(), second.begin(), second.end());
+            ok &= parse_throws(args, "conflict", "MSF and file credentials must conflict in either order");
+        }
+    }
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "c4m-01", "--auth-profile", "moqx-compat"},
+                      "already", "duplicate profiles must be rejected");
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-type", "16", "--auth-token-type", "1"},
+                      "already", "duplicate token types must be rejected");
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-type", "1"},
+                      "compat", "strict profile must reject token-type overrides");
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "moqx-compat"},
+                      "requires a credential", "explicit profile without credentials must not publish anonymously");
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "red5-cose-compat",
+                       "--auth-token-type", "16"},
+                      "requires a credential", "explicit token type without credentials must not publish anonymously");
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "unknown"},
+                      "--auth-profile", "unknown profile must be rejected");
+    for (const auto* type : {"", "-1", "+1", "1x", "4611686018427387904", "18446744073709551616"}) {
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "moqx-compat", "--auth-token-type", type},
+                          "--auth-token-type", "malformed or out-of-range token type must be rejected");
+    }
+    for (const auto* token : {"", "A", "AB", "AA=", "AA===", "AA+_", "AA AA", "+_8="}) {
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--url",
+                           std::string("moqt://h/p#msf:ns--catalog&c4m=") + token},
+                          "credential", "MSF must reject malformed base64url");
+    }
+    for (const auto* token : {"+/8=", "-_8"}) {
+        try {
+            const auto options = parse({"prog", "--input", "sample.mp4", "--url",
+                                         std::string("moqt://h/p#msf:ns--catalog&c4m=") + token});
+            ok &= expect(options.authorization.setup_credential &&
+                         options.authorization.setup_credential->cwt == std::vector<std::uint8_t>({0xfb, 0xff}),
+                         "MSF must decode standard base64 and the base64url extension without changing bytes");
+        } catch (const std::runtime_error& error) {
+            ok &= expect(false, std::string("MSF credential alphabet must parse: ") + error.what());
+        }
+    }
+    for (const std::string& malformed : {std::string(), std::string("hex:0"), std::string("hex:xx"),
+                                        std::string("base64:AB"), std::string(16385, '\x80'),
+                                        std::string(65537, 'A')}) {
+        {
+            std::ofstream output(auth_file, std::ios::binary);
+            output << malformed;
+        }
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string()},
+                          "credential", "empty, malformed, or oversized credentials must be rejected");
+    }
+    try {
+        parse({"prog", "--input", "sample.mp4", "--url",
+               "moqt://h/p#msf:ns--catalog&c4m=0INAoEA&TOP_SECRET"});
+        ok &= expect(false, "malformed MSF URL must throw");
+    } catch (const std::runtime_error& error) {
+        ok &= expect(std::string(error.what()).find("TOP_SECRET") == std::string::npos,
+                     "MSF parse diagnostics must not echo fragment contents");
+    }
+    for (const std::string& encoded : {std::string("base64:0INAoEA=\n"), std::string("hex:d08340a040\n"),
+                                      std::string("\xd0\x83\x40\xa0\x40", 5)}) {
+        {
+            std::ofstream output(auth_file, std::ios::binary);
+            output << encoded;
+        }
+        const auto options = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string()});
+        ok &= expect(options.authorization.setup_credential &&
+                     options.authorization.setup_credential->cwt == expected_cwt,
+                     "raw, hex, and base64 files must produce the exact same credential bytes");
+    }
+    const auto action_file = auth_file.string() + "-action";
+    {
+        std::ofstream output(action_file, std::ios::binary);
+        output << "hex:010002";
+    }
+    const auto separate = parse({"prog", "--input", "sample.mp4", "--auth-setup-token-file", auth_file.string(),
+                                 "--auth-token-type", "1", "--auth-profile", "red5-cose-compat",
+                                 "--auth-action-token-file", action_file});
+    ok &= expect(separate.authorization.setup_credential && separate.authorization.action_credential,
+                 "separate credentials must configure both independent roles");
+    if (separate.authorization.setup_credential && separate.authorization.action_credential) {
+        ok &= expect(separate.authorization.setup_credential->cwt == expected_cwt &&
+                     separate.authorization.action_credential->cwt == std::vector<std::uint8_t>({1, 0, 2}),
+                     "separate credentials must retain their distinct binary contents");
+        ok &= expect(separate.authorization.setup_credential->token_type == 1 &&
+                     separate.authorization.action_credential->token_type == 1,
+                     "compatibility override before profile must apply to both roles");
+    }
+    const auto action_only = parse({"prog", "--input", "sample.mp4", "--auth-action-token-file", action_file});
+    ok &= expect(!action_only.authorization.setup_credential && action_only.authorization.action_credential,
+                 "action-only credential must not be sent during setup");
+    const auto setup_only = parse({"prog", "--input", "sample.mp4", "--auth-setup-token-file", auth_file.string()});
+    ok &= expect(setup_only.authorization.setup_credential && !setup_only.authorization.action_credential,
+                 "setup-only credential must not become an action credential");
+    std::filesystem::remove(action_file);
+    {
+        std::ofstream output(auth_file, std::ios::binary);
+        output << std::string(16384, '\0');
+    }
+    const auto maximum = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                                "--endpoint", "first.example:443", "--endpoint", "second.example:443",
+                                "--auth-profile", "moqx-compat", "--auth-token-type", "4611686018427387903"});
+    ok &= expect(maximum.authorization.setup_credential &&
+                 maximum.authorization.setup_credential->cwt == std::vector<std::uint8_t>(16384, 0) &&
+                 maximum.authorization.setup_credential->token_type == ((std::uint64_t{1} << 62) - 1) &&
+                 maximum.endpoints.size() == 2,
+                 "maximum-sized binary credential and type must support explicitly configured failover endpoints");
+    try {
+        const auto draft18_maximum = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
+                                             "--auth-token-type", "18446744073709551615", "--draft", "18",
+                                             "--auth-profile", "moqx-compat"});
+        ok &= expect(draft18_maximum.authorization.setup_credential &&
+                     draft18_maximum.authorization.setup_credential->token_type == UINT64_MAX,
+                     "draft18 must retain the full 64-bit token type");
+    } catch (const std::runtime_error& error) {
+        ok &= expect(false, std::string("draft18 maximum token type must parse: ") + error.what());
+    }
+    std::filesystem::remove(auth_file);
+    ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string()},
+                      "credential", "missing credential files must be rejected");
 
     try {
         const auto options = parse({"prog", "--input", "sample.mp4", "--packaging", "locmaf"});
@@ -596,12 +771,25 @@ int main() {
                      "expected connection=wt to select WebTransport");
     }
 
-    // A c4m token is captured.
+    // A c4m token is decoded and applied to both setup and publication.
     {
         const auto options = parse(
             {"prog", "--input", "sample.mp4", "--url",
-             "moqt://relay.example/moq#msf:ns--catalog&c4m=abc123"});
-        ok &= expect(options.msf_c4m_token.value_or("") == "abc123", "expected the c4m token captured");
+             "moqt://relay.example/moq#msf:ns--catalog&c4m=0INAoEA"});
+        ok &= expect(options.msf_c4m_token.value_or("") == "0INAoEA", "expected the c4m token captured");
+        ok &= expect(options.authorization.setup_credential && options.authorization.action_credential,
+                     "MSF credential must reach setup and publication");
+        if (options.authorization.setup_credential && options.authorization.action_credential) {
+            ok &= expect(options.authorization.setup_credential->cwt == expected_cwt &&
+                         options.authorization.action_credential->cwt == expected_cwt &&
+                         options.authorization.setup_credential->profile == Profile::kC4m01,
+                         "MSF base64url must decode to exact bytes using the strict default profile");
+        }
+        const auto printed = build_track_msf_url(options.endpoint->host, options.endpoint->port,
+                                                 options.endpoint->path, options.endpoint->path_explicit,
+                                                 options.track_namespace, "catalog", ConnectionRequirement::kAny);
+        ok &= expect(printed.find("0INAoEA") == std::string::npos && printed.find("c4m=") == std::string::npos,
+                     "printed MSF URL must not expose the credential");
     }
 
     // An agreeing --transport is accepted.

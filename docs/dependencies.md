@@ -108,18 +108,17 @@ the test block; use `OPENMOQ_BUILD_EXAMPLES` for those.
 
 Default: `OFF`
 
-The default build compiles the example executables under `examples/`
+Set `-DOPENMOQ_BUILD_EXAMPLES=ON` to compile the example executables under `examples/`
 (`openmoq-publisher-psychedelic-example`, `openmoq-publisher-auth-example`, and
-`openmoq-publisher-msfts-example`). Set `-DOPENMOQ_BUILD_EXAMPLES=OFF` to omit
+`openmoq-publisher-msfts-example`). Leave `-DOPENMOQ_BUILD_EXAMPLES=OFF` to omit
 all of them, for instance when consuming this repository via
 `add_subdirectory(...)` and only the `openmoq_publisher_lib` target and CLI are
 wanted.
 
-The MSFTS example's companion test (`openmoq-publisher-msfts-tests`) compiles
-example sources, so it is built and registered with CTest only when both
-`OPENMOQ_BUILD_EXAMPLES=ON` and `OPENMOQ_BUILD_TESTS=ON`. The project defines
-no `install()` rules, so disabling examples also guarantees they never appear
-in downstream packaging steps that stage built artifacts.
+The auth, psychedelic, and MSFTS companion tests compile example sources,
+so they are built and registered with CTest only when both
+`OPENMOQ_BUILD_EXAMPLES=ON` and `OPENMOQ_BUILD_TESTS=ON`. Example executables
+are not installed by the project.
 
 ## `OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS`
 

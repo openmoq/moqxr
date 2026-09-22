@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
             .drm_systems = options.drm_systems,
             .catalog_republish_interval = options.catalog_republish_interval,
             .subscriber_timeout = options.subscriber_timeout,
+            .authorization = options.authorization,
             .media_packaging = options.media_packaging,
         };
         Publisher publisher(config);

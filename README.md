@@ -261,7 +261,16 @@ ctest --test-dir build-libmoq --output-on-failure
 
 The default build keeps the built-in transport path. See [docs/build.md](docs/build.md) for backend status, dependency discovery, and configuration details.
 
+CAT4MoQ on this backend requires moq5's `MOQ_SERVICE_AUTH_API_VERSION >= 1`.
+Use `-DOPENMOQ_LIBMOQ_SOURCE_DIR=../moq5` with the corresponding
+`feature/cat4moq` checkout while testing the coordinated change. Older moq5
+dependencies reject configured credentials before connecting. See the
+[auth design](docs/cat4moq-design.md) for backend limits and compatibility profiles.
+
 ## Examples
+
+Enable examples explicitly with `cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON`,
+then build them with `cmake --build build`.
 
 | Example | Target | Purpose |
 | --- | --- | --- |
@@ -270,6 +279,11 @@ The default build keeps the built-in transport path. See [docs/build.md](docs/bu
 | MSFTS publisher | `openmoq-publisher-msfts-example` | Publishes packet-aligned MPEG-2 TS or M2TS objects through `Publisher::publish_live_objects(...)` |
 
 The MSFTS example follows the local text draft in `examples/msfts-publisher/docs/`, discovers PAT/PMT data, selects one program, filters unrelated PIDs, and emits an MSF version 1 catalog with `packaging: "m2ts"`.
+
+This example discovers single-packet PAT/PMT sections within the first 4096
+source packets. It uses fixed 10 ms object pacing rather than PCR-derived
+timing, publishes one group, and declares `m2tsRandomAccess: false`; it does
+not identify random-access boundaries or track program changes.
 
 ```bash
 ./build/examples/msfts-publisher/openmoq-publisher-msfts-example \
@@ -295,6 +309,7 @@ Add `--program NUMBER` to select a program, `--packets-per-object COUNT` to chan
 | Relay interoperability | [docs/relay-interop.md](docs/relay-interop.md) |
 | C++ Publisher API | [docs/publisher-api.md](docs/publisher-api.md) |
 | CAT4MOQ auth example | [examples/auth/README.md](examples/auth/README.md) |
+| CAT4MoQ profiles and implementation status | [docs/cat4moq-design.md](docs/cat4moq-design.md), [docs/cat4moq-plan.md](docs/cat4moq-plan.md) |
 | MSFTS text draft | [examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt](examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt) |
 | Protocol mapping | [docs/protocol-mapping.md](docs/protocol-mapping.md) |
 | WebTransport compliance | [docs/webtransport-compliance.md](docs/webtransport-compliance.md) |

@@ -99,6 +99,28 @@ int main() {
     bool ok = true;
 
     {
+        PublisherConfig invalid;
+        invalid.authorization.setup_credential = openmoq::publisher::cat4moq::Credential{};
+        bool rejected = false;
+        try {
+            Publisher publisher(invalid);
+        } catch (const openmoq::publisher::cat4moq::AuthorizationError&) {
+            rejected = true;
+        }
+        ok &= expect(rejected, "publisher must reject empty structured credentials before connecting");
+
+        Publisher publisher;
+        rejected = false;
+        try {
+            publisher.set_config(invalid);
+        } catch (const openmoq::publisher::cat4moq::AuthorizationError&) {
+            rejected = true;
+        }
+        ok &= expect(rejected && !publisher.config().authorization.configured(),
+                     "invalid auth update must leave previous publisher configuration intact");
+    }
+
+    {
         PublisherConfig config;
         config.draft_version = DraftVersion::kDraft16;
         config.track_namespace = "app";
