@@ -612,6 +612,29 @@ bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draf
     }
 }
 
+// A DPoP proof only means something next to the credential it is bound to.
+template <typename Message>
+bool carries_dpop_proof(const Message& message) {
+    return message.authorization_token.has_value() && message.dpop_proof.has_value();
+}
+
+// Request parameters: the credential, then its proof as a repeated
+// AUTHORIZATION TOKEN. Draft-16 onward types every Key-Value-Pair as a delta
+// from the previous one, so the repeat is delta 0 (the first parameter's delta
+// from 0 equals its absolute type, which is why a lone token never showed the
+// difference); draft-14 keeps absolute types.
+template <typename Message>
+void append_authorization_parameters(std::vector<std::uint8_t>& payload, const Message& message) {
+    append_parameter(payload, message.draft, kParamAuthorizationToken, *message.authorization_token);
+    if (!carries_dpop_proof(message)) return;
+    if (message.draft == DraftVersion::kDraft14) {
+        append_parameter(payload, message.draft, kParamAuthorizationToken, *message.dpop_proof);
+    } else {
+        std::uint64_t previous_type = kParamAuthorizationToken;
+        append_parameter_delta(payload, message.draft, previous_type, kParamAuthorizationToken, *message.dpop_proof);
+    }
+}
+
 std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
     if (uses_moq_vi64(message.draft)) {
         std::vector<std::uint8_t> payload;
@@ -622,11 +645,17 @@ std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
             append_setup_option_delta(payload, message.draft, previous_option_type, kSetupParamPath, path);
             if (message.authorization_token.has_value()) {
                 append_setup_option_delta(payload, message.draft, previous_option_type, kParamAuthorizationToken, *message.authorization_token);
+                if (carries_dpop_proof(message)) {
+                    append_setup_option_delta(payload, message.draft, previous_option_type, kParamAuthorizationToken, *message.dpop_proof);
+                }
             }
             append_setup_option_delta(payload, message.draft, previous_option_type, kSetupParamAuthority, authority);
         } else if (message.authorization_token.has_value()) {
             std::uint64_t previous_option_type = 0;
             append_setup_option_delta(payload, message.draft, previous_option_type, kParamAuthorizationToken, *message.authorization_token);
+            if (carries_dpop_proof(message)) {
+                append_setup_option_delta(payload, message.draft, previous_option_type, kParamAuthorizationToken, *message.dpop_proof);
+            }
         }
 
         std::vector<std::uint8_t> message_bytes;
@@ -647,6 +676,7 @@ std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
     std::uint64_t parameter_count = include_native_quic_location ? 3 : 1;
     if (message.authorization_token.has_value()) {
         ++parameter_count;
+        if (carries_dpop_proof(message)) ++parameter_count;
     }
     append_moqint(payload, message.draft, parameter_count);
     std::uint64_t previous_parameter_type = 0;
@@ -666,6 +696,9 @@ std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
         append_parameter_delta(payload, message.draft, previous_parameter_type, kSetupParamMaxRequestId, max_request_id);
         if (message.authorization_token.has_value()) {
             append_parameter_delta(payload, message.draft, previous_parameter_type, kParamAuthorizationToken, *message.authorization_token);
+            if (carries_dpop_proof(message)) {
+                append_parameter_delta(payload, message.draft, previous_parameter_type, kParamAuthorizationToken, *message.dpop_proof);
+            }
         }
         if (include_native_quic_location) {
             const std::vector<std::uint8_t> authority = to_bytes(message.authority);
@@ -675,6 +708,9 @@ std::vector<std::uint8_t> encode_setup_message(const SetupMessage& message) {
         append_parameter(payload, message.draft, kSetupParamMaxRequestId, max_request_id);
         if (message.authorization_token.has_value()) {
             append_parameter(payload, message.draft, kParamAuthorizationToken, *message.authorization_token);
+            if (carries_dpop_proof(message)) {
+                append_parameter(payload, message.draft, kParamAuthorizationToken, *message.dpop_proof);
+            }
         }
     }
 
@@ -874,8 +910,8 @@ std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& messa
     }
     append_track_namespace(payload, message.draft, message.track_namespace);
     if (message.authorization_token.has_value()) {
-        append_moqint(payload, message.draft, 1);
-        append_parameter(payload, message.draft, kParamAuthorizationToken, *message.authorization_token);
+        append_moqint(payload, message.draft, carries_dpop_proof(message) ? 2 : 1);
+        append_authorization_parameters(payload, message);
     } else {
         append_moqint(payload, message.draft, 0);
     }
@@ -1680,8 +1716,8 @@ std::vector<std::uint8_t> encode_track_message(const TrackMessage& message) {
     }
 
     if (message.authorization_token.has_value()) {
-        append_moqint(payload, message.draft, 1);
-        append_parameter(payload, message.draft, kParamAuthorizationToken, *message.authorization_token);
+        append_moqint(payload, message.draft, carries_dpop_proof(message) ? 2 : 1);
+        append_authorization_parameters(payload, message);
     } else {
         append_moqint(payload, message.draft, 0);
     }

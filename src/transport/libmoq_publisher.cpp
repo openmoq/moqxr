@@ -173,8 +173,8 @@ TransportStatus LibmoqAuthorization::prepare(const cat4moq::AuthorizationConfig&
 #if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
     moq_auth_source_init_sized(&setup_, sizeof(setup_));
     moq_auth_source_init_sized(&requests_, sizeof(requests_));
-    setup_bytes_.clear();
-    action_bytes_.clear();
+    for (auto& bytes : setup_bytes_) bytes.clear();
+    for (auto& bytes : action_bytes_) bytes.clear();
     if (!config.configured()) return TransportStatus::success();
     if (draft != DraftVersion::kDraft16 && draft != DraftVersion::kDraft18)
         return TransportStatus::failure("CAT4MoQ authorization requires libmoq draft 16 or 18");
@@ -182,22 +182,30 @@ TransportStatus LibmoqAuthorization::prepare(const cat4moq::AuthorizationConfig&
         cat4moq::validate_authorization(config, draft);
         config_ = config;
         draft_ = draft;
-        const auto setup = cat4moq::resolve_authorization(config,
-            {cat4moq::Action::kClientSetup, {}, std::nullopt}, draft);
+        const cat4moq::Resource setup_resource{cat4moq::Action::kClientSetup, {}, std::nullopt};
+        const auto setup = cat4moq::resolve_authorization(config, setup_resource, draft);
         if (setup) {
-            decode_auth_value(*setup, draft, setup_token_, setup_bytes_);
-            setup_.tokens = &setup_token_;
+            decode_auth_value(*setup, draft, setup_tokens_[0], setup_bytes_[0]);
+            setup_.tokens = setup_tokens_;
             setup_.token_count = 1;
+            if (const auto proof = cat4moq::resolve_dpop_proof(config, setup_resource, draft)) {
+                decode_auth_value(*proof, draft, setup_tokens_[1], setup_bytes_[1]);
+                setup_.token_count = 2;
+            }
         }
         // Validate the static action envelope even when a provider overrides it.
         auto static_config = config;
         static_config.credential_provider = {};
-        const auto action = cat4moq::resolve_authorization(static_config,
-            {cat4moq::Action::kPublishNamespace, {}, std::nullopt}, draft);
+        const cat4moq::Resource action_resource{cat4moq::Action::kPublishNamespace, {}, std::nullopt};
+        const auto action = cat4moq::resolve_authorization(static_config, action_resource, draft);
         if (action) {
-            decode_auth_value(*action, draft, action_token_, action_bytes_);
-            requests_.tokens = &action_token_;
+            decode_auth_value(*action, draft, action_tokens_[0], action_bytes_[0]);
+            requests_.tokens = action_tokens_;
             requests_.token_count = 1;
+            if (const auto proof = cat4moq::resolve_dpop_proof(static_config, action_resource, draft)) {
+                decode_auth_value(*proof, draft, action_tokens_[1], action_bytes_[1]);
+                requests_.token_count = 2;
+            }
         }
         if (config.credential_provider) {
             requests_.tokens = nullptr;
@@ -250,9 +258,17 @@ moq_result_t LibmoqAuthorization::select(void* ctx, const moq_auth_request_t* re
         }
         const auto encoded = cat4moq::resolve_authorization(self.config_, resource, self.draft_);
         if (!encoded) return MOQ_ERR_INVAL;
-        decode_auth_value(*encoded, self.draft_, self.action_token_, self.action_bytes_);
-        out[0] = self.action_token_;
+        const auto proof = cat4moq::resolve_dpop_proof(self.config_, resource, self.draft_);
+        // A bound credential without its proof would only be refused; never send it alone.
+        if (proof && capacity < 2) return MOQ_ERR_INVAL;
+        decode_auth_value(*encoded, self.draft_, self.action_tokens_[0], self.action_bytes_[0]);
+        out[0] = self.action_tokens_[0];
         *count = 1;
+        if (proof) {
+            decode_auth_value(*proof, self.draft_, self.action_tokens_[1], self.action_bytes_[1]);
+            out[1] = self.action_tokens_[1];
+            *count = 2;
+        }
         return MOQ_OK;
     } catch (...) {
         return MOQ_ERR_INVAL;

@@ -48,10 +48,11 @@ private:
     DraftVersion draft_ = DraftVersion::kDraft16;
     moq_auth_source_t setup_{};
     moq_auth_source_t requests_{};
-    moq_auth_token_t setup_token_{};
-    moq_auth_token_t action_token_{};
-    std::vector<std::uint8_t> setup_bytes_;
-    std::vector<std::uint8_t> action_bytes_;
+    // [0] is the credential, [1] the DPoP proof of a cnf-bound credential.
+    moq_auth_token_t setup_tokens_[2]{};
+    moq_auth_token_t action_tokens_[2]{};
+    std::vector<std::uint8_t> setup_bytes_[2];
+    std::vector<std::uint8_t> action_bytes_[2];
 #endif
 };
 

@@ -34,6 +34,31 @@ int main() {
                     track.parameters.at(3) != std::vector<std::uint8_t>{3, 1, 0xa1, 1} || track.parameters.size() != 1) throw std::runtime_error("wrong track authorization");
             }
         }
+        // A DPoP proof is a second AUTHORIZATION TOKEN parameter of its own type, after the credential.
+        for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+            const auto token = cat4moq::encode_credential({{0xa1, 0x01}}, draft).bytes;
+            const auto proof = cat4moq::encode_dpop_proof("h.p.s", 17, draft).bytes;
+            const std::vector<std::uint8_t> expected_proof{3, 17, 'h', '.', 'p', '.', 's'};
+            for (const auto transport : {TransportKind::kRawQuic, TransportKind::kWebTransport}) {
+                const auto setup = cat4moq_test::decode(encode_setup_message({
+                    .draft = draft, .transport = transport, .authority = "example.org:443",
+                    .path = "/moq", .max_request_id = 100, .authorization_token = token, .dpop_proof = proof}), draft);
+                if (setup.authorization_tokens != std::vector{std::vector<std::uint8_t>{3, 1, 0xa1, 1}, expected_proof}) throw std::runtime_error("setup must carry credential then proof");
+                if (transport == TransportKind::kRawQuic && setup.parameters.at(1) != std::vector<std::uint8_t>{'/', 'm', 'o', 'q'}) throw std::runtime_error("setup path lost next to proof");
+            }
+            const auto ns = cat4moq_test::decode(encode_namespace_message({
+                .draft = draft, .track_namespace = "example.org/stream", .request_id = 0,
+                .authorization_token = token, .dpop_proof = proof}), draft);
+            if (ns.authorization_tokens != std::vector{std::vector<std::uint8_t>{3, 1, 0xa1, 1}, expected_proof}) throw std::runtime_error("namespace must carry credential then proof");
+            const auto track = cat4moq_test::decode(encode_track_message({
+                .draft = draft, .track_name = "video", .track_namespace = "example.org/stream",
+                .request_id = 2, .track_alias = 0, .authorization_token = token, .dpop_proof = proof}), draft);
+            if (track.authorization_tokens != std::vector{std::vector<std::uint8_t>{3, 1, 0xa1, 1}, expected_proof}) throw std::runtime_error("track must carry credential then proof");
+            // A proof without a credential is never sent on its own.
+            const auto lone = cat4moq_test::decode(encode_namespace_message({
+                .draft = draft, .track_namespace = "example.org/stream", .request_id = 0, .dpop_proof = proof}), draft);
+            if (!lone.authorization_tokens.empty()) throw std::runtime_error("proof without credential must be dropped");
+        }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

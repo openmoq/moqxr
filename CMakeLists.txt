@@ -467,6 +467,7 @@ endif()
 
 add_library(openmoq_publisher_lib STATIC
     src/cat4moq.cpp
+    src/cat4moq_dpop.cpp
     src/cenc.cpp
     src/cli_options.cpp
     src/cmaf_segmenter.cpp
@@ -498,6 +499,12 @@ add_library(openmoq_publisher_lib STATIC
 set_target_properties(openmoq_publisher_lib PROPERTIES
     OUTPUT_NAME openmoq_publisher
 )
+
+# DPoP proof signing (ES256 JWTs bound to a CAT token's cnf.jkt) uses the same
+# OpenSSL that picotls and picoquic already require; it stays an external
+# dependency of the installed archive like the rest of libcrypto.
+find_package(OpenSSL REQUIRED)
+target_link_libraries(openmoq_publisher_lib PRIVATE OpenSSL::Crypto)
 
 target_include_directories(openmoq_publisher_lib
     PUBLIC
@@ -787,6 +794,12 @@ if(OPENMOQ_BUILD_TESTS)
     )
     target_link_libraries(openmoq-publisher-cat4moq-transport-token-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-cat4moq-transport-token-tests COMMAND openmoq-publisher-cat4moq-transport-token-tests)
+
+    add_executable(openmoq-publisher-cat4moq-dpop-tests
+        tests/cat4moq_dpop_test.cpp
+    )
+    target_link_libraries(openmoq-publisher-cat4moq-dpop-tests PRIVATE openmoq_publisher_lib OpenSSL::Crypto)
+    add_test(NAME openmoq-publisher-cat4moq-dpop-tests COMMAND openmoq-publisher-cat4moq-dpop-tests)
 
     add_executable(openmoq-publisher-control-message-tests
         tests/moqt_control_messages_test.cpp

@@ -56,6 +56,8 @@ struct Message {
     std::string track_name;
     std::uint64_t track_alias = 0;
     std::map<std::uint64_t, std::vector<std::uint8_t>> parameters;
+    // Every AUTHORIZATION TOKEN (type 3) value in wire order; parameters holds the first.
+    std::vector<std::vector<std::uint8_t>> authorization_tokens;
     std::map<std::uint64_t, std::uint64_t> numeric_parameters;
 };
 
@@ -101,9 +103,13 @@ inline Message decode(std::span<const std::uint8_t> bytes, DraftVersion draft) {
     std::uint64_t previous = 0;
     for (std::size_t i = 0; i < count && (!uncounted || reader.offset < bytes.size()); ++i) {
         auto type = reader.integer();
-        if (setup && draft != DraftVersion::kDraft14) type += previous;
+        if (draft != DraftVersion::kDraft14) type += previous;  // draft-16+ Key-Value-Pair types are deltas
         previous = type;
-        if ((type & 1) != 0) {
+        if (type == 3) {
+            auto value = reader.blob();
+            message.parameters.emplace(type, value);
+            message.authorization_tokens.push_back(std::move(value));
+        } else if ((type & 1) != 0) {
             if (!message.parameters.emplace(type, reader.blob()).second) throw std::runtime_error("duplicate test parameter");
         } else {
             if (!message.numeric_parameters.emplace(type, reader.integer()).second) throw std::runtime_error("duplicate test parameter");

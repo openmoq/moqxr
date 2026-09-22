@@ -5871,6 +5871,49 @@ int main() {
                          "provider namespace exactly matches wire components for empty/slash-only names");
         }
 
+        {
+            // A cnf-bound credential travels with a DPoP proof on SETUP and on every request.
+            static constexpr const char* kDpopTestKeyPem =
+                "-----BEGIN PRIVATE KEY-----\n"
+                "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU3h+w6OcQb7NjtQ7\n"
+                "6aieEEHRnxoVYpDlWpCL05Z90DqhRANCAASPODFHeV2mkUnOM2ZV8dKYrtDudx2H\n"
+                "3j9HRjWk4R/IkLcCEfFyvYPuTzwqIhB6kV8vu8VnscyTUEw/WNV6tvXV\n"
+                "-----END PRIVATE KEY-----\n";
+            AuthorizationConfig bound;
+            bound.setup_credential = Credential{{0xa1}};
+            bound.action_credential = Credential{{0xa2}};
+            bound.dpop_signer = DpopSigner::from_pem(kDpopTestKeyPem);
+            MockTransport transport;
+            transport.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+            queue_publish_ok_responses(transport, DraftVersion::kDraft16, {2, 4});
+            MoqtSession session(transport, "org/stream", true, false, false, false, std::chrono::seconds(30), bound);
+            ok &= expect(session.connect(endpoint, tls).ok, "cnf-bound session connects");
+            ok &= expect(session.publish(draft16_materialized).ok, "cnf-bound publication succeeds");
+            if (transport.writes.size() >= 4) {
+                std::set<std::string> jtis;
+                for (std::size_t i = 0; i < 4; ++i) {
+                    const auto frame = cat4moq_test::decode(transport.writes[i].bytes, DraftVersion::kDraft16);
+                    ok &= expect(frame.authorization_tokens.size() == 2, "credential and proof on every authorized message");
+                    if (frame.authorization_tokens.size() != 2) continue;
+                    const auto& proof = frame.authorization_tokens[1];
+                    ok &= expect(proof.size() > 2 && proof[0] == 3 && proof[1] == 17, "proof is a USE_VALUE token of type 17");
+                    const std::string jwt(proof.begin() + 2, proof.end());
+                    const auto first_dot = jwt.find('.');
+                    const auto second_dot = jwt.find('.', first_dot + 1);
+                    const auto payload_bytes = decode_base64_token(jwt.substr(first_dot + 1, second_dot - first_dot - 1), true);
+                    const std::string payload(payload_bytes.begin(), payload_bytes.end());
+                    const auto jti_at = payload.find("\"jti\":\"");
+                    jtis.insert(payload.substr(jti_at, payload.find('"', jti_at + 7) - jti_at));
+                    const char* expected_actx = i == 0 ? "\"action\":\"SETUP\"}"
+                        : i == 1 ? "\"action\":\"PUB_NS\",\"tns\":[\"org\",\"stream\"]}"
+                        : frame.track_name == "catalog" ? "\"action\":\"PUBLISH\",\"tns\":[\"org\",\"stream\"],\"tn\":\"catalog\"}"
+                        : "\"action\":\"PUBLISH\",\"tns\":[\"org\",\"stream\"],\"tn\":\"vide_1\"}";
+                    ok &= expect(payload.find(expected_actx) != std::string::npos, "proof actx names the message's action and target");
+                }
+                ok &= expect(jtis.size() == 4, "every proof carries a fresh jti");
+            } else ok &= expect(false, "cnf-bound publication writes setup and requests");
+        }
+
         auth.credential_provider = [](const Resource&) -> Credential { throw std::runtime_error("secret credential"); };
         MockTransport denied;
         denied.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));

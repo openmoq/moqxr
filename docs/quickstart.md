@@ -403,7 +403,11 @@ decoded credential to both roles and conflicts with all credential file flags.
 Standard padded base64 and the base64url extension (padded or unpadded) are
 accepted; mixed alphabets are rejected.
 Duplicate authorization flags are errors. `--print-msf-urls` omits the `c4m`
-credential. Every explicitly configured failover endpoint receives the same
+credential. `--auth-dpop-key-file <pem>` (P-256 private key) signs a DPoP proof
+for a `cnf`-bound credential on every SETUP and request, sent as a second
+AUTHORIZATION TOKEN parameter of type `--auth-dpop-token-type` (default 17); it
+requires a credential to bind to. See `examples/auth/README.md` for the proof
+format and how to obtain the thumbprint the issuer needs. Every explicitly configured failover endpoint receives the same
 configured credentials, so all endpoints must be intended credential recipients.
 
 Authorization applies to file, stdin, SRT, and DASH publishing. The legacy
