@@ -1,4 +1,5 @@
 #include "openmoq/publisher/cat4moq.h"
+#include "cat4moq_internal.h"
 
 namespace openmoq::publisher::cat4moq {
 
@@ -35,6 +36,8 @@ void require_credential_size(std::size_t size) {
     }
 }
 
+}  // namespace
+
 void append_integer(std::vector<std::uint8_t>& out, std::uint64_t value, DraftVersion draft) {
     if (draft == DraftVersion::kDraft14 || draft == DraftVersion::kDraft16) {
         if (value > ((std::uint64_t{1} << 62) - 1)) throw AuthorizationError("token type exceeds draft integer range");
@@ -60,6 +63,8 @@ void append_integer(std::vector<std::uint8_t>& out, std::uint64_t value, DraftVe
         out.push_back(static_cast<std::uint8_t>(value >> ((remaining - 1) * 8)));
     }
 }
+
+namespace {
 
 std::string_view trim_encoding(std::string_view text) {
     constexpr std::string_view whitespace = " \t\r\n";
