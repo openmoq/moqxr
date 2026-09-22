@@ -23,6 +23,14 @@
 
 namespace openmoq::publisher::transport {
 
+// The AUTHORIZATION TOKEN parameter values one message carries: the CAT
+// credential selected for its resource and, for a cnf-bound credential, the
+// DPoP proof minted for that same message.
+struct AuthorizationValues {
+    std::optional<std::vector<std::uint8_t>> token;
+    std::optional<std::vector<std::uint8_t>> proof;
+};
+
 using NowFunction = std::function<std::chrono::steady_clock::time_point()>;
 
 struct LiveSrtCallerOptions {
@@ -136,8 +144,8 @@ private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
     void record_published_object(const std::string& track_name, std::uint64_t group_id, std::size_t payload_bytes);
-    std::optional<std::vector<std::uint8_t>> setup_authorization_token(DraftVersion draft) const;
-    std::optional<std::vector<std::uint8_t>> action_authorization_token(
+    AuthorizationValues setup_authorization(DraftVersion draft) const;
+    AuthorizationValues action_authorization(
         DraftVersion draft, cat4moq::Action action, std::optional<std::string> track_name = std::nullopt) const;
 
     TransportStatus ensure_setup(openmoq::publisher::DraftVersion draft);

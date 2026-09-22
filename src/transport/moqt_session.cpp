@@ -3365,7 +3365,7 @@ TransportStatus write_namespace_done_for_request(PublisherTransport& transport,
     return transport.write_stream(response_stream_id, encode_publish_namespace_done_message(namespace_message), false);
 }
 
-using TrackAuthorization = std::function<std::optional<std::vector<std::uint8_t>>(std::string_view)>;
+using TrackAuthorization = std::function<AuthorizationValues(std::string_view)>;
 
 TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         std::uint64_t control_stream_id,
@@ -5370,6 +5370,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
         request_id_by_track.emplace(track.name, next_request_id);
         tracks_by_name.emplace(track.name, track);
 
+        const AuthorizationValues track_auth = authorization_token ? authorization_token(track.name) : AuthorizationValues{};
         const TrackMessage track_message{
             .draft = plan.draft.version,
             .track_name = track.name,
@@ -5379,7 +5380,8 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             .largest_group_id = track.largest_group_id,
             .largest_object_id = track.largest_object_id,
             .content_exists = track.content_exists,
-            .authorization_token = authorization_token ? authorization_token(track.name) : std::nullopt,
+            .authorization_token = track_auth.token,
+            .dpop_proof = track_auth.proof,
         };
         TransportStatus status = TransportStatus::success();
         if (uses_request_streams(plan.draft.version)) {
@@ -5621,6 +5623,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
 
         request_id_by_track.emplace(track.name, next_request_id);
         tracks_by_name.emplace(track.name, track);
+        const AuthorizationValues track_auth = authorization_token ? authorization_token(track.name) : AuthorizationValues{};
         const TrackMessage track_message{
             .draft = plan.draft.version,
             .track_name = track.name,
@@ -5630,7 +5633,8 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
             .largest_group_id = track.largest_group_id,
             .largest_object_id = track.largest_object_id,
             .content_exists = track.content_exists,
-            .authorization_token = authorization_token ? authorization_token(track.name) : std::nullopt,
+            .authorization_token = track_auth.token,
+            .dpop_proof = track_auth.proof,
         };
         TransportStatus status = TransportStatus::success();
         if (uses_request_streams(plan.draft.version)) {
@@ -6325,12 +6329,25 @@ TransportStatus MoqtSession::send_catalog_objects(
     return TransportStatus::success();
 }
 
-std::optional<std::vector<std::uint8_t>> MoqtSession::setup_authorization_token(DraftVersion draft) const {
-    const auto token = cat4moq::resolve_authorization(authorization_, {cat4moq::Action::kClientSetup, {}, {}}, draft);
-    return token ? std::optional(token->bytes) : std::nullopt;
+namespace {
+
+AuthorizationValues resolve_authorization_values(const cat4moq::AuthorizationConfig& config,
+                                                 const cat4moq::Resource& resource, DraftVersion draft) {
+    AuthorizationValues values;
+    if (const auto token = cat4moq::resolve_authorization(config, resource, draft)) {
+        values.token = token->bytes;
+        if (const auto proof = cat4moq::resolve_dpop_proof(config, resource, draft)) values.proof = proof->bytes;
+    }
+    return values;
 }
 
-std::optional<std::vector<std::uint8_t>> MoqtSession::action_authorization_token(
+}  // namespace
+
+AuthorizationValues MoqtSession::setup_authorization(DraftVersion draft) const {
+    return resolve_authorization_values(authorization_, {cat4moq::Action::kClientSetup, {}, {}}, draft);
+}
+
+AuthorizationValues MoqtSession::action_authorization(
     DraftVersion draft, cat4moq::Action action, std::optional<std::string> track_name) const {
     cat4moq::Resource resource{action, {}, std::move(track_name)};
     std::size_t start = 0;
@@ -6341,8 +6358,7 @@ std::optional<std::vector<std::uint8_t>> MoqtSession::action_authorization_token
         start = end + 1;
     }
     if (resource.track_namespace.empty()) resource.track_namespace.push_back(track_namespace_);
-    const auto token = cat4moq::resolve_authorization(authorization_, resource, draft);
-    return token ? std::optional(token->bytes) : std::nullopt;
+    return resolve_authorization_values(authorization_, resource, draft);
 }
 
 TransportStatus MoqtSession::connect(const EndpointConfig& endpoint, const TlsConfig& tls) {
@@ -6408,10 +6424,10 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
         return status;
     }
     std::cout << "connection_id=" << transport_.connection_id() << '\n' << std::flush;
-    const auto action_token = action_authorization_token(plan.draft.version, cat4moq::Action::kPublishNamespace);
+    const auto action_auth = action_authorization(plan.draft.version, cat4moq::Action::kPublishNamespace);
 
     const TrackAuthorization track_authorization = [this, draft = plan.draft.version](std::string_view name) {
-        return action_authorization_token(draft, cat4moq::Action::kPublish, std::string(name));
+        return action_authorization(draft, cat4moq::Action::kPublish, std::string(name));
     };
     const std::vector<PublishedTrack> tracks = build_published_tracks(plan);
     const LoopState loop_state = build_loop_state(plan, loop_);
@@ -6420,7 +6436,8 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
         .draft = plan.draft.version,
         .track_namespace = track_namespace_,
         .request_id = 0,
-        .authorization_token = action_token,
+        .authorization_token = action_auth.token,
+        .dpop_proof = action_auth.proof,
     };
     if (uses_request_streams(plan.draft.version)) {
         status = send_request_stream_and_wait(
@@ -6754,7 +6771,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return status;
     }
     std::cout << "connection_id=" << transport_.connection_id() << '\n' << std::flush;
-    const auto action_token = action_authorization_token(draft_version, cat4moq::Action::kPublishNamespace);
+    const auto action_auth = action_authorization(draft_version, cat4moq::Action::kPublishNamespace);
     PeerRequestIdValidator peer_request_ids(
         draft_version, advertised_max_request_id(endpoint_->transport));
 
@@ -6847,7 +6864,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         .draft = draft_version,
         .track_namespace = track_namespace_,
         .request_id = 0,
-        .authorization_token = action_token,
+        .authorization_token = action_auth.token,
+        .dpop_proof = action_auth.proof,
     };
     if (draft_version == openmoq::publisher::DraftVersion::kDraft18) {
         status = send_request_stream_and_wait(
@@ -7685,7 +7703,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         return status;
     }
     std::cout << "connection_id=" << transport_.connection_id() << '\n' << std::flush;
-    const auto action_token = action_authorization_token(draft_version, cat4moq::Action::kPublishNamespace);
+    const auto action_auth = action_authorization(draft_version, cat4moq::Action::kPublishNamespace);
     PeerRequestIdValidator peer_request_ids(
         draft_version, advertised_max_request_id(endpoint_->transport));
 
@@ -7768,7 +7786,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         .draft = draft_version,
         .track_namespace = track_namespace_,
         .request_id = 0,
-        .authorization_token = action_token,
+        .authorization_token = action_auth.token,
+        .dpop_proof = action_auth.proof,
     };
     if (uses_request_streams(draft_version)) {
         status = send_request_stream_and_wait(
@@ -7841,6 +7860,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     if (!uses_request_streams(draft_version)) {
         std::uint64_t pub_req_id = 2;
         for (const auto& track : tracks) {
+            const auto track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track.track_name);
             const TrackMessage track_msg{
                 .draft = draft_version,
                 .track_name = track.track_name,
@@ -7850,7 +7870,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 .largest_group_id = 0,
                 .largest_object_id = 0,
                 .content_exists = true,
-                .authorization_token = action_authorization_token(draft_version, cat4moq::Action::kPublish, track.track_name),
+                .authorization_token = track_auth.token,
+                .dpop_proof = track_auth.proof,
             };
             status = transport_.write_stream(control_stream_id_, encode_track_message(track_msg), false);
             if (!status.ok) {
@@ -8326,9 +8347,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (alias_it == alias_by_track.end()) {
                 continue;
             }
-            std::optional<std::vector<std::uint8_t>> track_token;
+            AuthorizationValues track_auth;
             try {
-                track_token = action_authorization_token(draft_version, cat4moq::Action::kPublish, track_name);
+                track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track_name);
             } catch (const cat4moq::AuthorizationError& error) {
                 // Return through the caller's reader-thread cleanup path.
                 return TransportStatus::failure(error.what());
@@ -8342,7 +8363,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 .largest_group_id = 0,
                 .largest_object_id = 0,
                 .content_exists = true,
-                .authorization_token = std::move(track_token),
+                .authorization_token = std::move(track_auth.token),
+                .dpop_proof = std::move(track_auth.proof),
             };
             PublishOk publish_ok;
             std::uint64_t track_stream_id = 0;
@@ -9382,7 +9404,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         return status;
     }
     std::cout << "connection_id=" << transport_.connection_id() << '\n' << std::flush;
-    const auto action_token = action_authorization_token(draft_version, cat4moq::Action::kPublishNamespace);
+    const auto action_auth = action_authorization(draft_version, cat4moq::Action::kPublishNamespace);
     PeerRequestIdValidator peer_request_ids(
         draft_version, advertised_max_request_id(endpoint_->transport));
 
@@ -9390,7 +9412,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         .draft = draft_version,
         .track_namespace = track_namespace_,
         .request_id = 0,
-        .authorization_token = action_token,
+        .authorization_token = action_auth.token,
+        .dpop_proof = action_auth.proof,
     };
     if (uses_request_streams(draft_version)) {
         status = send_request_stream_and_wait(
@@ -9437,6 +9460,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     if (!uses_request_streams(draft_version) && preannounce_tracks_) {
         std::uint64_t request_id = 2;
         for (const auto& [track_name, alias] : alias_by_track) {
+            const auto track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track_name);
             TrackMessage track_message{
                 .draft = draft_version,
                 .track_name = track_name,
@@ -9446,7 +9470,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 .largest_group_id = 0,
                 .largest_object_id = 0,
                 .content_exists = true,
-                .authorization_token = action_authorization_token(draft_version, cat4moq::Action::kPublish, track_name),
+                .authorization_token = track_auth.token,
+                .dpop_proof = track_auth.proof,
             };
             status = transport_.write_stream(control_stream_id_, encode_track_message(track_message), false);
             if (!status.ok) {
@@ -9477,6 +9502,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return TransportStatus::success();
         }
         for (const auto& [track_name, alias] : alias_by_track) {
+            const auto track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track_name);
             TrackMessage track_message{
                 .draft = draft_version,
                 .track_name = track_name,
@@ -9486,7 +9512,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 .largest_group_id = 0,
                 .largest_object_id = 0,
                 .content_exists = true,
-                .authorization_token = action_authorization_token(draft_version, cat4moq::Action::kPublish, track_name),
+                .authorization_token = track_auth.token,
+                .dpop_proof = track_auth.proof,
             };
             PublishOk publish_ok;
             std::uint64_t stream_id = 0;
@@ -10535,13 +10562,15 @@ TransportStatus MoqtSession::ensure_setup(openmoq::publisher::DraftVersion draft
     std::string authority = endpoint_->host + ":" + std::to_string(endpoint_->port);
     const std::uint64_t max_request_id =
         endpoint_->transport == openmoq::publisher::transport::TransportKind::kWebTransport ? 128 : 100;
+    const AuthorizationValues setup_auth = setup_authorization(draft);
     const std::vector<std::uint8_t> setup_bytes = encode_setup_message({
         .draft = draft,
         .transport = endpoint_->transport,
         .authority = authority,
         .path = endpoint_->path,
         .max_request_id = max_request_id,
-        .authorization_token = setup_authorization_token(draft),
+        .authorization_token = setup_auth.token,
+        .dpop_proof = setup_auth.proof,
     });
     status = write_frame(control_stream_id_, setup_bytes, false);
     if (!status.ok) {
