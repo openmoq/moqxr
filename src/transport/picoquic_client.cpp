@@ -27,6 +27,7 @@
 #include <picoquic_utils.h>
 #include <picosocks.h>
 
+#include "peer_close.h"
 #include "tls_verification.h"
 #endif
 
@@ -108,6 +109,9 @@ struct PicoquicClient::Impl {
     // picoquic_get_logging_cnxid may only run on the loop thread afterwards.
     std::string connection_id_hex;
     std::string last_error;
+    // Set when the relay, not this client, closed the connection: its MOQT
+    // termination code and reason, reported in place of a generic close.
+    std::string peer_close_message;
     std::thread packet_loop_thread;
 
 #ifdef OPENMOQ_HAS_PICOQUIC
@@ -531,6 +535,15 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
     return 0;
 }
 
+// Why a closed connection can no longer carry data: the relay's own close
+// (termination code and reason) when it ended the session, else a local close.
+std::string closed_message(const PicoquicClient::Impl& impl) {
+    if (!impl.close_requested && !impl.peer_close_message.empty()) {
+        return impl.peer_close_message;
+    }
+    return "transport close requested";
+}
+
 int client_callback(picoquic_cnx_t* cnx,
                     uint64_t stream_id,
                     uint8_t* bytes,
@@ -593,7 +606,22 @@ int client_callback(picoquic_cnx_t* cnx,
                   " remote_reason=" + std::to_string(remote_reason) +
                   " local_application_reason=" + std::to_string(local_application_reason) +
                   " remote_application_reason=" + std::to_string(remote_application_reason));
+            // Runs on the packet loop, so the reason phrase picoquic stored from
+            // the peer's CONNECTION_CLOSE can be read here.
+            std::string peer_close_message;
+            if (event == picoquic_callback_stateless_reset) {
+                peer_close_message = "relay reset the connection (stateless reset)";
+            } else if (local_reason == 0 && local_application_reason == 0) {
+                peer_close_message = describe_peer_close(PeerClose{
+                    .application_error = remote_application_reason,
+                    .transport_error = remote_reason,
+                    .reason = cnx->remote_error_reason != nullptr ? cnx->remote_error_reason : "",
+                });
+            }
             std::lock_guard<std::mutex> lock(impl->mutex);
+            if (!impl->close_requested && impl->peer_close_message.empty()) {
+                impl->peer_close_message = std::move(peer_close_message);
+            }
             impl->disconnected = true;
             impl->pending_media.clear_connection();
             impl->subgroup_deadlines.clear();
@@ -1132,7 +1160,7 @@ ObjectWriteResult PicoquicClient::try_write_object(std::uint64_t stream_id,
                 impl_->last_error.empty() ? "picoquic transport failed" : impl_->last_error};
     }
     if (impl_->close_requested || impl_->disconnected || impl_->cnx == nullptr) {
-        return {ObjectWriteDisposition::kFailed, "transport close requested"};
+        return {ObjectWriteDisposition::kFailed, closed_message(*impl_)};
     }
     if (!impl_->connected) {
         return {ObjectWriteDisposition::kFailed, "transport is not connected"};
@@ -1241,7 +1269,7 @@ TransportStatus PicoquicClient::accept_stream(StreamDirection direction,
                                                                   : impl_->last_error);
     }
     if (impl_->close_requested || impl_->disconnected) {
-        return TransportStatus::failure("transport close requested");
+        return TransportStatus::failure(closed_message(*impl_));
     }
 
     for (const auto& [candidate_stream_id, ignored] : impl_->received_streams) {
@@ -1286,7 +1314,7 @@ TransportStatus PicoquicClient::read_stream(std::uint64_t stream_id,
     const auto it = impl_->received_streams.find(stream_id);
     if (it == impl_->received_streams.end()) {
         if (impl_->close_requested || impl_->disconnected) {
-            return TransportStatus::failure("transport close requested");
+            return TransportStatus::failure(closed_message(*impl_));
         }
         return TransportStatus::failure(impl_->last_error.empty() ? "stream closed before data arrived"
                                                                   : impl_->last_error);

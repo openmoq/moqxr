@@ -779,6 +779,14 @@ if(OPENMOQ_BUILD_TESTS)
     add_test(NAME openmoq-publisher-webtransport-requirements-tests
         COMMAND openmoq-publisher-webtransport-requirements-tests)
 
+    add_executable(openmoq-publisher-peer-close-tests
+        tests/peer_close_test.cpp
+    )
+    target_include_directories(openmoq-publisher-peer-close-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/transport"
+    )
+    add_test(NAME openmoq-publisher-peer-close-tests COMMAND openmoq-publisher-peer-close-tests)
+
     add_executable(openmoq-publisher-api-tests
         tests/publisher_api_test.cpp
     )

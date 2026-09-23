@@ -32,6 +32,7 @@
 #include <pico_webtransport.h>
 
 #include "tls_verification.h"
+#include "peer_close.h"
 #include "webtransport_requirements.h"
 #endif
 
@@ -107,6 +108,9 @@ struct WebTransportClient::Impl {
     std::uint64_t quic_local_error = 0;
     std::uint64_t quic_remote_error = 0;
     std::string last_error;
+    // Set when the relay, not this client, ended the session: its MOQT
+    // termination code and reason, reported in place of a generic close.
+    std::string peer_close_message;
     std::thread packet_loop_thread;
 
 #ifdef OPENMOQ_HAS_PICOQUIC
@@ -116,6 +120,8 @@ struct WebTransportClient::Impl {
     h3zero_callback_ctx_t* h3_ctx = nullptr;
     h3zero_stream_ctx_t* control_stream_ctx = nullptr;
     int packet_loop_return_code = 0;
+    // CONNECT-stream capsule being accumulated; touched only on the loop thread.
+    picowt_capsule_t close_capsule{};
 #endif
 };
 
@@ -577,6 +583,51 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
     return 0;
 }
 
+// Records why the relay ended the session, unless this client asked to close.
+void note_peer_close(WebTransportClient::Impl& impl, std::string message) {
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    if (!impl.close_requested && impl.peer_close_message.empty()) {
+        impl.peer_close_message = std::move(message);
+    }
+}
+
+// Loop thread. MoQT ends a WebTransport session with a CLOSE_WEBTRANSPORT_SESSION
+// capsule on the CONNECT stream (draft-ietf-moq-transport-18 section 3.5) whose
+// code is the session termination code.
+void note_session_close_capsule(picoquic_cnx_t* cnx, WebTransportClient::Impl& impl,
+                                const uint8_t* bytes, size_t length) {
+    if (bytes == nullptr || length == 0 ||
+        picowt_receive_capsule(cnx, bytes, bytes + length, &impl.close_capsule) != 0) {
+        return;
+    }
+    const picowt_capsule_t& capsule = impl.close_capsule;
+    if (!capsule.h3_capsule.is_stored ||
+        capsule.h3_capsule.capsule_type != picowt_capsule_close_webtransport_session) {
+        return;
+    }
+    std::string reason;
+    if (capsule.error_msg != nullptr && capsule.error_msg_len != 0) {
+        reason.assign(reinterpret_cast<const char*>(capsule.error_msg), capsule.error_msg_len);
+    }
+    note_peer_close(impl, describe_peer_close(PeerClose{
+                              .application_error = capsule.error_code,
+                              .reason = std::move(reason),
+                          }));
+    // The capsule ends the session whether or not a FIN follows it.
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    impl.disconnected = true;
+    impl.condition.notify_all();
+}
+
+// Why a closed session can no longer carry data: the relay's own close
+// (termination code and reason) when it ended the session, else a local close.
+std::string closed_message(const WebTransportClient::Impl& impl) {
+    if (!impl.close_requested && !impl.peer_close_message.empty()) {
+        return impl.peer_close_message;
+    }
+    return "transport close requested";
+}
+
 // Runs on the packet-loop thread (from the h3zero callback), so reading the
 // peer's SETTINGS and transport parameters here does not race the loop.
 std::string describe_unanswered_connect(picoquic_cnx_t* cnx, const h3zero_callback_ctx_t* h3_ctx) {
@@ -657,6 +708,10 @@ int webtransport_callback(picoquic_cnx_t* cnx,
         case picohttp_callback_post_fin: {
             if (stream_ctx == nullptr) {
                 return 0;
+            }
+            if (impl->control_stream_ctx != nullptr &&
+                stream_ctx->stream_id == impl->control_stream_ctx->stream_id) {
+                note_session_close_capsule(cnx, *impl, bytes, length);
             }
             std::lock_guard<std::mutex> lock(impl->mutex);
             auto& received = impl->received_streams[stream_ctx->stream_id];
@@ -792,6 +847,30 @@ int webtransport_connection_callback(picoquic_cnx_t* cnx,
                                      picoquic_call_back_event_t fin_or_event,
                                      void* callback_ctx,
                                      void* v_stream_ctx) {
+    if (fin_or_event == picoquic_callback_close || fin_or_event == picoquic_callback_application_close ||
+        fin_or_event == picoquic_callback_stateless_reset) {
+        WebTransportClient::Impl* impl = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_connection_impl_mutex);
+            const auto it = g_connection_impls.find(cnx);
+            impl = it == g_connection_impls.end() ? nullptr : it->second;
+        }
+        std::uint64_t local_reason = 0;
+        std::uint64_t remote_reason = 0;
+        std::uint64_t local_application_reason = 0;
+        std::uint64_t remote_application_reason = 0;
+        picoquic_get_close_reasons(
+            cnx, &local_reason, &remote_reason, &local_application_reason, &remote_application_reason);
+        if (impl != nullptr && fin_or_event == picoquic_callback_stateless_reset) {
+            note_peer_close(*impl, "relay reset the connection (stateless reset)");
+        } else if (impl != nullptr && local_reason == 0 && local_application_reason == 0) {
+            note_peer_close(*impl, describe_peer_close(PeerClose{
+                                       .application_error = remote_application_reason,
+                                       .transport_error = remote_reason,
+                                       .reason = cnx->remote_error_reason != nullptr ? cnx->remote_error_reason : "",
+                                   }));
+        }
+    }
     return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event, callback_ctx, v_stream_ctx);
 }
 
@@ -806,6 +885,10 @@ WebTransportClient::WebTransportClient(std::size_t media_capacity_for_testing)
 WebTransportClient::~WebTransportClient() {
     const auto status = close(0);
     static_cast<void>(status);
+#ifdef OPENMOQ_HAS_PICOQUIC
+    // close() has joined the packet loop, so the capsule buffer is no longer in use.
+    picowt_release_capsule(&impl_->close_capsule);
+#endif
 }
 
 TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, const TlsConfig& tls) {
@@ -828,6 +911,10 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->quic_local_error = 0;
     impl_->quic_remote_error = 0;
     impl_->last_error.clear();
+    impl_->peer_close_message.clear();
+#ifdef OPENMOQ_HAS_PICOQUIC
+    picowt_release_capsule(&impl_->close_capsule);
+#endif
     impl_->pending_writes.clear();
     impl_->pending_resets.clear();
     impl_->pending_media.clear_connection();
@@ -1228,7 +1315,7 @@ ObjectWriteResult WebTransportClient::try_write_object(std::uint64_t stream_id,
                 impl_->last_error.empty() ? "webtransport connection failed" : impl_->last_error};
     }
     if (impl_->close_requested || impl_->disconnected || impl_->cnx == nullptr) {
-        return {ObjectWriteDisposition::kFailed, "transport close requested"};
+        return {ObjectWriteDisposition::kFailed, closed_message(*impl_)};
     }
     if (!impl_->connected) {
         return {ObjectWriteDisposition::kFailed, "transport is not connected"};
@@ -1341,7 +1428,7 @@ TransportStatus WebTransportClient::accept_stream(StreamDirection direction,
         return TransportStatus::failure(impl_->last_error.empty() ? "webtransport connection failed" : impl_->last_error);
     }
     if (impl_->close_requested || impl_->disconnected) {
-        return TransportStatus::failure("transport close requested");
+        return TransportStatus::failure(closed_message(*impl_));
     }
     for (const auto& [candidate_stream_id, ignored] : impl_->received_streams) {
         static_cast<void>(ignored);
@@ -1383,7 +1470,7 @@ TransportStatus WebTransportClient::read_stream(std::uint64_t stream_id,
         return TransportStatus::failure(impl_->last_error.empty() ? "webtransport connection failed" : impl_->last_error);
     }
     if ((impl_->close_requested || impl_->disconnected) && !impl_->received_streams.contains(stream_id)) {
-        return TransportStatus::failure("transport close requested");
+        return TransportStatus::failure(closed_message(*impl_));
     }
 
     auto it = impl_->received_streams.find(stream_id);

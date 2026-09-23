@@ -75,6 +75,12 @@ struct SmokeServer {
     bool setup_response_sent = false;
     bool namespace_response_sent = false;
     bool publish_responses_sent = false;
+    // When set, answer the first control-stream bytes (the client SETUP) by
+    // closing the connection with this MOQT code and reason, as a relay
+    // refusing the credential does.
+    std::optional<std::uint64_t> reject_setup_code;
+    std::string reject_setup_reason;
+    bool setup_rejected = false;
 };
 
 bool trace_enabled() {
@@ -187,6 +193,18 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
                     server->media_stream_fin_received = true;
                     server->media_stream_fins.insert(stream_id);
                 }
+            }
+            if (stream_id == 0 && server->reject_setup_code.has_value()) {
+                if (!server->setup_rejected) {
+                    server->setup_rejected = true;
+                    // picoquic keeps the reason pointer until the close is sent;
+                    // the server outlives the connection.
+                    if (picoquic_close_ex(cnx, *server->reject_setup_code,
+                                          server->reject_setup_reason.c_str()) != 0) {
+                        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+                    }
+                }
+                return 0;
             }
             if (stream_id == 0) {
                 server->control_bytes.insert(server->control_bytes.end(), bytes, bytes + length);
@@ -916,5 +934,31 @@ int main() {
                      "expected activation-time raw-QUIC expiry reset before connection close");
     }
     stop_server(delivery_server);
+
+    {
+        // A relay refusing the SETUP credential closes with a MOQT termination
+        // code and a reason phrase; the publish error must carry both.
+        SmokeServer reject_server;
+        reject_server.reject_setup_code = 0x18;
+        reject_server.reject_setup_reason = "expired authorization token";
+        ok &= expect(start_server(reject_server), "expected rejecting smoke server to start");
+        const EndpointConfig reject_endpoint{
+            .host = "127.0.0.1",
+            .port = reject_server.port,
+            .alpn = "moq-00",
+        };
+        PicoquicClient reject_transport;
+        MoqtSession reject_session(reject_transport, "media", true);
+        auto reject_status = reject_session.connect(reject_endpoint, tls);
+        if (reject_status.ok) {
+            reject_status = reject_session.publish(materialized);
+        }
+        ok &= expect(!reject_status.ok, "expected a publish refused at SETUP to fail");
+        ok &= expect(reject_status.message.find("EXPIRED_AUTH_TOKEN (0x18)") != std::string::npos,
+                     "expected the relay's termination code in the error, got: " + reject_status.message);
+        ok &= expect(reject_status.message.find("\"expired authorization token\"") != std::string::npos,
+                     "expected the relay's reason phrase in the error, got: " + reject_status.message);
+        stop_server(reject_server);
+    }
     return ok ? 0 : 1;
 }

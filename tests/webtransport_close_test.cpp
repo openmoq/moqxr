@@ -79,6 +79,13 @@ struct SilentServer {
     std::set<std::uint64_t> stop_sending_sent_streams;
     picohttp_server_path_item_t path_item{};
     picohttp_server_parameters_t params{};
+    // When set, answer the client's first application-stream bytes with a
+    // CLOSE_WEBTRANSPORT_SESSION capsule carrying this code and reason, as a
+    // relay ending a MoQT session over WebTransport does.
+    std::optional<std::uint32_t> close_session_code;
+    std::string close_session_reason;
+    h3zero_stream_ctx_t* control_stream_ctx = nullptr;
+    bool close_session_sent = false;
 };
 
 // WebTransport path callback for the server. Accepts the CONNECT and then
@@ -107,12 +114,22 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         stream_ctx->path_callback = silent_path_callback;
         stream_ctx->path_callback_ctx = server;
         std::lock_guard<std::mutex> lock(server->mutex);
+        server->control_stream_ctx = stream_ctx;
         server->connect_accepted = true;
         server->condition.notify_all();
     } else if (event == picohttp_callback_post_data || event == picohttp_callback_post_fin) {
         // Count application stream bytes so the drain scenario can verify
         // everything written before close() actually arrived.
         std::lock_guard<std::mutex> lock(server->mutex);
+        if (server->close_session_code.has_value() && !server->close_session_sent &&
+            stream_ctx != nullptr && stream_ctx != server->control_stream_ctx && length != 0 &&
+            server->control_stream_ctx != nullptr) {
+            server->close_session_sent = true;
+            if (picowt_send_close_session_message(cnx, server->control_stream_ctx, *server->close_session_code,
+                                                  server->close_session_reason.c_str()) != 0) {
+                return -1;
+            }
+        }
         server->stream_bytes_received += length;
         if (stream_ctx != nullptr && length != 0 &&
             server->stop_sending_stream_ids.contains(stream_ctx->stream_id) &&
@@ -967,5 +984,38 @@ int main() {
     ok &= expect(capacity_client.close(0).ok,
                  "expected reconnected capacity client close to succeed");
     stop_server(capacity_server);
+
+    {
+        // A relay ending the MoQT session over WebTransport sends a
+        // CLOSE_WEBTRANSPORT_SESSION capsule; a read must report its code and
+        // reason instead of a generic close or timeout.
+        SilentServer closing_server;
+        closing_server.close_session_code = 0x18;
+        closing_server.close_session_reason = "expired authorization token";
+        ok &= expect(start_server(closing_server), "expected session-closing webtransport server to start");
+        EndpointConfig closing_endpoint = endpoint;
+        closing_endpoint.port = closing_server.port;
+        WebTransportClient closing_client;
+        ok &= expect(closing_client.configure(closing_endpoint, tls).ok,
+                     "expected session-closing client configure to succeed");
+        ok &= expect(closing_client.connect().ok, "expected session-closing client CONNECT to succeed");
+        std::uint64_t request_stream_id = 0;
+        ok &= expect(closing_client.open_stream(StreamDirection::kBidirectional, request_stream_id).ok,
+                     "expected session-closing client request stream to open");
+        const std::vector<std::uint8_t> setup_bytes(16, 0x20);
+        ok &= expect(closing_client.write_stream(request_stream_id, setup_bytes, false).ok,
+                     "expected session-closing client write to succeed");
+        std::vector<std::uint8_t> response;
+        bool response_fin = false;
+        const auto read_status =
+            closing_client.read_stream(request_stream_id, response, response_fin, std::chrono::seconds(5));
+        ok &= expect(!read_status.ok, "expected the read to fail once the relay closed the session");
+        ok &= expect(read_status.message.find("EXPIRED_AUTH_TOKEN (0x18)") != std::string::npos,
+                     "expected the capsule's termination code in the read error, got: " + read_status.message);
+        ok &= expect(read_status.message.find("\"expired authorization token\"") != std::string::npos,
+                     "expected the capsule's reason in the read error, got: " + read_status.message);
+        ok &= expect(closing_client.close(0).ok, "expected session-closing client close to succeed");
+        stop_server(closing_server);
+    }
     return ok ? 0 : 1;
 }
