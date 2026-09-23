@@ -3,6 +3,7 @@ import java.nio.file.Path;
 import java.util.Base64;
 import java.util.Map;
 
+import org.red5.server.net.moq.auth.CatTokenParser;
 import org.red5.server.net.moq.auth.CatTokenValidator;
 import org.red5.server.net.moq.auth.MoqtAction;
 import org.red5.server.net.moq.message.TrackNamespace;
@@ -14,7 +15,8 @@ public class VerifyToken {
         String secret = Files.readString(Path.of(args[1])).trim();
         byte[] key = moqx ? CatTokenValidator.deriveMoqxKey(secret) : Base64.getDecoder().decode(secret);
         var validator = new CatTokenValidator(Map.of("interop", key), 0,
-                moqx ? 65000 : 100, moqx ? 65001 : 101, false, moqx);
+                moqx ? 65000 : CatTokenParser.DEFAULT_MOQT_CLAIM_KEY,
+                moqx ? 65001 : CatTokenParser.DEFAULT_MOQT_REVAL_CLAIM_KEY, false, moqx);
         var result = validator.validate(Files.readAllBytes(Path.of(args[2])));
         if (result.isValid() != Boolean.parseBoolean(args[7])) {
             throw new AssertionError("Unexpected signature/expiry validity: " + result.getStatus());
