@@ -184,6 +184,7 @@ server.unified.enabled=true
 auth.cat.enabled=true
 auth.cat.allow.anonymous=false
 auth.cat.profile={profile}
+auth.cat.token.type=16
 auth.cat.require.setup.token=true
 auth.cat.expiration.tolerance=0
 auth.cat.key.ids=interop
@@ -216,7 +217,7 @@ auth.cat.key.interop.secret.file={secret}
                                   "-stream_loop", "-1", "-i", directory / "sample.mp4", "-c", "copy",
                                   "-movflags", "+frag_keyframe+empty_moov+default_base_moof+separate_moof",
                                   "-f", "mp4", "pipe:1"]
-                publisher = [args.publisher, "--input", "-",
+                publisher = [args.publisher, "--input", "-", "--transport", args.publisher_transport,
                              "--namespace", namespace, "--draft", "18", "--endpoint", f"{'https' if args.publisher_transport == 'webtransport' else 'moqt'}://127.0.0.1:{port}/moq",
                              "--insecure", "--forward", "1" if case in ("valid-publish", "wrong-action", "wrong-track") else "0", "--coalesce-cmaf-chunks", "--publish-catalog", "--catalog-republish-interval", "1",
                              "--timeout", "30"]
