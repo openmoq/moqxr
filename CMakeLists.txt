@@ -686,6 +686,8 @@ if(OPENMOQ_BUILD_TESTS)
     add_executable(openmoq-publisher-live-media-queue-tests
         tests/live_media_queue_test.cpp
     )
+    find_package(Threads REQUIRED)
+    target_link_libraries(openmoq-publisher-live-media-queue-tests PRIVATE Threads::Threads)
     target_include_directories(openmoq-publisher-live-media-queue-tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
