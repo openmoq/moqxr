@@ -110,6 +110,8 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
 
 `moq-relay.red5.net:4433` currently accepts WebTransport on `/moq`; `/moq-relay` returns HTTP `404` during CONNECT. The moqx relay examples use a placeholder hostname because those relay hostnames are not public yet; moqx uses `/moq-relay`.
 
+moqx does not currently send the `reset_stream_at` transport parameter that WebTransport over HTTP/3 requires of servers, so the moqx WebTransport example above ends with `webtransport CONNECT not sent: server does not meet the WebTransport over HTTP/3 requirements ...; missing reset_stream_at transport parameter` until [openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752) is fixed. Use `--transport raw` with a `moqt://` endpoint for moqx meanwhile. See [WebTransport compliance](webtransport-compliance.md).
+
 ## CAT4MOQ Authorization with moqx
 
 For moqx services with auth enabled, the publisher CLI accepts

@@ -15,7 +15,7 @@
 - catalog、初期化、media、probe、publish plan の各ファイルをローカル検査用に出力します。
 - メイン CLI が対応する MOQT draft profile（draft 16、デフォルト、および draft 18）で公開します。
 - picoquic と picotls が利用可能な場合、Raw QUIC または WebTransport で公開します。
-- stdin からの live fragmented MP4、libsrt が利用可能な場合の SRT 経由 MPEG-TS、HTTP/1.1 chunked CTE LL-DASH ingest 経由の CMAF を受け付けます。
+- stdin からの live fragmented MP4、libsrt が利用可能な場合の SRT 経由 MPEG-TS、HTTP/1.1 CTE LL-DASH ingest（chunked または固定長 request）経由の CMAF を受け付けます。
 - `--url` で MSF URL を解析し、`--print-msf-urls` で catalog discovery URL を表示します。
 - FFmpeg 生成ライブメディア、CAT4MOQ 認可、MPEG-2 TS/M2TS パッケージング用の C++ Publisher API example を提供します。
 - draft 16 と 18 では、C11 Media-over-QUIC library [moq5](https://github.com/openmoq/moq5) 経由の公開を選択できます。
@@ -77,7 +77,7 @@ CLI では一度に 1 つの live source を使用します。
 | --- | --- | --- | --- |
 | Fragmented MP4 | `--live-source stdin --input -` | 標準入力の CMAF/fMP4 | 対応するすべての platform で利用可能 |
 | SRT | `--live-source srt --srt-config FILE` | SRT 経由 MPEG-TS | libsrt が必要。この経路では CENC metadata を利用不可 |
-| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | chunked CMAF `POST` または `PUT` request | listener は現在 Unix 系 platform が必要 |
+| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | CMAF `POST` または `PUT` request（chunked または `Content-Length` 付き） | listener は現在 Unix 系 platform が必要 |
 
 ### SRT ingest
 
@@ -166,6 +166,17 @@ curl -X PUT \
   --data-binary @live-video.cmaf \
   http://127.0.0.1:8080/ingest/video
 ```
+
+chunked transfer encoding の代わりに `Content-Length` を持つ request も受け付けます。DASH-IF ingest 仕様が chunked を推奨しているのは低遅延の場合だけだからです。[livesim2](https://github.com/Dash-Industry-Forum/livesim2) は init segment をこの形で送るため、その CMAF ingest 出力をそのまま listener に向けられます:
+
+```bash
+curl -X PUT \
+  -H 'Content-Type: video/mp4' \
+  --data-binary @init.cmfv \
+  http://127.0.0.1:8080/ingest/video/init.cmfv
+```
+
+`/ingest/video/init.cmfv` の後に `/ingest/video/1.cmfv` が続く場合のように、path の最後の segment にファイル拡張子があるときは、それを含む directory（`/ingest/video`）が representation path になり、media segment は先行する init segment を見つけられます。下の FFmpeg レシピのような拡張子のない path はそのまま使われます。どちらの framing header もない request は `411 Length Required` で、設定上限（既定 256 MiB）を超える長さを宣言した request は `413 Content Too Large` で拒否されます。
 
 代わりに FFmpeg で 2 つの video representation と audio を作成し、ingest prefix へ直接送信できます。
 
