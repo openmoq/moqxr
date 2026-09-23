@@ -13,8 +13,25 @@ Tipi principali:
 - `openmoq::publisher::PublisherConfig`
 - `openmoq::publisher::Publisher`
 - `openmoq::publisher::PreparedPublish`
+- `openmoq::publisher::cat4moq::AuthorizationConfig`
 
-## 2. Configurare il Publisher
+## 2. Collegare la libreria
+
+La build locale e gli archivi di release forniscono gli header pubblici sotto `include/openmoq/publisher` e una libreria publisher statica:
+
+- Linux/macOS: `libopenmoq_publisher.a`
+- Windows: `openmoq_publisher.lib`
+
+Se il vostro progetto include questo repository con CMake, collegate il target `openmoq_publisher_lib` in modo che CMake propaghi il percorso degli include, il requisito C++20 e le dipendenze di trasporto:
+
+```cmake
+add_subdirectory(path/to/moqxr)
+target_link_libraries(your_app PRIVATE openmoq_publisher_lib)
+```
+
+Se collegate l'archivio grezzo di un pacchetto di release, aggiungete la directory `include/` del pacchetto al percorso degli include e collegate le stesse dipendenze di trasporto usate per compilare l'archivio. Le build con supporto al trasporto picoquic richiedono picoquic, picotls, OpenSSL e le librerie socket della piattaforma, oltre all'archivio publisher.
+
+## 3. Configurare il Publisher
 
 Create un `PublisherConfig` una sola volta e passatelo a `Publisher`.
 
@@ -27,6 +44,7 @@ config.track_namespace = "media";
 config.forward = false;
 config.publish_catalog = false;
 config.include_sap = false;
+config.include_msf_timeline = false;
 config.split_cmaf_chunks = true;
 config.paced = false;
 config.loop = false;
@@ -35,7 +53,83 @@ config.subscriber_timeout = std::chrono::seconds(30);
 openmoq::publisher::Publisher publisher(config);
 ```
 
-## 3. Preparare i media una sola volta (modalità batch)
+### Packaging LOC opzionale
+
+```cpp
+config.media_packaging = openmoq::publisher::MediaPackaging::kLoc;
+config.draft_version = openmoq::publisher::DraftVersion::kDraft18;
+```
+
+Il backend nativo estrae un campione H.264/AAC in chiaro per oggetto e fornisce le proprietà LOC-04. Per oggetti già codificati, dichiarate `LivePackaging::kLoc`, fornite gli extradata del codec in `LiveTrack::init_data` e popolate `LiveObject::properties` con voci `ObjectProperty` tipizzate. Gli ID pari contengono `uint64_t`; gli ID dispari contengono vettori di byte. Fornite Timestamp (16) e un Timescale (8) diverso da zero, e mantenete il subgroup zero. La correttezza di campioni e configurazione e i confini dei GOP sono responsabilità del chiamante; iniziate ogni group video con un frame indipendente all'oggetto zero. Il catalog generato trasporta la configurazione del codec. I catalog forniti dalla sorgente e la pubblicazione LOC tramite libmoq vengono rifiutati. Vedere i [vincoli](quickstart.md#opt-in-to-loc).
+
+### Packaging LOCMAF opzionale
+
+`PublisherConfig::media_packaging` ha come valore predefinito `MediaPackaging::kCmaf`. Scegliete LOCMAF prima di costruire il publisher o di chiamare `set_config()`:
+
+```cpp
+using namespace openmoq::publisher;
+PublisherConfig config;
+config.media_packaging = MediaPackaging::kLocmaf;
+Publisher publisher(config);
+```
+
+Questo converte l'input preparato da file/stream e l'input incrementale da stdin/SRT sul backend predefinito. Mantenete `split_cmaf_chunks = true` e `live_stream_per_object = false`; le configurazioni incompatibili vengono rifiutate. La preparazione batch può mantenere in CMAF una track non idonea, quindi ispezionate il packaging delle track nel piano preparato invece di presumere che ogni track sia stata convertita. Vedere i [vincoli LOCMAF](quickstart.md#opt-in-to-locmaf).
+
+Per l'ingestione CTE DASH, impostate anche `LiveDashIngestConfig::media_packaging = MediaPackaging::kLocmaf` sul server di ingestione, oppure passate `MediaPackaging::kLocmaf` come secondo argomento del costruttore di `LiveDashIngestSession`. Quel producer esegue la conversione prima di passare gli oggetti a `publish_live_objects()`. La CLI configura entrambi i lati quando è selezionato `--packaging locmaf`.
+
+## 4. Autorizzazione CAT4MOQ opzionale
+
+Le applicazioni configurano credenziali emesse esternamente a livello di API pubblica. Il publisher nativo le trasporta nelle richieste di setup, di pubblicazione del namespace e di pubblicazione delle track. Il backend gestito libmoq trasporta le credenziali con `MOQ_SERVICE_AUTH_API_VERSION >= 1` di moq5, usando sorgenti di endpoint e sender possedute. Le dipendenze più vecchie rifiutano l'autorizzazione configurata prima della connessione. Vedere il [design CAT4MoQ](cat4moq-design.md#backend-and-interoperability-boundaries) per i backend supportati e i limiti di validazione.
+
+Le nuove applicazioni dovrebbero usare credenziali strutturate con un profilo esplicito:
+
+```cpp
+using namespace openmoq::publisher;
+PublisherConfig config;
+config.authorization.setup_credential = cat4moq::Credential{
+    .cwt = setup_cwt,
+    .profile = cat4moq::Profile::kMoqxCompat,
+};
+config.authorization.action_credential = cat4moq::Credential{
+    .cwt = publish_cwt,
+    .profile = cat4moq::Profile::kMoqxCompat,
+};
+```
+
+`kC4m01` è il nuovo valore predefinito dell'API e invia il token type 1. `kMoqxCompat` invia il type 16 per l'attuale moqx e per il profilo `moqx` di Red5. `kRed5CoseCompat` trasporta credenziali emesse per il profilo `cose` di Red5, anch'esso con type 16 per impostazione predefinita. Una credenziale di compatibilità può sovrascrivere `token_type` per corrispondere a un ricevitore configurato esplicitamente. La selezione del profilo non transcodifica né rifirma i CWT. Il formato degli scope di moqx differisce da C4M-01, e selezionare `kC4m01` non aggiorna un ricevitore. Red5 ha spostato il suo profilo `cose` su C4M-01 (token type 1, etichette dei claim 327/328) il 21 settembre 2026; `kC4m01` verso quel profilo non è ancora stato verificato. Vedere il [design](cat4moq-design.md).
+
+Per credenziali per singola risorsa, impostate `authorization.credential_provider` a un callable che accetta `const cat4moq::Resource&` e restituisce una `Credential`. La risorsa contiene l'azione, i componenti del namespace sul wire e un nome di track opzionale. Il provider seleziona le credenziali per le richieste di namespace e PUBLISH emesse; non è un filtro locale di controllo degli accessi ai media. Le risposte guidate dai subscribe non hanno un campo per la credenziale del publisher, quindi il relay deve già possedere il grant applicabile dal setup o dalla pubblicazione del namespace. Il provider gestisce solo le azioni; il setup usa la credenziale di setup statica. Deve coprire le track di catalog e di inizializzazione oltre ai media. Lanciare un'eccezione rifiuta l'operazione con un errore di autorizzazione sanificato; non esiste alcun fallback a una credenziale statica o alla pubblicazione anonima. Le callback devono restituire rapidamente e gestire in sicurezza qualsiasi stato condiviso.
+
+Per token CAT vincolati a una chiave tramite `cnf.jkt`, impostate `authorization.dpop_signer = cat4moq::DpopSigner::from_pem(pem)` con la chiave privata P-256. La sessione invia allora una prova DPoP (draft-ietf-moq-c4m-01 sezione 3) come secondo parametro AUTHORIZATION TOKEN accanto alla credenziale su SETUP e su ogni richiesta che autorizza. Ogni prova è un JWT ES256 nuovo che indica l'azione, il namespace e la track. Le prove usano per impostazione predefinita il token type 17 (`DpopSigner::token_type`). `from_pem` lancia `cat4moq::AuthorizationError` per qualsiasi chiave diversa da P-256. Entrambi i backend lo supportano; gli equivalenti CLI sono `--auth-dpop-key-file` e `--auth-dpop-token-type`.
+
+I wrapper legacy pre-codificati restano disponibili per le applicazioni esistenti:
+
+```cpp
+#include "openmoq/publisher/cat4moq.h"
+#include "openmoq/publisher/publisher_api.h"
+
+std::vector<std::uint8_t> setup_cwt = read_setup_token();
+std::vector<std::uint8_t> publish_cwt = read_publish_token();
+
+openmoq::publisher::PublisherConfig config;
+config.authorization.setup_token =
+    openmoq::publisher::cat4moq::wrap_cat_token(setup_cwt);
+config.authorization.action_token =
+    openmoq::publisher::cat4moq::wrap_cat_token(publish_cwt);
+```
+
+`setup_token` viene trasportato nel messaggio di setup della sessione. `action_token` viene trasportato nelle richieste di azione del publisher, come la pubblicazione del namespace e la pubblicazione delle track. Lasciate vuoto uno dei due campi quando quella parte della policy del relay non richiede un token.
+
+Wrapper helper:
+
+- `wrap_cat_token(...)`: mantiene lo storico wrapper di compatibilità type-16; non seleziona C4M-01.
+- `wrap_out_of_band_token(...)`: incapsula byte grezzi di un token privato con il token type out-of-band.
+- `AuthorizationToken`: memorizza il valore codificato dell'authorization token inviato sul wire.
+- `AuthorizationConfig`: raggruppa i token a livello di setup e a livello di azione per `PublisherConfig`.
+
+L'esempio eseguibile in [examples/auth](../examples/auth/README.md) mostra token basati su file, l'integrazione con il comando Catapult e un flusso deterministico `publish_live_objects(...)` verso un relay moqx.
+
+## 5. Preparare i media una sola volta (modalità batch)
 
 Per workflow basati su file o stream bufferizzati, preparate prima i media:
 
@@ -61,7 +155,7 @@ Questo è utile per applicazioni più grandi che vogliono:
 - salvare lo stato del piano
 - pubblicare lo stesso asset preparato verso più endpoint
 
-## 4. Opzionale: ispezionare o emettere il piano
+## 6. Opzionale: ispezionare o emettere il piano
 
 Renderizzare il piano per logging o debug:
 
@@ -75,7 +169,7 @@ Emettere su disco il catalogo generato e gli oggetti media:
 publisher.emit_objects(prepared, "out");
 ```
 
-## 5. Configurare endpoint e TLS
+## 7. Configurare endpoint e TLS
 
 Costruite `EndpointConfig` e l'eventuale `TlsConfig`.
 
@@ -109,7 +203,7 @@ tls.insecure_skip_verify = false;
 // tls.private_key_path = "...";
 ```
 
-## 6. Pubblicare contenuto preparato
+## 8. Pubblicare contenuto preparato
 
 Usate il contenuto preparato insieme all'endpoint:
 
@@ -132,9 +226,9 @@ Helper di comodità:
 - `publish_file(path, endpoint, tls)`
 - `publish_stream(input, source_name, endpoint, tls)`
 
-## 7. Pubblicazione di input live (stdin/stream incrementale)
+## 9. Pubblicazione di input live (stdin/stream incrementale)
 
-Per pipeline live, ad esempio ffmpeg che invia MP4 frammentato tramite pipe:
+Il percorso live predefinito si aspetta MP4 frammentato, che corrisponde alle pipeline ffmpeg/CMAF:
 
 ```cpp
 const auto status = publisher.publish_live(std::cin, endpoint, tls);
@@ -150,7 +244,87 @@ if (!status.ok) {
 
 `publish_live(...)` usa parsing incrementale e un flusso di pubblicazione live invece di bufferizzare fino a EOF.
 
-## 8. Comportamento dell'override ALPN
+## 10. Pubblicazione live di oggetti arbitrari
+
+Le applicazioni che producono già direttamente oggetti MoQ possono aggirare l'ingestione di MP4 frammentato con `publish_live_objects(...)`.
+
+Quando è selezionato il backend opzionale libmoq, ogni `LiveTrack` deve dichiarare metadati media reali affinché il media sender di libmoq possa creare il catalog e impacchettare gli oggetti. Obbligatori: `media_type` e `codec`; le track video aggiungono `width`/`height`, le track audio aggiungono `sample_rate`/`channel_count`. `packaging` seleziona il framing degli oggetti RAW o CMAF. `bitrate` è opzionale (se omesso viene usato un valore predefinito in base al tipo di media).
+
+`init_data` (configurazione del codec/decoder) è **opzionale**: fornitelo solo quando il codec o il container richiede una configurazione del decoder out-of-band: un segmento di init CMAF, o codec i cui parameter set non sono trasportati in-band (SPS/PPS/VPS H.264/HEVC, AudioSpecificConfig AAC, ...). Una track RAW il cui codec trasporta i propri parametri in-band può ometterlo.
+
+```cpp
+std::vector<openmoq::publisher::LiveObject> objects = {
+    {
+        .track_name = "video",
+        .group_id = 0,
+        .object_id = 0,
+        .media_time_us = 0,
+        .payload = encoded_access_unit,
+    },
+};
+std::size_t next = 0;
+
+openmoq::publisher::LiveObjectSource source;
+source.tracks = {
+    openmoq::publisher::LiveTrack{
+        .track_name = "video",
+        .media_type = openmoq::publisher::LiveMediaType::kVideo,
+        .packaging = openmoq::publisher::LivePackaging::kRaw,  // or kCmaf
+        .codec = "av01",
+        .init_data = decoder_config,   // SPS/PPS, AV1 config, CMAF init segment, ...
+        .bitrate = 1500000,
+        .width = 1280,
+        .height = 720,
+    },
+};
+source.next_object = [&]() -> std::optional<openmoq::publisher::LiveObject> {
+    if (next >= objects.size()) {
+        return std::nullopt;
+    }
+    return objects[next++];
+};
+
+const auto status = publisher.publish_live_objects(source, endpoint, tls);
+```
+
+Ogni `LiveObject` fornisce la track di destinazione, gli ID di group/oggetto, il timing dei media e i byte di payload da inviare. `object_id == 0` avvia un group (ed è trattato come punto di sincronizzazione); `final_in_subgroup && subgroup_contains_group_largest` chiude il group.
+
+### Oggetti LOCMAF già codificati
+
+`publish_live_objects()` inoltra i payload forniti dal chiamante; impostare l'opzione globale di packaging non converte payload CMAF o RAW arbitrari. Dichiarate una track già codificata come `LivePackaging::kLocmaf`, fornite oggetti LOCMAF validi e i corrispondenti dati di catalog/inizializzazione tramite la sorgente, e usate il subgroup zero. La sessione nativa mantiene il subgroup aperto tra un oggetto e l'altro, ignorando `final_in_subgroup` per le track LOCMAF. Lo stato degli header e il recupero sono responsabilità del chiamante; header completi su ogni oggetto corrispondono al comportamento dei producer integrati.
+
+Le sorgenti LOCMAF rifiutano `LiveCatalogMode::kSourceObject` e le dichiarazioni di track media RAW. Anche il backend libmoq rifiuta LOCMAF. Usate la preparazione da file/stream, `publish_live()` incrementale o l'ingestione DASH quando deve essere la libreria a eseguire la conversione e la costruzione del catalog.
+
+### Catalog forniti dal chiamante
+
+Impostate `LiveCatalogMode::kSourceObject` quando la sorgente deve fornire un catalog il cui formato non può essere generato dai metadati media di `LiveTrack`:
+
+```cpp
+openmoq::publisher::LiveObjectSource source;
+source.tracks = {
+    openmoq::publisher::LiveTrack{.track_name = "catalog"},
+    openmoq::publisher::LiveTrack{.track_name = "transport"},
+};
+source.next_object = next_catalog_then_media_object;
+source.catalog_mode =
+    openmoq::publisher::LiveCatalogMode::kSourceObject;
+```
+
+Questa modalità richiede esattamente una track chiamata `catalog`, almeno una track non-catalog e un catalog non vuoto come primo oggetto restituito. Il Publisher usa il percorso oggetti di `MoqtSession` per una sorgente di questo tipo anche quando è selezionato il backend libmoq, perché libmoq attualmente crea catalog solo per il proprio packaging media RAW e CMAF. L'esempio MSFTS in `examples/msfts-publisher` usa questa modalità per il packaging `"m2ts"` e fornisce i campi packet-size, program/PID, intervallo PSI, random-access, timestamp-mode e `initData` PAT/PMT in Base64 dalla propria bozza testuale locale.
+
+**Gating sulla domanda (relay lazy).** Quando è selezionato il backend libmoq, il percorso di pubblicazione attende almeno un subscriber media a valle prima di produrre media: un relay lazy inoltra un SUBSCRIBE solo quando un player si sottoscrive. Fino ad allora non viene scritto nulla (batch/oggetti/stdin non consumano la propria sorgente; SRT live scarta i frammenti per restare limitato). Se nessun subscriber compare entro `PublisherConfig::subscriber_timeout`, la chiamata fallisce con `timed out waiting for media subscriber` invece di bloccarsi.
+
+Chiamare `disconnect()` da un altro thread interrompe tempestivamente una pubblicazione `publish_live_objects` in corso (o stdin/SRT live); il ciclo del driver si interrompe, l'endpoint viene interrotto e la chiamata restituisce successo. Nel caso specifico di stdin, la cancellazione viene osservata non appena la lettura bloccante corrente ritorna.
+
+> **Nota legacy:** le voci `LiveTrack{.track_name = ...}` nude, senza metadati
+> media (una track di oggetti generica in stile "events"), vengono rifiutate nel normale
+> percorso con catalog generato da libmoq. Iniettate una `TransportFactory` personalizzata per
+> track di oggetti legacy generiche, oppure usate `LiveCatalogMode::kSourceObject` solo quando la
+> sorgente fornisce effettivamente l'oggetto catalog richiesto.
+
+L'API `publish_live(...)` per MP4 frammentato resta il percorso di pubblicazione live predefinito per l'ingestione di media.
+
+## 11. Comportamento dell'override ALPN
 
 Per impostazione predefinita, l'API applica l'ALPN appropriato al trasporto:
 
@@ -174,8 +348,9 @@ Lo stesso flag di override esiste su:
 - `publish_file(...)`
 - `publish_stream(...)`
 - `publish_live(...)`
+- `publish_live_objects(...)`
 
-## 9. Modello di gestione degli errori
+## 12. Modello di gestione degli errori
 
 Tutte le chiamate di pubblicazione dell'API restituiscono `TransportStatus`:
 
@@ -197,7 +372,7 @@ if (!status.ok) {
 }
 ```
 
-## 10. Modello di integrazione per applicazioni più grandi
+## 13. Modello di integrazione per applicazioni più grandi
 
 Per un'integrazione in stile servizio:
 
@@ -205,10 +380,11 @@ Per un'integrazione in stile servizio:
 2. All'ingestione, chiamate `prepare_file(...)` o `prepare_stream(...)`.
 3. Salvate o ispezionate i metadati di `PreparedPublish` secondo necessità.
 4. Pubblicate verso uno o più endpoint con `publish(...)`.
-5. Per input continui, eseguite `publish_live(...)` in un thread worker.
-6. Usate i messaggi `TransportStatus` per metriche e decisioni di retry.
+5. Per input continui in MP4 frammentato, eseguite `publish_live(...)` in un thread worker.
+6. Per producer diretti di oggetti, fornite una `LiveObjectSource` e chiamate `publish_live_objects(...)`.
+7. Usate i messaggi `TransportStatus` per metriche e decisioni di retry.
 
-## 11. Riepilogo di pubblicazione (`stats`)
+## 14. Riepilogo di pubblicazione (`stats`)
 
 L'API publisher è bloccante: `publish(...)`, `publish_file(...)`, `publish_stream(...)` e `publish_live(...)` eseguono la sessione sul thread chiamante. Poiché non esiste un ciclo di polling integrato, le statistiche sono esposte come riepilogo strutturato dell'operazione di pubblicazione corrente o più recente, non come stream di telemetria live.
 
@@ -229,6 +405,7 @@ Campi correnti:
 - `groupsPublished`: unità (track, group) totali pubblicate nella sessione corrente o precedente
 - `splitCmafChunks`: modalità di packaging corrente (`true` = chunk separati, `false` = chunk uniti)
 - `includeSap`: indica se il packaging di track/oggetti SAP è abilitato
+- `includeMsfTimeline`: indica se il packaging di track/oggetti della media timeline MSF è abilitato
 - `transport`, `host`, `port`, `path`: contesto endpoint per la sessione corrente o precedente
 - `connectionId`: ultimo ID di connessione di trasporto noto
 - `lastError`: ultimo errore a livello publisher, se presente
@@ -254,6 +431,7 @@ Esempio:
   "groupsPublished": 42,
   "splitCmafChunks": true,
   "includeSap": false,
+  "includeMsfTimeline": false,
   "transport": "webtransport",
   "host": "relay.example.com",
   "port": 443,
@@ -263,7 +441,7 @@ Esempio:
 }
 ```
 
-## 12. Esempio completo
+## 15. Esempio completo
 
 ```cpp
 #include "openmoq/publisher/publisher_api.h"
@@ -309,7 +487,7 @@ int main() {
 }
 ```
 
-## 13. Pubblicazione live con encoder audio/video su altri thread
+## 16. Pubblicazione live con encoder audio/video su altri thread
 
 `publish_live(...)` consuma un singolo stream di byte MP4.  
 Per la pubblicazione live multi-track, il modello comune è:
