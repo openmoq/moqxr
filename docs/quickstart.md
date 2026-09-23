@@ -196,6 +196,11 @@ connection options such as `--transport`, `--alpn`, `--sni`, `--ca`, and
 that share those settings. Every endpoint used with WebTransport must include an
 explicit path.
 
+An `--endpoint` scheme does not choose the transport. `https://host:port/path`
+only supplies the path, so pass `--transport webtransport` to publish over
+WebTransport; without it the publisher connects over raw QUIC. `--url` is
+different, since its URL carries the connection type.
+
 File input is materialized before publication and can be reused for every
 attempt. DASH live ingest keeps a bounded replay window, republishes the retained
 catalog, and resumes from the newest retained video group boundary when a new

@@ -7,7 +7,9 @@ It is intentionally limited to the draft variants we support today:
 - MoQ Transport draft 16
 - MoQ Transport draft 17
 - MoQ Transport draft 18
-- WebTransport over HTTP/3 draft 14
+- WebTransport over HTTP/3 as implemented by picoquic's h3zero, with its
+  session requirements checked against draft 16
+  ([text](draft-ietf-webtrans-http3-16.txt))
 
 ## Normative Model
 
@@ -42,6 +44,25 @@ For WebTransport over HTTP/3:
 - the connection requires the H3/WebTransport settings and transport parameters
 
 In this codebase, picoquic's `picowt_prepare_client_cnx()` already configures the required transport parameters and H3 callback path.
+
+Section 3.1 of WebTransport over HTTP/3 draft 16 lists what a server must send
+before a client may establish sessions: `SETTINGS_WT_ENABLED=1`,
+`SETTINGS_ENABLE_CONNECT_PROTOCOL=1`, `SETTINGS_H3_DATAGRAM=1`, a
+`max_datagram_frame_size` transport parameter greater than 0, and an empty
+`reset_stream_at` transport parameter. The client MUST NOT establish sessions
+otherwise. picoquic enforces this: it holds the CONNECT until the server's
+SETTINGS arrive and drops it when anything is missing, so the relay never sees
+a request. The publisher then reports the gap by name, for example:
+
+```text
+webtransport CONNECT not sent: server does not meet the WebTransport over HTTP/3 requirements (draft-ietf-webtrans-http3 section 3.1); missing reset_stream_at transport parameter
+```
+
+That is a server configuration problem, not a relay rejection. The check lives
+in `src/transport/webtransport_requirements.h` and mirrors picoquic's
+`picowt_webtransport_requirements_met()`; keep the two in step when picoquic
+changes. MoQT itself does not need RESET_STREAM_AT on raw QUIC (draft 18
+section 1.3).
 
 ### 3. WT protocol negotiation
 
@@ -150,9 +171,12 @@ Before changing wire behavior, verify each of these:
 
 ## Current risk focus
 
-The current WebTransport path is interoperating with the tested moqx and Red5
-draft-16/draft-18 relay paths. Draft-17 is selectable and codec-tested, but has
-less relay coverage. Remaining risk is now concentrated in broader
+The current WebTransport path interoperates with the tested Red5
+draft-16/draft-18 relay paths. It cannot currently reach moqx over WebTransport,
+because moqx omits the `reset_stream_at` transport parameter (see below and
+[openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)); raw QUIC to
+moqx is unaffected. Draft-17 is selectable and codec-tested, but has less relay
+coverage. Remaining risk is now concentrated in broader
 coverage rather than initial session establishment:
 
 - higher object volume and backpressure behavior
@@ -163,8 +187,18 @@ coverage rather than initial session establishment:
 ## Current interoperability state
 
 Observed behavior as of May 16, 2026, with the Red5 relay result refreshed on
-September 4, 2026:
+September 4, 2026 and the local moqx and Red5 results on September 23, 2026:
 
+- local moqx (build-san binary from July 23 and `v0.3.4-9-gc3a95726`), draft 18
+  - WebTransport: no session. The relay omits the `reset_stream_at` transport
+    parameter, so picoquic (from `5f58129`, September 14) withholds the
+    CONNECT; tracked as [openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)
+  - raw QUIC: all 10 CAT4MoQ interop runtime cases pass, and CTE LL-DASH ingest (chunked and
+    `Content-Length`) delivers catalog plus audio and video to a Playa subscriber
+  - the May entries below predate picoquic's requirements check
+- local red5-moq-relay `fa082f0`, picoquic backend, draft 18
+  - WebTransport and raw QUIC publishing both pass the CAT4MoQ interop matrix
+    for the `moqx` and `cose` profiles
 - `<moqx-la-relay-host>:4433/moq-relay`
   - draft-16 CONNECT succeeds with verified TLS
   - `PUBLISH_NAMESPACE_OK` arrives on the WT control stream as expected

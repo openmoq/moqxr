@@ -233,6 +233,19 @@ initialization and progressing audio/video payloads through Playa's connection
 API; it does not prove player routing or rendering. The player alias collision
 is tracked in [moq-playa issue 17](https://github.com/openmoq/moq-playa/issues/17).
 
+`--publisher-transport webtransport` passes `--transport webtransport` to the
+publisher. Before 0.3.26 the harness only switched the endpoint to `https://`,
+which does not select WebTransport, so those runs published over raw QUIC. The
+moqx target cannot pass with WebTransport publishing until moqx sends the
+`reset_stream_at` transport parameter
+([openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)); run it with
+the default raw transport.
+
+Red5 now defaults to C4M-01 (token type 1, COSE claim labels 327/328). The
+harness pins `auth.cat.token.type=16` in the Red5 relay config to match the
+compatibility profiles, and its validator fixture takes the claim labels from
+Red5's `CatTokenParser` defaults.
+
 Prerequisites are a built publisher with the new CLI, the sibling moqx relay and
 standalone issuer, built Red5 classes/picoquic JNI libraries, built Playa packages,
 JDK, Node, OpenSSL and FFmpeg with H.264/AAC encoders. The default moqx binaries are

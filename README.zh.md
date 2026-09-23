@@ -15,7 +15,7 @@
 - 输出 catalog、初始化、媒体、probe 和发布计划文件，以便在本地检查。
 - 使用主 CLI 支持的 MOQT draft profile 发布：draft 16（默认）和 draft 18。
 - 当 picoquic 和 picotls 可用时，通过 Raw QUIC 或 WebTransport 发布。
-- 接受来自 stdin 的直播 fragmented MP4、libsrt 可用时通过 SRT 传输的 MPEG-TS，以及通过 HTTP/1.1 chunked CTE LL-DASH ingest 传输的 CMAF。
+- 接受来自 stdin 的直播 fragmented MP4、libsrt 可用时通过 SRT 传输的 MPEG-TS，以及通过 HTTP/1.1 CTE LL-DASH ingest（chunked 或固定长度请求）传输的 CMAF。
 - 使用 `--url` 解析 MSF URL，并使用 `--print-msf-urls` 打印 catalog discovery URL。
 - 提供用于 FFmpeg 生成直播媒体、CAT4MOQ 授权和 MPEG-2 TS/M2TS 打包的 C++ Publisher API 示例。
 - 对于 drafts 16 和 18，可选择通过 C11 Media-over-QUIC 库 [moq5](https://github.com/openmoq/moq5) 进行发布。
@@ -77,7 +77,7 @@ CLI 一次使用一个直播源：
 | --- | --- | --- | --- |
 | Fragmented MP4 | `--live-source stdin --input -` | 标准输入上的 CMAF/fMP4 | 在所有受支持平台上可用 |
 | SRT | `--live-source srt --srt-config FILE` | SRT 上的 MPEG-TS | 需要 libsrt；此路径无法获得 CENC metadata |
-| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | chunked CMAF `POST` 或 `PUT` 请求 | listener 目前需要类 Unix 平台 |
+| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | CMAF `POST` 或 `PUT` 请求，chunked 或带 `Content-Length` | listener 目前需要类 Unix 平台 |
 
 ### SRT ingest
 
@@ -166,6 +166,17 @@ curl -X PUT \
   --data-binary @live-video.cmaf \
   http://127.0.0.1:8080/ingest/video
 ```
+
+携带 `Content-Length` 而非 chunked transfer encoding 的请求同样被接受，因为 DASH-IF ingest 规范仅在低延迟场景下推荐 chunked。[livesim2](https://github.com/Dash-Industry-Forum/livesim2) 就是这样推送 init segment 的，因此可以把它的 CMAF ingest 输出直接指向 listener：
+
+```bash
+curl -X PUT \
+  -H 'Content-Type: video/mp4' \
+  --data-binary @init.cmfv \
+  http://127.0.0.1:8080/ingest/video/init.cmfv
+```
+
+当路径的最后一段带有文件扩展名时，例如 `/ingest/video/init.cmfv` 之后是 `/ingest/video/1.cmfv`，其所在目录（`/ingest/video`）就是 representation 路径，因此 media segment 能找到之前的 init segment。没有扩展名的路径（如下面的 FFmpeg 示例）按原样使用。两种 framing header 都没有的请求会以 `411 Length Required` 拒绝，声明长度超过配置上限（默认 256 MiB）的请求会以 `413 Content Too Large` 拒绝。
 
 FFmpeg 也可以创建两个视频 representation 和音频，并将它们直接推送到 ingest prefix：
 

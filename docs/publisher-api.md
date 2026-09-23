@@ -126,8 +126,10 @@ type 16 for current moqx and Red5's `moqx` profile. `kRed5CoseCompat` carries
 credentials issued for Red5's `cose` profile, also type 16 by default. A
 compatibility credential may override `token_type` to match an explicitly
 configured receiver. Profile selection does not transcode or re-sign CWTs.
-The current relays' scope formats differ from C4M-01; selecting `kC4m01`
-does not upgrade a receiver. See the [design](cat4moq-design.md).
+moqx's scope format differs from C4M-01, and selecting `kC4m01` does not
+upgrade a receiver. Red5 moved its `cose` profile to C4M-01 (token type 1,
+claim labels 327/328) on September 21, 2026; `kC4m01` against that profile has
+not been verified yet. See the [design](cat4moq-design.md).
 
 For per-resource credentials, set `authorization.credential_provider` to a
 callable accepting `const cat4moq::Resource&` and returning a `Credential`.
@@ -141,6 +143,17 @@ setup credential. It must cover catalog and initialization tracks as well as
 media. Throwing rejects the operation with a sanitized authorization error;
 there is no fallback to a static credential or anonymous publishing. Callbacks
 must return promptly and manage any shared state safely.
+
+For CAT tokens bound to a key through `cnf.jkt`, set
+`authorization.dpop_signer = cat4moq::DpopSigner::from_pem(pem)` with the
+P-256 private key. The session then sends a DPoP proof
+(draft-ietf-moq-c4m-01 section 3) as a second AUTHORIZATION TOKEN parameter
+next to the credential on SETUP and on every request it authorizes. Each proof
+is a fresh ES256 JWT naming the action, namespace and track. Proofs use token
+type 17 by default (`DpopSigner::token_type`). `from_pem` throws
+`cat4moq::AuthorizationError` for anything other than a P-256 key. Both backends
+support it; the CLI equivalents are `--auth-dpop-key-file` and
+`--auth-dpop-token-type`.
 
 Legacy preencoded wrappers remain available for existing applications:
 

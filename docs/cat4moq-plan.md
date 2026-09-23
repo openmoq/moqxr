@@ -41,6 +41,9 @@ by adding a profile selector to moqxr.
   exact/prefix/suffix matching, final nil and provisional claim-label agreement.
   Retain compatibility profiles and test cross-profile rejection. Validate
   normative semantics independently of the draft's illustrative test vectors.
+  Red5 side landed September 21-22, 2026 (`8dd1176` through `fa082f0`): its
+  defaults are now token type 1 and COSE claim labels 327/328, with DPoP and
+  moqt-reval enforcement. moqx remains to do.
 - [ ] Implement or explicitly reject DPoP/revalidation constraints; add lifecycle
   tests for expiry/revalidation and rotation before claiming complete support.
 - [ ] Audit moqx peer admission and request/media paths. Routing IDs and peering
@@ -204,8 +207,9 @@ use the player-mode moqx matrix above.
 ### Final managed relay matrix
 
 The selected topologies passed **60/60 cases**: ten cases for each of moqx,
-Red5 `moqx` and Red5 `cose`, over both raw-QUIC and WebTransport publishing,
-transport draft 18. Subscribers used WebTransport: full Playa player for moqx,
+Red5 `moqx` and Red5 `cose`, run once with the raw-QUIC and once with the
+WebTransport publisher option (see the correction below: both runs actually
+published over raw QUIC), transport draft 18. Subscribers used WebTransport: full Playa player for moqx,
 and Playa connection API for Red5. Each positive media case received video
 initialization (790 bytes), audio initialization (728 bytes), video groups 0/1
 (150,593 bytes), and audio groups 0/1 (17,791 bytes). Each topology also accepted
@@ -218,6 +222,24 @@ rejected the publisher and observed no catalog/media for eight seconds.
 | WebTransport | Player, moqx | 10/10 | `/tmp/cat4moq-interop-tevsvrbf` |
 | Raw QUIC | Connection, both Red5 profiles | 20/20 | `/tmp/cat4moq-interop-5nuppi7o` |
 | WebTransport | Connection, both Red5 profiles | 20/20 | `/tmp/cat4moq-interop-d1lev_5v` |
+
+**Correction (September 23, 2026).** The two WebTransport rows above did not
+exercise WebTransport publishing. The harness only switched the publisher
+endpoint to `https://`, which supplies the path but not the transport, so the
+publisher connected over raw QUIC. Red5's log for
+`/tmp/cat4moq-interop-d1lev_5v` records each publisher session as
+`type=native, path=/, alpn=moqt-18`; only the subscribers used WebTransport. The
+harness now passes `--transport` explicitly.
+
+Rerun with real WebTransport publishing on September 23, 2026 (native
+publisher `427c9ce`, draft 18, player subscriber, Red5 `fa082f0` picoquic
+backend): both Red5 profiles passed 20/20 runtime cases plus 20 issuer/validator
+decisions, and Red5 logged every session, publisher and subscriber, as
+`type=webtransport, path=/moq`. Artifacts: `/tmp/cat4moq-interop-1w3f3tyw`.
+moqx cannot be reached with WebTransport publishing because it omits the
+`reset_stream_at` transport parameter
+([openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)); its raw-QUIC
+matrix still passes all 10 runtime cases.
 
 The last two runs also tried moqx in connection mode: wrong-action/wrong-track
 observations failed on each transport with an upstream-session-closed request

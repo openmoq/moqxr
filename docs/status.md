@@ -9,6 +9,7 @@ Draft status:
 - draft 14 is the primary target
 - draft 16 is maintained as a secondary compatibility profile
 - draft 17 is selectable and has VI64, request-stream, control-codec, ALPN, and WebTransport protocol-offer support; relay interop coverage remains limited
+- WebTransport publishing to moqx is blocked: moqx omits the `reset_stream_at` transport parameter that WebTransport over HTTP/3 requires of servers, so picoquic withholds the CONNECT and the publisher names the missing parameter ([openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)); raw QUIC to moqx and WebTransport to Red5 are unaffected
 - draft 18 support includes version selection, setup/request framing, request-stream response correlation, fragmented subscriber-interest reads, and same-stream `SUBSCRIBE_OK` responses
 - draft 19 is archived as `docs/superpowers/specs/draft-ietf-moq-transport-19.txt` for later review and is not selectable
 - CTE LL-DASH regressions cover FFmpeg-style multi-representation paths and draft-16 await-subscribe delivery

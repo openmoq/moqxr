@@ -15,7 +15,7 @@ Ele empacota mídia de arquivo e ao vivo para Media over QUIC Transport (MOQT), 
 - Emite arquivos de catálogo, inicialização, mídia, probe e plano de publicação para inspeção local.
 - Publica com os perfis de draft MOQT aceitos pela CLI principal: draft 16 (padrão) e draft 18.
 - Publica por Raw QUIC ou WebTransport quando picoquic e picotls estão disponíveis.
-- Aceita MP4 fragmentado ao vivo via stdin, MPEG-TS sobre SRT quando libsrt está disponível e CMAF via ingest CTE LL-DASH chunked HTTP/1.1.
+- Aceita MP4 fragmentado ao vivo via stdin, MPEG-TS sobre SRT quando libsrt está disponível e CMAF via ingest CTE LL-DASH HTTP/1.1 (requisições chunked ou de tamanho fixo).
 - Analisa URLs MSF com `--url` e imprime a URL de descoberta do catálogo com `--print-msf-urls`.
 - Fornece exemplos da API Publisher C++ para mídia ao vivo gerada por FFmpeg, autorização CAT4MOQ e empacotamento MPEG-2 TS/M2TS.
 - Opcionalmente encaminha a publicação pela biblioteca C11 Media-over-QUIC [moq5](https://github.com/openmoq/moq5) para os drafts 16 e 18.
@@ -77,7 +77,7 @@ A CLI expõe uma fonte ao vivo por vez:
 | --- | --- | --- | --- |
 | MP4 fragmentado | `--live-source stdin --input -` | CMAF/fMP4 na entrada padrão | Disponível em todas as plataformas suportadas |
 | SRT | `--live-source srt --srt-config FILE` | MPEG-TS sobre SRT | Requer libsrt; metadados CENC não estão disponíveis neste caminho |
-| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | Requisições CMAF chunked `POST` ou `PUT` | O listener atualmente requer uma plataforma semelhante a Unix |
+| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | Requisições CMAF `POST` ou `PUT`, chunked ou com `Content-Length` | O listener atualmente requer uma plataforma semelhante a Unix |
 
 ### Ingest SRT
 
@@ -166,6 +166,17 @@ curl -X PUT \
   --data-binary @live-video.cmaf \
   http://127.0.0.1:8080/ingest/video
 ```
+
+Requisições que trazem `Content-Length` em vez de transfer encoding chunked também são aceitas, pois a especificação de ingest da DASH-IF só recomenda chunked para baixa latência. É assim que o [livesim2](https://github.com/Dash-Industry-Forum/livesim2) envia os segmentos de inicialização, então sua saída de ingest CMAF pode apontar diretamente para o listener:
+
+```bash
+curl -X PUT \
+  -H 'Content-Type: video/mp4' \
+  --data-binary @init.cmfv \
+  http://127.0.0.1:8080/ingest/video/init.cmfv
+```
+
+Quando o último segmento do caminho tem uma extensão de arquivo, como `/ingest/video/init.cmfv` seguido de `/ingest/video/1.cmfv`, o diretório que o contém (`/ingest/video`) é o caminho da representation, de modo que os segmentos de mídia encontram o segmento de inicialização que os precedeu. Caminhos sem extensão, como na receita FFmpeg abaixo, são usados como estão. Uma requisição sem nenhum dos dois cabeçalhos de framing é recusada com `411 Length Required`, e um tamanho declarado acima do limite configurado (256 MiB por padrão) com `413 Content Too Large`.
 
 Como alternativa, o FFmpeg pode criar duas representações de vídeo mais áudio e enviá-las diretamente ao prefixo de ingest:
 
