@@ -92,7 +92,7 @@ ffmpeg -stream_loop -1 -re -i bbb_sunflower_1080p_30fps_normal.mp4 \
 
 ## CTE LL-DASH HTTP Ingest
 
-The DASH live path lets FFmpeg send CMAF/fMP4 over HTTP/1.1 chunked requests instead of piping fragmented MP4 through stdin. Start the publisher first:
+The DASH live path lets FFmpeg send CMAF/fMP4 over HTTP/1.1 requests, chunked or with a `Content-Length`, instead of piping fragmented MP4 through stdin. Start the publisher first:
 
 ```bash
 ./build/openmoq-publisher \
@@ -128,5 +128,7 @@ ffmpeg -re \
 ```
 
 With this naming pattern, FFmpeg sends representation requests under the ingest prefix, such as `/ingest/video0`, `/ingest/video1`, and `/ingest/video2`. The publisher treats each representation path independently, discovers tracks from init segments sent on those paths, and emits catalog plus media objects for subscribers.
+
+Segment names that carry a file extension are grouped by their directory instead: `/ingest/video/init.cmfv` and `/ingest/video/1.cmfv` both belong to the `/ingest/video` representation. That is the layout livesim2's CMAF ingester produces, and its fixed-length (non-chunked) init and media requests are accepted alongside chunked ones.
 
 For relay smoke testing, use `--forward 1` so objects are forwarded immediately. Use `--forward 0` when the relay should wait for subscriber interest before media delivery. In that mode, `connection_id=` confirms transport and MOQT setup only; it does not mean the relay accepted the namespace or forwarded a subscription. Draft-16 subscriptions arrive on the control stream, while draft-17/18 subscriptions arrive on bidirectional request streams and are acknowledged with `SUBSCRIBE_OK` on the same stream. Use `--timeout` to bound the initial wait and `OPENMOQ_PICOQUIC_TRACE=1` to inspect relay control traffic.

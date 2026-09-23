@@ -15,7 +15,7 @@ It packages file and live media for Media over QUIC Transport (MOQT), builds MSF
 - Emits catalog, initialization, media, probe, and publish-plan files for local inspection.
 - Publishes with the main CLI's supported MOQT draft profiles: draft 16 (default) and draft 18.
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
-- Accepts live fragmented MP4 from stdin, MPEG-TS over SRT when libsrt is available, and CMAF over HTTP/1.1 chunked CTE LL-DASH ingest.
+- Accepts live fragmented MP4 from stdin, MPEG-TS over SRT when libsrt is available, and CMAF over HTTP/1.1 CTE LL-DASH ingest (chunked or fixed-length requests).
 - Parses MSF URLs with `--url` and prints the catalog discovery URL with `--print-msf-urls`.
 - Supports ordered relay failover with repeated `--endpoint` options and configurable same-endpoint retries with `--retry`.
 - Provides C++ Publisher API examples for FFmpeg-generated live media, CAT4MOQ authorization, and MPEG-2 TS/M2TS packaging.
@@ -110,7 +110,7 @@ The CLI exposes one live source at a time:
 | --- | --- | --- | --- |
 | Fragmented MP4 | `--live-source stdin --input -` | CMAF/fMP4 on standard input | Available on all supported platforms |
 | SRT | `--live-source srt --srt-config FILE` | MPEG-TS over SRT | Requires libsrt; CENC metadata is unavailable in this path |
-| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | Chunked CMAF `POST` or `PUT` requests | Listener currently requires a Unix-like platform |
+| CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | CMAF `POST` or `PUT` requests, chunked or with `Content-Length` | Listener currently requires a Unix-like platform |
 
 ### Fragmented MP4 ingest
 
@@ -196,7 +196,7 @@ Set `srt.mode` to `caller` to connect to an existing SRT listener, or to `listen
 
 ### CTE LL-DASH ingest
 
-Start the publisher with an HTTP/1.1 chunked CMAF listener and a MoQ relay target:
+Start the publisher with an HTTP/1.1 CMAF listener and a MoQ relay target:
 
 ```bash
 ./build/openmoq-publisher \
@@ -222,6 +222,17 @@ curl -X PUT \
   http://127.0.0.1:8080/ingest/video
 ```
 
+Requests that carry a `Content-Length` instead of chunked transfer encoding are accepted too, as the DASH-IF ingest specification only recommends chunking for low latency. This is how [livesim2](https://github.com/Dash-Industry-Forum/livesim2) pushes init segments, so its CMAF ingest output can be pointed straight at the listener:
+
+```bash
+curl -X PUT \
+  -H 'Content-Type: video/mp4' \
+  --data-binary @init.cmfv \
+  http://127.0.0.1:8080/ingest/video/init.cmfv
+```
+
+When the final path segment has a file extension, such as `/ingest/video/init.cmfv` followed by `/ingest/video/1.cmfv`, the enclosing directory (`/ingest/video`) is the representation path, so media segments find the init segment that preceded them. Paths without an extension, like the FFmpeg recipe below, are used as-is. A request with neither framing header is refused with `411 Length Required`, and a declared length above the configured cap (256 MiB by default) with `413 Content Too Large`.
+
 FFmpeg can instead create two video representations plus audio and push them directly to the ingest prefix:
 
 ```bash
@@ -241,7 +252,7 @@ ffmpeg -re \
   http://127.0.0.1:8080/ingest/
 ```
 
-Each path below `/ingest` maintains independent parser state and produces path-prefixed MoQ track names. Use `--forward 1` to send objects immediately, or `--forward 0` to wait for subscriber interest. The DASH listener currently requires a Unix-like platform.
+Each representation path below `/ingest` maintains independent parser state and produces path-prefixed MoQ track names. Use `--forward 1` to send objects immediately, or `--forward 0` to wait for subscriber interest. The DASH listener currently requires a Unix-like platform.
 
 See the [CLI quick start](docs/quickstart.md), [FFmpeg recipes](docs/ffmpeg.md), and [SRT technical note](docs/srt-ingest-technical-note.md) for additional details.
 

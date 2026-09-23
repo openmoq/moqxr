@@ -230,7 +230,7 @@ cat sample.mp4 | ./build/openmoq-publisher --input - --draft 14 --dump-plan
   --dump-plan
 ```
 
-Push CMAF segments with HTTP/1.1 chunked transfer encoding (curl or the FFmpeg DASH recipe in `docs/quickstart.md`) at `http://127.0.0.1:8099/ingest/...`. Like a live publish, the dry run keeps draining objects until it is interrupted; wrap it in `timeout` for scripted checks.
+Push CMAF segments over HTTP/1.1, chunked or with a `Content-Length` (curl, livesim2, or the FFmpeg DASH recipe in `docs/quickstart.md`), at `http://127.0.0.1:8099/ingest/...`. Like a live publish, the dry run keeps draining objects until it is interrupted; wrap it in `timeout` for scripted checks.
 
 ### Live Red5 Relay Smoke Test
 
