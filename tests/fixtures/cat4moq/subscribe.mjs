@@ -4,9 +4,11 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const [playa, modules, url, namespace, cert, token, timeout = '25', quicPackage = '', subscriberApi = 'player'] = process.argv.slice(2);
-// Draft-18 USE_VALUE=3, token type=16: both integers have one-byte vi64 encodings.
-const authTokens = [new Uint8Array(Buffer.concat([Buffer.from([3, 16]), readFileSync(token)]))];
+const [playa, modules, url, namespace, cert, token, timeout = '25', quicPackage = '', subscriberApi = 'player',
+  tokenType = '16'] = process.argv.slice(2);
+// Draft-18 USE_VALUE=3, then the token type: 1 (draft-ietf-moq-c4m-01) or 16 (moqx). Both
+// integers stay below 64, so each has a one-byte vi64 encoding.
+const authTokens = [new Uint8Array(Buffer.concat([Buffer.from([3, Number(tokenType)]), readFileSync(token)]))];
 const load = (pkg) => import(pathToFileURL(resolve(playa, `packages/${pkg}/dist/index.js`)));
 const { MoqtConnection } = await load('webtransport');
 const { MoqtPlayer, CatalogManager } = await load('player');

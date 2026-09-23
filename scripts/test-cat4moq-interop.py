@@ -184,7 +184,6 @@ server.unified.enabled=true
 auth.cat.enabled=true
 auth.cat.allow.anonymous=false
 auth.cat.profile={profile}
-auth.cat.token.type=16
 auth.cat.require.setup.token=true
 auth.cat.expiration.tolerance=0
 auth.cat.key.ids=interop
@@ -222,8 +221,12 @@ auth.cat.key.interop.secret.file={secret}
                              "--insecure", "--forward", "1" if case in ("valid-publish", "wrong-action", "wrong-track") else "0", "--coalesce-cmaf-chunks", "--publish-catalog", "--catalog-republish-interval", "1",
                              "--timeout", "30"]
                 if token:
-                    auth_profile = "c4m-01" if case == "profile-mismatch" else (
-                        "red5-cose-compat" if profile == "cose" else "moqx-compat")
+                    # Each relay runs on its default token type: the cose profile follows
+                    # draft-ietf-moq-c4m-01 (type 1), moqx and Red5's moqx profile use 16.
+                    # The mismatch case presents the credential under the other type.
+                    native_profile = "c4m-01" if profile == "cose" else "moqx-compat"
+                    other_profile = "moqx-compat" if profile == "cose" else "c4m-01"
+                    auth_profile = other_profile if case == "profile-mismatch" else native_profile
                     publisher += ["--auth-profile", auth_profile,
                                   "--auth-token-file", token]
                 relay_offset = log.stat().st_size
@@ -255,7 +258,8 @@ auth.cat.key.interop.secret.file={secret}
                         command += ["--experimental-quic"]
                     command += [FIXTURES / "subscribe.mjs", args.playa, args.node_modules,
                                 f"{'moqt' if args.quic_package else 'https'}://127.0.0.1:{port}/moq",
-                                namespace, cert, subscriber, str(timeout), args.quic_package or "", args.subscriber_api]
+                                namespace, cert, subscriber, str(timeout), args.quic_package or "", args.subscriber_api,
+                                "1" if profile == "cose" else "16"]
                     # Only pre-subscriber relay evidence can attribute a setup rejection
                     # to the publisher without relying on implementation-specific IDs.
                     publisher_relay_text = log.read_bytes()[relay_offset:].decode(errors="replace")
