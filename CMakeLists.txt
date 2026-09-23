@@ -768,6 +768,15 @@ if(OPENMOQ_BUILD_TESTS)
     target_link_libraries(openmoq-publisher-webtransport-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-webtransport-tests COMMAND openmoq-publisher-webtransport-tests)
 
+    add_executable(openmoq-publisher-webtransport-requirements-tests
+        tests/webtransport_requirements_test.cpp
+    )
+    target_include_directories(openmoq-publisher-webtransport-requirements-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/transport"
+    )
+    add_test(NAME openmoq-publisher-webtransport-requirements-tests
+        COMMAND openmoq-publisher-webtransport-requirements-tests)
+
     add_executable(openmoq-publisher-api-tests
         tests/publisher_api_test.cpp
     )

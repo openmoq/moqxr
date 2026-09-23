@@ -32,6 +32,7 @@
 #include <pico_webtransport.h>
 
 #include "tls_verification.h"
+#include "webtransport_requirements.h"
 #endif
 
 namespace openmoq::publisher::transport {
@@ -576,13 +577,32 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
     return 0;
 }
 
+// Runs on the packet-loop thread (from the h3zero callback), so reading the
+// peer's SETTINGS and transport parameters here does not race the loop.
+std::string describe_unanswered_connect(picoquic_cnx_t* cnx, const h3zero_callback_ctx_t* h3_ctx) {
+    WebTransportPeerRequirements peer;
+    if (h3_ctx != nullptr) {
+        peer.settings_received = h3_ctx->settings.settings_received != 0;
+        peer.h3_datagram = h3_ctx->settings.h3_datagram != 0;
+        peer.enable_connect_protocol = h3_ctx->settings.enable_connect_protocol != 0;
+        peer.wt_enabled = h3_ctx->settings.webtransport_enabled;
+        peer.wt_max_sessions = h3_ctx->settings.webtransport_max_sessions;
+    }
+    const picoquic_tp_t* remote_tp = cnx == nullptr ? nullptr : picoquic_get_transport_parameters(cnx, 0);
+    if (remote_tp != nullptr) {
+        peer.transport_parameters_known = true;
+        peer.max_datagram_frame_size = remote_tp->max_datagram_frame_size;
+        peer.reset_stream_at = remote_tp->is_reset_stream_at_enabled != 0;
+    }
+    return describe_webtransport_requirements_failure(peer);
+}
+
 int webtransport_callback(picoquic_cnx_t* cnx,
                           uint8_t* bytes,
                           size_t length,
                           picohttp_call_back_event_t event,
                           h3zero_stream_ctx_t* stream_ctx,
                           void* path_app_ctx) {
-    static_cast<void>(cnx);
     auto* impl = static_cast<WebTransportClient::Impl*>(path_app_ctx);
     if (impl == nullptr) {
         return -1;
@@ -614,8 +634,16 @@ int webtransport_callback(picoquic_cnx_t* cnx,
         case picohttp_callback_connect_refused: {
             std::lock_guard<std::mutex> lock(impl->mutex);
             impl->failed = true;
-            impl->last_error = "webtransport CONNECT refused with status=" +
-                               std::to_string(stream_ctx != nullptr ? stream_ctx->ps.stream_state.header.status : 0);
+            const int status = stream_ctx != nullptr ? stream_ctx->ps.stream_state.header.status : 0;
+            // No status means no response: picoquic withheld the CONNECT because
+            // the server's SETTINGS or transport parameters fall short.
+            std::string requirements_failure;
+            if (status == 0) {
+                requirements_failure = describe_unanswered_connect(cnx, impl->h3_ctx);
+            }
+            impl->last_error = !requirements_failure.empty()
+                                   ? requirements_failure
+                                   : "webtransport CONNECT refused with status=" + std::to_string(status);
             impl->condition.notify_all();
             return 0;
         }
