@@ -273,7 +273,9 @@ auth.cat.key.interop.secret.file={secret}
                             if pub.poll() is None:
                                 raise RuntimeError(f"{issuer}/{case}: no bounded publisher rejection; inspect {publog}")
                             text = publog.read_text(errors="replace")
-                            rejection = r"(?i)unauthoriz|forbidden|denied|not permitted|authorization token does not permit|auth.*fail|peer rejected publication authorization"
+                            rejection = (r"(?i)unauthoriz|forbidden|denied|not permitted|authorization token does not permit|auth.*fail|"
+                                 r"peer rejected publication authorization|"
+                                 r"(MALFORMED|EXPIRED)_AUTH_TOKEN|UNKNOWN_AUTH_TOKEN_ALIAS")
                             if pub.returncode == 0 or not re.search(rejection, text + "\n" + publisher_relay_text):
                                 raise RuntimeError(f"{issuer}/{case}: missing publisher-attributed authorization rejection; inspect {publog}")
                         result = sub.wait(timeout=timeout + 10)
