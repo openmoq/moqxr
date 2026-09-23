@@ -191,3 +191,95 @@ jobs:
               --target "${GITHUB_SHA}" \
               --generate-notes
           fi
+
+  build-freebsd:
+    name: Build FreeBSD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag and select package name
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.release_tag }}"
+          if [[ -z "${version}" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          if [[ -z "${version}" || "${GITHUB_REF_TYPE}" != "tag" && -z "${{ github.event.inputs.release_tag }}" ]]; then
+            version="manual-${GITHUB_RUN_NUMBER}"
+          fi
+          if [[ "${version}" == v* ]]; then
+            project_version="$(sed -nE 's/^[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n1)"
+            if [[ "${version}" != "v${project_version}" ]]; then
+              echo "ERROR: release tag ${version} does not match project(VERSION ${project_version}) in CMakeLists.txt" >&2
+              exit 1
+            fi
+            echo "release_enabled=true" >> "${GITHUB_ENV}"
+          else
+            echo "release_enabled=false" >> "${GITHUB_ENV}"
+          fi
+          echo "release_version=${version}" >> "${GITHUB_ENV}"
+          echo "package_root=openmoq-publisher-${version}-FreeBSD" >> "${GITHUB_ENV}"
+          echo "archive=openmoq-publisher-${version}-FreeBSD.tar.gz" >> "${GITHUB_ENV}"
+
+      - name: Build and package in FreeBSD 14.4
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          envs: release_version package_root archive
+          prepare: |
+            pkg install -y cmake ninja git pkgconf openssl
+          run: |
+            set -eu
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF
+            cmake --build build --parallel 2
+            ctest --test-dir build --output-on-failure
+
+            mkdir -p "${package_root}/lib"
+            cp build/openmoq-publisher "${package_root}/"
+            cp build/libopenmoq_publisher.a "${package_root}/lib/"
+            find build -type f \( -name 'libpicoquic*.a' -o -name 'libpicohttp*.a' \
+              -o -name 'libpicotls*.a' \) -exec cp {} "${package_root}/lib/" \;
+            cp -R include "${package_root}/include"
+            cp README.md LICENSE "${package_root}/"
+            cp -R docs "${package_root}/docs"
+
+            lib_count="$(find "${package_root}/lib" -type f -name '*.a' | wc -l | tr -d ' ')"
+            if [ "${lib_count}" -lt 5 ]; then
+              echo "ERROR: expected the publisher library plus picoquic/picotls dependencies, found ${lib_count}" >&2
+              exit 1
+            fi
+            tar -czf "${archive}" "${package_root}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.package_root }}
+          path: ${{ env.archive }}
+          if-no-files-found: error
+
+      - name: Attach asset to GitHub release
+        if: env.release_enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ env.release_version }}"
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${{ env.archive }}" --clobber
+          else
+            gh release create "${tag}" "${{ env.archive }}" \
+              --title "${tag}" \
+              --target "${GITHUB_SHA}" \
+              --generate-notes
+          fi
