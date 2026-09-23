@@ -30,8 +30,8 @@ requests. The session encodes them for the selected draft.
 | Option | Behavior |
 | --- | --- |
 | `--auth-profile moqx-compat` | Example default; current moqx and Red5 `moqx` credentials, type 16 |
-| `--auth-profile red5-cose-compat` | Red5 `cose` credentials, type 16 by default |
-| `--auth-profile c4m-01` | C4M-01 credentials, type 1; requires a matching receiver |
+| `--auth-profile red5-cose-compat` | Red5 `cose` credentials, type 16 by default; only for Red5 relays pinned to `auth.cat.token.type=16` |
+| `--auth-profile c4m-01` | C4M-01 credentials, type 1; Red5's `cose` profile (draft-01) accepts it on its defaults |
 | `--auth-token-type N` | Override type with an explicit compatibility profile |
 
 The library and main CLI default to C4M-01; this relay-compatibility example
@@ -203,10 +203,13 @@ source validation, and literal command placeholder substitution.
 
 The main publisher now accepts raw externally issued credentials through
 `--auth-profile moqx-compat|red5-cose-compat|c4m-01` and `--auth-token-file`.
-Use `moqx-compat` with moqx/Catapult or Red5's `auth.cat.profile=moqx`; use
-`red5-cose-compat` with Red5's `auth.cat.profile=cose`. Both compatibility profiles
-use token type 16 by default. `c4m-01` uses type 1 and does not convert existing
-relay claims into the C4M-01 namespace-matching format. Explicit legacy wrappers remain available for existing callers.
+Use `moqx-compat` with moqx/Catapult or Red5's `auth.cat.profile=moqx`; both expect
+token type 16. Use `c4m-01`, the main publisher's default, with Red5's
+`auth.cat.profile=cose`, which follows draft-ietf-moq-c4m-01 and expects type 1.
+Neither pairing needs an `auth.cat.token.type` setting on the relay (Red5 defaults
+the type by profile from `52ae16e`). `red5-cose-compat` sends type 16 and is only for
+Red5 relays pinned to `auth.cat.token.type=16`. Profiles choose the token type; they
+do not convert moqx claims into the C4M-01 namespace-matching format. Explicit legacy wrappers remain available for existing callers.
 
 Run the opt-in harness from the repository root:
 
@@ -241,10 +244,14 @@ moqx target cannot pass with WebTransport publishing until moqx sends the
 ([openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)); run it with
 the default raw transport.
 
-Red5 now defaults to C4M-01 (token type 1, COSE claim labels 327/328). The
-harness pins `auth.cat.token.type=16` in the Red5 relay config to match the
-compatibility profiles, and its validator fixture takes the claim labels from
-Red5's `CatTokenParser` defaults.
+Every relay runs on its default token type; the harness sets no
+`auth.cat.token.type`. moqx and Red5's `moqx` profile take type 16 from
+`moqx-compat`. Red5's `cose` profile follows C4M-01 (type 1, COSE claim labels
+327/328) and takes the publisher's default `c4m-01` profile, and the Playa
+subscriber sends the matching type. The `profile-mismatch` case presents the
+credential under the other type. Red5's `moqx`-profile default of 16 needs
+red5-moq-relay `52ae16e` or later. The validator fixture takes the claim labels
+from Red5's `CatTokenParser` defaults.
 
 Prerequisites are a built publisher with the new CLI, the sibling moqx relay and
 standalone issuer, built Red5 classes/picoquic JNI libraries, built Playa packages,

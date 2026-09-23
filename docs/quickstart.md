@@ -386,9 +386,9 @@ Choose a profile that matches the issuer and relay:
 
 | Profile | Token type | Use |
 | --- | --- | --- |
-| `c4m-01` (default) | 1 | Published C4M-01 credentials and claims |
+| `c4m-01` (default) | 1 | Published C4M-01 credentials and claims; Red5's `cose` profile |
 | `moqx-compat` | 16 | Current moqx/Catapult credentials; also Red5's `moqx` profile |
-| `red5-cose-compat` | 16 by default | Externally issued Red5 COSE credentials |
+| `red5-cose-compat` | 16 by default | Red5 COSE credentials for relays pinned to `auth.cat.token.type=16` |
 
 `--auth-token-type <uint>` overrides the type only with an explicit compatibility
 profile. Selecting a profile preserves the signed bytes; it does not translate

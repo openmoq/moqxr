@@ -11,9 +11,10 @@ issuer keys, or claim to validate relay authorization policy.
 
 The default new credential profile is `c4m-01` (token type 1). Explicit
 `moqx-compat` uses token type 16 and the existing Catapult envelope/claims;
-Red5's `moqx` profile accepts the same format. `red5-cose-compat` carries
-externally issued Red5 COSE credentials, with an explicitly selected token
-type (16 by default). Profile selection never rewrites signed claims and
+Red5's `moqx` profile accepts the same format. Red5's `cose` profile follows
+C4M-01 and takes the default `c4m-01` profile (type 1). `red5-cose-compat`
+carries Red5 COSE credentials with an explicitly selected token type (16 by
+default), for Red5 relays pinned to type 16. Profile selection never rewrites signed claims and
 never falls back after rejection. Existing `wrap_cat_token` callers retain
 their historical type-16 behavior.
 

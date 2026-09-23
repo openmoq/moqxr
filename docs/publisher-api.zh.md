@@ -96,7 +96,7 @@ config.authorization.action_credential = cat4moq::Credential{
 };
 ```
 
-`kC4m01` 是新 API 的默认值，发送 token type 1。`kMoqxCompat` 为当前 moqx 以及 Red5 的 `moqx` profile 发送 type 16。`kRed5CoseCompat` 携带为 Red5 `cose` profile 签发的凭据，默认同样为 type 16。兼容性凭据可以覆盖 `token_type`，以匹配显式配置的接收方。profile 选择不会转码或重新签名 CWT。moqx 的 scope 格式与 C4M-01 不同，选择 `kC4m01` 并不会升级接收方。Red5 已于 2026 年 9 月 21 日将其 `cose` profile 迁移到 C4M-01（token type 1，claim 标签 327/328）；`kC4m01` 针对该 profile 的行为尚未验证。参见[设计文档](cat4moq-design.md)。
+`kC4m01` 是新 API 的默认值，发送 token type 1。`kMoqxCompat` 为当前 moqx 以及 Red5 的 `moqx` profile 发送 type 16。`kRed5CoseCompat` 以 type 16 发送 Red5 `cose` 凭据，适用于固定为 `auth.cat.token.type=16` 的 Red5 relay。兼容性凭据可以覆盖 `token_type`，以匹配显式配置的接收方。profile 选择不会转码或重新签名 CWT。moqx 的 scope 格式与 C4M-01 不同，选择 `kC4m01` 并不会升级接收方。Red5 的 `cose` profile 遵循 C4M-01（token type 1，claim 标签 327/328），`kC4m01` 在 Red5 默认配置下即可与其互通，包括 DPoP proof，raw QUIC 与 WebTransport 均已验证（2026 年 9 月 23 日，red5-moq-relay `52ae16e`）。参见[设计文档](cat4moq-design.md)。
 
 对于按资源区分的凭据，请将 `authorization.credential_provider` 设置为一个接受 `const cat4moq::Resource&` 并返回 `Credential` 的可调用对象。resource 包含 action、wire 上的 namespace 组件以及可选的 track 名称。provider 为发出的 namespace 和 PUBLISH 请求选择凭据；它不是本地媒体访问控制过滤器。由 subscribe 驱动的响应没有 publisher 凭据字段，因此 relay 必须已经通过 setup 或 namespace 发布持有相应的授权。provider 只处理 action；setup 使用静态 setup 凭据。它必须覆盖 catalog 和初始化 track 以及媒体 track。抛出异常会以经过清理的授权错误拒绝该操作；不会回退到静态凭据或匿名发布。回调必须及时返回，并安全地管理任何共享状态。
 

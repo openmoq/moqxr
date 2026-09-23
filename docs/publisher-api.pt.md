@@ -127,13 +127,14 @@ config.authorization.action_credential = cat4moq::Credential{
 
 `kC4m01` é o novo padrão da API e envia o token type 1. `kMoqxCompat` envia o
 type 16 para o moqx atual e para o perfil `moqx` do Red5. `kRed5CoseCompat`
-transporta credenciais emitidas para o perfil `cose` do Red5, também type 16
-por padrão. Uma credencial de compatibilidade pode sobrescrever `token_type`
+envia credenciais `cose` do Red5 como type 16, para relays Red5 fixados em
+`auth.cat.token.type=16`. Uma credencial de compatibilidade pode sobrescrever `token_type`
 para corresponder a um receptor configurado explicitamente. A seleção de perfil
 não transcodifica nem reassina CWTs. O formato de escopo do moqx difere do
-C4M-01, e selecionar `kC4m01` não atualiza um receptor. O Red5 migrou seu perfil
-`cose` para C4M-01 (token type 1, claim labels 327/328) em 21 de setembro de
-2026; `kC4m01` com esse perfil ainda não foi verificado. Veja o
+C4M-01, e selecionar `kC4m01` não atualiza um receptor. O perfil `cose` do Red5
+segue o C4M-01 (token type 1, claim labels 327/328), e `kC4m01` funciona com ele
+na configuração padrão do Red5, incluindo provas DPoP, em QUIC raw e
+WebTransport (verificado em 23 de setembro de 2026 com red5-moq-relay `52ae16e`). Veja o
 [design](cat4moq-design.md).
 
 Para credenciais por recurso, defina `authorization.credential_provider` como

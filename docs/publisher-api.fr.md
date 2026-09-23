@@ -123,14 +123,15 @@ config.authorization.action_credential = cat4moq::Credential{
 ```
 
 `kC4m01` est la nouvelle valeur par défaut de l'API et envoie le type de jeton 1. `kMoqxCompat` envoie
-le type 16 pour le moqx actuel et le profil `moqx` de Red5. `kRed5CoseCompat` transporte
-des identifiants émis pour le profil `cose` de Red5, également de type 16 par défaut. Un
+le type 16 pour le moqx actuel et le profil `moqx` de Red5. `kRed5CoseCompat` envoie
+les identifiants `cose` de Red5 en type 16, pour les relays Red5 fixés à `auth.cat.token.type=16`. Un
 identifiant de compatibilité peut surcharger `token_type` pour correspondre à un récepteur
 configuré explicitement. La sélection du profil ne transcode ni ne re-signe les CWT.
 Le format de scope de moqx diffère de C4M-01, et sélectionner `kC4m01` ne met pas
-à niveau un récepteur. Red5 a fait passer son profil `cose` à C4M-01 (type de jeton 1,
-labels de claims 327/328) le 21 septembre 2026 ; `kC4m01` face à ce profil n'a
-pas encore été vérifié. Voir la [conception](cat4moq-design.md).
+à niveau un récepteur. Le profil `cose` de Red5 suit C4M-01 (type de jeton 1,
+labels de claims 327/328), et `kC4m01` fonctionne avec lui sur la configuration par défaut
+de Red5, preuves DPoP comprises, en QUIC raw comme en WebTransport (vérifié le
+23 septembre 2026 avec red5-moq-relay `52ae16e`). Voir la [conception](cat4moq-design.md).
 
 Pour des identifiants par ressource, définissez `authorization.credential_provider` avec un
 callable acceptant `const cat4moq::Resource&` et renvoyant un `Credential`.

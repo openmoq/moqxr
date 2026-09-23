@@ -41,9 +41,12 @@ by adding a profile selector to moqxr.
   exact/prefix/suffix matching, final nil and provisional claim-label agreement.
   Retain compatibility profiles and test cross-profile rejection. Validate
   normative semantics independently of the draft's illustrative test vectors.
-  Red5 side landed September 21-22, 2026 (`8dd1176` through `fa082f0`): its
-  defaults are now token type 1 and COSE claim labels 327/328, with DPoP and
-  moqt-reval enforcement. moqx remains to do.
+  Red5 side landed September 21-23, 2026 (`8dd1176` through `52ae16e`): the
+  `cose` profile follows C4M-01 (token type 1, COSE claim labels 327/328) with
+  DPoP and moqt-reval enforcement, and an unset token type defaults by profile
+  (`moqx` 16, `cose` 1). moqxr's default `c4m-01` profile interoperates with
+  Red5 `cose` on its defaults, DPoP included, over raw QUIC and WebTransport
+  (September 23, 2026). moqx remains to do.
 - [ ] Implement or explicitly reject DPoP/revalidation constraints; add lifecycle
   tests for expiry/revalidation and rotation before claiming complete support.
 - [ ] Audit moqx peer admission and request/media paths. Routing IDs and peering
