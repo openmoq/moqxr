@@ -29,6 +29,8 @@ The build also produces the reusable publisher API static library:
 
 The CMake target remains `openmoq_publisher_lib`, so projects that include this repository with `add_subdirectory(...)` should link that target. Projects that consume the raw archive directly should add `include/` to their include path and link the same transport dependencies used by the build, especially picoquic, picotls, OpenSSL, and platform socket libraries when picoquic transport support is enabled.
 
+Configuring with `-DBUILD_SHARED_LIBS=ON -DOPENMOQ_INSTALL=OFF` builds `libopenmoq_publisher` and the managed picotls/picoquic libraries as shared libraries instead, for build-tree use; see `BUILD_SHARED_LIBS` in `docs/dependencies.md` for the constraints.
+
 The default build also compiles the MSFTS Publisher API example:
 
 ```bash

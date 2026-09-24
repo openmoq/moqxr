@@ -137,6 +137,29 @@ executables. It is effective only when both `OPENMOQ_BUILD_TESTS=ON` and
 `OPENMOQ_ENABLE_PICOQUIC` set above. Running the tests also requires permission
 to create local network sockets.
 
+## `BUILD_SHARED_LIBS`
+
+Default: `OFF` (unset)
+
+Standard CMake variable. `libopenmoq_publisher` is declared without a
+`STATIC`/`SHARED` keyword, so `-DBUILD_SHARED_LIBS=ON` builds it as a shared
+library; the managed picotls and picoquic libraries are declared the same way
+and become shared objects in the same configuration. When
+`OPENMOQ_USE_LIBMOQ_PUBLISHER` selects libmoq, that project's own build system
+determines how it interprets the variable. The default (`OFF`/unset) builds
+static archives exactly as before.
+
+Shared configurations are build-tree-only: this project installs only
+first-party artifacts and never the managed dependencies, so
+`-DOPENMOQ_INSTALL=OFF` is required (configuration fails otherwise, with an
+explanation). The shared objects carry no install RPATH story; run executables
+from the build tree.
+
+This is unrelated to embedding the Publisher into a shared library of your
+own: for that, keep the default static configuration and add
+`-DCMAKE_POSITION_INDEPENDENT_CODE=ON` as described under the development
+install.
+
 ## Dependency Source and Refresh Flags
 
 These cache variables change where dependencies come from; they do not enable

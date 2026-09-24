@@ -545,7 +545,11 @@ if(OPENMOQ_HAS_LIBMOQ)
         "${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}" "${_openmoq_libmoq_ref}")
 endif()
 
-add_library(openmoq_publisher_lib STATIC
+# No STATIC/SHARED keyword: the standard BUILD_SHARED_LIBS variable selects
+# the library type (OFF/unset builds the static archive, as before). Shared
+# builds are build-tree-only and require -DOPENMOQ_INSTALL=OFF; see
+# "Installation" below and docs/dependencies.md.
+add_library(openmoq_publisher_lib
     src/cat4moq.cpp
     src/cat4moq_dpop.cpp
     src/cenc.cpp
@@ -579,6 +583,18 @@ add_library(openmoq_publisher_lib STATIC
 set_target_properties(openmoq_publisher_lib PROPERTIES
     OUTPUT_NAME openmoq_publisher
 )
+
+get_target_property(_openmoq_publisher_lib_type openmoq_publisher_lib TYPE)
+if(_openmoq_publisher_lib_type STREQUAL "SHARED_LIBRARY")
+    # Conventionally versioned shared-object names, and import libraries on
+    # Windows despite the unannotated headers (consumers of global data
+    # symbols across a DLL boundary would still need __declspec(dllimport);
+    # the public Publisher API is class/function based).
+    set_target_properties(openmoq_publisher_lib PROPERTIES
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+        WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 # DPoP proof signing (ES256 JWTs bound to a CAT token's cnf.jkt) uses the same
 # OpenSSL that picotls and picoquic already require; it stays an external
@@ -994,9 +1010,9 @@ endif()
 # in-tree dependency in the Publisher's link closure is a static library that
 # can be linked (and, for the development install, bundled) into the
 # first-party artifacts; this is validated below and holds for the default
-# configuration. BUILD_SHARED_LIBS=ON would turn the dependency libraries into
-# shared objects living only in the build tree, so it is rejected when
-# installation is requested.
+# configuration. BUILD_SHARED_LIBS=ON would turn openmoq_publisher_lib and the
+# dependency libraries into shared objects living only in the build tree, so it
+# is rejected when installation is requested.
 #
 # The development install ships a SELF-CONTAINED static archive: every
 # non-imported static library in openmoq_publisher_lib's transitive link
@@ -1084,12 +1100,14 @@ if(OPENMOQ_INSTALL)
 
     if(_openmoq_nonstatic_libs)
         message(FATAL_ERROR
-            "OPENMOQ_INSTALL requires the in-tree dependency libraries to be "
-            "static, but the following are not: ${_openmoq_nonstatic_libs}. "
-            "This project installs only first-party artifacts, so an installed "
-            "openmoq-publisher (or the bundled development archive) would "
-            "reference shared libraries that exist only in the build tree. "
-            "Configure with -DBUILD_SHARED_LIBS=OFF (the default), or set "
+            "OPENMOQ_INSTALL requires every library in the Publisher's link "
+            "closure (openmoq_publisher_lib itself and the in-tree "
+            "dependencies) to be static, but the following are not: "
+            "${_openmoq_nonstatic_libs}. This project installs only "
+            "first-party artifacts, so an installed openmoq-publisher (or the "
+            "bundled development archive) would reference shared libraries "
+            "that exist only in the build tree. Configure with "
+            "-DBUILD_SHARED_LIBS=OFF (the default), or set "
             "-DOPENMOQ_INSTALL=OFF for a build-tree-only configuration.")
     endif()
 
