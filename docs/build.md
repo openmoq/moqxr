@@ -88,6 +88,65 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+## Build with a System picoquic Package
+
+Distribution packagers usually maintain picoquic and picotls as separate
+packages and must not let moqxr download or compile its own copies. Configure
+with `OPENMOQ_USE_SYSTEM_PICOQUIC=ON` to link an installed picoquic instead:
+
+```bash
+cmake -S . -B build \
+  -DOPENMOQ_USE_SYSTEM_PICOQUIC=ON \
+  -DCMAKE_PREFIX_PATH=/usr/local \
+  -DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+In this mode CMake never touches `<build>/_deps`, so it works with
+`FETCHCONTENT_FULLY_DISCONNECTED=ON`. picotls is not located separately: the
+installed picoquic's CMake export records the picotls it was built against.
+
+The installed picoquic package must provide:
+
+- picoquic's CMake CONFIG package (`picoquic-config.cmake`, installed by
+  picoquic under `<prefix>/lib/cmake/picoquic`) exporting
+  `picoquic::picoquic-core`, `picoquic::picoquic-log` and
+  `picoquic::picohttp-core`. That means picoquic built with `BUILD_HTTP=ON` and
+  `BUILD_LOGLIB=ON` (both are picoquic's defaults) and installed with
+  `cmake --install`.
+- picotls headers and static libraries at the location picoquic's export
+  recorded when picoquic was configured (picotls has no install rules of its
+  own, so its package stages `include/` and `libpicotls-*.a` by hand and
+  picoquic is built with `PTLS_PREFIX` pointing at that prefix).
+- `picoquic_internal.h` and `picohash.h` next to `picoquic.h`. picoquic treats
+  these as private and does not install them, but the Publisher's close-drain
+  logic (`src/transport/picoquic_close_drain.h`) reads connection and stream
+  state through them. They must be copied from the **same source revision** the
+  installed libraries were built from; a header from another revision is a
+  silent ABI mismatch. If the package installs them elsewhere, point
+  `OPENMOQ_PICOQUIC_INTERNAL_INCLUDE_DIR` at that directory.
+
+Use `CMAKE_PREFIX_PATH` or `picoquic_DIR` to locate a package outside the
+default search prefixes. Configure output reports the package version and the
+directory the private headers were taken from.
+
+The following are not available with a system picoquic and are rejected at
+configure time; use a source tree (managed or `OPENMOQ_PICOQUIC_SOURCE_DIR`)
+for them:
+
+- `OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON` (the loopback tests use picoquic's test
+  certificates and private logging headers from its source tree)
+- `OPENMOQ_PICOQUIC_THREAD_CHECK=ON` (requires picoquic itself to be compiled
+  with `WITH_THREAD_CHECK`)
+- libmoq (`OPENMOQ_USE_LIBMOQ_PUBLISHER=ON` or `OPENMOQ_LIBMOQ_SOURCE_DIR`); its
+  drain-capable picoquic adapters are built from the picoquic source tree
+- `OPENMOQ_PICOQUIC_SOURCE_DIR` / `OPENMOQ_PICOTLS_SOURCE_DIR` (contradictory)
+
+With `OPENMOQ_INSTALL_DEVELOPMENT=ON`, the installed static Publisher library
+does not bundle picoquic or picotls in this mode; consumers link the installed
+picoquic package (which brings its picotls) together with OpenSSL.
+
 ## Windows Additional Requirements
 
 picotls requires both `pkg-config` and OpenSSL headers and libraries. On Windows, install both and tell CMake where OpenSSL is:
@@ -111,6 +170,10 @@ GitHub Actions workflows set `OPENSSL_ROOT_DIR` automatically from the runner's 
 - `-DOPENMOQ_DEPENDENCY_REFRESH_INTERVAL_HOURS=24`
 - `-DOPENMOQ_PICOQUIC_SOURCE_DIR=/path/to/picoquic` (explicit local override)
 - `-DOPENMOQ_PICOTLS_SOURCE_DIR=/path/to/picotls` (explicit local override)
+- `-DOPENMOQ_USE_SYSTEM_PICOQUIC=ON|OFF` (default `OFF`; link an installed
+  picoquic package, see above)
+- `-DOPENMOQ_PICOQUIC_INTERNAL_INCLUDE_DIR=/path` (system picoquic only:
+  directory holding `picoquic_internal.h` when it is not next to `picoquic.h`)
 - `-DOPENMOQ_LIBMOQ_SOURCE_DIR=/path/to/moq5` (explicit local override)
 - `-DOPENMOQ_OPENSSL_ROOT_DIR=/path/to/openssl`
 - `-DOPENSSL_ROOT_DIR=/path/to/openssl`

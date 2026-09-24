@@ -28,8 +28,8 @@ dependencies are required when it is enabled:
 
 | Dependency | How it is supplied | Purpose |
 | --- | --- | --- |
-| [picoquic](https://github.com/private-octopus/picoquic) | Managed `master` checkout, or `OPENMOQ_PICOQUIC_SOURCE_DIR` | QUIC, HTTP/3, and WebTransport transport |
-| [picotls](https://github.com/h2o/picotls) | Managed `master` checkout with submodules, or `OPENMOQ_PICOTLS_SOURCE_DIR` | TLS implementation used by picoquic |
+| [picoquic](https://github.com/private-octopus/picoquic) | Managed `master` checkout, `OPENMOQ_PICOQUIC_SOURCE_DIR`, or an installed package with `OPENMOQ_USE_SYSTEM_PICOQUIC=ON` | QUIC, HTTP/3, and WebTransport transport |
+| [picotls](https://github.com/h2o/picotls) | Managed `master` checkout with submodules, or `OPENMOQ_PICOTLS_SOURCE_DIR`; supplied by the installed picoquic when `OPENMOQ_USE_SYSTEM_PICOQUIC=ON` | TLS implementation used by picoquic |
 | OpenSSL development headers and libraries | System installation selected by CMake | Required by the picoquic build's default OpenSSL backend |
 | pkg-config | System installation | Required while configuring picotls; on Windows, CI uses `pkgconfiglite` |
 | Platform thread library | Located by CMake's `Threads` package | Required by picoquic |
@@ -50,6 +50,13 @@ choco install pkgconfiglite openssl
 cmake -S . -B build `
   -DOPENMOQ_OPENSSL_ROOT_DIR="C:\Program Files\OpenSSL-Win64"
 ```
+
+Set `-DOPENMOQ_USE_SYSTEM_PICOQUIC=ON` to link a picoquic that is already
+installed (for example a distribution package) instead of building picoquic and
+picotls from source. The installed package must export picoquic's CMake CONFIG
+package and ship `picoquic_internal.h`; see
+[Build with a System picoquic Package](build.md#build-with-a-system-picoquic-package)
+for the exact requirements and the features that still need a source tree.
 
 Set `-DOPENMOQ_ENABLE_PICOQUIC=OFF` to build without picoquic, picotls,
 OpenSSL, pkg-config, or the picoquic thread dependency. The publisher library

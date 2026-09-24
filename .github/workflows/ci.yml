@@ -106,3 +106,77 @@ jobs:
           else
             ctest --test-dir build --output-on-failure
           fi
+
+  system-picoquic:
+    name: Build against an installed picoquic (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install picotls and picoquic into a prefix
+        shell: bash
+        run: |
+          # Mirror what a distribution package provides: picotls and picoquic
+          # installed under one prefix, plus picoquic's private
+          # picoquic_internal.h / picohash.h next to picoquic.h (see
+          # docs/build.md, "Build with a System picoquic Package").
+          prefix="${GITHUB_WORKSPACE}/.deps/prefix"
+          git clone --depth 1 --recurse-submodules https://github.com/h2o/picotls.git .deps/picotls
+          cmake -S .deps/picotls -B .deps/picotls/build \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${prefix}"
+          cmake --build .deps/picotls/build --parallel
+          # picotls has no install rules; stage it the way packagers do:
+          # headers under include/, the static archives under lib/.
+          mkdir -p "${prefix}/include" "${prefix}/lib"
+          cp -R .deps/picotls/include/. "${prefix}/include/"
+          cp .deps/picotls/build/libpicotls-*.a "${prefix}/lib/"
+
+          git clone --depth 1 https://github.com/private-octopus/picoquic.git .deps/picoquic
+          cmake -S .deps/picoquic -B .deps/picoquic/build \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${prefix}" \
+            -DCMAKE_PREFIX_PATH="${prefix}" \
+            -DPTLS_PREFIX="${prefix}" \
+            -DBUILD_HTTP=ON -DBUILD_LOGLIB=ON \
+            -DBUILD_DEMO=OFF -DBUILD_LOGREADER=OFF -DBUILD_PQBENCH=OFF \
+            -Dpicoquic_BUILD_TESTS=OFF
+          cmake --build .deps/picoquic/build --parallel
+          cmake --install .deps/picoquic/build
+          install -m 0644 \
+            .deps/picoquic/picoquic/picoquic_internal.h \
+            .deps/picoquic/picoquic/picohash.h \
+            "${prefix}/include/"
+          echo "OPENMOQ_DEPS_PREFIX=${prefix}" >> "${GITHUB_ENV}"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DOPENMOQ_USE_SYSTEM_PICOQUIC=ON \
+            -DCMAKE_PREFIX_PATH="${OPENMOQ_DEPS_PREFIX}" \
+            -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Verify no picoquic or picotls was built in-tree
+        run: |
+          test -f build/libopenmoq_publisher.a
+          if find build -type f \( -name 'libpicoquic*.a' -o -name 'libpicohttp*.a' -o -name 'libpicotls*.a' \) | grep -q .; then
+            echo "ERROR: picoquic/picotls archives were built in-tree despite OPENMOQ_USE_SYSTEM_PICOQUIC=ON" >&2
+            exit 1
+          fi
+          test ! -e build/_deps/picoquic-src
+          test ! -e build/_deps/picotls-src
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install
+        run: |
+          cmake --install build --prefix "${GITHUB_WORKSPACE}/.install"
+          "${GITHUB_WORKSPACE}/.install/bin/openmoq-publisher" --version

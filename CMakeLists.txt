@@ -17,6 +17,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(OPENMOQ_BUILD_TESTS "Build OpenMOQ publisher tests" ON)
 option(OPENMOQ_BUILD_EXAMPLES "Build OpenMOQ publisher example executables" OFF)
 option(OPENMOQ_ENABLE_PICOQUIC "Enable picoquic transport integration when picoquic is available" ON)
+# Link an installed picoquic (its CMake CONFIG package, `find_package(picoquic)`)
+# instead of building picoquic and picotls from managed or overridden source
+# trees. Meant for distribution packaging, where the QUIC stack is a separately
+# maintained package. picotls is not located separately: the installed
+# picoquic's export already carries the picotls it was built against. See
+# "Build with a System picoquic Package" in docs/build.md for what the
+# installed package must provide (notably picoquic's private
+# picoquic_internal.h) and for the features that need a source tree instead.
+option(OPENMOQ_USE_SYSTEM_PICOQUIC
+    "Link an installed picoquic package instead of building picoquic/picotls from source" OFF)
 option(OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS "Build and run picoquic loopback smoke tests" OFF)
 # Compiles picoquic (and this project) with PICOQUIC_WITH_THREAD_CHECK so any
 # picoquic API call from a thread other than the packet-loop thread aborts.
@@ -107,6 +117,33 @@ set(OPENMOQ_PICOTLS_SOURCE_DIR "" CACHE PATH
 set(OPENMOQ_LIBMOQ_SOURCE_DIR "" CACHE PATH
     "Optional moq5/libmoq source override; empty fetches openmoq/moq5 main when selected")
 
+if(OPENMOQ_USE_SYSTEM_PICOQUIC)
+    if(OPENMOQ_PICOQUIC_SOURCE_DIR OR OPENMOQ_PICOTLS_SOURCE_DIR)
+        message(FATAL_ERROR
+            "OPENMOQ_USE_SYSTEM_PICOQUIC=ON links an installed picoquic package, so "
+            "OPENMOQ_PICOQUIC_SOURCE_DIR and OPENMOQ_PICOTLS_SOURCE_DIR must be empty. "
+            "Clear those overrides, or set OPENMOQ_USE_SYSTEM_PICOQUIC=OFF to build "
+            "from the source trees.")
+    endif()
+    if(OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS)
+        message(FATAL_ERROR
+            "OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON is not supported with "
+            "OPENMOQ_USE_SYSTEM_PICOQUIC=ON: the loopback smoke tests use "
+            "picoquic's test certificates and private logging headers from its "
+            "source tree, which an installed package does not provide. Configure "
+            "with -DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF, or build picoquic from "
+            "source.")
+    endif()
+    if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+        message(FATAL_ERROR
+            "OPENMOQ_PICOQUIC_THREAD_CHECK=ON is not supported with "
+            "OPENMOQ_USE_SYSTEM_PICOQUIC=ON: the check only works when picoquic "
+            "itself is compiled with WITH_THREAD_CHECK, which this project cannot "
+            "control for an installed package. Configure with "
+            "-DOPENMOQ_PICOQUIC_THREAD_CHECK=OFF, or build picoquic from source.")
+    endif()
+endif()
+
 # Migrate build trees configured before managed dependencies became the
 # default. Their auto-detected paths were cached with a "defaults to" help
 # string and otherwise look indistinguishable from a deliberate override.
@@ -181,6 +218,15 @@ endif()
 set(OPENMOQ_HAS_PICOQUIC OFF)
 set(OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR "")
 set(OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR "")
+# How the Publisher reaches picoquic, filled in by whichever mode below runs:
+# the three library targets to link (bare names for the in-tree build,
+# picoquic::-namespaced imported targets for an installed package) and any
+# include directories the sources need beyond those targets' usage
+# requirements.
+set(OPENMOQ_PICOQUIC_CORE_TARGET "")
+set(OPENMOQ_PICOQUIC_LOG_TARGET "")
+set(OPENMOQ_PICOHTTP_TARGET "")
+set(OPENMOQ_PICOQUIC_EXTRA_INCLUDE_DIRS "")
 
 function(openmoq_sanitize_target_link_directories target_name)
     if(NOT TARGET "${target_name}")
@@ -202,7 +248,15 @@ function(openmoq_sanitize_target_link_directories target_name)
     endforeach()
 endfunction()
 
-if(OPENMOQ_ENABLE_PICOQUIC)
+if(OPENMOQ_ENABLE_PICOQUIC AND OPENMOQ_USE_SYSTEM_PICOQUIC)
+    # Installed package: nothing is fetched or built here. The export's link
+    # interfaces carry picotls/OpenSSL/threads, and the save-ticket ABI shim in
+    # OpenMoqPicoquicCompat.cmake does not apply because picoquic was already
+    # compiled against its picotls.
+    include(OpenMoqSystemPicoquic)
+    openmoq_find_system_picoquic()
+    set(OPENMOQ_HAS_PICOQUIC ON)
+elseif(OPENMOQ_ENABLE_PICOQUIC)
     # picotls still declares compatibility with old CMake versions; newer CMake
     # releases require an explicit policy floor when configuring that subproject.
     set(CMAKE_POLICY_VERSION_MINIMUM "3.5" CACHE STRING "" FORCE)
@@ -329,6 +383,15 @@ if(OPENMOQ_ENABLE_PICOQUIC)
 
     # Sanitize after both dependency projects have configured their targets.
     openmoq_sanitize_target_link_directories(picotls-core)
+
+    set(OPENMOQ_PICOQUIC_CORE_TARGET picoquic-core)
+    set(OPENMOQ_PICOQUIC_LOG_TARGET picoquic-log)
+    if(TARGET picohttp-core)
+        set(OPENMOQ_PICOHTTP_TARGET picohttp-core)
+        # picohttp's headers are only on picohttp-core's private include path.
+        set(OPENMOQ_PICOQUIC_EXTRA_INCLUDE_DIRS
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
+    endif()
     set(OPENMOQ_HAS_PICOQUIC ON)
 endif()
 
@@ -383,6 +446,20 @@ if(_openmoq_configure_libmoq)
     # Keep libmoq's own test/sim suite out of moqxr's CTest run.
     set(MOQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(MOQ_BUILD_SIM   OFF CACHE BOOL "" FORCE)
+
+    if(OPENMOQ_HAS_PICOQUIC AND OPENMOQ_USE_SYSTEM_PICOQUIC)
+        # libmoq's threaded picoquic helper and managed WebTransport adapter
+        # compile against picoquic_internal.h from MOQ_PICOQUIC_SOURCE_DIR and
+        # refuse an installed package (see moq5's cmake/FindPicoquic.cmake).
+        # Silently dropping those adapters would change what --libmoq-backend
+        # picoquic can do, so refuse the combination instead.
+        message(FATAL_ERROR
+            "libmoq (OPENMOQ_USE_LIBMOQ_PUBLISHER / OPENMOQ_LIBMOQ_SOURCE_DIR) is "
+            "not supported together with OPENMOQ_USE_SYSTEM_PICOQUIC=ON: libmoq's "
+            "drain-capable picoquic adapters must be built from the picoquic "
+            "source tree. Build picoquic from source (OPENMOQ_USE_SYSTEM_PICOQUIC=OFF) "
+            "when enabling libmoq.")
+    endif()
 
     if(OPENMOQ_HAS_PICOQUIC)
         # Usable raw QUIC + WebTransport: enable the picoquic adapter + threaded
@@ -439,7 +516,10 @@ else()
         "libmoq was not selected and no OPENMOQ_LIBMOQ_SOURCE_DIR override was provided")
 endif()
 
-if(OPENMOQ_HAS_PICOQUIC)
+if(OPENMOQ_HAS_PICOQUIC AND OPENMOQ_USE_SYSTEM_PICOQUIC)
+    message(STATUS
+        "OpenMOQ: picoquic source=system package version=${OPENMOQ_SYSTEM_PICOQUIC_VERSION}")
+elseif(OPENMOQ_HAS_PICOQUIC)
     if(OPENMOQ_PICOQUIC_SOURCE_DIR)
         set(_openmoq_picoquic_ref "local override")
     else()
@@ -522,26 +602,29 @@ if(OPENMOQ_HAS_PICOQUIC)
         # picoquic itself gets the define via WITH_THREAD_CHECK above.
         target_compile_definitions(openmoq_publisher_lib PRIVATE PICOQUIC_WITH_THREAD_CHECK)
     endif()
-    if(TARGET picohttp-core AND TARGET picoquic-log AND NOT APPLE AND NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
-        # Linux with modern CMake: RESCAN resolves circular deps between picohttp/picoquic via --start-group/--end-group.
-        target_link_libraries(openmoq_publisher_lib PRIVATE "$<LINK_GROUP:RESCAN,picohttp-core,picoquic-log,picoquic-core>")
-        target_include_directories(openmoq_publisher_lib PRIVATE
-            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
+    # The same link shape serves the in-tree build and an installed package;
+    # only the target spellings differ (see OPENMOQ_PICOQUIC_*_TARGET above).
+    # picohttp-core and picoquic-core reference each other, so on ELF linkers
+    # they go inside one --start-group/--end-group.
+    if(OPENMOQ_PICOHTTP_TARGET AND NOT APPLE AND NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+        # Linux/BSD with modern CMake: RESCAN resolves the circular deps.
+        target_link_libraries(openmoq_publisher_lib PRIVATE
+            "$<LINK_GROUP:RESCAN,${OPENMOQ_PICOHTTP_TARGET},${OPENMOQ_PICOQUIC_LOG_TARGET},${OPENMOQ_PICOQUIC_CORE_TARGET}>")
+    elseif(OPENMOQ_PICOHTTP_TARGET AND NOT APPLE AND NOT WIN32)
+        # GNU ld: emulate $<LINK_GROUP:RESCAN,...> for CMake < 3.24
+        target_link_libraries(openmoq_publisher_lib PRIVATE
+            "-Wl,--start-group"
+            ${OPENMOQ_PICOHTTP_TARGET} ${OPENMOQ_PICOQUIC_LOG_TARGET} ${OPENMOQ_PICOQUIC_CORE_TARGET}
+            "-Wl,--end-group")
     else()
-        if(NOT APPLE AND NOT WIN32)
-            # GNU ld: emulate $<LINK_GROUP:RESCAN,...> for CMake < 3.24
-            target_link_libraries(openmoq_publisher_lib PRIVATE
-                "-Wl,--start-group" picohttp-core picoquic-log picoquic-core "-Wl,--end-group")
-            target_include_directories(openmoq_publisher_lib PRIVATE
-                "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
-        else()
-            target_link_libraries(openmoq_publisher_lib PRIVATE picoquic-core)
+        target_link_libraries(openmoq_publisher_lib PRIVATE ${OPENMOQ_PICOQUIC_CORE_TARGET})
+        if(OPENMOQ_PICOHTTP_TARGET)
+            target_link_libraries(openmoq_publisher_lib PRIVATE ${OPENMOQ_PICOHTTP_TARGET})
         endif()
     endif()
-    if(TARGET picohttp-core AND (APPLE OR WIN32))
-        target_link_libraries(openmoq_publisher_lib PRIVATE picohttp-core)
+    if(OPENMOQ_PICOQUIC_EXTRA_INCLUDE_DIRS)
         target_include_directories(openmoq_publisher_lib PRIVATE
-            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp")
+            ${OPENMOQ_PICOQUIC_EXTRA_INCLUDE_DIRS})
     endif()
     if(WIN32)
         target_link_libraries(openmoq_publisher_lib PRIVATE ws2_32 iphlpapi)
@@ -927,6 +1010,11 @@ endif()
 # No install(EXPORT) package is generated on purpose: the library target
 # references the excluded dependency targets, so a faithful export set cannot
 # be produced until those are consumed as installed packages.
+#
+# With OPENMOQ_USE_SYSTEM_PICOQUIC=ON the picoquic libraries are imported
+# targets and therefore external: they are not bundled, and consumers of the
+# development install link the installed picoquic package (which brings its
+# picotls) alongside OpenSSL, exactly as the executable does.
 if(OPENMOQ_INSTALL)
     include(GNUInstallDirs)
 

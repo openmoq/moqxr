@@ -25,6 +25,18 @@
         "CMAKE_BUILD_TYPE": "Release",
         "OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS": "OFF"
       }
+    },
+    {
+      "name": "system-picoquic",
+      "displayName": "System picoquic package (build/)",
+      "description": "Link an installed picoquic package instead of building picoquic/picotls from source; set CMAKE_PREFIX_PATH if the package is not in a default prefix.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "OPENMOQ_USE_SYSTEM_PICOQUIC": "ON",
+        "OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -35,6 +47,10 @@
     {
       "name": "default-make",
       "configurePreset": "default-make"
+    },
+    {
+      "name": "system-picoquic",
+      "configurePreset": "system-picoquic"
     }
   ],
   "testPresets": [
@@ -48,6 +64,13 @@
     {
       "name": "default-make",
       "configurePreset": "default-make",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "system-picoquic",
+      "configurePreset": "system-picoquic",
       "output": {
         "outputOnFailure": true
       }
