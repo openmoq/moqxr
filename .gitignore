@@ -45,6 +45,7 @@ run-trace*.log
 openmoq-publisher-trace.csv
 /.claude
 /third_party
+*/__pycache__
 
 # Stray dtrace-generated probe header (build artifact)
 .tmp.dprobes.h
