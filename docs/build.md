@@ -133,6 +133,15 @@ Use `CMAKE_PREFIX_PATH` or `picoquic_DIR` to locate a package outside the
 default search prefixes. Configure output reports the package version and the
 directory the private headers were taken from.
 
+The `system-picoquic` CMake preset configures this mode but reuses `build/` as
+its binary directory, the same as `default` and `default-make`. Those presets
+configure `build/` with different generators (Ninja vs. Unix Makefiles), and
+CMake does not support switching generators in place: reconfiguring an
+existing `build/` with a different preset's generator corrupts the cache
+rather than reconfiguring cleanly. Remove `build/` (or point the preset at a
+separate binary directory) before switching to or from `system-picoquic` in an
+existing build tree.
+
 The following are not available with a system picoquic and are rejected at
 configure time; use a source tree (managed or `OPENMOQ_PICOQUIC_SOURCE_DIR`)
 for them:
