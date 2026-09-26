@@ -396,6 +396,15 @@ int main() {
                      "expected --draft 18 to select draft-18 mode");
     }
 
+    try {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--draft", "21"});
+        ok &= expect(options.draft_version == openmoq::publisher::DraftVersion::kDraft21,
+                     "expected --draft 21 to select draft-21 mode");
+    } catch (const std::exception& error) {
+        ok &= expect(false, std::string("--draft 21 must parse: ") + error.what());
+    }
+
     {
         const CliOptions options = parse(
             {"openmoq-publisher", "--input", "sample.mp4", "--endpoint", "203.0.113.10:443", "--sni", "moq-relay.red5.net"});
