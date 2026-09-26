@@ -1193,7 +1193,8 @@ std::vector<std::uint8_t> encode_subscribe_namespace_ok_message(DraftVersion dra
 bool decode_location_filter(std::span<const std::uint8_t> bytes,
                             std::size_t& offset,
                             std::size_t end,
-                            SubscribeMessage& message) {
+                            SubscribeMessage& message,
+                            bool* overflowed = nullptr) {
     std::uint64_t fields[4] = {};
     std::size_t count = 0;
     while (offset < end) {
@@ -1224,6 +1225,9 @@ bool decode_location_filter(std::span<const std::uint8_t> bytes,
             break;
         default:
             if (fields[2] > std::numeric_limits<std::uint64_t>::max() - fields[0]) {
+                if (overflowed != nullptr) {
+                    *overflowed = true;
+                }
                 return false;
             }
             message.filter_type = 0x04;
@@ -1696,8 +1700,14 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                 }
                 SubscribeMessage decoded_filter;
                 std::size_t filter_offset = offset;
-                if (!decode_subscribe_filter(bytes, filter_offset, parameter_end, draft, decoded_filter)) {
-                    return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+                bool overflowed = false;
+                const bool decoded =
+                    draft == DraftVersion::kDraft21
+                        ? decode_location_filter(bytes, filter_offset, parameter_end, decoded_filter, &overflowed)
+                        : decode_subscribe_filter(bytes, filter_offset, parameter_end, draft, decoded_filter);
+                if (!decoded) {
+                    return fail(overflowed ? RequestUpdateDecodeError::kSemantic
+                                           : RequestUpdateDecodeError::kKeyValueFormatting);
                 }
                 message.subscription_filter = SubscriptionFilter{
                     .filter_type = decoded_filter.filter_type,

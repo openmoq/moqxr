@@ -1958,8 +1958,46 @@ bool test_draft21_subscribe_tracks_rejects_range_filters() {
     return ok;
 }
 
+std::vector<std::uint8_t> build_draft21_request_update_with_raw_filter(const std::vector<std::uint8_t>& filter) {
+    constexpr DraftVersion draft = DraftVersion::kDraft21;
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 11);
+    append_moqint(payload, draft, 1);
+    append_moqint(payload, draft, 0x21);
+    append_moqint(payload, draft, filter.size());
+    payload.insert(payload.end(), filter.begin(), filter.end());
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x02);
+    bytes.push_back(0);
+    bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_request_update_filter_errors() {
+    bool ok = true;
+    // §9.20.10: StartGroup + EndGroupDelta beyond 2^64-1 is a PROTOCOL_VIOLATION,
+    // not a key/value formatting error.
+    RequestUpdateMessage update;
+    RequestUpdateDecodeError error = RequestUpdateDecodeError::kNone;
+    ok &= expect(!decode_request_update_message(
+                     build_draft21_request_update_with_raw_filter(
+                         {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfb, 0x00, 0x0a}),
+                     DraftVersion::kDraft21, update, &error) &&
+                     error == RequestUpdateDecodeError::kSemantic,
+                 "draft-21 REQUEST_UPDATE LOCATION_FILTER overflow is a semantic (PROTOCOL_VIOLATION) error");
+    RequestUpdateMessage truncated;
+    error = RequestUpdateDecodeError::kNone;
+    ok &= expect(!decode_request_update_message(build_draft21_request_update_with_raw_filter({0x0c, 0x80}),
+                                                DraftVersion::kDraft21, truncated, &error) &&
+                     error == RequestUpdateDecodeError::kKeyValueFormatting,
+                 "draft-21 REQUEST_UPDATE truncated LOCATION_FILTER stays a key/value formatting error");
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_draft21_request_update_filter_errors();
     ok &= test_draft21_subscribe_tracks_rejects_range_filters();
     ok &= test_parameter_length_wrap_is_rejected();
     ok &= test_draft21_publish_done_and_framing();
