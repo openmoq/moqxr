@@ -1528,6 +1528,9 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
+        if (parameter_type == kParamFillParameters && draft == DraftVersion::kDraft21) {
+            message.fill_requested = true;
+        }
         if (parameter_type == 0x21 && draft == DraftVersion::kDraft21) {  // LOCATION_FILTER
             SubscribeMessage decoded_filter;
             std::size_t filter_offset = offset;

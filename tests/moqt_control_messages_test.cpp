@@ -1785,6 +1785,8 @@ std::vector<std::uint8_t> build_fill_parameters_message(DraftVersion draft, std:
     if (message_type == 0x03) {
         append_track_namespace(payload, draft, {"live"});
         append_string(payload, draft, "video");
+    } else if (message_type == 0x51) {
+        append_track_namespace(payload, draft, {"live"});
     }
     append_moqint(payload, draft, 1);     // one parameter
     append_moqint(payload, draft, 0x23);  // FILL_PARAMETERS, length-prefixed
@@ -1811,6 +1813,16 @@ bool test_draft21_fill_parameters() {
                                                DraftVersion::kDraft21, update) &&
                      update.request_id == 11 && update.fill_requested,
                  "draft-21 REQUEST_UPDATE records a FILL_PARAMETERS request");
+    SubscribeTracksMessage tracks;
+    ok &= expect(decode_subscribe_tracks_message(build_fill_parameters_message(DraftVersion::kDraft21, 0x51),
+                                                 DraftVersion::kDraft21, tracks) &&
+                     tracks.fill_requested,
+                 "draft-21 SUBSCRIBE_TRACKS records a FILL_PARAMETERS request");
+    SubscribeTracksMessage draft18_tracks;
+    ok &= expect(decode_subscribe_tracks_message(build_fill_parameters_message(DraftVersion::kDraft18, 0x51),
+                                                 DraftVersion::kDraft18, draft18_tracks) &&
+                     !draft18_tracks.fill_requested,
+                 "draft-18 SUBSCRIBE_TRACKS keeps skipping unknown odd parameters");
     RequestUpdateMessage draft18_update;
     ok &= expect(!decode_request_update_message(build_fill_parameters_message(DraftVersion::kDraft18, 0x02),
                                                 DraftVersion::kDraft18, draft18_update),

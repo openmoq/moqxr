@@ -93,6 +93,9 @@ struct SubscribeTracksMessage {
     // (§9.18.1); 0 means GROUP_ORDER was omitted.
     std::uint8_t group_order = 0;
     std::optional<SubscriptionFilter> subscription_filter;
+    // FILL_PARAMETERS presence. PUBLISH never reports LARGEST_OBJECT, so the
+    // fill range is empty and no fill fetch stream is owed (§3.4).
+    bool fill_requested = false;
 };
 
 struct DeliveryTimeouts {
