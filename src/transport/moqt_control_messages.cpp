@@ -1499,6 +1499,11 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                     return false;
                 }
                 message.forward = static_cast<std::uint8_t>(value);
+            } else if (parameter_type == kParamGroupOrder && draft == DraftVersion::kDraft21) {
+                if (value != 0x1 && value != 0x2) {
+                    return false;
+                }
+                message.group_order = static_cast<std::uint8_t>(value);
             }
             continue;
         }
@@ -1506,6 +1511,21 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         std::uint64_t parameter_length = 0;
         if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
             return false;
+        }
+        if (parameter_type == 0x21 && draft == DraftVersion::kDraft21) {  // LOCATION_FILTER
+            SubscribeMessage decoded_filter;
+            std::size_t filter_offset = offset;
+            if (!decode_location_filter(bytes, filter_offset, offset + static_cast<std::size_t>(parameter_length),
+                                        decoded_filter)) {
+                return false;
+            }
+            message.subscription_filter = SubscriptionFilter{
+                .filter_type = decoded_filter.filter_type,
+                .start_group_id = decoded_filter.start_group_id,
+                .start_object_id = decoded_filter.start_object_id,
+                .end_group_id = decoded_filter.end_group_id,
+                .end_object_id = decoded_filter.end_object_id,
+            };
         }
         offset += static_cast<std::size_t>(parameter_length);
     }

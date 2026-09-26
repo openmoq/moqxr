@@ -6590,6 +6590,49 @@ int main() {
     }
 
     {
+        // A draft-21 SUBSCRIBE_TRACKS may carry a LOCATION_FILTER for the tracks
+        // it publishes (§9.18.1, §3.5). Rather than over-deliver, this publisher
+        // declines it with REQUEST_ERROR NOT_SUPPORTED and keeps the session.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, kTestTrackNamespace.size()));
+        payload.insert(payload.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));     // one parameter
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0x21));  // LOCATION_FILTER
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 2));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 12));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 5));
+        std::vector<std::uint8_t> subscribe_tracks = encode_moqint(DraftVersion::kDraft21, 0x51);
+        append_be16(subscribe_tracks, static_cast<std::uint16_t>(payload.size()));
+        subscribe_tracks.insert(subscribe_tracks.end(), payload.begin(), payload.end());
+        transport.reads[1].push_back(subscribe_tracks);
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 filtered SUBSCRIBE_TRACKS connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft21), source_bytes);
+        static_cast<void>(session.publish(materialized));
+        bool saw_not_supported = false;
+        bool saw_publish = false;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 1 && message_type(write.bytes) == 0x05) {
+                openmoq::publisher::transport::RequestError error;
+                saw_not_supported =
+                    openmoq::publisher::transport::decode_request_error(write.bytes, DraftVersion::kDraft21, error) &&
+                    error.error_code == 0x3;
+            }
+            saw_publish = saw_publish || message_type(write.bytes) == 0x1d;
+        }
+        ok &= expect(saw_not_supported, "expected filtered draft-21 SUBSCRIBE_TRACKS to receive REQUEST_ERROR NOT_SUPPORTED");
+        ok &= expect(!saw_publish, "expected declined draft-21 SUBSCRIBE_TRACKS to publish no tracks");
+        ok &= expect(transport.last_close_code == 0,
+                     "expected declining SUBSCRIBE_TRACKS not to close the session with an error");
+    }
+
+    {
         MockTransport draft18_subscribe_transport;
         draft18_subscribe_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_subscribe_transport.reads[0].push_back(

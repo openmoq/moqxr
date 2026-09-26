@@ -77,10 +77,22 @@ struct SubscribeNamespaceMessage {
     std::vector<std::string> track_namespace_prefix;
 };
 
+struct SubscriptionFilter {
+    std::uint64_t filter_type = 0;
+    std::size_t start_group_id = 0;
+    std::size_t start_object_id = 0;
+    std::size_t end_group_id = 0;
+    std::optional<std::size_t> end_object_id;
+};
+
 struct SubscribeTracksMessage {
     std::uint64_t request_id = 0;
     std::vector<std::string> track_namespace_prefix;
     std::uint8_t forward = 1;
+    // Draft-21 initial subscription parameters for the resulting PUBLISHes
+    // (§9.18.1); 0 means GROUP_ORDER was omitted.
+    std::uint8_t group_order = 0;
+    std::optional<SubscriptionFilter> subscription_filter;
 };
 
 struct DeliveryTimeouts {
@@ -107,14 +119,6 @@ struct SubscribeMessage {
 // The optional values carried by REQUEST_UPDATE are deliberately distinct
 // from SubscribeMessage defaults: an omitted parameter retains the existing
 // request value.
-struct SubscriptionFilter {
-    std::uint64_t filter_type = 0;
-    std::size_t start_group_id = 0;
-    std::size_t start_object_id = 0;
-    std::size_t end_group_id = 0;
-    std::optional<std::size_t> end_object_id;
-};
-
 struct RequestUpdateMessage {
     std::uint64_t request_id = 0;
     // Draft 16 identifies the target in the message. Draft 18 associates the

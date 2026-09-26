@@ -1626,6 +1626,20 @@ TransportStatus open_failed_fill_stream(PublisherTransport& transport,
     return transport.reset_stream(stream_id, kResetInternalError);
 }
 
+// Draft-21 SUBSCRIBE_TRACKS may seed the resulting subscriptions with a
+// LOCATION_FILTER (§9.18.1). Published-track delivery has no per-request
+// filter, so a non-empty one is declined rather than over-delivered.
+bool declines_subscribe_tracks_filter(openmoq::publisher::DraftVersion draft,
+                                      const SubscribeTracksMessage& subscribe_tracks) {
+    return draft == openmoq::publisher::DraftVersion::kDraft21 &&
+           subscribe_tracks.subscription_filter.has_value() &&
+           subscribe_tracks.subscription_filter->filter_type != 0;
+}
+
+constexpr std::uint64_t kRequestErrorNotSupported = 0x3;
+constexpr std::string_view kSubscribeTracksFilterUnsupported =
+    "SUBSCRIBE_TRACKS location filters are not supported";
+
 bool live_object_matches_request_union(
     const openmoq::publisher::CmsfObject& object,
     openmoq::publisher::DraftVersion draft,
@@ -4245,6 +4259,19 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                                true);
                     return write_status.ok ? TransportStatus::failure("peer requested unsupported namespace prefix")
                                            : write_status;
+                }
+
+                if (declines_subscribe_tracks_filter(draft, subscribe_tracks)) {
+                    const TransportStatus decline_status =
+                        transport.write_stream(request_stream_id,
+                                               encode_request_error_message(
+                                                   draft, 0, kRequestErrorNotSupported, 0,
+                                                   kSubscribeTracksFilterUnsupported),
+                                               true);
+                    if (!decline_status.ok) {
+                        return decline_status;
+                    }
+                    continue;
                 }
 
                 const TransportStatus ok_status =
@@ -8868,6 +8895,19 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                             0};
                 }
 
+                if (declines_subscribe_tracks_filter(draft_version, subscribe_tracks)) {
+                    const TransportStatus decline_status =
+                        transport_.write_stream(request_stream_id,
+                                                encode_request_error_message(
+                                                    draft_version, 0, kRequestErrorNotSupported, 0,
+                                                    kSubscribeTracksFilterUnsupported),
+                                                true);
+                    if (!decline_status.ok) {
+                        return {decline_status, 0};
+                    }
+                    continue;
+                }
+
                 TransportStatus write_status =
                     transport_.write_stream(request_stream_id,
                                             encode_request_ok_message(draft_version, subscribe_tracks.request_id),
@@ -9955,6 +9995,18 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                 true);
                     return write_status.ok ? TransportStatus::failure("peer requested unsupported namespace prefix")
                                            : write_status;
+                }
+                if (declines_subscribe_tracks_filter(draft_version, subscribe_tracks)) {
+                    const TransportStatus decline_status =
+                        transport_.write_stream(request_stream_id,
+                                                encode_request_error_message(
+                                                    draft_version, 0, kRequestErrorNotSupported, 0,
+                                                    kSubscribeTracksFilterUnsupported),
+                                                true);
+                    if (!decline_status.ok) {
+                        return decline_status;
+                    }
+                    continue;
                 }
                 TransportStatus write_status =
                     transport_.write_stream(request_stream_id,

@@ -1820,9 +1820,66 @@ bool test_draft21_fill_parameters() {
     return ok;
 }
 
+std::vector<std::uint8_t> build_draft21_subscribe_tracks(std::optional<std::uint8_t> group_order,
+                                                         std::optional<std::vector<std::uint64_t>> filter_fields) {
+    constexpr DraftVersion draft = DraftVersion::kDraft21;
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 93);
+    append_track_namespace(payload, draft, {"live"});
+    append_moqint(payload, draft, (filter_fields ? 1 : 0) + (group_order ? 1 : 0));
+    std::uint64_t previous = 0;
+    if (filter_fields) {
+        append_moqint(payload, draft, 0x21);
+        std::vector<std::uint8_t> filter;
+        for (const std::uint64_t field : *filter_fields) {
+            append_moqint(filter, draft, field);
+        }
+        append_moqint(payload, draft, filter.size());
+        payload.insert(payload.end(), filter.begin(), filter.end());
+        previous = 0x21;
+    }
+    if (group_order) {
+        append_moqint(payload, draft, 0x22 - previous);
+        payload.push_back(*group_order);
+    }
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x51);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_subscribe_tracks_parameters() {
+    bool ok = true;
+    SubscribeTracksMessage tracks;
+    ok &= expect(decode_subscribe_tracks_message(build_draft21_subscribe_tracks(std::uint8_t{2}, std::nullopt),
+                                                 DraftVersion::kDraft21, tracks) &&
+                     tracks.group_order == 2 && !tracks.subscription_filter.has_value(),
+                 "draft-21 SUBSCRIBE_TRACKS decodes GROUP_ORDER");
+    ok &= expect(!decode_subscribe_tracks_message(build_draft21_subscribe_tracks(std::uint8_t{3}, std::nullopt),
+                                                  DraftVersion::kDraft21, tracks),
+                 "draft-21 SUBSCRIBE_TRACKS rejects GROUP_ORDER outside Ascending/Descending");
+    SubscribeTracksMessage filtered;
+    ok &= expect(decode_subscribe_tracks_message(
+                     build_draft21_subscribe_tracks(std::nullopt, std::vector<std::uint64_t>{12, 5}),
+                     DraftVersion::kDraft21, filtered) &&
+                     filtered.subscription_filter.has_value() && filtered.subscription_filter->filter_type == 0x03 &&
+                     filtered.subscription_filter->start_group_id == 12 &&
+                     filtered.subscription_filter->start_object_id == 5,
+                 "draft-21 SUBSCRIBE_TRACKS decodes a LOCATION_FILTER");
+    SubscribeTracksMessage malformed;
+    ok &= expect(!decode_subscribe_tracks_message(
+                     build_draft21_subscribe_tracks(std::nullopt, std::vector<std::uint64_t>{1, 2, 3, 4, 5}),
+                     DraftVersion::kDraft21, malformed),
+                 "draft-21 SUBSCRIBE_TRACKS rejects a malformed LOCATION_FILTER");
+    return ok;
+}
+
 int main() {
     bool ok = true;
     ok &= test_draft21_location_filter();
+    ok &= test_draft21_subscribe_tracks_parameters();
     ok &= test_draft21_include_properties();
     ok &= test_draft21_fill_parameters();
     ok &= test_object_properties();
