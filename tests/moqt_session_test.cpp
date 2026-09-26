@@ -613,6 +613,47 @@ std::vector<std::uint8_t> encode_subscribe_namespace_message(DraftVersion draft,
     return message;
 }
 
+std::vector<std::uint8_t> encode_draft18_family_filter_value(DraftVersion draft,
+                                                            std::uint64_t filter_type,
+                                                            std::size_t start_group_id,
+                                                            std::size_t start_object_id,
+                                                            std::size_t end_group_id,
+                                                            std::optional<std::size_t> end_object_id = std::nullopt) {
+    std::vector<std::uint8_t> filter;
+    if (draft == DraftVersion::kDraft21) {
+        // Draft-21 LOCATION_FILTER: field count, not a Filter Type, selects the form.
+        switch (filter_type) {
+            case 0x01:
+                append_bytes(filter, encode_moqint(draft, 0));
+                break;
+            case 0x02:
+                append_bytes(filter, encode_moqint(draft, 0));
+                append_bytes(filter, encode_moqint(draft, 0));
+                break;
+            default:
+                append_bytes(filter, encode_moqint(draft, start_group_id));
+                append_bytes(filter, encode_moqint(draft, start_object_id));
+                if (filter_type == 0x04) {
+                    append_bytes(filter, encode_moqint(draft, end_group_id - start_group_id));
+                    if (end_object_id.has_value()) {
+                        append_bytes(filter, encode_moqint(draft, *end_object_id));
+                    }
+                }
+                break;
+        }
+        return filter;
+    }
+    append_bytes(filter, encode_moqint(draft, filter_type));
+    if (filter_type == 0x03 || filter_type == 0x04) {
+        append_bytes(filter, encode_moqint(draft, start_group_id));
+        append_bytes(filter, encode_moqint(draft, start_object_id));
+        if (filter_type == 0x04) {
+            append_bytes(filter, encode_moqint(draft, end_group_id));
+        }
+    }
+    return filter;
+}
+
 std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::string_view track_namespace,
                                                    std::string_view track_name,
@@ -625,7 +666,8 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::size_t start_group_id = 0,
                                                    std::size_t start_object_id = 0,
                                                    std::uint64_t filter_type_value = 0x03,
-                                                   std::size_t end_group_id = 0) {
+                                                   std::size_t end_group_id = 0,
+                                                   std::optional<std::size_t> end_object_id = std::nullopt) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     if (draft == DraftVersion::kDraft17) {
         append_bytes(payload, encode_moqint(draft, 0));
@@ -702,16 +744,22 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         // SUBSCRIPTION_FILTER (0x21, odd) delta=0x01
         // Value: filter type followed by its applicable locations.
         const std::vector<std::uint8_t> filter_delta = encode_moqint(draft, 0x21 - 0x20);
-        std::vector<std::uint8_t> filter_value;
-        const std::vector<std::uint8_t> ft =
-            encode_moqint(draft, filter_type_value);
-        const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
-        const std::vector<std::uint8_t> so = encode_moqint(draft, start_object_id);
-        filter_value.insert(filter_value.end(), ft.begin(), ft.end());
-        filter_value.insert(filter_value.end(), sg.begin(), sg.end());
-        filter_value.insert(filter_value.end(), so.begin(), so.end());
-        if (filter_type_value == 0x04) {
-            append_bytes(filter_value, encode_moqint(draft, end_group_id));
+        std::vector<std::uint8_t> filter_value =
+            draft == DraftVersion::kDraft21
+                ? encode_draft18_family_filter_value(
+                      draft, filter_type_value, start_group_id, start_object_id, end_group_id, end_object_id)
+                : std::vector<std::uint8_t>{};
+        if (draft != DraftVersion::kDraft21) {
+            const std::vector<std::uint8_t> ft =
+                encode_moqint(draft, filter_type_value);
+            const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
+            const std::vector<std::uint8_t> so = encode_moqint(draft, start_object_id);
+            filter_value.insert(filter_value.end(), ft.begin(), ft.end());
+            filter_value.insert(filter_value.end(), sg.begin(), sg.end());
+            filter_value.insert(filter_value.end(), so.begin(), so.end());
+            if (filter_type_value == 0x04) {
+                append_bytes(filter_value, encode_moqint(draft, end_group_id));
+            }
         }
         const std::vector<std::uint8_t> filter_len = encode_moqint(draft, filter_value.size());
         payload.insert(payload.end(), filter_delta.begin(), filter_delta.end());
@@ -833,14 +881,8 @@ std::vector<std::uint8_t> encode_request_update_filter_message(
     }
     append_bytes(payload, encode_moqint(draft, 1));
     append_bytes(payload, encode_moqint(draft, 0x21));
-    std::vector<std::uint8_t> filter = encode_moqint(draft, filter_type);
-    if (filter_type == 0x03 || filter_type == 0x04) {
-        append_bytes(filter, encode_moqint(draft, start_group_id));
-        append_bytes(filter, encode_moqint(draft, start_object_id));
-        if (filter_type == 0x04) {
-            append_bytes(filter, encode_moqint(draft, end_group_id));
-        }
-    }
+    const std::vector<std::uint8_t> filter =
+        encode_draft18_family_filter_value(draft, filter_type, start_group_id, start_object_id, end_group_id);
     append_bytes(payload, encode_moqint(draft, filter.size()));
     payload.insert(payload.end(), filter.begin(), filter.end());
 
@@ -891,10 +933,16 @@ std::vector<std::uint8_t> encode_malformed_request_update_parameter(
     append_bytes(payload, encode_moqint(draft, parameter_type));
     append_bytes(payload, encode_moqint(draft, 1));
     // REGISTER lacks its required alias/type; a range filter lacks all
-    // required locations. Both are malformed known key/value encodings.
-    append_bytes(payload,
-                 encode_moqint(draft,
-                               parameter_type == 0x03 ? 0x01 : 0x03));
+    // required locations. Both are malformed known key/value encodings. A
+    // draft-21 LOCATION_FILTER has no Filter Type, so its malformed form is a
+    // truncated two-byte vi64.
+    if (draft == DraftVersion::kDraft21 && parameter_type == 0x21) {
+        payload.push_back(0x80);
+    } else {
+        append_bytes(payload,
+                     encode_moqint(draft,
+                                   parameter_type == 0x03 ? 0x01 : 0x03));
+    }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
     append_be16(message, static_cast<std::uint16_t>(payload.size()));
@@ -1626,6 +1674,37 @@ int main() {
     std::string authority;
     std::string path;
     std::uint64_t max_request_id = 1;
+
+    {
+        // Draft-21 LOCATION_FILTER {StartGroup=1, StartObject=0, EndGroupDelta=0,
+        // EndObject=1} is inclusive of {1,1} and excludes later objects.
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft21,
+            0, 0, 128, 0, 1, 0, 0x04, 1, std::size_t{1}));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 1, .marker = 'B'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 2, .marker = 'C'},
+            {.track_name = "events", .group_id = 2, .subgroup_id = 0, .object_id = 0, .marker = 'D'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft21);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 end-object session connect to succeed");
+        const TransportStatus end_object_status = session.publish(plan);
+        ok &= expect(end_object_status.ok, "expected draft-21 end-object publish to succeed: " + end_object_status.message);
+        std::string markers;
+        for (const auto& attempt : transport.object_write_attempts) {
+            if (!attempt.bytes.empty()) {
+                markers.push_back(static_cast<char>(attempt.bytes.back()));
+            }
+        }
+        ok &= expect(markers == "AB",
+                     "expected draft-21 LOCATION_FILTER EndObject to stop delivery after {1,1}, got '" + markers + "'");
+    }
 
     for (int property_case = 0; property_case < 4; ++property_case) {
         MockTransport transport;

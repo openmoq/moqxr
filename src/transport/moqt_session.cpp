@@ -1560,7 +1560,9 @@ bool object_matches_filter(const openmoq::publisher::CmsfObject& object, const S
         case 0x04:
             return (object.group_id > subscribe.start_group_id ||
                     (object.group_id == subscribe.start_group_id && object.object_id >= subscribe.start_object_id)) &&
-                   object.group_id <= subscribe.end_group_id;
+                   object.group_id <= subscribe.end_group_id &&
+                   !(subscribe.end_object_id.has_value() && object.group_id == subscribe.end_group_id &&
+                     object.object_id > *subscribe.end_object_id);
         default:
             return true;
     }
@@ -1648,6 +1650,7 @@ bool apply_request_update(SubscribeMessage& subscribe,
         subscribe.start_group_id = filter.start_group_id;
         subscribe.start_object_id = filter.start_object_id;
         subscribe.end_group_id = filter.end_group_id;
+        subscribe.end_object_id = filter.end_object_id;
     }
     return true;
 }
@@ -5715,6 +5718,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                     .start_group_id = 0,
                                     .start_object_id = 0,
                                     .end_group_id = 0,
+                                    .end_object_id = std::nullopt,
                                     .delivery_timeouts = publish_ok_it->second.delivery_timeouts,
                                 },
                             .track = track_it->second,
@@ -5983,6 +5987,7 @@ TransportStatus exercise_live_srt_publish_flow_for_testing(
             .group_order = 1,
             .forward = 1,
             .filter_type = 0x01,
+            .end_object_id = std::nullopt,
             .delivery_timeouts =
                 {.object_ms = initial_object_timeout_ms,
                  .subgroup_ms = 0},

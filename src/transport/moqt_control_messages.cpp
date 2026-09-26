@@ -66,8 +66,7 @@ bool decode_varint_impl(std::span<const std::uint8_t> bytes, std::size_t& offset
 bool decode_vi64_impl(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 
 bool uses_moq_vi64(DraftVersion draft) {
-    return draft == DraftVersion::kDraft17 || is_draft18_or_later(draft) ||
-        draft == DraftVersion::kDraft21;
+    return draft == DraftVersion::kDraft17 || is_draft18_or_later(draft);
 }
 
 bool decode_moqint_impl(std::span<const std::uint8_t> bytes,
@@ -1160,11 +1159,66 @@ std::vector<std::uint8_t> encode_subscribe_namespace_ok_message(DraftVersion dra
     return message_bytes;
 }
 
+// Draft-21 LOCATION_FILTER (§9.20.10): the field count, not a Filter Type,
+// selects the form. Maps onto the draft-18 filter model; a relative start more
+// than zero groups back starts at the next object because live delivery keeps
+// no history to replay.
+bool decode_location_filter(std::span<const std::uint8_t> bytes,
+                            std::size_t& offset,
+                            std::size_t end,
+                            SubscribeMessage& message) {
+    std::uint64_t fields[4] = {};
+    std::size_t count = 0;
+    while (offset < end) {
+        if (count == 4 || !decode_moqint_impl(bytes.subspan(0, end), offset, DraftVersion::kDraft21, fields[count])) {
+            return false;
+        }
+        ++count;
+    }
+    message.filter_type = 0x00;
+    message.start_group_id = 0;
+    message.start_object_id = 0;
+    message.end_group_id = 0;
+    message.end_object_id.reset();
+    switch (count) {
+        case 0:
+            break;
+        case 1:
+            message.filter_type = fields[0] == 0 ? 0x01 : 0x02;
+            break;
+        case 2:
+            if (fields[0] == 0 && fields[1] == 0) {
+                message.filter_type = 0x02;
+                break;
+            }
+            message.filter_type = 0x03;
+            message.start_group_id = static_cast<std::size_t>(fields[0]);
+            message.start_object_id = static_cast<std::size_t>(fields[1]);
+            break;
+        default:
+            if (fields[2] > std::numeric_limits<std::uint64_t>::max() - fields[0]) {
+                return false;
+            }
+            message.filter_type = 0x04;
+            message.start_group_id = static_cast<std::size_t>(fields[0]);
+            message.start_object_id = static_cast<std::size_t>(fields[1]);
+            message.end_group_id = static_cast<std::size_t>(fields[0] + fields[2]);
+            if (count == 4) {
+                message.end_object_id = static_cast<std::size_t>(fields[3]);
+            }
+            break;
+    }
+    return offset == end;
+}
+
 bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
                              std::size_t& offset,
                              std::size_t end,
                              DraftVersion draft,
                              SubscribeMessage& message) {
+    if (draft == DraftVersion::kDraft21) {
+        return decode_location_filter(bytes, offset, end, message);
+    }
     if (!decode_moqint_impl(bytes, offset, draft, message.filter_type)) {
         return false;
     }
@@ -1572,6 +1626,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                     .start_group_id = decoded_filter.start_group_id,
                     .start_object_id = decoded_filter.start_object_id,
                     .end_group_id = decoded_filter.end_group_id,
+                    .end_object_id = decoded_filter.end_object_id,
                 };
                 break;
             }

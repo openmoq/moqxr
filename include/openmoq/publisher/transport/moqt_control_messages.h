@@ -99,6 +99,8 @@ struct SubscribeMessage {
     std::size_t start_group_id = 0;
     std::size_t start_object_id = 0;
     std::size_t end_group_id = 0;
+    // Draft-21 LOCATION_FILTER may bound the end group at an inclusive object.
+    std::optional<std::size_t> end_object_id;
     DeliveryTimeouts delivery_timeouts;
 };
 
@@ -110,6 +112,7 @@ struct SubscriptionFilter {
     std::size_t start_group_id = 0;
     std::size_t start_object_id = 0;
     std::size_t end_group_id = 0;
+    std::optional<std::size_t> end_object_id;
 };
 
 struct RequestUpdateMessage {

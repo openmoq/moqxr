@@ -1652,8 +1652,87 @@ bool test_draft21_identity() {
     return ok;
 }
 
+std::vector<std::uint8_t> build_draft21_subscribe_with_raw_location_filter(const std::vector<std::uint8_t>& filter) {
+    constexpr DraftVersion draft = DraftVersion::kDraft21;
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 9);
+    append_track_namespace(payload, draft, {"live"});
+    append_string(payload, draft, "video");
+    append_moqint(payload, draft, 1);     // one parameter
+    append_moqint(payload, draft, 0x21);  // LOCATION_FILTER
+    append_moqint(payload, draft, filter.size());
+    payload.insert(payload.end(), filter.begin(), filter.end());
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x03);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> build_draft21_subscribe_with_location_filter(const std::vector<std::uint64_t>& fields) {
+    std::vector<std::uint8_t> filter;
+    for (const std::uint64_t field : fields) {
+        append_moqint(filter, DraftVersion::kDraft21, field);
+    }
+    return build_draft21_subscribe_with_raw_location_filter(filter);
+}
+
+bool test_draft21_location_filter() {
+    bool ok = true;
+    struct Case {
+        std::vector<std::uint64_t> fields;
+        std::uint64_t filter_type;
+        std::size_t start_group;
+        std::size_t start_object;
+        std::size_t end_group;
+        std::optional<std::size_t> end_object;
+        std::string label;
+    };
+    const std::vector<Case> cases = {
+        {{}, 0x00, 0, 0, 0, std::nullopt, "empty LOCATION_FILTER is unfiltered"},
+        {{0}, 0x01, 0, 0, 0, std::nullopt, "StartGroup=0 is Next Group Start"},
+        {{3}, 0x02, 0, 0, 0, std::nullopt, "relative StartGroup>0 starts at the next object"},
+        {{0, 0}, 0x02, 0, 0, 0, std::nullopt, "StartGroup=StartObject=0 is Next Object"},
+        {{12, 5}, 0x03, 12, 5, 0, std::nullopt, "two fields are an absolute start"},
+        {{12, 5, 3}, 0x04, 12, 5, 15, std::nullopt, "EndGroupDelta is relative to StartGroup"},
+        {{12, 5, 3, 7}, 0x04, 12, 5, 15, std::size_t{7}, "EndObject bounds the end group"},
+    };
+    for (const Case& c : cases) {
+        SubscribeMessage subscribe;
+        const bool decoded = decode_subscribe_message(build_draft21_subscribe_with_location_filter(c.fields),
+                                                      DraftVersion::kDraft21, subscribe);
+        ok &= expect(decoded, "draft-21 decode: " + c.label);
+        ok &= expect(decoded && subscribe.filter_type == c.filter_type && subscribe.start_group_id == c.start_group &&
+                         subscribe.start_object_id == c.start_object && subscribe.end_group_id == c.end_group &&
+                         subscribe.end_object_id == c.end_object,
+                     "draft-21 mapping: " + c.label);
+    }
+    SubscribeMessage rejected;
+    ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_location_filter({1, 2, 3, 4, 5}),
+                                           DraftVersion::kDraft21, rejected),
+                 "draft-21 LOCATION_FILTER rejects a fifth field");
+    // StartGroup = 2^64-5 in the 9-byte vi64 form, StartObject = 0, EndGroupDelta = 10.
+    std::vector<std::uint8_t> overflow{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfb, 0x00, 0x0a};
+    ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_raw_location_filter(overflow),
+                                           DraftVersion::kDraft21, rejected),
+                 "draft-21 LOCATION_FILTER rejects StartGroup + EndGroupDelta overflow");
+    // 0x0c = StartGroup 12, then 0x80 opens a two-byte vi64 with no second byte.
+    ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_raw_location_filter({0x0c, 0x80}),
+                                           DraftVersion::kDraft21, rejected),
+                 "draft-21 LOCATION_FILTER rejects a truncated trailing field");
+
+    SubscribeMessage draft18;
+    std::vector<std::uint8_t> draft18_filter = build_draft21_subscribe_with_location_filter({3, 12, 5});
+    ok &= expect(decode_subscribe_message(draft18_filter, DraftVersion::kDraft18, draft18) &&
+                     draft18.filter_type == 0x03 && draft18.start_group_id == 12 && draft18.start_object_id == 5,
+                 "draft-18 keeps the Filter Type encoding for the same bytes");
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_draft21_location_filter();
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
     ok &= test_draft21_identity();
