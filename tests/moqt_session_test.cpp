@@ -6590,6 +6590,32 @@ int main() {
     }
 
     {
+        // Draft-21 reserves 0x1E ("PUBLISH_OK in <= 17"); PUBLISH is answered with
+        // REQUEST_OK, so a 0x1E response on the PUBLISH stream is a violation.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, kTestTrackNamespace.size()));
+        payload.insert(payload.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> subscribe_tracks = encode_moqint(DraftVersion::kDraft21, 0x51);
+        append_be16(subscribe_tracks, static_cast<std::uint16_t>(payload.size()));
+        subscribe_tracks.insert(subscribe_tracks.end(), payload.begin(), payload.end());
+        transport.reads[1].push_back(subscribe_tracks);
+        transport.reads[4].push_back(std::vector<std::uint8_t>{0x1e, 0x00, 0x00});
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 reserved PUBLISH_OK connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft21), source_bytes);
+        const TransportStatus reserved_status = session.publish(materialized);
+        ok &= expect(!reserved_status.ok && transport.last_close_code == 0x3,
+                     "expected draft-21 reserved 0x1E PUBLISH response to close with PROTOCOL_VIOLATION");
+    }
+
+    {
         // A draft-21 SUBSCRIBE_TRACKS may carry a LOCATION_FILTER for the tracks
         // it publishes (§9.18.1, §3.5). Rather than over-deliver, this publisher
         // declines it with REQUEST_ERROR NOT_SUPPORTED and keeps the session.

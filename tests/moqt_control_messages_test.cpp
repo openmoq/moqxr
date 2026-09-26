@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <span>
@@ -1876,8 +1877,41 @@ bool test_draft21_subscribe_tracks_parameters() {
     return ok;
 }
 
+bool test_draft21_publish_done_and_framing() {
+    bool ok = true;
+    // Draft-21 §9.9 widens PUBLISH_DONE Stream Count to 2^64-1, which needs the
+    // 9-byte vi64 form (0xff prefix + 8 bytes).
+    const std::vector<std::uint8_t> expected_done{
+        0x0b, 0x00, 0x0f, 0x02,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x04, 'd', 'o', 'n', 'e'};
+    ok &= expect(openmoq::publisher::transport::encode_publish_done_message(
+                     DraftVersion::kDraft21, 1, std::numeric_limits<std::uint64_t>::max(), 0x2, "done") ==
+                     expected_done,
+                 "draft-21 PUBLISH_DONE carries a 2^64-1 stream count");
+
+    // GOAWAY and the FETCH family stay opaque uint16-length frames: this
+    // publisher never decodes their fields, so draft-21's GOAWAY without a
+    // Request ID and the restructured FETCH need no parser.
+    for (const std::uint64_t message_type : {0x10ULL, 0x16ULL, 0x17ULL, 0x18ULL, 0x19ULL}) {
+        std::vector<std::uint8_t> payload;
+        append_string(payload, DraftVersion::kDraft21, "opaque");
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, DraftVersion::kDraft21, message_type);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        std::size_t message_size = 0;
+        ok &= expect(openmoq::publisher::transport::next_control_message(bytes, DraftVersion::kDraft21, message_size) &&
+                         message_size == bytes.size(),
+                     "draft-21 frames message type " + std::to_string(message_type) + " as an opaque control message");
+    }
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_draft21_publish_done_and_framing();
     ok &= test_draft21_location_filter();
     ok &= test_draft21_subscribe_tracks_parameters();
     ok &= test_draft21_include_properties();
