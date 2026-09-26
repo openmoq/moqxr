@@ -69,6 +69,12 @@ bool uses_moq_vi64(DraftVersion draft) {
     return draft == DraftVersion::kDraft17 || is_draft18_or_later(draft);
 }
 
+// Peer lengths are vi64 values up to 2^64-1, so offset + length can wrap and
+// rewind the parser; compare against the remaining span instead.
+bool fits(std::size_t offset, std::uint64_t length, std::size_t end) {
+    return offset <= end && length <= end - offset;
+}
+
 bool decode_moqint_impl(std::span<const std::uint8_t> bytes,
                         std::size_t& offset,
                         DraftVersion draft,
@@ -161,7 +167,7 @@ bool decode_reason_phrase(std::span<const std::uint8_t> bytes,
                           DraftVersion draft,
                           std::string& reason) {
     std::uint64_t length = 0;
-    if (!decode_moqint_impl(bytes, offset, draft, length) || offset + length > bytes.size()) {
+    if (!decode_moqint_impl(bytes, offset, draft, length) || !fits(offset, length, bytes.size())) {
         return false;
     }
     reason.assign(reinterpret_cast<const char*>(bytes.data() + offset), static_cast<std::size_t>(length));
@@ -282,7 +288,7 @@ bool decode_track_namespace(std::span<const std::uint8_t> bytes,
     track_namespace.reserve(static_cast<std::size_t>(entry_count));
     for (std::uint64_t index = 0; index < entry_count; ++index) {
         std::uint64_t length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, length) || offset + length > bytes.size()) {
+        if (!decode_moqint_impl(bytes, offset, draft, length) || !fits(offset, length, bytes.size())) {
             return false;
         }
         track_namespace.emplace_back(reinterpret_cast<const char*>(bytes.data() + offset), static_cast<std::size_t>(length));
@@ -298,7 +304,7 @@ bool decode_varint_impl(std::span<const std::uint8_t> bytes, std::size_t& offset
 
     const std::uint8_t first = bytes[offset];
     const std::size_t length = 1ULL << (first >> 6);
-    if (offset + length > bytes.size()) {
+    if (!fits(offset, length, bytes.size())) {
         return false;
     }
 
@@ -345,7 +351,7 @@ bool decode_vi64_impl(std::span<const std::uint8_t> bytes, std::size_t& offset, 
         length = 9;
         prefix_mask = 0x00;
     }
-    if (offset + length > bytes.size()) {
+    if (!fits(offset, length, bytes.size())) {
         return false;
     }
     value = first & prefix_mask;
@@ -767,7 +773,7 @@ bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetu
     const std::size_t payload_length =
         (static_cast<std::size_t>(bytes[offset]) << 8) | static_cast<std::size_t>(bytes[offset + 1]);
     offset += 2;
-    if (offset + payload_length > bytes.size()) {
+    if (!fits(offset, payload_length, bytes.size())) {
         return false;
     }
 
@@ -850,7 +856,7 @@ bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetu
 
         std::uint64_t parameter_length = 0;
         if (!decode_moqint_impl(payload_bytes, offset, message.draft, parameter_length) ||
-            offset + parameter_length > payload_end) {
+            !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         offset += parameter_length;
@@ -1023,7 +1029,7 @@ bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             }
         } else {
             std::uint64_t parameter_length = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+            if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
                 return false;
             }
             offset += static_cast<std::size_t>(parameter_length);
@@ -1083,12 +1089,12 @@ bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draf
     std::uint64_t connect_uri_length = 0;
     std::vector<std::string> redirect_namespace;
     std::uint64_t track_name_length = 0;
-    if (!decode_moqint_impl(bytes, offset, draft, connect_uri_length) || offset + connect_uri_length > payload_end) {
+    if (!decode_moqint_impl(bytes, offset, draft, connect_uri_length) || !fits(offset, connect_uri_length, payload_end)) {
         return false;
     }
     offset += static_cast<std::size_t>(connect_uri_length);
     if (!decode_track_namespace(bytes.subspan(0, payload_end), offset, draft, redirect_namespace) ||
-        !decode_moqint_impl(bytes, offset, draft, track_name_length) || offset + track_name_length > payload_end) {
+        !decode_moqint_impl(bytes, offset, draft, track_name_length) || !fits(offset, track_name_length, payload_end)) {
         return false;
     }
     offset += static_cast<std::size_t>(track_name_length);
@@ -1154,7 +1160,7 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
             continue;
         }
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         if (draft == DraftVersion::kDraft16 && parameter_type != 0x03) {
@@ -1291,7 +1297,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         }
     }
     if (!decode_track_namespace(bytes.subspan(0, payload_end), offset, draft, message.track_namespace) ||
-        !decode_moqint_impl(bytes, offset, draft, track_name_length) || offset + track_name_length > payload_end) {
+        !decode_moqint_impl(bytes, offset, draft, track_name_length) || !fits(offset, track_name_length, payload_end)) {
         return false;
     }
 
@@ -1411,7 +1417,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
 
         // Odd type: length-prefixed bytes.
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         switch (parameter_type) {
@@ -1509,7 +1515,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         }
 
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         if (parameter_type == 0x21 && draft == DraftVersion::kDraft21) {  // LOCATION_FILTER
@@ -1992,7 +1998,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
     if (!parsed) {
         return false;
     }
-    if (payload_offset + payload_length > bytes.size()) {
+    if (!fits(payload_offset, payload_length, bytes.size())) {
         return false;
     }
     std::size_t offset = payload_offset;
@@ -2040,7 +2046,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             std::uint64_t parameter_length = 0;
             if (!decode_moqint_impl(bytes, offset, draft, parameter_type) ||
                 !decode_moqint_impl(bytes, offset, draft, parameter_length) ||
-                offset + parameter_length > payload_end) {
+                !fits(offset, parameter_length, payload_end)) {
                 return false;
             }
             offset += static_cast<std::size_t>(parameter_length);
@@ -2109,7 +2115,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         }
 
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         switch (parameter_type) {
@@ -2137,7 +2143,7 @@ bool decode_publish_error(std::span<const std::uint8_t> bytes, DraftVersion draf
     if (!parse_publish_family_message(bytes, draft, kPublishErrorType, payload_offset, payload_length)) {
         return false;
     }
-    if (payload_offset + payload_length > bytes.size()) {
+    if (!fits(payload_offset, payload_length, bytes.size())) {
         return false;
     }
     std::size_t offset = payload_offset;

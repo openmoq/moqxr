@@ -1909,8 +1909,33 @@ bool test_draft21_publish_done_and_framing() {
     return ok;
 }
 
+bool test_parameter_length_wrap_is_rejected() {
+    bool ok = true;
+    // A parameter length near 2^64 must not wrap offset + length and rewind the
+    // parser (which re-parses the same bytes for up to 2^64 parameters).
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        std::vector<std::uint8_t> payload;
+        append_moqint(payload, draft, 1);
+        append_track_namespace(payload, draft, {"live"});
+        payload.insert(payload.end(), {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff});  // 2^64-1 params
+        payload.insert(payload.end(), {0x2b, 0x00});  // odd type, length 0
+        payload.push_back(0x02);                      // delta to 0x2d (odd, length-prefixed)
+        payload.insert(payload.end(), {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf6});  // length 2^64-10
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, draft, 0x51);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        SubscribeTracksMessage tracks;
+        ok &= expect(!decode_subscribe_tracks_message(bytes, draft, tracks),
+                     draft_label(draft) + " SUBSCRIBE_TRACKS rejects a wrapping parameter length");
+    }
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_parameter_length_wrap_is_rejected();
     ok &= test_draft21_publish_done_and_framing();
     ok &= test_draft21_location_filter();
     ok &= test_draft21_subscribe_tracks_parameters();
