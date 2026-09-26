@@ -1942,6 +1942,12 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
             return false;
         }
+        // Draft-21 PUBLISH_OK carries only EXPIRES: subscription parameters
+        // moved to PUBLISH and REQUEST_UPDATE, and a parameter outside its
+        // allowed messages is a PROTOCOL_VIOLATION (§9.20.1).
+        if (draft == DraftVersion::kDraft21 && parameter_type != 0x08) {
+            return false;
+        }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
             if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {

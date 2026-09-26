@@ -1283,6 +1283,42 @@ bool test_control_message_framing_and_parameter_regressions() {
                      draft14_bad_group_order_subscribe, DraftVersion::kDraft14, subscribe),
                  "draft-14 SUBSCRIBE rejects group order 0");
 
+    {
+        // Draft-21 PUBLISH_OK (REQUEST_OK) may carry only EXPIRES; subscription
+        // parameters moved to PUBLISH/REQUEST_UPDATE (§9.20.17-19, §9.20.1).
+        PublishOk rejected;
+        ok &= expect(!decode_publish_ok(build_publish_ok_message(DraftVersion::kDraft21), DraftVersion::kDraft21, rejected),
+                     "draft-21 PUBLISH_OK rejects subscription parameters");
+        for (const std::uint64_t parameter_type : {0x10ULL, 0x20ULL, 0x22ULL}) {
+            std::vector<std::uint8_t> payload;
+            append_moqint(payload, DraftVersion::kDraft21, 1);
+            append_moqint(payload, DraftVersion::kDraft21, parameter_type);
+            append_message_uint8(payload, DraftVersion::kDraft21, 1);
+            std::vector<std::uint8_t> bytes;
+            append_moqint(bytes, DraftVersion::kDraft21, 0x07);
+            bytes.push_back(0);
+            bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
+            PublishOk single;
+            ok &= expect(!decode_publish_ok(bytes, DraftVersion::kDraft21, single),
+                         "draft-21 PUBLISH_OK rejects parameter " + std::to_string(parameter_type));
+        }
+
+        std::vector<std::uint8_t> payload;
+        append_moqint(payload, DraftVersion::kDraft21, 1);
+        append_moqint(payload, DraftVersion::kDraft21, 0x08);  // EXPIRES
+        append_moqint(payload, DraftVersion::kDraft21, 30000);
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, DraftVersion::kDraft21, 0x07);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        PublishOk accepted;
+        ok &= expect(decode_publish_ok(bytes, DraftVersion::kDraft21, accepted) &&
+                         accepted.request_id == 0 && accepted.forward == 1 && accepted.subscriber_priority == 128,
+                     "draft-21 PUBLISH_OK with only EXPIRES decodes with subscription defaults");
+    }
+
     std::vector<std::uint8_t> draft14_bad_group_order_publish_ok =
         build_publish_ok_message(DraftVersion::kDraft14);
     if (draft14_bad_group_order_publish_ok.size() > 5) {
