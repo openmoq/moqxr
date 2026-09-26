@@ -1360,6 +1360,8 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
     message.start_group_id = 0;
     message.start_object_id = 0;
     message.end_group_id = 0;
+    message.end_object_id.reset();
+    message.fill_requested = false;
 
     std::uint64_t parameter_count = 0;
     if (!decode_moqint_impl(bytes, offset, draft, parameter_count)) {
@@ -1428,11 +1430,10 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
             case 0x03:  // AUTHORIZATION_TOKEN — defined in SUBSCRIBE, opaque to this publisher.
                 break;
             case kParamFillParameters:
-                // SUBSCRIBE_OK never reports a Largest Object, so the fill range
-                // is empty and no fill fetch stream opens (§3.4).
-                if (draft != DraftVersion::kDraft21) {
+                if (draft != DraftVersion::kDraft21 || message.fill_requested) {
                     return false;
                 }
+                message.fill_requested = true;
                 break;
             case 0x21: {  // SUBSCRIPTION_FILTER
                 std::size_t filter_offset = offset;

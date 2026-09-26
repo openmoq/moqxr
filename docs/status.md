@@ -14,7 +14,7 @@ Draft status:
 - draft 21 (`--draft 21`, native backend only) runs on the draft-18 request-stream model and adds LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS, and TOO_MANY_REQUEST_UPDATES handling. Known limitations:
   - a LOCATION_FILTER relative start of one or more groups starts at the next object, because live delivery keeps no history
   - fill fetch streams always fail: a REQUEST_UPDATE ack that reports LARGEST_OBJECT with Forward=1 opens a stream, writes FETCH_HEADER, and resets it with INTERNAL_ERROR. The reset uses RESET_STREAM, not RESET_STREAM_AT, so the header may not reach the subscriber. A fill stream that cannot be opened is logged and the subscription continues
-  - SUBSCRIBE_OK never reports LARGEST_OBJECT (shared with draft 18), so FILL_PARAMETERS on SUBSCRIBE opens no fill stream
+  - draft-21 SUBSCRIBE_OK reports LARGEST_OBJECT as the largest object already sent on the track, so a SUBSCRIBE with FILL_PARAMETERS gets the same open-then-reset fill failure once anything was sent. The catalog track omits it, because its retained copy is re-sent to each new subscriber. Drafts 14/16/18 still omit LARGEST_OBJECT from SUBSCRIBE_OK
   - SUBSCRIBE_TRACKS with a LOCATION_FILTER other than Next Object is declined with REQUEST_ERROR NOT_SUPPORTED; its GROUP_ORDER is validated but not applied
   - range filters (0x25-0x29) are rejected because MAX_FILTER_RANGES is never advertised
 - drafts 19 and 20 are archived under `docs/` for later review and are not selectable

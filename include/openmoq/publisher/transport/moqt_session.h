@@ -12,6 +12,7 @@
 #include <functional>
 #include <iosfwd>
 #include <optional>
+#include <utility>
 #include <chrono>
 #include <span>
 #include <string>
@@ -143,7 +144,11 @@ public:
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
-    void record_published_object(const std::string& track_name, std::uint64_t group_id, std::size_t payload_bytes);
+    void record_published_object(const std::string& track_name,
+                                 std::uint64_t group_id,
+                                 std::uint64_t object_id,
+                                 std::size_t payload_bytes);
+    std::optional<std::pair<std::size_t, std::size_t>> largest_sent_object(const std::string& track_name) const;
     AuthorizationValues setup_authorization(DraftVersion draft) const;
     AuthorizationValues action_authorization(
         DraftVersion draft, cat4moq::Action action, std::optional<std::string> track_name = std::nullopt) const;
@@ -187,6 +192,7 @@ private:
     std::map<std::uint64_t, std::uint64_t> publish_stream_id_by_request_id_;
     PublishStats publish_stats_{};
     std::unordered_map<std::string, std::uint64_t> last_group_by_track_;
+    std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> largest_sent_by_track_;
     std::atomic<bool> stop_requested_{false};
 
     // Persistent catalog lifecycle state (MSF section 5 and 11.3). This is

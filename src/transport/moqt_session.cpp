@@ -1603,11 +1603,12 @@ std::vector<std::uint8_t> encode_live_request_ok_message(
 // fetchable history, the publisher reports fill failure the only way the draft
 // allows: FETCH_HEADER, then an immediate reset.
 void open_failed_fill_stream(PublisherTransport& transport,
-                                        openmoq::publisher::DraftVersion draft,
-                                        const RequestUpdateMessage& update,
-                                        std::uint8_t forward,
-                                        bool largest_reported) {
-    if (draft != openmoq::publisher::DraftVersion::kDraft21 || !update.fill_requested || forward != 1 ||
+                             openmoq::publisher::DraftVersion draft,
+                             bool fill_requested,
+                             std::uint64_t request_id,
+                             std::uint8_t forward,
+                             bool largest_reported) {
+    if (draft != openmoq::publisher::DraftVersion::kDraft21 || !fill_requested || forward != 1 ||
         !largest_reported) {
         return;
     }
@@ -1617,13 +1618,13 @@ void open_failed_fill_stream(PublisherTransport& transport,
     TransportStatus status = transport.open_stream(StreamDirection::kUnidirectional, stream_id);
     if (!status.ok) {
         std::cerr << "[moqt-session] warning: could not open fill fetch stream for request_id="
-                  << update.request_id << ": " << status.message << '\n';
+                  << request_id << ": " << status.message << '\n';
         return;
     }
-    status = transport.write_stream(stream_id, encode_fetch_header(draft, update.request_id), false);
+    status = transport.write_stream(stream_id, encode_fetch_header(draft, request_id), false);
     if (!status.ok) {
         std::cerr << "[moqt-session] warning: could not write fill FETCH_HEADER for request_id="
-                  << update.request_id << ": " << status.message << '\n';
+                  << request_id << ": " << status.message << '\n';
     }
     // Stream reset INTERNAL_ERROR (§12.5): the draft has no reset code for an
     // unsupported fill, and 0x3 here would mean SESSION_CLOSED.
@@ -1631,7 +1632,7 @@ void open_failed_fill_stream(PublisherTransport& transport,
     status = transport.reset_stream(stream_id, kResetInternalError);
     if (!status.ok) {
         std::cerr << "[moqt-session] warning: could not reset fill fetch stream for request_id="
-                  << update.request_id << ": " << status.message << '\n';
+                  << request_id << ": " << status.message << '\n';
     }
 }
 
@@ -3444,7 +3445,36 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         const NowFunction& now_function,
                                         std::uint64_t first_request_id = 2);
 
-using PublishedObjectSink = std::function<void(const std::string&, std::uint64_t, std::size_t)>;
+using PublishedObjectSink =
+    std::function<void(const std::string&, std::uint64_t group_id, std::uint64_t object_id, std::size_t)>;
+using LargestSentLookup =
+    std::function<std::optional<std::pair<std::size_t, std::size_t>>(const std::string& track_name)>;
+
+// Draft-21 SUBSCRIBE_OK reports the largest object already sent on the track
+// (§9.20.18). The catalog is left out because its retained copy is re-sent to
+// each new subscriber, which a Next Object filter would then drop.
+std::optional<std::pair<std::size_t, std::size_t>> subscribe_ok_largest(
+    openmoq::publisher::DraftVersion draft,
+    const std::string& track_name,
+    std::optional<std::pair<std::size_t, std::size_t>> largest_sent) {
+    if (draft != openmoq::publisher::DraftVersion::kDraft21 || track_name == "catalog") {
+        return std::nullopt;
+    }
+    return largest_sent;
+}
+
+std::vector<std::uint8_t> encode_subscribe_ok_with_largest(
+    openmoq::publisher::DraftVersion draft,
+    std::uint64_t request_id,
+    std::uint64_t track_alias,
+    const std::optional<std::pair<std::size_t, std::size_t>>& largest) {
+    return encode_subscribe_ok_message(draft,
+                                       request_id,
+                                       track_alias,
+                                       largest ? largest->first : 0,
+                                       largest ? largest->second : 0,
+                                       largest.has_value());
+}
 
 TransportStatus read_request_stream_message(PublisherTransport& transport,
                                             std::uint64_t request_stream_id,
@@ -3714,6 +3744,7 @@ TransportStatus process_draft16_control_request_update(
 
 TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     PublishedObjectSink published_sink,
+                                    const LargestSentLookup& largest_sent,
                                     std::uint64_t control_stream_id,
                                     std::uint64_t namespace_stream_id,
                                     std::uint64_t peer_control_stream_id,
@@ -4069,7 +4100,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             return response_status;
         }
         open_failed_fill_stream(
-            transport, draft, update, forward_after_update, largest_object_for_response.has_value());
+            transport, draft, update.fill_requested, update.request_id, forward_after_update, largest_object_for_response.has_value());
         return TransportStatus::success();
     };
 
@@ -4159,18 +4190,21 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         }
                         continue;
                     }
+                    const auto largest = subscribe_ok_largest(
+                        draft, subscribe.track_name,
+                        largest_sent ? largest_sent(subscribe.track_name) : std::nullopt);
                     const TransportStatus ok_status =
                         transport.write_stream(request_stream_id,
-                                               encode_subscribe_ok_message(draft,
-                                                                           subscribe.request_id,
-                                                                           track_it->second.alias,
-                                                                           0,
-                                                                           0,
-                                                                           false),
+                                               encode_subscribe_ok_with_largest(draft,
+                                                                                subscribe.request_id,
+                                                                                track_it->second.alias,
+                                                                                largest),
                                                false);
                     if (!ok_status.ok) {
                         return ok_status;
                     }
+                    open_failed_fill_stream(transport, draft, subscribe.fill_requested, subscribe.request_id,
+                                            subscribe.forward, largest.has_value());
                     ActiveSubscription active{
                         .subscribe = subscribe,
                         .track = track_it->second,
@@ -5128,6 +5162,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     if (object_published && published_sink) {
                         published_sink(object.track_name,
                                        object.group_id,
+                                       object.object_id,
                                        object_payload_size(source_object));
                     }
                     if (object_published) {
@@ -5302,6 +5337,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     if (object_published && published_sink) {
                         published_sink(object.track_name,
                                        object.group_id,
+                                       object.object_id,
                                        object_payload_size(source_object));
                     }
                     if (object_published) {
@@ -5427,6 +5463,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
 
 TransportStatus forward_published_tracks(PublisherTransport& transport,
                                          PublishedObjectSink published_sink,
+                                         const LargestSentLookup& largest_sent,
                                          std::uint64_t control_stream_id,
                                          std::uint64_t namespace_stream_id,
                                          const openmoq::publisher::PublishPlan& plan,
@@ -5632,6 +5669,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                   << downgraded_tracks_by_name.size() << " track(s) after forward=0 reply" << '\n';
         status = serve_subscriptions(transport,
                                      published_sink,
+                                     largest_sent,
                                      control_stream_id,
                                      namespace_stream_id,
                                      control_stream_id,
@@ -6324,11 +6362,19 @@ MoqtSession::MoqtSession(PublisherTransport& transport,
 void MoqtSession::reset_publish_stats() {
     publish_stats_ = PublishStats{};
     last_group_by_track_.clear();
+    largest_sent_by_track_.clear();
 }
 
 void MoqtSession::record_published_object(const std::string& track_name,
                                           std::uint64_t group_id,
+                                          std::uint64_t object_id,
                                           std::size_t payload_bytes) {
+    const std::pair<std::size_t, std::size_t> sent{static_cast<std::size_t>(group_id),
+                                                   static_cast<std::size_t>(object_id)};
+    auto [largest_it, first_sent] = largest_sent_by_track_.emplace(track_name, sent);
+    if (!first_sent) {
+        largest_it->second = std::max(largest_it->second, sent);
+    }
     publish_stats_.bytes_published += static_cast<std::uint64_t>(payload_bytes);
     publish_stats_.objects_published += 1;
     auto [it, inserted] = last_group_by_track_.emplace(track_name, group_id);
@@ -6336,6 +6382,15 @@ void MoqtSession::record_published_object(const std::string& track_name,
         publish_stats_.groups_published += 1;
         it->second = group_id;
     }
+}
+
+std::optional<std::pair<std::size_t, std::size_t>> MoqtSession::largest_sent_object(
+    const std::string& track_name) const {
+    const auto it = largest_sent_by_track_.find(track_name);
+    if (it == largest_sent_by_track_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 MoqtSession::PublishStats MoqtSession::publish_stats() const {
@@ -6409,7 +6464,7 @@ TransportStatus MoqtSession::send_catalog_objects(
             return status;
         }
         if (object_published) {
-            record_published_object("catalog", object.group_id, object.payload.size());
+            record_published_object("catalog", object.group_id, object.object_id, object.payload.size());
         }
     }
     return TransportStatus::success();
@@ -6550,14 +6605,18 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
         tracks_by_name.emplace(track.name, track);
     }
 
-    auto stats_sink = [this](const std::string& track, std::uint64_t group, std::size_t bytes) {
-        this->record_published_object(track, group, bytes);
+    auto stats_sink = [this](const std::string& track, std::uint64_t group, std::uint64_t object, std::size_t bytes) {
+        this->record_published_object(track, group, object, bytes);
+    };
+    const LargestSentLookup largest_sent = [this](const std::string& track) {
+        return this->largest_sent_object(track);
     };
 
     if (auto_forward_) {
         status = forward_published_tracks(
             transport_,
             stats_sink,
+            largest_sent,
             control_stream_id_,
             namespace_stream_id_,
             plan,
@@ -6608,6 +6667,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
 
             return serve_subscriptions(transport_,
                                        stats_sink,
+                                       largest_sent,
                                        control_stream_id_,
                                        namespace_stream_id_,
                                        peer_control_stream_id_,
@@ -6638,6 +6698,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
 
     return serve_subscriptions(transport_,
                                stats_sink,
+                               largest_sent,
                                control_stream_id_,
                                namespace_stream_id_,
                                peer_control_stream_id_,
@@ -7242,6 +7303,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             last_group_id_by_track[fragment.track_name] = static_cast<std::uint64_t>(fragment.group_id);
             record_published_object(fragment.track_name,
                                     static_cast<std::uint64_t>(fragment.group_id),
+                                    static_cast<std::uint64_t>(fragment.object_id),
                                     fragment.payload.owned_bytes.size());
             if (publish_stats_.objects_published % 100 == 1) {
                 std::cerr << "[moqt-session] published track=" << fragment.track_name
@@ -7320,7 +7382,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             }
             open_failed_fill_stream(transport_,
                                            draft_version,
-                                           update,
+                                           update.fill_requested, update.request_id,
                                            active_it->second.forward,
                                            largest_object_by_track.contains(track_name));
             return TransportStatus::success();
@@ -7447,20 +7509,22 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     }
                     continue;
                 }
+                const auto largest = subscribe_ok_largest(
+                    draft_version, subscribe.track_name, largest_sent_object(subscribe.track_name));
                 const TransportStatus response_status =
                     transport_.write_stream(
                         request_stream_id,
-                        encode_subscribe_ok_message(
+                        encode_subscribe_ok_with_largest(
                             draft_version,
                             subscribe.request_id,
                             track_it->second,
-                            0,
-                            0,
-                            false),
+                            largest),
                         false);
                 if (!response_status.ok) {
                     return {response_status, 0};
                 }
+                open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested, subscribe.request_id,
+                                        subscribe.forward, largest.has_value());
                 active_subscriptions.insert_or_assign(
                     subscribe.request_id, subscribe);
                 active_subscription_stream_ids.insert_or_assign(
@@ -8414,6 +8478,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             last_group_id_by_track[fragment.track_name] = static_cast<std::uint64_t>(fragment.group_id);
             record_published_object(fragment.track_name,
                                     static_cast<std::uint64_t>(fragment.group_id),
+                                    static_cast<std::uint64_t>(fragment.object_id),
                                     fragment.payload.owned_bytes.size());
             std::cerr << "[moqt-session] live: sent track=" << fragment.track_name
                       << " group=" << fragment.group_id
@@ -8589,7 +8654,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             open_failed_fill_stream(transport_,
                                            draft_version,
-                                           update,
+                                           update.fill_requested, update.request_id,
                                            settings_it->second.forward,
                                            largest_object_by_track.contains(track_name));
             return TransportStatus::success();
@@ -8671,7 +8736,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             open_failed_fill_stream(transport_,
                                            draft_version,
-                                           update,
+                                           update.fill_requested, update.request_id,
                                            active_it->second.forward,
                                            largest_object_by_track.contains(track_name));
             return TransportStatus::success();
@@ -8789,18 +8854,20 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         continue;
                     }
 
+                    const auto largest = subscribe_ok_largest(
+                        draft_version, subscribe.track_name, largest_sent_object(subscribe.track_name));
                     TransportStatus write_status =
                         transport_.write_stream(request_stream_id,
-                                                encode_subscribe_ok_message(draft_version,
-                                                                            subscribe.request_id,
-                                                                            track_it->second,
-                                                                            0,
-                                                                            0,
-                                                                            false),
+                                                encode_subscribe_ok_with_largest(draft_version,
+                                                                                 subscribe.request_id,
+                                                                                 track_it->second,
+                                                                                 largest),
                                                 false);
                     if (!write_status.ok) {
                         return {write_status, 0};
                     }
+                    open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested,
+                                            subscribe.request_id, subscribe.forward, largest.has_value());
                     active_subscriptions.emplace(subscribe.request_id, subscribe);
                     active_subscription_stream_ids.insert_or_assign(subscribe.request_id, request_stream_id);
                     pending_subscription_request_bytes.insert_or_assign(
@@ -9715,18 +9782,20 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                            false);
         }
 
+        const auto largest = subscribe_ok_largest(
+            draft_version, subscribe.track_name, largest_sent_object(subscribe.track_name));
         TransportStatus write_status =
             transport_.write_stream(response_stream_id,
-                                    encode_subscribe_ok_message(draft_version,
-                                                                subscribe.request_id,
-                                                                track_it->second,
-                                                                0,
-                                                                0,
-                                                                false),
+                                    encode_subscribe_ok_with_largest(draft_version,
+                                                                     subscribe.request_id,
+                                                                     track_it->second,
+                                                                     largest),
                                     false);
         if (!write_status.ok) {
             return write_status;
         }
+        open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested, subscribe.request_id,
+                                subscribe.forward, largest.has_value());
         active_subscriptions.emplace(subscribe.request_id, subscribe);
         active_subscription_stream_ids.insert_or_assign(subscribe.request_id, response_stream_id);
         if (subscription_forwards_objects(
@@ -9798,7 +9867,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             open_failed_fill_stream(transport_,
                                            draft_version,
-                                           update,
+                                           update.fill_requested, update.request_id,
                                            active_it->second.forward,
                                            largest_object_by_track.contains(track_name));
             return TransportStatus::success();
@@ -9865,7 +9934,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 }
                 open_failed_fill_stream(transport_,
                                                draft_version,
-                                               update,
+                                               update.fill_requested, update.request_id,
                                                settings_it->second.forward,
                                                largest_object_by_track.contains(track_name));
                 return TransportStatus::success();
@@ -10196,8 +10265,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return send_status;
         }
         if (object_published) {
-            record_published_object(
-                "catalog", static_cast<std::uint64_t>(catalog.group_id), catalog.payload.size());
+            record_published_object("catalog",
+                                    static_cast<std::uint64_t>(catalog.group_id),
+                                    static_cast<std::uint64_t>(catalog.object_id),
+                                    catalog.payload.size());
         }
         live_object_catalog_sent = true;
         served_catalog_subscription_count = subscription_count;
@@ -10482,6 +10553,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
         record_published_object(next->track_name,
                                 static_cast<std::uint64_t>(next->group_id),
+                                static_cast<std::uint64_t>(next->object_id),
                                 next->payload.size());
         last_group_id_by_track[next->track_name] = static_cast<std::uint64_t>(next->group_id);
         if (stop_requested_.load(std::memory_order_acquire)) {

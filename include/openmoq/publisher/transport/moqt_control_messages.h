@@ -117,6 +117,8 @@ struct SubscribeMessage {
     // Draft-21 LOCATION_FILTER may bound the end group at an inclusive object.
     std::optional<std::size_t> end_object_id;
     DeliveryTimeouts delivery_timeouts;
+    // Draft-21 FILL_PARAMETERS presence.
+    bool fill_requested = false;
 };
 
 // The optional values carried by REQUEST_UPDATE are deliberately distinct

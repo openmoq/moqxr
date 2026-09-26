@@ -672,7 +672,8 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::size_t start_object_id = 0,
                                                    std::uint64_t filter_type_value = 0x03,
                                                    std::size_t end_group_id = 0,
-                                                   std::optional<std::size_t> end_object_id = std::nullopt) {
+                                                   std::optional<std::size_t> end_object_id = std::nullopt,
+                                                   bool fill_parameters = false) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     if (draft == DraftVersion::kDraft17) {
         append_bytes(payload, encode_moqint(draft, 0));
@@ -711,8 +712,8 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         const std::uint64_t timeout_parameter_count =
             (delivery_timeout_ms != 0 ? 1 : 0) +
             (draft18_family(draft) && subgroup_delivery_timeout_ms != 0 ? 1 : 0);
-        const std::vector<std::uint8_t> parameter_count =
-            encode_moqint(draft, 3 + timeout_parameter_count + (group_order != 0 ? 1 : 0));
+        const std::vector<std::uint8_t> parameter_count = encode_moqint(
+            draft, 3 + timeout_parameter_count + (group_order != 0 ? 1 : 0) + (fill_parameters ? 1 : 0));
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
         std::uint64_t previous_type = 0;
         if (delivery_timeout_ms != 0) {
@@ -777,6 +778,10 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                              : encode_moqint(draft, group_order);
             payload.insert(payload.end(), group_order_delta.begin(), group_order_delta.end());
             payload.insert(payload.end(), group_order_value.begin(), group_order_value.end());
+        }
+        if (fill_parameters) {  // FILL_PARAMETERS (0x23), empty override block
+            append_bytes(payload, encode_moqint(draft, 0x23 - (group_order != 0 ? 0x22 : 0x21)));
+            append_bytes(payload, encode_moqint(draft, 0));
         }
     }
 
@@ -8350,6 +8355,149 @@ int main() {
         } else {
             ok &= expect(!fill_stream.has_value(), "expected FILL_PARAMETERS with Forward=0 to open no fill fetch stream");
         }
+    }
+
+    for (const DraftVersion draft : {DraftVersion::kDraft21, DraftVersion::kDraft18}) {
+        for (const bool live : {true, false}) {
+            // Draft-21 SUBSCRIBE_OK reports the largest object already sent on
+            // the track (§9.20.18); a later SUBSCRIBE with FILL_PARAMETERS then
+            // gets a fill fetch stream that is opened and reset. Draft-18 keeps
+            // omitting LARGEST_OBJECT.
+            const bool draft21 = draft == DraftVersion::kDraft21;
+            MockTransport transport;
+            transport.keep_open_streams.insert(1);
+            transport.keep_open_streams.insert(5);
+            transport.reads[3].push_back(encode_draft18_setup_response());
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[1].push_back(encode_subscribe_message(
+                91, kTestTrackNamespace, "events", 1, draft, 0, 0, 100, 1, 0, 0, 0x04, 4));
+            bool second_queued = false;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                    if (!second_queued) {
+                        current.reads[5].push_back(encode_subscribe_message(
+                            95, kTestTrackNamespace, "events", 1, draft, 0, 0, 100, 1, 0, 0, 0x04, 4,
+                            std::nullopt, draft21));
+                        second_queued = true;
+                    }
+                    return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+                };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected SUBSCRIBE_OK largest session connect to succeed");
+            if (live) {
+                std::size_t object_index = 0;
+                LiveObjectSource source{
+                    .tracks = {LiveTrack{.track_name = "events"}},
+                    .next_object = [&]() -> std::optional<LiveObject> {
+                        const std::size_t index = object_index++;
+                        if (index > 1) {
+                            return std::nullopt;
+                        }
+                        return LiveObject{.track_name = "events", .group_id = 3, .subgroup_id = 0,
+                                          .object_id = 7 + index, .payload = {static_cast<std::uint8_t>('X' + index)},
+                                          .subgroup_contains_group_largest = index == 1,
+                                          .final_in_subgroup = index == 1};
+                    },
+                };
+                status = session.publish_live_objects(source, draft);
+            } else {
+                PublishPlan plan = make_scheduling_plan({
+                    {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'X'},
+                    {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 8, .marker = 'Y'},
+                });
+                plan.draft = openmoq::publisher::draft_profile(draft);
+                status = session.publish(plan);
+            }
+            const std::string label = openmoq::publisher::to_string(draft) + (live ? " live" : " VOD");
+            ok &= expect(status.ok, "expected " + label + " SUBSCRIBE_OK largest publish to succeed: " + status.message);
+            std::optional<std::vector<std::uint8_t>> first_ok;
+            std::optional<std::vector<std::uint8_t>> second_ok;
+            for (const auto& write : transport.writes) {
+                if (message_type(write.bytes) == 0x04) {
+                    (write.stream_id == 1 ? first_ok : second_ok) = write.bytes;
+                }
+            }
+            bool first_without_largest = false;
+            bool second_matches = false;
+            for (std::uint64_t alias = 0; alias < 8; ++alias) {
+                using openmoq::publisher::transport::encode_subscribe_ok_message;
+                first_without_largest = first_without_largest ||
+                    first_ok == encode_subscribe_ok_message(draft, 91, alias, 0, 0, false);
+                second_matches = second_matches ||
+                    second_ok == encode_subscribe_ok_message(draft, 95, alias, 3, 7, draft21);
+            }
+            ok &= expect(first_without_largest, "expected " + label + " SUBSCRIBE_OK before any object to omit LARGEST_OBJECT");
+            ok &= expect(second_queued && second_matches,
+                         "expected " + label + " SUBSCRIBE_OK after an object was sent to " +
+                             (draft21 ? "report LARGEST_OBJECT {3,7}" : "keep omitting LARGEST_OBJECT"));
+            std::optional<std::uint64_t> fill_stream;
+            for (const auto& write : transport.writes) {
+                if (write.bytes == std::vector<std::uint8_t>{0x05, 95}) {
+                    fill_stream = write.stream_id;
+                }
+            }
+            if (draft21) {
+                ok &= expect(fill_stream.has_value() &&
+                                 std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                           std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x00}) !=
+                                     transport.reset_calls.end(),
+                             "expected " + label + " SUBSCRIBE with FILL_PARAMETERS to open and reset a fill fetch stream");
+            }
+        }
+    }
+
+    {
+        // The retained catalog is re-sent to each new subscriber, so a draft-21
+        // catalog SUBSCRIBE_OK omits LARGEST_OBJECT even after the catalog was
+        // sent; otherwise a Next Object filter would drop that re-send.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.keep_open_streams.insert(5);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "catalog", 1, draft));
+        bool second_queued = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                if (!second_queued) {
+                    current.reads[5].push_back(encode_subscribe_message(95, kTestTrackNamespace, "catalog", 1, draft));
+                    second_queued = true;
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .subgroup_id = 0, .object_id = 0, .payload = {'{', '}'}},
+            LiveObject{.track_name = "video0_vide_1", .group_id = 1, .subgroup_id = 0, .object_id = 0, .payload = {'M'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video0_vide_1"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, true, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 catalog SUBSCRIBE_OK connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        std::optional<std::vector<std::uint8_t>> second_ok;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 5 && message_type(write.bytes) == 0x04) {
+                second_ok = write.bytes;
+            }
+        }
+        bool without_largest = false;
+        for (std::uint64_t alias = 0; alias < 8; ++alias) {
+            without_largest = without_largest ||
+                second_ok == openmoq::publisher::transport::encode_subscribe_ok_message(draft, 95, alias, 0, 0, false);
+        }
+        ok &= expect(second_queued && second_ok.has_value() && without_largest,
+                     "expected a draft-21 catalog SUBSCRIBE_OK to omit LARGEST_OBJECT after the catalog was sent");
     }
 
     {
