@@ -4361,6 +4361,52 @@ int main() {
     }
 
     {
+        // VOD ack site: an end-extending REQUEST_UPDATE reports LARGEST_OBJECT,
+        // so FILL_PARAMETERS on it must open, then reset, a fill fetch stream.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 20, 1, 0, 0, 0x04, 1);
+        std::vector<std::uint8_t> update_payload = encode_moqint(draft, 93);
+        append_bytes(update_payload, encode_moqint(draft, 2));
+        append_bytes(update_payload, encode_moqint(draft, 0x21));  // LOCATION_FILTER {0,0,4}
+        const std::vector<std::uint8_t> filter =
+            encode_draft18_family_filter_value(draft, 0x04, 0, 0, 4);
+        append_bytes(update_payload, encode_moqint(draft, filter.size()));
+        append_bytes(update_payload, filter);
+        append_bytes(update_payload, encode_moqint(draft, 0x23 - 0x21));  // FILL_PARAMETERS
+        append_bytes(update_payload, encode_moqint(draft, 0));
+        append_bytes(coalesced, encode_moqint(draft, 0x02));
+        append_be16(coalesced, static_cast<std::uint16_t>(update_payload.size()));
+        append_bytes(coalesced, update_payload);
+        transport.reads[1].push_back(std::move(coalesced));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'E'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(draft);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 VOD fill connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected draft-21 VOD fill publish to succeed: " + status.message);
+        std::optional<std::uint64_t> fill_stream;
+        for (const auto& write : transport.writes) {
+            if (write.bytes == std::vector<std::uint8_t>{0x05, 93}) {
+                fill_stream = write.stream_id;
+            }
+        }
+        ok &= expect(fill_stream.has_value() &&
+                         std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                   std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x00}) !=
+                             transport.reset_calls.end(),
+                     "expected the draft-21 VOD end-extension ack to open and reset a fill fetch stream");
+    }
+
+    {
         MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
