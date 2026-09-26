@@ -17,7 +17,25 @@ implementation.
 Full compliance with the draft-21 wire format and session semantics is in
 scope, covering every change listed below relative to draft-18 (the last
 implemented draft), per the spec's own cumulative changelog (Appendix A,
-since-18/-19/-20).
+since-18/-19/-20) — **scoped to the message types this publisher actually
+originates or must parse**. This is a publisher-only implementation: GOAWAY
+and the FETCH family (FETCH, FETCH_CANCEL, FETCH_OK, FETCH_ERROR) have no
+structs or field-level encode/decode today, only opaque uint16-length-frame
+byte-skipping in `next_control_message` (`src/transport/moqt_control_messages.cpp`).
+There is likewise no `PUBLISH` struct — what this codebase calls
+`PublishOk`/`PublishError`/`encode_publish_done_message` corresponds to
+MOQT's SUBSCRIBE_OK-family (the publisher responding to an incoming
+subscription), not an outbound PUBLISH message the publisher sends. Full
+compliance for this work means: (a) for FETCH/GOAWAY, verifying the uint16
+frame-length rule still matches the draft-21 wire layout for these types
+and leaving them as opaque skip-only frames — no new structs, no field
+decode; (b) for message types the publisher does originate or parse
+(SETUP, SUBSCRIBE_TRACKS, PUBLISH_OK/PUBLISH_ERROR/PUBLISH_DONE,
+REQUEST_UPDATE), implementing every draft-21 field/semantic change in full;
+(c) PUBLISH_STATE_NOTIFY and the PUBLISH_BLOCKED→PUBLISH_SKIPPED rename are
+implemented only if session logic must dispatch on them (i.e. the publisher
+receives them), not as an outbound message the publisher constructs from
+scratch with no caller.
 
 ## Normative Requirements
 
@@ -32,28 +50,38 @@ authoritative. Relevant changes since draft-18:
   `TOO_MANY_REQUEST_UPDATES`.
 - `VERSION_NEGOTIATION_FAILED` session error is removed for this draft.
 
-**Control messages**
-- FETCH: the "Joining FETCH" variant is removed. Fetch is restructured
-  around fill streams; range is now carried in a new `LOCATION_FILTER`
-  parameter instead of message fields, plus a new `FILL_PARAMETERS`
-  parameter.
+**Control messages — in scope (publisher originates or parses these today)**
 - SUBSCRIBE_TRACKS: gains Range Filters; gains `GROUP_ORDER` (moved here
   from PUBLISH_OK); multiple concurrent subscriptions per track are now
   permitted.
-- PUBLISH: may carry Subscription Parameters; no longer copies
-  `AUTHORIZATION_TOKEN` from SUBSCRIBE_TRACKS.
 - PUBLISH_OK: loses `GROUP_ORDER` (moved to SUBSCRIBE_TRACKS) and
   subscription parameters (moved to REQUEST_UPDATE).
-- PUBLISH_BLOCKED is renamed `PUBLISH_SKIPPED` (message identifier and
-  semantics change).
 - PUBLISH_DONE: removes the `SUBSCRIPTION_ENDED` status code; max Stream
   Count becomes 2^64-1.
 - REQUEST_UPDATE: gains subscription parameters (moved from PUBLISH_OK); an
   unexpected REQUEST_UPDATE is now a session-terminating error.
-- GOAWAY: Request ID field is removed.
-- PUBLISH_STATE_NOTIFY: new message type, no draft-18 analog.
-- Editorial: message "Payload" field is renamed "Message Body" — cosmetic,
-  no wire impact.
+
+**Control messages — out of scope for field-level decode, framing-only**
+- GOAWAY: Request ID field is removed in draft-21. The codebase has never
+  decoded GOAWAY fields (only skips its uint16-length payload), so this
+  change requires no code change beyond confirming the frame-length rule
+  in `next_control_message` still applies to draft-21's GOAWAY layout.
+- FETCH family (FETCH, FETCH_CANCEL, FETCH_OK, FETCH_ERROR): "Joining
+  FETCH" removal, fill streams, `LOCATION_FILTER`, and `FILL_PARAMETERS`
+  are all field-level FETCH changes. Since this publisher has never
+  decoded FETCH fields (framing-only today), these remain framing-only
+  under draft-21 — no new structs or encode/decode functions.
+- PUBLISH (an inbound message from a subscriber-turned-publisher, not one
+  this publisher sends): Subscription Parameters and dropped
+  `AUTHORIZATION_TOKEN` copy-through are out of scope unless session
+  logic is found to require dispatching on this message type for
+  draft-21 (verify during Task decomposition in the implementation plan).
+- PUBLISH_BLOCKED→PUBLISH_SKIPPED rename and PUBLISH_STATE_NOTIFY: added
+  only if session dispatch logic must recognize these types under
+  draft-21 (i.e. the publisher receives them from a peer); not
+  constructed as new outbound messages with no existing caller.
+- Editorial: message "Payload" field renamed "Message Body" — cosmetic,
+  no wire impact, no code change.
 
 **Data plane**
 - OBJECT_DATAGRAM / SUBGROUP_HEADER type flags are formally bitfields; an
@@ -73,12 +101,15 @@ unrelated refactor of working code, risking drafts 16/18 regressions for no
 requirement of this task), and a fully separate draft-21 code path with no
 shared logic (needless duplication, since most fields are unchanged).
 
-Within the existing pattern, messages that changed structurally (FETCH,
-PUBLISH, PUBLISH_OK, PUBLISH_DONE, REQUEST_UPDATE, GOAWAY, and the new
-PUBLISH_STATE_NOTIFY) get dedicated encode/decode helper functions selected
-by draft, rather than deeper `if` nesting inside the existing large
-functions. Messages with only additive/no changes keep their current
-single-function-with-branch shape.
+Within the existing pattern, `kDraft21` branches are added directly inside
+the existing `encode_*`/`decode_*` functions for the in-scope messages
+(`PublishOk`, `PublishError`, `encode_publish_done_message`,
+`RequestUpdateMessage`, `SubscribeTracksMessage`, `SetupMessage`/
+`ServerSetupMessage`), matching how `kDraft18` branches were added
+alongside `kDraft14`/`kDraft16` in the same functions — no new files, no
+new abstraction layer. FETCH/GOAWAY/PUBLISH stay untouched beyond
+confirming their frame-length byte-skipping still matches draft-21 (see
+Scope); no encode/decode functions are added for them.
 
 ## Components
 
@@ -88,19 +119,39 @@ single-function-with-branch shape.
   `to_string()`, `default_alpn()` (→ `"moqt-21"`).
 - `include/openmoq/publisher/transport/moqt_control_messages.h` /
   `src/transport/moqt_control_messages.cpp`:
-  - add `kDraft21Version` wire constant and `draft_version_number()` case;
-  - add `kDraft21` branches to `encode_client_setup_message`,
-    `decode_server_setup_message` for `MAX_REQUEST_UPDATES` and the removal
-    of `VERSION_NEGOTIATION_FAILED`;
-  - new encode/decode functions for FETCH (fill streams, `LOCATION_FILTER`,
-    `FILL_PARAMETERS`), PUBLISH, PUBLISH_OK, PUBLISH_DONE, REQUEST_UPDATE,
-    GOAWAY (drop Request ID), and PUBLISH_SKIPPED (renamed from
-    PUBLISH_BLOCKED);
-  - new PUBLISH_STATE_NOTIFY message struct plus encode/decode functions.
+  - add `kDraft21Version` wire constant (`kDraft21Version = 0xff000015ULL`,
+    following the `0xff0000XX` pattern, though draft-21 negotiates via ALPN
+    like draft-18 — the constant exists for symmetry/logging, not in-band
+    SETUP negotiation) and a `kDraft21` case in `draft_version_number()`;
+  - extend `uses_moq_vi64()` to return true for `kDraft21` (draft-21 keeps
+    the vi64 integer encoding introduced in draft-17/18);
+  - add `MAX_REQUEST_UPDATES` SETUP option handling in `encode_setup_message`
+    / `decode_server_setup_message` / `encode_server_setup_message`, and
+    stop emitting `VERSION_NEGOTIATION_FAILED` under `kDraft21`;
+  - add `kDraft21` branches inside `decode_publish_ok`, `decode_publish_error`,
+    `encode_publish_done_message` (drop `SUBSCRIPTION_ENDED` status code,
+    widen max Stream Count), `decode_subscribe_tracks_message` (Range
+    Filters, `GROUP_ORDER` parameter), and `decode_request_update_message`
+    (subscription-parameter fields moved from `PublishOk`);
+  - move `group_order` out of `PublishOk` and subscription-filter/parameter
+    fields into `RequestUpdateMessage` for `kDraft21` only — both structs
+    gain fields conditionally meaningful per-draft (existing drafts keep
+    their current field usage; add a code comment explaining the
+    per-draft field-ownership split, following the existing comment style
+    on `RequestUpdateMessage` at moqt_control_messages.h:117-119);
+  - confirm (add a regression test, not new code) that `next_control_message`
+    still correctly frames GOAWAY/FETCH/FETCH_CANCEL/FETCH_OK/FETCH_ERROR
+    as opaque uint16-length payloads under `kDraft21`.
 - `src/transport/moqt_session.cpp`: `kDraft21` arms wherever session logic
   branches on draft (request handling, scheduling, timeout classification,
   message dispatch), plus the new session-terminating error path for a
-  stray REQUEST_UPDATE and the new PUBLISH_STATE_NOTIFY dispatch case.
+  stray REQUEST_UPDATE. PUBLISH_BLOCKED/PUBLISH_SKIPPED and
+  PUBLISH_STATE_NOTIFY are not currently referenced anywhere in this file
+  (confirmed: no `PUBLISH_BLOCKED` hits, and no message-type constant for
+  either exists in `moqt_control_messages.cpp`) — treat both the same as
+  FETCH/GOAWAY (framing-only, no new dispatch case) unless a task
+  discovers the publisher must actually recognize one of them for
+  draft-21 session correctness.
 - `src/cli_options.cpp`: `parse_draft()` accepts `"21"`; default remains
   `kDraft16`; drafts 14/17/19/20 remain unselectable as today.
 - `src/publisher_api.cpp`, `src/transport/libmoq_publisher.cpp`: add
@@ -132,17 +183,28 @@ selecting one) exists today and none is added by this work.
 
 ## Testing
 
-Mirror the three test files touched by the draft-18 addition:
+Both test files use a hand-rolled `expect()`-accumulation harness, not
+gtest (`tests/moqt_control_messages_test.cpp` has no `TEST(...)` macros;
+existing coverage lives in functions like
+`test_peer_control_message_decoders_for_all_drafts()` that loop
+`for (DraftVersion draft : {kDraft14, kDraft16, kDraft18, ...})`). New
+draft-21 coverage extends these loops and functions rather than adding
+gtest fixtures.
 
 - `tests/cli_options_test.cpp`: accept/reject matrix including `"21"`.
-- `tests/moqt_control_messages_test.cpp`: encode/decode round-trip coverage
-  for every changed or new message (FETCH fill streams, PUBLISH,
-  PUBLISH_OK, PUBLISH_DONE, REQUEST_UPDATE, GOAWAY, PUBLISH_SKIPPED,
-  PUBLISH_STATE_NOTIFY), plus SETUP with `MAX_REQUEST_UPDATES`.
-- `tests/moqt_session_test.cpp`: fill-stream FETCH flow, REQUEST_UPDATE
-  parameter relocation, GOAWAY without Request ID, session error on a
-  stray REQUEST_UPDATE, PUBLISH_STATE_NOTIFY dispatch, and the
-  `PROTOCOL_VIOLATION` on an unspecified type-flag bit.
+- `tests/moqt_control_messages_test.cpp`: add `kDraft21` to the existing
+  draft-iteration lists and extend the existing round-trip assertions for
+  `PublishOk`/`PublishError`/`encode_publish_done_message` (dropped
+  `SUBSCRIPTION_ENDED`, widened Stream Count), `SubscribeTracksMessage`
+  (Range Filters, `GROUP_ORDER`), `RequestUpdateMessage` (relocated
+  subscription-parameter fields), and SETUP (`MAX_REQUEST_UPDATES`
+  option). Add one test confirming `next_control_message` still frames
+  GOAWAY/FETCH*/PUBLISH as opaque uint16-length payloads under
+  `kDraft21` (no new struct needed — this pins the "stays framing-only"
+  decision so a future change can't silently break it).
+- `tests/moqt_session_test.cpp`: REQUEST_UPDATE parameter relocation,
+  session error on a stray REQUEST_UPDATE, and the `PROTOCOL_VIOLATION`
+  on an unspecified OBJECT_DATAGRAM/SUBGROUP_HEADER type-flag bit.
 
 Existing draft-14/16/18 tests must continue to pass unmodified except where
 a shared helper's signature gains the new draft as an argument (matching
