@@ -127,6 +127,9 @@ struct RequestUpdateMessage {
     std::optional<SubscriptionFilter> subscription_filter;
     std::optional<std::uint64_t> new_group_request;
     bool has_authorization_token = false;
+    // Draft-21 FILL_PARAMETERS presence; its overriding parameters are unused
+    // because this publisher can only report fill failure.
+    bool fill_requested = false;
 };
 
 // Archived positional update model retained only for pre-draft-16 session
@@ -163,6 +166,7 @@ struct PublishError {
 };
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
+std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 
 // Message-parameter ids shared by the SUBSCRIBE-family decoders. draft-17 and

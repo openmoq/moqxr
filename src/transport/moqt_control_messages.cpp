@@ -508,6 +508,8 @@ bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
 }
 
 constexpr std::uint64_t kParamIncludeProperties = 0x35;
+constexpr std::uint64_t kParamFillParameters = 0x23;
+constexpr std::uint64_t kFetchHeaderType = 0x05;
 
 // Draft-21 INCLUDE_PROPERTIES is an odd-typed uint8, an exception to the
 // odd-means-length-prefixed rule. This publisher never sends Track Properties,
@@ -517,6 +519,13 @@ bool decode_include_properties(std::span<const std::uint8_t> bytes, std::size_t&
         return false;
     }
     return bytes[offset++] <= 1;
+}
+
+std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id) {
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, kFetchHeaderType);
+    append_moqint(bytes, draft, request_id);
+    return bytes;
 }
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value) {
@@ -1408,6 +1417,13 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         switch (parameter_type) {
             case 0x03:  // AUTHORIZATION_TOKEN — defined in SUBSCRIBE, opaque to this publisher.
                 break;
+            case kParamFillParameters:
+                // SUBSCRIBE_OK never reports a Largest Object, so the fill range
+                // is empty and no fill fetch stream opens (§3.4).
+                if (draft != DraftVersion::kDraft21) {
+                    return false;
+                }
+                break;
             case 0x21: {  // SUBSCRIPTION_FILTER
                 std::size_t filter_offset = offset;
                 const std::size_t filter_end = offset + static_cast<std::size_t>(parameter_length);
@@ -1635,6 +1651,12 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                 if (is_draft18_or_later(draft)) {
                     return fail(RequestUpdateDecodeError::kSemantic);
                 }
+                break;
+            case kParamFillParameters:
+                if (draft != DraftVersion::kDraft21 || message.fill_requested) {
+                    return fail(RequestUpdateDecodeError::kSemantic);
+                }
+                message.fill_requested = true;
                 break;
             case 0x21: {
                 if (message.subscription_filter.has_value()) {

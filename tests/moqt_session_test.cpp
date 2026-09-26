@@ -8099,6 +8099,69 @@ int main() {
                      "expected a post-publication priority REQUEST_OK to carry the current largest known object in the draft-specific shape");
     }
 
+    for (const std::uint8_t forward : {std::uint8_t{1}, std::uint8_t{0}}) {
+        // Draft-21 §3.4.1: FILL_PARAMETERS on a REQUEST_UPDATE while Forward is 1
+        // and Largest Object is known must open a fill fetch stream; with no
+        // fetchable history the publisher signals failure by resetting it right
+        // after the FETCH_HEADER. Forward=0 opens nothing.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", forward, draft,
+            0, 0, 100, 1, 0, 0, 0x04, 4));
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                current.reads[1].push_back(encode_request_update_message(draft, 93, 0, 0x23));
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        bool update_queued_without_writes = false;
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index++ != 0) {
+                    if (forward == 0 && !update_queued_without_writes) {
+                        transport.reads[1].push_back(encode_request_update_message(draft, 93, 0, 0x23));
+                        update_queued_without_writes = true;
+                    }
+                    return std::nullopt;
+                }
+                return LiveObject{
+                    .track_name = "events",
+                    .group_id = 3,
+                    .subgroup_id = 0,
+                    .object_id = 7,
+                    .payload = {'X'},
+                    .subgroup_contains_group_largest = true,
+                    .final_in_subgroup = true,
+                };
+            },
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 fill session connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        const std::vector<std::uint8_t> fetch_header{0x05, 93};
+        std::optional<std::uint64_t> fill_stream;
+        for (const auto& write : transport.writes) {
+            if (write.bytes == fetch_header) {
+                fill_stream = write.stream_id;
+            }
+        }
+        if (forward == 1) {
+            ok &= expect(status.ok, "expected draft-21 fill publish to succeed: " + status.message);
+            ok &= expect(fill_stream.has_value() &&
+                             std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                       std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x03}) !=
+                                 transport.reset_calls.end(),
+                         "expected draft-21 FILL_PARAMETERS to open a fill fetch stream and reset it with NOT_SUPPORTED");
+        } else {
+            ok &= expect(!fill_stream.has_value(), "expected FILL_PARAMETERS with Forward=0 to open no fill fetch stream");
+        }
+    }
+
     for (const bool coalesced : {false, true}) {
         MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());

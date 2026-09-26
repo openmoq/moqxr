@@ -1778,10 +1778,53 @@ bool test_draft21_include_properties() {
     return ok;
 }
 
+std::vector<std::uint8_t> build_fill_parameters_message(DraftVersion draft, std::uint64_t message_type) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 11);
+    if (message_type == 0x03) {
+        append_track_namespace(payload, draft, {"live"});
+        append_string(payload, draft, "video");
+    }
+    append_moqint(payload, draft, 1);     // one parameter
+    append_moqint(payload, draft, 0x23);  // FILL_PARAMETERS, length-prefixed
+    append_moqint(payload, draft, 0);     // no overriding fill parameters
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, message_type);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_fill_parameters() {
+    bool ok = true;
+    SubscribeMessage subscribe;
+    ok &= expect(decode_subscribe_message(build_fill_parameters_message(DraftVersion::kDraft21, 0x03),
+                                          DraftVersion::kDraft21, subscribe),
+                 "draft-21 SUBSCRIBE accepts FILL_PARAMETERS");
+    ok &= expect(!decode_subscribe_message(build_fill_parameters_message(DraftVersion::kDraft18, 0x03),
+                                           DraftVersion::kDraft18, subscribe),
+                 "draft-18 SUBSCRIBE still rejects the undefined 0x23 parameter");
+    RequestUpdateMessage update;
+    ok &= expect(decode_request_update_message(build_fill_parameters_message(DraftVersion::kDraft21, 0x02),
+                                               DraftVersion::kDraft21, update) &&
+                     update.request_id == 11 && update.fill_requested,
+                 "draft-21 REQUEST_UPDATE records a FILL_PARAMETERS request");
+    RequestUpdateMessage draft18_update;
+    ok &= expect(!decode_request_update_message(build_fill_parameters_message(DraftVersion::kDraft18, 0x02),
+                                                DraftVersion::kDraft18, draft18_update),
+                 "draft-18 REQUEST_UPDATE still rejects the undefined 0x23 parameter");
+    ok &= expect(openmoq::publisher::transport::encode_fetch_header(DraftVersion::kDraft21, 93) ==
+                     std::vector<std::uint8_t>{0x05, 93},
+                 "draft-21 FETCH_HEADER is type 0x05 followed by the Request ID");
+    return ok;
+}
+
 int main() {
     bool ok = true;
     ok &= test_draft21_location_filter();
     ok &= test_draft21_include_properties();
+    ok &= test_draft21_fill_parameters();
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
     ok &= test_draft21_identity();

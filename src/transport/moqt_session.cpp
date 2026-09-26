@@ -1598,6 +1598,32 @@ std::vector<std::uint8_t> encode_live_request_ok_message(
                                      largest_it->second.second);
 }
 
+// Draft-21 §3.4.1: FILL_PARAMETERS on a REQUEST_UPDATE while Forward is 1 and
+// the REQUEST_OK reported a Largest Object opens a fill fetch stream. Holding no
+// fetchable history, the publisher reports fill failure the only way the draft
+// allows: FETCH_HEADER, then an immediate reset.
+TransportStatus open_failed_fill_stream(PublisherTransport& transport,
+                                        openmoq::publisher::DraftVersion draft,
+                                        const RequestUpdateMessage& update,
+                                        std::uint8_t forward,
+                                        bool largest_reported) {
+    if (draft != openmoq::publisher::DraftVersion::kDraft21 || !update.fill_requested || forward != 1 ||
+        !largest_reported) {
+        return TransportStatus::success();
+    }
+    std::uint64_t stream_id = 0;
+    TransportStatus status = transport.open_stream(StreamDirection::kUnidirectional, stream_id);
+    if (!status.ok) {
+        return status;
+    }
+    status = transport.write_stream(stream_id, encode_fetch_header(draft, update.request_id), false);
+    if (!status.ok) {
+        return status;
+    }
+    constexpr std::uint64_t kResetNotSupported = 0x03;
+    return transport.reset_stream(stream_id, kResetNotSupported);
+}
+
 bool live_object_matches_request_union(
     const openmoq::publisher::CmsfObject& object,
     openmoq::publisher::DraftVersion draft,
@@ -3940,14 +3966,17 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             }
         }
 
+        std::uint8_t forward_after_update = 0;
         auto pending_it = pending_subscriptions.find(existing_request_id);
         if (pending_it != pending_subscriptions.end()) {
             apply_request_update(pending_it->second, update);
             note_delivery_timeouts(transport, pending_it->second.delivery_timeouts);
+            forward_after_update = pending_it->second.forward;
         } else {
             auto active_it = active_subscriptions.find(existing_request_id);
             if (active_it != active_subscriptions.end()) {
                 apply_update_to_active(active_it->second, update);
+                forward_after_update = active_it->second.subscribe.forward;
                 enqueue_active_candidate(existing_request_id,
                                          active_it->second);
             } else if (dormant_published_tracks != nullptr) {
@@ -3980,6 +4009,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         dormant_it->second.subscribe.forward == 0,
                 };
                 apply_update_to_active(active, update);
+                forward_after_update = active.subscribe.forward;
                 if (!active.completed) {
                     active_subscriptions.insert_or_assign(
                         existing_request_id, std::move(active));
@@ -4002,7 +4032,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                       largest_object_for_response->first,
                       largest_object_for_response->second)
                 : encode_request_ok_message(draft, update.request_id);
-        return transport.write_stream(response_stream_id, response, false);
+        const TransportStatus response_status = transport.write_stream(response_stream_id, response, false);
+        if (!response_status.ok) {
+            return response_status;
+        }
+        return open_failed_fill_stream(
+            transport, draft, update, forward_after_update, largest_object_for_response.has_value());
     };
 
     while (true) {
@@ -7232,8 +7267,16 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                                update.request_id,
                                                track_name,
                                                largest_object_by_track);
-            return transport_.write_stream(
+            const TransportStatus response_status = transport_.write_stream(
                 response_stream_id, response, false);
+            if (!response_status.ok) {
+                return response_status;
+            }
+            return open_failed_fill_stream(transport_,
+                                           draft_version,
+                                           update,
+                                           active_it->second.forward,
+                                           largest_object_by_track.contains(track_name));
         };
 
     process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
@@ -8492,8 +8535,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                update.request_id,
                                                track_name,
                                                largest_object_by_track);
-            return transport_.write_stream(
+            const TransportStatus response_status = transport_.write_stream(
                 response_stream_id, response, false);
+            if (!response_status.ok) {
+                return response_status;
+            }
+            return open_failed_fill_stream(transport_,
+                                           draft_version,
+                                           update,
+                                           settings_it->second.forward,
+                                           largest_object_by_track.contains(track_name));
         };
 
     const auto apply_subscriber_request_update =
@@ -8565,8 +8616,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                update.request_id,
                                                track_name,
                                                largest_object_by_track);
-            return transport_.write_stream(
+            const TransportStatus response_status = transport_.write_stream(
                 response_stream_id, response, false);
+            if (!response_status.ok) {
+                return response_status;
+            }
+            return open_failed_fill_stream(transport_,
+                                           draft_version,
+                                           update,
+                                           active_it->second.forward,
+                                           largest_object_by_track.contains(track_name));
         };
 
     const auto process_publish_request_updates = [&]() -> TransportStatus {
@@ -9670,8 +9729,16 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                update.request_id,
                                                track_name,
                                                largest_object_by_track);
-            return transport_.write_stream(
+            const TransportStatus response_status = transport_.write_stream(
                 response_stream_id, response, false);
+            if (!response_status.ok) {
+                return response_status;
+            }
+            return open_failed_fill_stream(transport_,
+                                           draft_version,
+                                           update,
+                                           active_it->second.forward,
+                                           largest_object_by_track.contains(track_name));
         };
 
     const auto process_subscriber_request_updates = [&]() -> TransportStatus {
@@ -9728,8 +9795,16 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                    update.request_id,
                                                    track_name,
                                                    largest_object_by_track);
-                return transport_.write_stream(
+                const TransportStatus response_status = transport_.write_stream(
                     response_stream_id, response, false);
+                if (!response_status.ok) {
+                    return response_status;
+                }
+                return open_failed_fill_stream(transport_,
+                                               draft_version,
+                                               update,
+                                               settings_it->second.forward,
+                                               largest_object_by_track.contains(track_name));
             },
             [&](const std::string& track_name, std::uint64_t request_id) {
                 static_cast<void>(track_name);
