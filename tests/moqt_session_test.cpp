@@ -6692,6 +6692,43 @@ int main() {
     }
 
     {
+        // A {0,0} Next Object LOCATION_FILTER matches PUBLISH's own delivery start
+        // (§9.8: "Delivery starts at the Next Object"), so it is accepted.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, kTestTrackNamespace.size()));
+        payload.insert(payload.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));     // one parameter
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0x21));  // LOCATION_FILTER {0,0}
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 2));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> subscribe_tracks = encode_moqint(DraftVersion::kDraft21, 0x51);
+        append_be16(subscribe_tracks, static_cast<std::uint16_t>(payload.size()));
+        subscribe_tracks.insert(subscribe_tracks.end(), payload.begin(), payload.end());
+        transport.reads[1].push_back(subscribe_tracks);
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 2));
+        transport.reads[8].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 4));
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 Next Object SUBSCRIBE_TRACKS connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft21), source_bytes);
+        status = session.publish(materialized);
+        bool saw_ok = false;
+        bool saw_publish = false;
+        for (const auto& write : transport.writes) {
+            saw_ok = saw_ok || (write.stream_id == 1 && message_type(write.bytes) == 0x07);
+            saw_publish = saw_publish || message_type(write.bytes) == 0x1d;
+        }
+        ok &= expect(status.ok && saw_ok && saw_publish,
+                     "expected a Next Object draft-21 SUBSCRIBE_TRACKS filter to be accepted and publish tracks");
+    }
+
+    {
         MockTransport draft18_subscribe_transport;
         draft18_subscribe_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_subscribe_transport.reads[0].push_back(

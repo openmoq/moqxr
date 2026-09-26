@@ -1628,12 +1628,14 @@ TransportStatus open_failed_fill_stream(PublisherTransport& transport,
 
 // Draft-21 SUBSCRIBE_TRACKS may seed the resulting subscriptions with a
 // LOCATION_FILTER (§9.18.1). Published-track delivery has no per-request
-// filter, so a non-empty one is declined rather than over-delivered.
+// filter, so any filter other than Next Object (0x02), which matches PUBLISH's
+// own delivery start (§9.8), is declined rather than over-delivered.
 bool declines_subscribe_tracks_filter(openmoq::publisher::DraftVersion draft,
                                       const SubscribeTracksMessage& subscribe_tracks) {
     return draft == openmoq::publisher::DraftVersion::kDraft21 &&
            subscribe_tracks.subscription_filter.has_value() &&
-           subscribe_tracks.subscription_filter->filter_type != 0;
+           subscribe_tracks.subscription_filter->filter_type != 0 &&
+           subscribe_tracks.subscription_filter->filter_type != 0x02;
 }
 
 constexpr std::uint64_t kRequestErrorNotSupported = 0x3;
