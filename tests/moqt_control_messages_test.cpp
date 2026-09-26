@@ -1933,8 +1933,34 @@ bool test_parameter_length_wrap_is_rejected() {
     return ok;
 }
 
+bool test_draft21_subscribe_tracks_rejects_range_filters() {
+    bool ok = true;
+    // MAX_FILTER_RANGES defaults to 0 (§9.1.6), so a peer MUST NOT send range
+    // filters; 0x26/0x28 are even-typed yet length-prefixed, so they must be
+    // rejected before the even/odd dispatch rather than mis-framed.
+    for (const std::uint64_t filter_type : {0x25ULL, 0x26ULL, 0x27ULL, 0x28ULL, 0x29ULL}) {
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        std::vector<std::uint8_t> payload;
+        append_moqint(payload, draft, 93);
+        append_track_namespace(payload, draft, {"live"});
+        append_moqint(payload, draft, 1);
+        append_moqint(payload, draft, filter_type);
+        append_moqint(payload, draft, 0);  // empty range set
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, draft, 0x51);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        SubscribeTracksMessage tracks;
+        ok &= expect(!decode_subscribe_tracks_message(bytes, draft, tracks),
+                     "draft-21 SUBSCRIBE_TRACKS rejects range filter " + std::to_string(filter_type));
+    }
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_draft21_subscribe_tracks_rejects_range_filters();
     ok &= test_parameter_length_wrap_is_rejected();
     ok &= test_draft21_publish_done_and_framing();
     ok &= test_draft21_location_filter();

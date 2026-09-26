@@ -1489,6 +1489,12 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                    kParamAuthorizationToken)) {
             return false;
         }
+        // Range filters (0x25-0x29) need a MAX_FILTER_RANGES this publisher
+        // never advertises (§9.1.6); some are even-typed but length-prefixed,
+        // so reject them here instead of mis-framing them.
+        if (draft == DraftVersion::kDraft21 && parameter_type >= 0x25 && parameter_type <= 0x29) {
+            return false;
+        }
         if (draft == DraftVersion::kDraft21 && parameter_type == kParamIncludeProperties) {
             if (!decode_include_properties(bytes, offset, payload_end)) {
                 return false;
