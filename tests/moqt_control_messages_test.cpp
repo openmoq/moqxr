@@ -13,6 +13,7 @@
 namespace {
 
 using openmoq::publisher::DraftVersion;
+using openmoq::publisher::is_draft18_or_later;
 using openmoq::publisher::transport::MaxRequestIdMessage;
 using openmoq::publisher::transport::NamespaceMessage;
 using openmoq::publisher::transport::PublishError;
@@ -110,8 +111,7 @@ void append_vi64(std::vector<std::uint8_t>& out, std::uint64_t value) {
 }
 
 bool uses_vi64(DraftVersion draft) {
-    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18 ||
-        draft == DraftVersion::kDraft21;
+    return draft == DraftVersion::kDraft17 || is_draft18_or_later(draft);
 }
 
 void append_moqint(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint64_t value) {
@@ -312,6 +312,8 @@ std::string draft_label(DraftVersion draft) {
             return "draft-17";
         case DraftVersion::kDraft18:
             return "draft-18";
+        case DraftVersion::kDraft21:
+            return "draft-21";
     }
     return "unknown";
 }
@@ -319,7 +321,7 @@ std::string draft_label(DraftVersion draft) {
 void append_message_uint8(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint8_t value) {
     // draft-17 and draft-18 define FORWARD (0x10), SUBSCRIBER_PRIORITY (0x20)
     // and GROUP_ORDER (0x22) as uint8; earlier drafts encode them as varints.
-    if (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) {
+    if (draft == DraftVersion::kDraft17 || is_draft18_or_later(draft)) {
         out.push_back(value);
     } else {
         append_moqint(out, draft, value);
@@ -430,7 +432,7 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
                                                                           std::uint64_t subgroup_timeout_ms,
                                                                           bool include_subgroup_timeout = false) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         append_moqint(payload, draft, 55);
     }
     const bool with_subgroup = include_subgroup_timeout || subgroup_timeout_ms != 0;
@@ -458,7 +460,7 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
     append_message_uint8(payload, draft, 1);
 
     std::vector<std::uint8_t> bytes;
-    append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
+    append_moqint(bytes, draft, is_draft18_or_later(draft) ? 0x07 : 0x1e);
     bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
     bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
     bytes.insert(bytes.end(), payload.begin(), payload.end());
@@ -475,8 +477,8 @@ std::vector<std::uint8_t> build_subscribe_namespace_message(DraftVersion draft) 
     append_moqint(payload, draft, 0);  // parameters
 
     std::vector<std::uint8_t> bytes;
-    append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x50 : 0x11);
-    if (draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18) {
+    append_moqint(bytes, draft, is_draft18_or_later(draft) ? 0x50 : 0x11);
+    if (draft == DraftVersion::kDraft16 || is_draft18_or_later(draft)) {
         bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
         bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
     } else {
@@ -529,12 +531,12 @@ std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
     }
 
     const std::uint64_t parameter_count =
-        (draft == DraftVersion::kDraft18 ? 6 : 5) + (include_group_order ? 1 : 0);
+        (is_draft18_or_later(draft) ? 6 : 5) + (include_group_order ? 1 : 0);
     append_moqint(payload, draft, parameter_count);
     std::uint64_t previous_type = 0;
     auto append_numeric = [&](std::uint64_t type, std::uint64_t value) {
         append_moqint(payload, draft, type - previous_type);
-        if (draft == DraftVersion::kDraft18 &&
+        if (is_draft18_or_later(draft) &&
             (type == 0x10 || type == 0x20 || type == 0x22)) {
             payload.push_back(static_cast<std::uint8_t>(value));
         } else {
@@ -544,7 +546,7 @@ std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
     };
 
     append_numeric(0x02, zero_draft16_timeout ? 0 : 900);
-    if (draft == DraftVersion::kDraft18) {
+    if (is_draft18_or_later(draft)) {
         append_numeric(0x06, 250);
     }
     append_numeric(0x10, 1);
@@ -622,13 +624,13 @@ std::vector<std::uint8_t> build_request_update_duplicate_parameter(
     }
     append_moqint(payload, draft, 2);
     append_moqint(payload, draft, 0x10);
-    if (draft == DraftVersion::kDraft18) {
+    if (is_draft18_or_later(draft)) {
         payload.push_back(1);
     } else {
         append_moqint(payload, draft, 1);
     }
     append_moqint(payload, draft, 0);
-    if (draft == DraftVersion::kDraft18) {
+    if (is_draft18_or_later(draft)) {
         payload.push_back(1);
     } else {
         append_moqint(payload, draft, 1);
@@ -663,7 +665,7 @@ std::vector<std::uint8_t> build_draft18_request_update_delta_overflow() {
 
 std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         append_moqint(payload, draft, 55);
     }
     if (draft == DraftVersion::kDraft14) {
@@ -695,7 +697,7 @@ std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     if (draft == DraftVersion::kDraft14) {
         append_varint_length_message(bytes, 0x1e, payload);
     } else {
-        append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
+        append_moqint(bytes, draft, is_draft18_or_later(draft) ? 0x07 : 0x1e);
         bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
         bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
         bytes.insert(bytes.end(), payload.begin(), payload.end());
@@ -720,7 +722,7 @@ std::vector<std::uint8_t> build_publish_error_message(DraftVersion draft) {
 
 bool test_setup_serdes_for_all_drafts() {
     bool ok = true;
-    for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18}) {
+    for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         const std::string label = draft_label(draft) + " setup";
         const SetupMessage setup{
             .draft = draft,
@@ -965,7 +967,7 @@ bool test_peer_control_message_decoders_for_all_drafts() {
         ok &= expect(subscribe_namespace.request_id == 91, label + " subscribe namespace request id");
         ok &= expect(subscribe_namespace.track_namespace_prefix == std::vector<std::string>({"live", "alpha"}),
                      label + " subscribe namespace tuple");
-        if (draft == DraftVersion::kDraft18) {
+        if (is_draft18_or_later(draft)) {
             std::vector<std::uint8_t> legacy_subscribe_namespace = build_subscribe_namespace_message(draft);
             legacy_subscribe_namespace[0] = 0x11;
             ok &= expect(!decode_subscribe_namespace_message(legacy_subscribe_namespace, draft, subscribe_namespace),
@@ -987,7 +989,7 @@ bool test_peer_control_message_decoders_for_all_drafts() {
                      label + " subscribe filter fields");
 
         SubscribeTracksMessage subscribe_tracks;
-        if (draft == DraftVersion::kDraft18) {
+        if (is_draft18_or_later(draft)) {
             ok &= expect(decode_subscribe_tracks_message(build_subscribe_tracks_message(), draft, subscribe_tracks),
                          label + " subscribe tracks decode");
             ok &= expect(subscribe_tracks.request_id == 93, label + " subscribe tracks request id");
@@ -1001,7 +1003,7 @@ bool test_peer_control_message_decoders_for_all_drafts() {
 
         PublishOk publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message(draft), draft, publish_ok), label + " publish ok decode");
-        ok &= expect(publish_ok.request_id == (draft == DraftVersion::kDraft18 ? 0 : 55) &&
+        ok &= expect(publish_ok.request_id == (is_draft18_or_later(draft) ? 0 : 55) &&
                          publish_ok.forward == 1 &&
                          publish_ok.subscriber_priority == (draft == DraftVersion::kDraft14 ? 128 : 200) &&
                          publish_ok.filter_type == 3,
@@ -1228,7 +1230,7 @@ bool test_subgroup_header_and_object_serdes_for_all_drafts() {
         std::uint64_t object_status = 99;
         ok &= expect(read_varint(empty, offset, object_delta) && object_delta == 0, label + " empty object id");
         ok &= expect(read_varint(empty, offset, payload_length) && payload_length == 0, label + " empty payload length");
-        if (draft == DraftVersion::kDraft18) {
+        if (is_draft18_or_later(draft)) {
             ok &= expect(read_varint(empty, offset, object_status) && object_status == 0,
                          label + " empty object status after zero length");
         }
@@ -1590,6 +1592,27 @@ bool test_draft21_identity() {
     Uint16Frame frame;
     ok &= expect(expect_uint16_frame(bytes, 0x2f00, frame, "draft-21 setup"),
                  "draft-21 SETUP uses the vi64 unified SETUP type 0x2f00");
+
+    // A relay may advertise MAX_REQUEST_UPDATES (even option 0x08, value only,
+    // draft-21 §9.1.7); the publisher's SETUP decode must accept it.
+    std::vector<std::uint8_t> options;
+    append_moqint(options, DraftVersion::kDraft21, 0x02);  // MAX_REQUEST_ID
+    append_moqint(options, DraftVersion::kDraft21, 64);
+    append_moqint(options, DraftVersion::kDraft21, 0x06);  // delta to MAX_REQUEST_UPDATES
+    append_moqint(options, DraftVersion::kDraft21, 4);
+    std::vector<std::uint8_t> server_setup;
+    append_moqint(server_setup, DraftVersion::kDraft21, 0x2f00);
+    server_setup.push_back(static_cast<std::uint8_t>((options.size() >> 8) & 0xff));
+    server_setup.push_back(static_cast<std::uint8_t>(options.size() & 0xff));
+    server_setup.insert(server_setup.end(), options.begin(), options.end());
+    ServerSetupMessage decoded;
+    ok &= expect(decode_setup_response_message(server_setup, DraftVersion::kDraft21, decoded),
+                 "draft-21 server SETUP with MAX_REQUEST_UPDATES decodes");
+    ok &= expect(decoded.draft == DraftVersion::kDraft21, "draft-21 server SETUP keeps the negotiated draft");
+    ServerSetupMessage as_draft18;
+    ok &= expect(!decode_setup_response_message(encode_server_setup_message({.draft = DraftVersion::kDraft21}),
+                                                DraftVersion::kDraft16, as_draft18),
+                 "draft-21 server SETUP is rejected by a draft-16 session");
     return ok;
 }
 
