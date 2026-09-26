@@ -68,6 +68,12 @@ using openmoq::publisher::ByteSpan;
 using openmoq::publisher::CmsfObject;
 using openmoq::publisher::CmsfObjectKind;
 using openmoq::publisher::DraftVersion;
+
+// Draft-21 keeps the draft-18 control/request-stream model for everything the
+// session tests exercise, so draft-21 cases share draft-18 expectations.
+bool draft18_family(DraftVersion draft) {
+    return draft == DraftVersion::kDraft18 || draft == DraftVersion::kDraft21;
+}
 using openmoq::publisher::LiveCatalogMode;
 using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
@@ -120,7 +126,7 @@ std::vector<std::uint8_t> encode_vi64(std::uint64_t value) {
 }
 
 std::vector<std::uint8_t> encode_moqint(DraftVersion draft, std::uint64_t value) {
-    return (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18)
+    return (draft == DraftVersion::kDraft17 || draft18_family(draft))
                ? encode_vi64(value)
                : encode_varint(value);
 }
@@ -564,13 +570,13 @@ std::vector<std::uint8_t> make_live_init_mp4_cenc_no_pssh() {
 
 std::vector<std::uint8_t> encode_publish_namespace_ok_message(DraftVersion draft, std::uint64_t request_id) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!draft18_family(draft)) {
         payload = encode_moqint(draft, request_id);
     }
     if (draft == DraftVersion::kDraft16) {
         const std::vector<std::uint8_t> parameter_count = encode_varint(0);
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
-    } else if (draft == DraftVersion::kDraft18) {
+    } else if (draft18_family(draft)) {
         const std::vector<std::uint8_t> parameter_count = encode_moqint(draft, 0);
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     }
@@ -596,8 +602,8 @@ std::vector<std::uint8_t> encode_subscribe_namespace_message(DraftVersion draft,
     const std::vector<std::uint8_t> parameter_count = encode_moqint(draft, 0);
     payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
 
-    std::vector<std::uint8_t> message = encode_moqint(draft, draft == DraftVersion::kDraft18 ? 0x50 : 0x11);
-    if (draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18) {
+    std::vector<std::uint8_t> message = encode_moqint(draft, draft18_family(draft) ? 0x50 : 0x11);
+    if (draft == DraftVersion::kDraft16 || draft18_family(draft)) {
         append_be16(message, static_cast<std::uint16_t>(payload.size()));
     } else {
         const std::vector<std::uint8_t> length = encode_varint(payload.size());
@@ -657,7 +663,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         // SUBGROUP_DELIVERY_TIMEOUT (0x06).
         const std::uint64_t timeout_parameter_count =
             (delivery_timeout_ms != 0 ? 1 : 0) +
-            (draft == DraftVersion::kDraft18 && subgroup_delivery_timeout_ms != 0 ? 1 : 0);
+            (draft18_family(draft) && subgroup_delivery_timeout_ms != 0 ? 1 : 0);
         const std::vector<std::uint8_t> parameter_count =
             encode_moqint(draft, 3 + timeout_parameter_count + (group_order != 0 ? 1 : 0));
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
@@ -669,7 +675,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             payload.insert(payload.end(), timeout_value.begin(), timeout_value.end());
             previous_type = 0x02;
         }
-        if (draft == DraftVersion::kDraft18 && subgroup_delivery_timeout_ms != 0) {
+        if (draft18_family(draft) && subgroup_delivery_timeout_ms != 0) {
             const std::vector<std::uint8_t> timeout_delta =
                 encode_moqint(draft, 0x06 - previous_type);
             const std::vector<std::uint8_t> timeout_value =
@@ -687,7 +693,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         // value as a single uint8 byte; earlier drafts use a varint.
         const std::vector<std::uint8_t> priority_delta = encode_moqint(draft, 0x20 - 0x10);
         const bool uint8_params =
-            draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+            draft == DraftVersion::kDraft17 || draft18_family(draft);
         const std::vector<std::uint8_t> priority_value =
             uint8_params ? std::vector<std::uint8_t>{subscriber_priority}
                          : encode_moqint(draft, subscriber_priority);
@@ -800,7 +806,7 @@ std::vector<std::uint8_t> encode_request_update_message(DraftVersion draft,
     }
     append_bytes(payload, encode_moqint(draft, 1));
     append_bytes(payload, encode_moqint(draft, parameter_type));
-    if (draft == DraftVersion::kDraft18 &&
+    if (draft18_family(draft) &&
         (parameter_type == 0x10 || parameter_type == 0x20 || parameter_type == 0x22)) {
         payload.push_back(value);
     } else {
@@ -907,13 +913,13 @@ std::vector<std::uint8_t> encode_duplicate_request_update_parameter(
     }
     append_bytes(payload, encode_moqint(draft, 2));
     append_bytes(payload, encode_moqint(draft, 0x10));
-    if (draft == DraftVersion::kDraft18) {
+    if (draft18_family(draft)) {
         payload.push_back(1);
     } else {
         append_bytes(payload, encode_moqint(draft, 1));
     }
     append_bytes(payload, encode_moqint(draft, 0));
-    if (draft == DraftVersion::kDraft18) {
+    if (draft18_family(draft)) {
         payload.push_back(1);
     } else {
         append_bytes(payload, encode_moqint(draft, 1));
@@ -962,7 +968,7 @@ std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
                                                     std::uint64_t request_id,
                                                     std::uint8_t forward = 1) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!draft18_family(draft)) {
         payload = encode_varint(request_id);
     }
     if (draft == DraftVersion::kDraft14) {
@@ -984,7 +990,7 @@ std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
         }
     }
 
-    std::vector<std::uint8_t> message = encode_moqint(draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
+    std::vector<std::uint8_t> message = encode_moqint(draft, draft18_family(draft) ? 0x07 : 0x1e);
     if (draft == DraftVersion::kDraft14) {
         const std::vector<std::uint8_t> length = encode_varint(payload.size());
         message.insert(message.end(), length.begin(), length.end());
@@ -1584,8 +1590,8 @@ int main() {
         .ca_path = {},
         .insecure_skip_verify = true,
     };
-    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18}) {
-        const bool modern = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        const bool modern = draft == DraftVersion::kDraft17 || draft18_family(draft);
         for (const bool provider_denial : {false, true}) {
             if (provider_denial && !modern) continue;
             MockTransport denied;
@@ -1688,7 +1694,7 @@ int main() {
         "expected transport mapping to preserve subscriber-priority precedence");
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.on_try_write_object =
@@ -1752,14 +1758,14 @@ int main() {
                              return write.stream_id == response_stream_id &&
                                     write.bytes == expected_done &&
                                     write.fin ==
-                                        (draft == DraftVersion::kDraft18) &&
+                                        (draft18_family(draft)) &&
                                     write.reset_count_before_write == 2;
                          }) == 1,
                      "expected draft-specific TOO_FAR_BEHIND PUBLISH_DONE after every SRT subgroup reset");
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.failing_reset_streams.insert(2);
@@ -2418,7 +2424,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
         MockTransport transport;
@@ -3521,7 +3527,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
@@ -3589,7 +3595,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         for (const std::uint64_t parameter_type : {0x03ULL, 0x21ULL}) {
             MockTransport transport;
             const std::uint64_t subscription_request_id =
@@ -3657,7 +3663,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
@@ -3974,7 +3980,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t request_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -7763,7 +7769,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -7933,7 +7939,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;

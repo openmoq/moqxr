@@ -87,7 +87,7 @@ std::vector<MediaFragment> LocTrackEncoder::encode(std::span<const EncodedSample
 }
 
 PublishPlan prepare_loc_plan(const ParsedMp4& parsed, const PublisherConfig& config) {
-    if (config.draft_version != DraftVersion::kDraft18) throw std::runtime_error("LOC-04 requires draft 18");
+    if (!is_draft18_or_later(config.draft_version)) throw std::runtime_error("LOC-04 requires draft 18");
     const auto samples = read_encoded_samples(parsed);
     SegmentedMp4 segmented;
     segmented.tracks = parsed.tracks;

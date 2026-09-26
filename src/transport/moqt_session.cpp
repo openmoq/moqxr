@@ -281,7 +281,7 @@ public:
     TransportStatus validate(PublisherTransport& transport,
                              std::uint64_t request_id) {
         if (draft_ != openmoq::publisher::DraftVersion::kDraft16 &&
-            draft_ != openmoq::publisher::DraftVersion::kDraft18) {
+            !is_draft18_or_later(draft_)) {
             return TransportStatus::success();
         }
 
@@ -355,10 +355,10 @@ std::optional<std::chrono::steady_clock::time_point> deadline_after(
 DeliveryTimeouts timeouts_for_draft(openmoq::publisher::DraftVersion draft,
                                     DeliveryTimeouts timeouts) {
     if (draft != openmoq::publisher::DraftVersion::kDraft16 &&
-        draft != openmoq::publisher::DraftVersion::kDraft18) {
+        !is_draft18_or_later(draft)) {
         return {};
     }
-    if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         timeouts.subgroup_ms = 0;
     }
     return timeouts;
@@ -517,17 +517,17 @@ bool is_idle_subscribe_exit(std::string_view message) {
 
 bool uses_peer_max_request_id(openmoq::publisher::DraftVersion draft) {
     return draft != openmoq::publisher::DraftVersion::kDraft17 &&
-           draft != openmoq::publisher::DraftVersion::kDraft18;
+           !is_draft18_or_later(draft);
 }
 
 bool uses_request_streams(openmoq::publisher::DraftVersion draft) {
     return draft == openmoq::publisher::DraftVersion::kDraft17 ||
-           draft == openmoq::publisher::DraftVersion::kDraft18;
+           is_draft18_or_later(draft);
 }
 
 bool uses_priority_scheduler(openmoq::publisher::DraftVersion draft) {
     return draft == openmoq::publisher::DraftVersion::kDraft16 ||
-           draft == openmoq::publisher::DraftVersion::kDraft18;
+           is_draft18_or_later(draft);
 }
 
 bool subscription_forwards_objects(
@@ -540,7 +540,7 @@ TransportStatus assign_request_stream_priority(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
     std::uint64_t stream_id) {
-    if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         return TransportStatus::success();
     }
     return transport.set_reliable_stream_priority(stream_id, 1);
@@ -642,7 +642,7 @@ const char* control_message_type_name(std::uint64_t message_type,
         case 0x1f:
             return "PUBLISH_ERROR";
         case 0x51:
-            return draft == openmoq::publisher::DraftVersion::kDraft18 ? "SUBSCRIBE_TRACKS"
+            return is_draft18_or_later(draft) ? "SUBSCRIBE_TRACKS"
                                                                        : "STREAM_HEADER_GROUP";
         case 0x20:
             return "CLIENT_SETUP";
@@ -669,7 +669,7 @@ const char* control_message_type_name(std::uint64_t message_type,
         case 0x2f00:
             return "SETUP";
         case 0x50:
-            return draft == openmoq::publisher::DraftVersion::kDraft18 ? "SUBSCRIBE_NAMESPACE" : "UNKNOWN";
+            return is_draft18_or_later(draft) ? "SUBSCRIBE_NAMESPACE" : "UNKNOWN";
         default:
             return "UNKNOWN";
     }
@@ -762,8 +762,8 @@ void trace_control_message(std::span<const std::uint8_t> message_bytes, openmoq:
                 std::cerr << " forward=" << static_cast<unsigned int>(*message.forward);
             }
         }
-    } else if ((draft == openmoq::publisher::DraftVersion::kDraft18 && message_type == 0x50) ||
-               (draft != openmoq::publisher::DraftVersion::kDraft18 && message_type == 0x11)) {
+    } else if ((is_draft18_or_later(draft) && message_type == 0x50) ||
+               (!is_draft18_or_later(draft) && message_type == 0x11)) {
         SubscribeNamespaceMessage message;
         if (decode_subscribe_namespace_message(message_bytes, draft, message)) {
             std::cerr << " request_id=" << message.request_id;
@@ -780,7 +780,7 @@ void trace_control_message(std::span<const std::uint8_t> message_bytes, openmoq:
                       << " forward=" << static_cast<unsigned int>(message.forward)
                       << " filter_type=" << message.filter_type;
         }
-    } else if (message_type == 0x51 && draft == openmoq::publisher::DraftVersion::kDraft18) {
+    } else if (message_type == 0x51 && is_draft18_or_later(draft)) {
         SubscribeTracksMessage message;
         if (decode_subscribe_tracks_message(message_bytes, draft, message)) {
             std::cerr << " request_id=" << message.request_id
@@ -1376,7 +1376,7 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
             const bool is_goaway = response_type == 0x10;
 
             if (is_goaway) {
-                if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+                if (!is_draft18_or_later(draft)) {
                     return protocol_violation(transport, "request stream received GOAWAY");
                 }
                 const TransportStatus reset_status = transport.reset_stream(request_stream_id, 0x0);
@@ -1421,7 +1421,7 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                     set_out_stream();
                     return TransportStatus::success();
                 }
-                if (draft == openmoq::publisher::DraftVersion::kDraft18) {
+                if (is_draft18_or_later(draft)) {
                     return protocol_violation(transport, "invalid draft-18 PUBLISH_OK");
                 }
             }
@@ -1656,7 +1656,7 @@ bool request_update_renews_peer_stopped_subgroups(
     openmoq::publisher::DraftVersion draft,
     const SubscribeMessage& subscribe,
     const RequestUpdateMessage& update) {
-    return draft == openmoq::publisher::DraftVersion::kDraft18 &&
+    return is_draft18_or_later(draft) &&
            subscribe.forward == 0 &&
            update.forward == std::optional<std::uint8_t>{1};
 }
@@ -3060,7 +3060,7 @@ TransportStatus terminate_live_srt_resource_limit(
     }
 
     const std::uint64_t too_far_behind =
-        draft == openmoq::publisher::DraftVersion::kDraft18 ? 0x05 : 0x06;
+        is_draft18_or_later(draft) ? 0x05 : 0x06;
     for (const auto& [request_id, subscribe] : active_subscriptions) {
         if (subscribe.track_name == "catalog") {
             continue;
@@ -3434,7 +3434,7 @@ TransportStatus poll_retained_subscribe_request_updates(
     std::map<std::uint64_t, std::vector<std::uint8_t>>& pending_bytes,
     PeerRequestIdValidator& peer_request_ids,
     ApplyUpdate&& apply_update) {
-    if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         return TransportStatus::success();
     }
     for (const auto& [existing_request_id, subscribe] :
@@ -3531,7 +3531,7 @@ TransportStatus poll_retained_publish_request_updates(
     PeerRequestIdValidator& peer_request_ids,
     ApplyUpdate&& apply_update,
     OnFin&& on_fin) {
-    if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         return TransportStatus::success();
     }
     for (const auto& [track_name, request_id] : request_ids_by_track) {
@@ -4251,7 +4251,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             }
         }
 
-        if (draft == DraftVersion::kDraft18) {
+        if (is_draft18_or_later(draft)) {
             for (auto& [existing_request_id, active] : active_subscriptions) {
                 while (true) {
                     std::size_t update_size = 0;
@@ -4350,7 +4350,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             // messages that next_control_message() can frame successfully;
             // log them for visibility only when tracing is explicitly enabled.
             if (uses_request_streams(draft) &&
-                ((draft == DraftVersion::kDraft18 && message_type == 0x02) ||
+                ((is_draft18_or_later(draft) && message_type == 0x02) ||
                  message_type == 0x03 || message_type == 0x06 || message_type == 0x50 ||
                  message_type == 0x16 || message_type == 0x1d || message_type == 0x51)) {
                 return protocol_violation(transport, "draft-18 request message received on control stream");
@@ -6391,12 +6391,12 @@ TransportStatus MoqtSession::connect(const EndpointConfig& endpoint, const TlsCo
 TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan) try {
     try {
         for (const auto& track : plan.tracks) {
-            if (track.packaging == "loc" && plan.draft.version != DraftVersion::kDraft18) {
+            if (track.packaging == "loc" && !is_draft18_or_later(plan.draft.version)) {
                 return TransportStatus::failure("LOC requires draft 18");
             }
         }
         for (const auto& object : plan.objects) {
-            if (!object.properties.empty() && plan.draft.version != DraftVersion::kDraft18) {
+            if (!object.properties.empty() && !is_draft18_or_later(plan.draft.version)) {
                 return TransportStatus::failure("object properties require draft 18");
             }
             openmoq::publisher::serialize_object_properties(object.properties);
@@ -6742,7 +6742,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                           bool split_cmaf_chunks,
                                           bool stream_per_object) try {
     if (media_packaging_ == MediaPackaging::kLoc &&
-        (draft_version != DraftVersion::kDraft18 || !split_cmaf_chunks || stream_per_object)) {
+        (!is_draft18_or_later(draft_version) || !split_cmaf_chunks || stream_per_object)) {
         return TransportStatus::failure("LOC requires draft 18, split chunks, and GOP subgroup streams");
     }
     if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
@@ -6867,7 +6867,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         .authorization_token = action_auth.token,
         .dpop_proof = action_auth.proof,
     };
-    if (draft_version == openmoq::publisher::DraftVersion::kDraft18) {
+    if (is_draft18_or_later(draft_version)) {
         status = send_request_stream_and_wait(
             transport_, draft_version, encode_namespace_message(namespace_message), false, nullptr,
             &namespace_stream_id_);
@@ -7431,7 +7431,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 return {TransportStatus::failure("failed to parse control request type"), 0};
             }
 
-            if ((draft_version == DraftVersion::kDraft18 &&
+            if ((is_draft18_or_later(draft_version) &&
                  message_type == 0x02) ||
                 (uses_request_streams(draft_version) &&
                  (message_type == 0x03 || message_type == 0x06 ||
@@ -7688,7 +7688,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                            bool split_cmaf_chunks,
                                            bool stream_per_object) try {
     if (media_packaging_ == MediaPackaging::kLoc &&
-        (draft_version != DraftVersion::kDraft18 || !split_cmaf_chunks || stream_per_object)) {
+        (!is_draft18_or_later(draft_version) || !split_cmaf_chunks || stream_per_object)) {
         return TransportStatus::failure("LOC requires draft 18, split chunks, and GOP subgroup streams");
     }
     if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
@@ -8863,7 +8863,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             trace_control_message(message_bytes, draft_version);
 
-            if ((draft_version == DraftVersion::kDraft18 &&
+            if ((is_draft18_or_later(draft_version) &&
                  message_type == 0x02) ||
                 (uses_request_streams(draft_version) &&
                  (message_type == 0x03 || message_type == 0x06 ||
@@ -9363,7 +9363,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         if (track.packaging == openmoq::publisher::LivePackaging::kLoc) loc_tracks.insert(track.track_name);
     }
     if (media_packaging_ == MediaPackaging::kLoc || !loc_tracks.empty()) {
-        if (draft_version != DraftVersion::kDraft18) return TransportStatus::failure("LOC requires draft 18");
+        if (!is_draft18_or_later(draft_version)) return TransportStatus::failure("LOC requires draft 18");
         if (source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject) {
             return TransportStatus::failure("LOC cannot transform a source-owned catalog");
         }
@@ -9903,7 +9903,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             trace_control_message(message_bytes, draft_version);
 
-            if ((draft_version == DraftVersion::kDraft18 &&
+            if ((is_draft18_or_later(draft_version) &&
                  message_type == 0x02) ||
                 (uses_request_streams(draft_version) &&
                  (message_type == 0x03 || message_type == 0x06 ||

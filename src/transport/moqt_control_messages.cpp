@@ -66,7 +66,7 @@ bool decode_varint_impl(std::span<const std::uint8_t> bytes, std::size_t& offset
 bool decode_vi64_impl(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 
 bool uses_moq_vi64(DraftVersion draft) {
-    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18 ||
+    return draft == DraftVersion::kDraft17 || is_draft18_or_later(draft) ||
         draft == DraftVersion::kDraft21;
 }
 
@@ -495,7 +495,7 @@ bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
                                       std::uint64_t parameter_type,
                                       std::uint64_t& value) {
     const bool is_uint8 =
-        (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) &&
+        (draft == DraftVersion::kDraft17 || is_draft18_or_later(draft)) &&
         (parameter_type == kParamForward || parameter_type == kParamSubscriberPriority ||
          parameter_type == kParamGroupOrder);
     if (!is_uint8) {
@@ -859,7 +859,7 @@ bool decode_setup_response_message(std::span<const std::uint8_t> bytes,
     if (!decode_server_setup_message(bytes, message)) {
         return false;
     }
-    if (uses_moq_vi64(expected_draft) && message.draft == DraftVersion::kDraft18) {
+    if (uses_moq_vi64(expected_draft) && is_draft18_or_later(message.draft)) {
         message.draft = expected_draft;
     }
     return message.draft == expected_draft;
@@ -1081,7 +1081,7 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     const std::uint64_t message_type =
-        draft == DraftVersion::kDraft18 ? kSubscribeNamespaceTypeDraft18 : kSubscribeNamespaceType;
+        is_draft18_or_later(draft) ? kSubscribeNamespaceTypeDraft18 : kSubscribeNamespaceType;
     const bool framed =
         draft == DraftVersion::kDraft14
             ? parse_varint_length_message(bytes, draft, message_type, payload_offset, payload_length)
@@ -1146,7 +1146,7 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
 }
 
 std::vector<std::uint8_t> encode_subscribe_namespace_ok_message(DraftVersion draft, std::uint64_t request_id) {
-    if (draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18) {
+    if (draft == DraftVersion::kDraft16 || is_draft18_or_later(draft)) {
         return encode_request_ok_message(draft, request_id);
     }
 
@@ -1295,11 +1295,11 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
             }
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT).
-                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
+                    if (!is_draft18_or_later(draft) && value == 0) { return false; }
                     message.delivery_timeouts.object_ms = value;
                     break;
                 case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         message.delivery_timeouts.subgroup_ms = value;
                     } else if (draft == DraftVersion::kDraft16) {
                         return false;
@@ -1359,7 +1359,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
 bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                      DraftVersion draft,
                                      SubscribeTracksMessage& message) {
-    if (draft != DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         return false;
     }
 
@@ -1432,7 +1432,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
     if (error != nullptr) {
         *error = RequestUpdateDecodeError::kNone;
     }
-    if (draft != DraftVersion::kDraft16 && draft != DraftVersion::kDraft18) {
+    if (draft != DraftVersion::kDraft16 && !is_draft18_or_later(draft)) {
         return fail(RequestUpdateDecodeError::kSemantic);
     }
 
@@ -1494,14 +1494,14 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                     message.object_delivery_timeout_ms = value;
                     break;
                 case 0x06:
-                    if (draft != DraftVersion::kDraft18 ||
+                    if (!is_draft18_or_later(draft) ||
                         message.subgroup_delivery_timeout_ms.has_value()) {
                         return fail(RequestUpdateDecodeError::kSemantic);
                     }
                     message.subgroup_delivery_timeout_ms = value;
                     break;
                 case 0x08:  // EXPIRES is known but outside REQUEST_UPDATE.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         return fail(RequestUpdateDecodeError::kSemantic);
                     }
                     break;
@@ -1521,7 +1521,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                     // Draft 16 requires known parameters outside their message
                     // scope to be ignored. Draft 18 makes the same condition a
                     // connection-level protocol violation.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         return fail(RequestUpdateDecodeError::kSemantic);
                     }
                     break;
@@ -1554,7 +1554,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                 message.has_authorization_token = true;
                 break;
             case 0x09:  // LARGEST_OBJECT is known but outside REQUEST_UPDATE.
-                if (draft == DraftVersion::kDraft18) {
+                if (is_draft18_or_later(draft)) {
                     return fail(RequestUpdateDecodeError::kSemantic);
                 }
                 break;
@@ -1785,7 +1785,7 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
                                                  std::uint64_t subgroup_id,
                                                  bool end_of_group,
                                                  bool properties_present) {
-    if (properties_present && draft != DraftVersion::kDraft18) {
+    if (properties_present && !is_draft18_or_later(draft)) {
         throw std::invalid_argument("object properties require draft 18");
     }
     // Current callers always serve subgroup_id = 0 and the publisher default
@@ -1812,7 +1812,7 @@ std::vector<std::uint8_t> encode_subgroup_object(DraftVersion draft,
                                                  std::span<const ObjectProperty> properties,
                                                  bool properties_present) {
     properties_present = properties_present || !properties.empty();
-    if (properties_present && draft != DraftVersion::kDraft18) {
+    if (properties_present && !is_draft18_or_later(draft)) {
         throw std::invalid_argument("object properties require draft 18");
     }
     if (previous_object_id && object_id <= *previous_object_id) {
@@ -1864,7 +1864,7 @@ bool decode_publish_namespace_error(std::span<const std::uint8_t> bytes, Publish
 bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishOk& message) {
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
-    const bool request_ok_alias = draft == DraftVersion::kDraft18;
+    const bool request_ok_alias = is_draft18_or_later(draft);
     const bool parsed = request_ok_alias
                             ? parse_uint16_length_message(bytes, draft, kRequestOkType, payload_offset, payload_length)
                             : parse_publish_family_message(bytes, draft, kPublishOkType, payload_offset, payload_length);
@@ -1949,11 +1949,11 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             }
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT)
-                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
+                    if (!is_draft18_or_later(draft) && value == 0) { return false; }
                     message.delivery_timeouts.object_ms = value;
                     break;
                 case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         message.delivery_timeouts.subgroup_ms = value;
                     } else if (draft == DraftVersion::kDraft16) {
                         return false;

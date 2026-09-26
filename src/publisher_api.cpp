@@ -22,7 +22,7 @@ namespace {
 
 void validate_packaging(const PublisherConfig& config) {
     if (config.media_packaging == MediaPackaging::kLoc) {
-        if (config.draft_version != DraftVersion::kDraft18) throw std::runtime_error("LOC-04 requires draft 18");
+        if (!is_draft18_or_later(config.draft_version)) throw std::runtime_error("LOC-04 requires draft 18");
         if (!config.split_cmaf_chunks || config.live_stream_per_object) throw std::runtime_error("LOC requires one sample per object and a stream per GOP");
     }
     if (config.media_packaging == MediaPackaging::kLocmaf &&

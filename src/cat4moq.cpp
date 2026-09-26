@@ -49,7 +49,7 @@ void append_integer(std::vector<std::uint8_t>& out, std::uint64_t value, DraftVe
         }
         return;
     }
-    if (draft != DraftVersion::kDraft17 && draft != DraftVersion::kDraft18) throw AuthorizationError("unsupported credential draft");
+    if (draft != DraftVersion::kDraft17 && !is_draft18_or_later(draft)) throw AuthorizationError("unsupported credential draft");
     unsigned size = 1;
     while (size < 8 && value >= (std::uint64_t{1} << (size * 7))) ++size;
     if (size == 8 && value >= (std::uint64_t{1} << 56)) size = 9;

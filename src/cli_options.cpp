@@ -614,7 +614,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
     }
 
     if (options.media_packaging == MediaPackaging::kLoc) {
-        if (options.draft_version != DraftVersion::kDraft18) {
+        if (!is_draft18_or_later(options.draft_version)) {
             throw std::runtime_error("LOC-04 requires --draft 18");
         }
         if (options.stream_per_object || !options.split_cmaf_chunks) {
