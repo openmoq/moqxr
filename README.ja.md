@@ -13,7 +13,7 @@
 - MSF/CMSF version 1 catalog、初期化データ、任意の media timeline、SAP event timeline を構築します。
 - batch input、stdin からの live fragmented MP4、CTE LL-DASH ingest に既存の CMAF CENC content protection がある場合、それを検出して通知します。暗号化や復号は行いません。
 - catalog、初期化、media、probe、publish plan の各ファイルをローカル検査用に出力します。
-- メイン CLI が対応する MOQT draft profile（draft 16、デフォルト、および draft 18）で公開します。
+- メイン CLI が対応する MOQT draft profile（draft 16、デフォルト、draft 18、および draft 21）で公開します。
 - picoquic と picotls が利用可能な場合、Raw QUIC または WebTransport で公開します。
 - stdin からの live fragmented MP4、libsrt が利用可能な場合の SRT 経由 MPEG-TS、HTTP/1.1 CTE LL-DASH ingest（chunked または固定長 request）経由の CMAF を受け付けます。
 - `--url` で MSF URL を解析し、`--print-msf-urls` で catalog discovery URL を表示します。
@@ -272,6 +272,6 @@ program を選択するには `--program NUMBER`、object size を変更する�
 
 ## 現在の状態
 
-メインの `openmoq-publisher` CLI は draft 16 と 18 を受け付けます。draft 16 がデフォルトで、draft 18 はより新しい request-stream profile を提供します。draft 14、17、19 の text は実装履歴と protocol review 用に `docs/` に残されていますが、メイン CLI では選択できません。独立した MSFTS example は draft-specific test 用に draft 14/16/17/18 の選択を維持しています。
+メインの `openmoq-publisher` CLI は draft 16、18、21 を受け付けます。draft 16 がデフォルトで、draft 18 はより新しい request-stream profile を提供し、draft 21 はそれを拡張します（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）。draft 21 は native backend のみで、moq5 backend は draft 16 と 18 のままです。draft 14、17、19、20 の text は実装履歴と protocol review 用に `docs/` に残されていますが、メイン CLI では選択できません。独立した MSFTS example は draft-specific test 用に draft 14/16/17/18 の選択を維持しています。
 
 デフォルトの picoquic backend と任意の moq5 backend は、どちらも継続的に interoperability test が行われています。詳細な機能範囲、制限、roadmap については [docs/status.md](docs/status.md) と [docs/protocol-mapping.md](docs/protocol-mapping.md) を参照してください。

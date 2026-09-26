@@ -6461,7 +6461,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
     try {
         for (const auto& track : plan.tracks) {
             if (track.packaging == "loc" && !is_draft18_or_later(plan.draft.version)) {
-                return TransportStatus::failure("LOC requires draft 18");
+                return TransportStatus::failure("LOC requires draft 18 or 21");
             }
         }
         for (const auto& object : plan.objects) {
@@ -6812,7 +6812,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                           bool stream_per_object) try {
     if (media_packaging_ == MediaPackaging::kLoc &&
         (!is_draft18_or_later(draft_version) || !split_cmaf_chunks || stream_per_object)) {
-        return TransportStatus::failure("LOC requires draft 18, split chunks, and GOP subgroup streams");
+        return TransportStatus::failure("LOC requires draft 18 or 21, split chunks, and GOP subgroup streams");
     }
     if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
         return TransportStatus::failure("LOCMAF requires a single subgroup stream per group");
@@ -7766,7 +7766,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                            bool stream_per_object) try {
     if (media_packaging_ == MediaPackaging::kLoc &&
         (!is_draft18_or_later(draft_version) || !split_cmaf_chunks || stream_per_object)) {
-        return TransportStatus::failure("LOC requires draft 18, split chunks, and GOP subgroup streams");
+        return TransportStatus::failure("LOC requires draft 18 or 21, split chunks, and GOP subgroup streams");
     }
     if (media_packaging_ == MediaPackaging::kLocmaf && stream_per_object) {
         return TransportStatus::failure("LOCMAF requires a single subgroup stream per group");
@@ -9469,7 +9469,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         if (track.packaging == openmoq::publisher::LivePackaging::kLoc) loc_tracks.insert(track.track_name);
     }
     if (media_packaging_ == MediaPackaging::kLoc || !loc_tracks.empty()) {
-        if (!is_draft18_or_later(draft_version)) return TransportStatus::failure("LOC requires draft 18");
+        if (!is_draft18_or_later(draft_version)) return TransportStatus::failure("LOC requires draft 18 or 21");
         if (source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject) {
             return TransportStatus::failure("LOC cannot transform a source-owned catalog");
         }

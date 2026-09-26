@@ -1091,6 +1091,11 @@ int main() {
     } catch (const std::exception& error) {
         ok &= expect(false, std::string("LOC-04 CLI should be accepted: ") + error.what());
     }
+    try {
+        parse({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "21"});
+    } catch (const std::exception& error) {
+        ok &= expect(false, std::string("LOC-04 CLI should accept draft 21: ") + error.what());
+    }
     ok &= expect(parse_throws({"publisher", "--input", "sample.mp4", "--packaging", "loc"},
                               "draft 18", "LOC must reject the default draft16"), "LOC draft gate");
     for (const auto flag : {"--coalesce-cmaf-chunks", "--stream-per-object"}) {

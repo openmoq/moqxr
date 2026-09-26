@@ -13,7 +13,7 @@ Ele empacota mídia de arquivo e ao vivo para Media over QUIC Transport (MOQT), 
 - Cria catálogos MSF/CMSF versão 1, dados de inicialização, timelines de mídia opcionais e timelines de eventos SAP.
 - Detecta e sinaliza proteção de conteúdo CMAF CENC existente para entrada em lote, MP4 fragmentado ao vivo via stdin e ingest CTE LL-DASH. Não criptografa nem descriptografa a mídia.
 - Emite arquivos de catálogo, inicialização, mídia, probe e plano de publicação para inspeção local.
-- Publica com os perfis de draft MOQT aceitos pela CLI principal: draft 16 (padrão) e draft 18.
+- Publica com os perfis de draft MOQT aceitos pela CLI principal: draft 16 (padrão), draft 18 e draft 21.
 - Publica por Raw QUIC ou WebTransport quando picoquic e picotls estão disponíveis.
 - Aceita MP4 fragmentado ao vivo via stdin, MPEG-TS sobre SRT quando libsrt está disponível e CMAF via ingest CTE LL-DASH HTTP/1.1 (requisições chunked ou de tamanho fixo).
 - Analisa URLs MSF com `--url` e imprime a URL de descoberta do catálogo com `--print-msf-urls`.
@@ -274,6 +274,6 @@ Guias localizados da API Publisher estão disponíveis em [espanhol](docs/publis
 
 ## Status Atual
 
-A CLI principal `openmoq-publisher` aceita os drafts 16 e 18; o draft 16 permanece como padrão, enquanto o draft 18 fornece o perfil mais recente baseado em request streams. O texto dos drafts 14, 17 e 19 permanece em `docs/` para o histórico de implementação e a revisão do protocolo, mas essas versões não podem ser selecionadas na CLI principal. O exemplo MSFTS separado mantém a seleção dos drafts 14/16/17/18 para testes específicos de draft.
+A CLI principal `openmoq-publisher` aceita os drafts 16, 18 e 21; o draft 16 permanece como padrão, o draft 18 fornece o perfil mais recente baseado em request streams e o draft 21 o estende (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). O draft 21 está disponível apenas no backend nativo; o backend moq5 continua nos drafts 16 e 18. O texto dos drafts 14, 17, 19 e 20 permanece em `docs/` para o histórico de implementação e a revisão do protocolo, mas essas versões não podem ser selecionadas na CLI principal. O exemplo MSFTS separado mantém a seleção dos drafts 14/16/17/18 para testes específicos de draft.
 
 Tanto o backend picoquic padrão quanto o backend moq5 opcional estão em testes ativos de interoperabilidade. Para cobertura detalhada de recursos, limitações e roadmap, consulte [docs/status.md](docs/status.md) e [docs/protocol-mapping.md](docs/protocol-mapping.md).
