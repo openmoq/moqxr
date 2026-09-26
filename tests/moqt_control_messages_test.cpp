@@ -110,7 +110,8 @@ void append_vi64(std::vector<std::uint8_t>& out, std::uint64_t value) {
 }
 
 bool uses_vi64(DraftVersion draft) {
-    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18 ||
+        draft == DraftVersion::kDraft21;
 }
 
 void append_moqint(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint64_t value) {
@@ -1580,10 +1581,23 @@ bool test_object_properties() {
     return ok;
 }
 
+bool test_draft21_identity() {
+    bool ok = true;
+    ok &= expect(openmoq::publisher::default_alpn(DraftVersion::kDraft21) == "moqt-21", "draft-21 ALPN token");
+    ok &= expect(openmoq::publisher::to_string(DraftVersion::kDraft21) == "draft-21", "draft-21 to_string");
+    const SetupMessage setup{.draft = DraftVersion::kDraft21, .max_request_id = 1};
+    const std::vector<std::uint8_t> bytes = encode_setup_message(setup);
+    Uint16Frame frame;
+    ok &= expect(expect_uint16_frame(bytes, 0x2f00, frame, "draft-21 setup"),
+                 "draft-21 SETUP uses the vi64 unified SETUP type 0x2f00");
+    return ok;
+}
+
 int main() {
     bool ok = true;
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
+    ok &= test_draft21_identity();
     ok &= test_uint8_message_parameter_decoding();
     ok &= test_publisher_control_message_encoders_for_all_drafts();
     ok &= test_peer_control_message_decoders_for_all_drafts();

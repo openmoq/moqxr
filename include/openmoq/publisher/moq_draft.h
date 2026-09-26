@@ -9,6 +9,7 @@ enum class DraftVersion {
     kDraft16,
     kDraft17,
     kDraft18,
+    kDraft21,
 };
 
 struct DraftProfile {

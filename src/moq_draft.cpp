@@ -38,6 +38,15 @@ DraftProfile draft_profile(DraftVersion version) {
                 .object_status_label = "Object Status",
                 .notes = "Current target profile. Control/request stream semantics differ from draft-16.",
             };
+        case DraftVersion::kDraft21:
+            return {
+                .version = version,
+                .subscribe_namespace_label = "Track Namespace",
+                .track_alias_label = "Track Alias",
+                .object_status_label = "Object Status",
+                .notes = "Draft-21 profile. Extends draft-18 semantics: PUBLISH_OK drops GROUP_ORDER, "
+                         "SUBSCRIBE_TRACKS gains it and Range Filters, SETUP gains MAX_REQUEST_UPDATES.",
+            };
     }
 
     throw std::runtime_error("unreachable draft version");
@@ -53,6 +62,8 @@ std::string to_string(DraftVersion version) {
             return "draft-17";
         case DraftVersion::kDraft18:
             return "draft-18";
+        case DraftVersion::kDraft21:
+            return "draft-21";
     }
 
     throw std::runtime_error("unreachable draft version");
@@ -68,6 +79,8 @@ std::string default_alpn(DraftVersion version) {
             return "moqt-17";
         case DraftVersion::kDraft18:
             return "moqt-18";
+        case DraftVersion::kDraft21:
+            return "moqt-21";
     }
 
     throw std::runtime_error("unreachable draft version");

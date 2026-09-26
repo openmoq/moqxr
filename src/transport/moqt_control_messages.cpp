@@ -54,6 +54,7 @@ constexpr std::uint64_t kDraft14Version = 0xff00000eULL;
 constexpr std::uint64_t kDraft16Version = 0xff000010ULL;
 constexpr std::uint64_t kDraft17Version = 0xff000011ULL;
 constexpr std::uint64_t kDraft18Version = 0xff000012ULL;
+constexpr std::uint64_t kDraft21Version = 0xff000015ULL;
 constexpr std::uint64_t kMaxQuicVarintValue = 4611686018427387903ULL;
 constexpr std::uint64_t kSubscribeErrorTrackDoesNotExist = 0x2;
 constexpr std::uint8_t kGroupOrderAscending = 0x1;
@@ -65,7 +66,8 @@ bool decode_varint_impl(std::span<const std::uint8_t> bytes, std::size_t& offset
 bool decode_vi64_impl(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 
 bool uses_moq_vi64(DraftVersion draft) {
-    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18 ||
+        draft == DraftVersion::kDraft21;
 }
 
 bool decode_moqint_impl(std::span<const std::uint8_t> bytes,
@@ -478,6 +480,8 @@ std::uint64_t draft_version_number(DraftVersion draft) {
             return kDraft17Version;
         case DraftVersion::kDraft18:
             return kDraft18Version;
+        case DraftVersion::kDraft21:
+            return kDraft21Version;
     }
 
     return kDraft18Version;
