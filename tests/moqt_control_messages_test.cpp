@@ -1730,9 +1730,58 @@ bool test_draft21_location_filter() {
     return ok;
 }
 
+std::vector<std::uint8_t> build_draft_request_with_include_properties(DraftVersion draft,
+                                                                     std::uint64_t message_type,
+                                                                     std::uint8_t include_properties) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 11);
+    append_track_namespace(payload, draft, {"live"});
+    if (message_type == 0x03) {
+        append_string(payload, draft, "video");
+    }
+    append_moqint(payload, draft, 1);     // one parameter
+    append_moqint(payload, draft, 0x35);  // INCLUDE_PROPERTIES (uint8)
+    payload.push_back(include_properties);
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, message_type);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_include_properties() {
+    bool ok = true;
+    for (const std::uint8_t value : {std::uint8_t{0}, std::uint8_t{1}}) {
+        SubscribeMessage subscribe;
+        ok &= expect(decode_subscribe_message(build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x03, value),
+                                              DraftVersion::kDraft21, subscribe),
+                     "draft-21 SUBSCRIBE accepts INCLUDE_PROPERTIES=" + std::to_string(value));
+        SubscribeTracksMessage tracks;
+        ok &= expect(decode_subscribe_tracks_message(
+                         build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x51, value),
+                         DraftVersion::kDraft21, tracks),
+                     "draft-21 SUBSCRIBE_TRACKS accepts INCLUDE_PROPERTIES=" + std::to_string(value));
+    }
+    SubscribeMessage subscribe;
+    ok &= expect(!decode_subscribe_message(build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x03, 2),
+                                           DraftVersion::kDraft21, subscribe),
+                 "draft-21 SUBSCRIBE rejects INCLUDE_PROPERTIES outside 0..1");
+    SubscribeTracksMessage tracks;
+    ok &= expect(!decode_subscribe_tracks_message(
+                     build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x51, 2),
+                     DraftVersion::kDraft21, tracks),
+                 "draft-21 SUBSCRIBE_TRACKS rejects INCLUDE_PROPERTIES outside 0..1");
+    ok &= expect(!decode_subscribe_message(build_draft_request_with_include_properties(DraftVersion::kDraft18, 0x03, 1),
+                                           DraftVersion::kDraft18, subscribe),
+                 "draft-18 SUBSCRIBE still rejects the undefined 0x35 parameter");
+    return ok;
+}
+
 int main() {
     bool ok = true;
     ok &= test_draft21_location_filter();
+    ok &= test_draft21_include_properties();
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
     ok &= test_draft21_identity();

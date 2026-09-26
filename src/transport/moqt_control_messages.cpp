@@ -507,6 +507,18 @@ bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
     return true;
 }
 
+constexpr std::uint64_t kParamIncludeProperties = 0x35;
+
+// Draft-21 INCLUDE_PROPERTIES is an odd-typed uint8, an exception to the
+// odd-means-length-prefixed rule. This publisher never sends Track Properties,
+// so either legal value is already honored.
+bool decode_include_properties(std::span<const std::uint8_t> bytes, std::size_t& offset, std::size_t end) {
+    if (offset >= end) {
+        return false;
+    }
+    return bytes[offset++] <= 1;
+}
+
 std::vector<std::uint8_t> encode_varint(std::uint64_t value) {
     std::vector<std::uint8_t> bytes;
     if (!append_varint(bytes, value)) {
@@ -1341,6 +1353,12 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
             return false;
         }
+        if (draft == DraftVersion::kDraft21 && parameter_type == kParamIncludeProperties) {
+            if (!decode_include_properties(bytes, offset, payload_end)) {
+                return false;
+            }
+            continue;
+        }
 
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
@@ -1448,6 +1466,12 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                    parameter_type,
                                    kParamAuthorizationToken)) {
             return false;
+        }
+        if (draft == DraftVersion::kDraft21 && parameter_type == kParamIncludeProperties) {
+            if (!decode_include_properties(bytes, offset, payload_end)) {
+                return false;
+            }
+            continue;
         }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
