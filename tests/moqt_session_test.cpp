@@ -874,15 +874,16 @@ std::vector<std::uint8_t> encode_request_update_filter_message(
     std::uint64_t filter_type,
     std::size_t start_group_id,
     std::size_t start_object_id,
-    std::size_t end_group_id = 0) {
+    std::size_t end_group_id = 0,
+    std::optional<std::size_t> end_object_id = std::nullopt) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     if (draft == DraftVersion::kDraft16) {
         append_bytes(payload, encode_moqint(draft, existing_request_id.value_or(0)));
     }
     append_bytes(payload, encode_moqint(draft, 1));
     append_bytes(payload, encode_moqint(draft, 0x21));
-    const std::vector<std::uint8_t> filter =
-        encode_draft18_family_filter_value(draft, filter_type, start_group_id, start_object_id, end_group_id);
+    const std::vector<std::uint8_t> filter = encode_draft18_family_filter_value(
+        draft, filter_type, start_group_id, start_object_id, end_group_id, end_object_id);
     append_bytes(payload, encode_moqint(draft, filter.size()));
     payload.insert(payload.end(), filter.begin(), filter.end());
 
@@ -4320,6 +4321,38 @@ int main() {
                                     write.bytes == expected_ok;
                          }) == 1,
                      "expected draft-18 end-extension REQUEST_OK to include current LARGEST_OBJECT without an id");
+    }
+
+    {
+        // Draft-21: raising only EndObject within the same End Group extends the
+        // subscription end (§9.5.1), so REQUEST_OK must carry LARGEST_OBJECT.
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, DraftVersion::kDraft21,
+            0, 0, 20, 1, 0, 0, 0x04, 1, std::size_t{0});
+        append_bytes(coalesced, encode_request_update_filter_message(
+                                    DraftVersion::kDraft21, 93, std::nullopt, 0x04, 0, 0, 1, std::size_t{5}));
+        transport.reads[1].push_back(std::move(coalesced));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'E'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft21);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 EndObject extension connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected draft-21 EndObject extension to succeed: " + status.message);
+        const auto expected_ok =
+            openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft21, 93, 3, 7);
+        ok &= expect(std::count_if(transport.writes.begin(), transport.writes.end(),
+                                   [&](const MockTransport::WriteEvent& write) {
+                                       return write.stream_id == 1 && write.bytes == expected_ok;
+                                   }) == 1,
+                     "expected draft-21 EndObject-only extension REQUEST_OK to include LARGEST_OBJECT");
     }
 
     {

@@ -1713,8 +1713,13 @@ bool request_update_extends_end(const SubscribeMessage& subscribe,
         return false;
     }
     const SubscriptionFilter& updated = *update.subscription_filter;
-    return updated.filter_type != 0x04 ||
-           updated.end_group_id > subscribe.end_group_id;
+    if (updated.filter_type != 0x04) {
+        return true;
+    }
+    // An absent EndObject covers the whole End Group.
+    constexpr std::size_t kWholeGroup = std::numeric_limits<std::size_t>::max();
+    return std::pair{updated.end_group_id, updated.end_object_id.value_or(kWholeGroup)} >
+           std::pair{subscribe.end_group_id, subscribe.end_object_id.value_or(kWholeGroup)};
 }
 
 bool apply_subscribe_update(SubscribeMessage& subscribe, const SubscribeUpdateMessage& update) {
