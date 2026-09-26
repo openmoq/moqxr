@@ -1602,28 +1602,37 @@ std::vector<std::uint8_t> encode_live_request_ok_message(
 // the REQUEST_OK reported a Largest Object opens a fill fetch stream. Holding no
 // fetchable history, the publisher reports fill failure the only way the draft
 // allows: FETCH_HEADER, then an immediate reset.
-TransportStatus open_failed_fill_stream(PublisherTransport& transport,
+void open_failed_fill_stream(PublisherTransport& transport,
                                         openmoq::publisher::DraftVersion draft,
                                         const RequestUpdateMessage& update,
                                         std::uint8_t forward,
                                         bool largest_reported) {
     if (draft != openmoq::publisher::DraftVersion::kDraft21 || !update.fill_requested || forward != 1 ||
         !largest_reported) {
-        return TransportStatus::success();
+        return;
     }
+    // A fill failure never affects the subscription (§3.4.1), so transport
+    // errors here are logged rather than ending the session.
     std::uint64_t stream_id = 0;
     TransportStatus status = transport.open_stream(StreamDirection::kUnidirectional, stream_id);
     if (!status.ok) {
-        return status;
+        std::cerr << "[moqt-session] warning: could not open fill fetch stream for request_id="
+                  << update.request_id << ": " << status.message << '\n';
+        return;
     }
     status = transport.write_stream(stream_id, encode_fetch_header(draft, update.request_id), false);
     if (!status.ok) {
-        return status;
+        std::cerr << "[moqt-session] warning: could not write fill FETCH_HEADER for request_id="
+                  << update.request_id << ": " << status.message << '\n';
     }
     // Stream reset INTERNAL_ERROR (§12.5): the draft has no reset code for an
     // unsupported fill, and 0x3 here would mean SESSION_CLOSED.
     constexpr std::uint64_t kResetInternalError = 0x00;
-    return transport.reset_stream(stream_id, kResetInternalError);
+    status = transport.reset_stream(stream_id, kResetInternalError);
+    if (!status.ok) {
+        std::cerr << "[moqt-session] warning: could not reset fill fetch stream for request_id="
+                  << update.request_id << ": " << status.message << '\n';
+    }
 }
 
 // Draft-21 SUBSCRIBE_TRACKS may seed the resulting subscriptions with a
@@ -4059,8 +4068,9 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         if (!response_status.ok) {
             return response_status;
         }
-        return open_failed_fill_stream(
+        open_failed_fill_stream(
             transport, draft, update, forward_after_update, largest_object_for_response.has_value());
+        return TransportStatus::success();
     };
 
     while (true) {
@@ -7308,11 +7318,12 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             if (!response_status.ok) {
                 return response_status;
             }
-            return open_failed_fill_stream(transport_,
+            open_failed_fill_stream(transport_,
                                            draft_version,
                                            update,
                                            active_it->second.forward,
                                            largest_object_by_track.contains(track_name));
+            return TransportStatus::success();
         };
 
     process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
@@ -8576,11 +8587,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!response_status.ok) {
                 return response_status;
             }
-            return open_failed_fill_stream(transport_,
+            open_failed_fill_stream(transport_,
                                            draft_version,
                                            update,
                                            settings_it->second.forward,
                                            largest_object_by_track.contains(track_name));
+            return TransportStatus::success();
         };
 
     const auto apply_subscriber_request_update =
@@ -8657,11 +8669,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (!response_status.ok) {
                 return response_status;
             }
-            return open_failed_fill_stream(transport_,
+            open_failed_fill_stream(transport_,
                                            draft_version,
                                            update,
                                            active_it->second.forward,
                                            largest_object_by_track.contains(track_name));
+            return TransportStatus::success();
         };
 
     const auto process_publish_request_updates = [&]() -> TransportStatus {
@@ -9783,11 +9796,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             if (!response_status.ok) {
                 return response_status;
             }
-            return open_failed_fill_stream(transport_,
+            open_failed_fill_stream(transport_,
                                            draft_version,
                                            update,
                                            active_it->second.forward,
                                            largest_object_by_track.contains(track_name));
+            return TransportStatus::success();
         };
 
     const auto process_subscriber_request_updates = [&]() -> TransportStatus {
@@ -9849,11 +9863,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 if (!response_status.ok) {
                     return response_status;
                 }
-                return open_failed_fill_stream(transport_,
+                open_failed_fill_stream(transport_,
                                                draft_version,
                                                update,
                                                settings_it->second.forward,
                                                largest_object_by_track.contains(track_name));
+                return TransportStatus::success();
             },
             [&](const std::string& track_name, std::uint64_t request_id) {
                 static_cast<void>(track_name);

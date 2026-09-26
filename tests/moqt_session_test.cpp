@@ -206,6 +206,10 @@ struct MockTransport final : PublisherTransport {
             return TransportStatus::failure("not connected");
         }
 
+        if (direction == StreamDirection::kUnidirectional && fail_next_uni_open) {
+            fail_next_uni_open = false;
+            return TransportStatus::failure("injected unidirectional open failure");
+        }
         if (direction == StreamDirection::kBidirectional) {
             stream_id = next_bidi_;
             next_bidi_ += 4;
@@ -383,6 +387,7 @@ struct MockTransport final : PublisherTransport {
     std::uint64_t next_bidi_ = 0;
     std::uint64_t next_uni_ = 2;
     std::uint64_t last_close_code = 0;
+    bool fail_next_uni_open = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reset_calls;
     std::size_t read_count = 0;
     std::string missing_read_error;
@@ -8299,6 +8304,40 @@ int main() {
         } else {
             ok &= expect(!fill_stream.has_value(), "expected FILL_PARAMETERS with Forward=0 to open no fill fetch stream");
         }
+    }
+
+    {
+        // §3.4.1: fill failure never affects the subscription, so a fill stream
+        // that cannot even be opened must not end the session.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 100, 1, 0, 0, 0x04, 4));
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                current.reads[1].push_back(encode_request_update_message(draft, 93, 0, 0x23));
+                current.fail_next_uni_open = true;
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index++ != 0) {
+                    return std::nullopt;
+                }
+                return LiveObject{.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7,
+                                  .payload = {'X'}, .subgroup_contains_group_largest = true,
+                                  .final_in_subgroup = true};
+            },
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 failed-fill connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected a fill stream that cannot open to leave the session running: " + status.message);
     }
 
     for (const bool coalesced : {false, true}) {
