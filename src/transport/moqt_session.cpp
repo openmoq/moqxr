@@ -1620,8 +1620,10 @@ TransportStatus open_failed_fill_stream(PublisherTransport& transport,
     if (!status.ok) {
         return status;
     }
-    constexpr std::uint64_t kResetNotSupported = 0x03;
-    return transport.reset_stream(stream_id, kResetNotSupported);
+    // Stream reset INTERNAL_ERROR (§12.5): the draft has no reset code for an
+    // unsupported fill, and 0x3 here would mean SESSION_CLOSED.
+    constexpr std::uint64_t kResetInternalError = 0x00;
+    return transport.reset_stream(stream_id, kResetInternalError);
 }
 
 bool live_object_matches_request_union(

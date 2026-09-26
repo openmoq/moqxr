@@ -8154,9 +8154,9 @@ int main() {
             ok &= expect(status.ok, "expected draft-21 fill publish to succeed: " + status.message);
             ok &= expect(fill_stream.has_value() &&
                              std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
-                                       std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x03}) !=
+                                       std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x00}) !=
                                  transport.reset_calls.end(),
-                         "expected draft-21 FILL_PARAMETERS to open a fill fetch stream and reset it with NOT_SUPPORTED");
+                         "expected draft-21 FILL_PARAMETERS to open a fill fetch stream and reset it with INTERNAL_ERROR");
         } else {
             ok &= expect(!fill_stream.has_value(), "expected FILL_PARAMETERS with Forward=0 to open no fill fetch stream");
         }
