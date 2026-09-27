@@ -404,6 +404,25 @@ void append_parameter_delta(std::vector<std::uint8_t>& out,
     previous_type = type;
 }
 
+// LARGEST_OBJECT (0x09) is a Location. Drafts 17+ define per-parameter encodings, so it is
+// two bare vi64s there; draft 16 frames it as an odd Key-Value-Pair with a length.
+void append_largest_object_parameter(std::vector<std::uint8_t>& out,
+                                     DraftVersion draft,
+                                     std::uint64_t& previous_type,
+                                     std::size_t group_id,
+                                     std::size_t object_id) {
+    constexpr std::uint64_t kParamLargestObject = 0x09;
+    std::vector<std::uint8_t> location;
+    append_location(location, draft, group_id, object_id);
+    if (!uses_moq_vi64(draft)) {
+        append_parameter_delta(out, draft, previous_type, kParamLargestObject, location);
+        return;
+    }
+    append_moqint(out, draft, kParamLargestObject - previous_type);
+    out.insert(out.end(), location.begin(), location.end());
+    previous_type = kParamLargestObject;
+}
+
 enum class ParameterTypeDecodeError {
     kNone,
     kEncoding,
@@ -976,17 +995,8 @@ std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
         append_moqint(payload, draft, request_id);
     }
     append_moqint(payload, draft, 1);
-    std::vector<std::uint8_t> largest_object;
-    append_location(largest_object,
-                    draft,
-                    largest_group_id,
-                    largest_object_id);
     std::uint64_t previous_parameter_type = 0;
-    append_parameter_delta(payload,
-                           draft,
-                           previous_parameter_type,
-                           0x09,
-                           largest_object);
+    append_largest_object_parameter(payload, draft, previous_parameter_type, largest_group_id, largest_object_id);
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kRequestOkType);
@@ -1800,9 +1810,8 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
         std::uint64_t previous_parameter_type = 0;
         std::uint64_t parameter_count = 0;
         if (content_exists) {
-            std::vector<std::uint8_t> largest_object;
-            append_location(largest_object, draft, largest_group_id, largest_object_id);
-            append_parameter_delta(parameters, draft, previous_parameter_type, 0x09, largest_object);
+            append_largest_object_parameter(
+                parameters, draft, previous_parameter_type, largest_group_id, largest_object_id);
             ++parameter_count;
         }
         append_moqint(payload, draft, parameter_count);

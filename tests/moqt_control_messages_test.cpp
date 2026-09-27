@@ -1,5 +1,6 @@
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -943,9 +944,13 @@ bool test_publisher_control_message_encoders_for_all_drafts() {
             std::uint64_t largest_object = 0;
             ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object_delta) && largest_object_delta == 0x09,
                          label + " subscribe ok largest-object parameter delta");
-            ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object_length),
-                         label + " subscribe ok largest-object length");
-            const std::size_t largest_object_end = offset + static_cast<std::size_t>(largest_object_length);
+            // LARGEST_OBJECT is a bare Location on draft-17+; draft 16 length-prefixes it.
+            std::size_t largest_object_end = frame.payload_end;
+            if (!uses_vi64(draft)) {
+                ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object_length),
+                             label + " subscribe ok largest-object length");
+                largest_object_end = offset + static_cast<std::size_t>(largest_object_length);
+            }
             ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_group) && largest_group == 3,
                          label + " subscribe ok largest group");
             ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object) && largest_object == 5,
@@ -1172,7 +1177,7 @@ bool test_request_update_response_wire_shapes() {
                  "draft-16 end-extension REQUEST_OK carries request id and LARGEST_OBJECT");
 
     const std::vector<std::uint8_t> draft18_extended_ok = {
-        0x07, 0x00, 0x05, 0x01, 0x09, 0x02, 0x0c, 0x05,
+        0x07, 0x00, 0x04, 0x01, 0x09, 0x0c, 0x05,
     };
     ok &= expect(encode_request_ok_message(
                      DraftVersion::kDraft18, 101, 12, 5) ==
@@ -2009,8 +2014,31 @@ bool test_draft21_request_update_filter_errors() {
     return ok;
 }
 
+bool test_largest_object_parameter_is_a_bare_location() {
+    bool ok = true;
+    // LARGEST_OBJECT (0x09) is "a Location" (draft-18 10.2.11, draft-21 9.20.18): two vi64s
+    // with no length prefix on drafts that define per-parameter encodings (17+). Draft 16
+    // still frames it as an odd KVP with a length.
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        ok &= expect(openmoq::publisher::transport::encode_subscribe_ok_message(draft, 9, 1, 3, 7, true) ==
+                         std::vector<std::uint8_t>{0x04, 0x00, 0x05, 0x01, 0x01, 0x09, 0x03, 0x07},
+                     draft_label(draft) + " SUBSCRIBE_OK carries LARGEST_OBJECT as a bare Location");
+        ok &= expect(encode_request_ok_message(draft, 93, 3, 7) ==
+                         std::vector<std::uint8_t>{0x07, 0x00, 0x04, 0x01, 0x09, 0x03, 0x07},
+                     draft_label(draft) + " REQUEST_UPDATE_OK carries LARGEST_OBJECT as a bare Location");
+    }
+    const std::vector<std::uint8_t> draft16 =
+        openmoq::publisher::transport::encode_subscribe_ok_message(DraftVersion::kDraft16, 9, 1, 3, 7, true);
+    const std::vector<std::uint8_t> draft16_largest{0x09, 0x02, 0x03, 0x07};
+    ok &= expect(std::search(draft16.begin(), draft16.end(), draft16_largest.begin(), draft16_largest.end()) !=
+                     draft16.end(),
+                 "draft-16 SUBSCRIBE_OK keeps LARGEST_OBJECT length-prefixed");
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_largest_object_parameter_is_a_bare_location();
     ok &= test_draft21_request_update_filter_errors();
     ok &= test_draft21_subscribe_tracks_rejects_range_filters();
     ok &= test_parameter_length_wrap_is_rejected();
