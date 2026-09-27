@@ -558,7 +558,9 @@ std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
     append_moqint(filter, draft, 0x04);
     append_moqint(filter, draft, 12);
     append_moqint(filter, draft, 5);
-    append_moqint(filter, draft, 20);
+    // Draft-16 carries an absolute End Group; drafts 17/18 carry End Group
+    // Delta from the Start Group (§5.1.2), so End Group 20 is delta 8.
+    append_moqint(filter, draft, draft == DraftVersion::kDraft16 ? 20 : 8);
     append_moqint(payload, draft, filter.size());
     payload.insert(payload.end(), filter.begin(), filter.end());
     previous_type = 0x21;

@@ -1270,6 +1270,14 @@ bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
             if (!decode_moqint_impl(bytes, offset, draft, end_group_id)) {
                 return false;
             }
+            // Drafts 17/18 carry End Group Delta from the Start Group (§5.1.2);
+            // draft 16 carries the absolute End Group.
+            if (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) {
+                if (end_group_id > std::numeric_limits<std::uint64_t>::max() - group_id) {
+                    return false;
+                }
+                end_group_id += group_id;
+            }
             message.end_group_id = static_cast<std::size_t>(end_group_id);
         }
     } else {

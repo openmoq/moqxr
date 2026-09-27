@@ -653,7 +653,9 @@ std::vector<std::uint8_t> encode_draft18_family_filter_value(DraftVersion draft,
         append_bytes(filter, encode_moqint(draft, start_group_id));
         append_bytes(filter, encode_moqint(draft, start_object_id));
         if (filter_type == 0x04) {
-            append_bytes(filter, encode_moqint(draft, end_group_id));
+            // Drafts 17/18 encode End Group Delta; draft 16 the absolute End Group.
+            const bool delta = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+            append_bytes(filter, encode_moqint(draft, delta ? end_group_id - start_group_id : end_group_id));
         }
     }
     return filter;
@@ -764,7 +766,9 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             filter_value.insert(filter_value.end(), sg.begin(), sg.end());
             filter_value.insert(filter_value.end(), so.begin(), so.end());
             if (filter_type_value == 0x04) {
-                append_bytes(filter_value, encode_moqint(draft, end_group_id));
+                const bool delta = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+                append_bytes(filter_value,
+                             encode_moqint(draft, delta ? end_group_id - start_group_id : end_group_id));
             }
         }
         const std::vector<std::uint8_t> filter_len = encode_moqint(draft, filter_value.size());
