@@ -3984,6 +3984,37 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             resume_generation_leaders();
         };
 
+    // Draft-21 #1833 (section 3.3.1): a publisher does not end a subscription
+    // because the Largest Object passes the end of its Location Filter; the
+    // subscriber can still widen it with REQUEST_UPDATE. A draft-21
+    // subscription that has sent everything its filter selects is therefore
+    // kept until its track ends: when the track's last plan object becomes
+    // available (at once when unpaced), or never while the track loops.
+    const auto track_end_at =
+        [&](const ActiveSubscription& active)
+            -> std::optional<std::chrono::steady_clock::time_point> {
+        if (loop_state.enabled && track_can_loop(loop_state, active.track.name)) {
+            return std::nullopt;
+        }
+        std::optional<std::size_t> last_index;
+        for (std::size_t index = 0; index < plan.objects.size(); ++index) {
+            if (plan.objects[index].track_name == active.track.name) {
+                last_index = index;
+            }
+        }
+        if (!last_index.has_value() || !uses_priority_scheduler(draft)) {
+            return read_now(now_function);
+        }
+        return generation_availability.object_available_at(active.loop_cycle, *last_index);
+    };
+    const auto held_until_track_end = [&](const ActiveSubscription& active) {
+        if (draft != openmoq::publisher::DraftVersion::kDraft21) {
+            return false;
+        }
+        const auto end_at = track_end_at(active);
+        return !end_at.has_value() || read_now(now_function) < *end_at;
+    };
+
     const auto process_subscription_request_update =
         [&](const RequestUpdateMessage& update,
             std::uint64_t existing_request_id,
@@ -4240,6 +4271,12 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         enqueue_active_candidate(
                             subscribe.request_id,
                             active_subscriptions.at(subscribe.request_id));
+                    } else if (draft == openmoq::publisher::DraftVersion::kDraft21) {
+                        // Nothing matches yet; the subscription still lasts until the
+                        // track ends (see held_until_track_end).
+                        active.completed = true;
+                        active_subscriptions.insert_or_assign(subscribe.request_id, std::move(active));
+                        served_any_subscription = true;
                     } else {
                         const TransportStatus finalize_status =
                             finalize_subscription(transport, draft, request_stream_id, subscribe.request_id, 0, completed_request_ids);
@@ -4877,7 +4914,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         if (!active_subscriptions.empty()) {
             std::vector<std::uint64_t> completed_request_ids_to_finalize;
             for (const auto& [request_id, active] : active_subscriptions) {
-                if (active.completed) {
+                if (active.completed && !held_until_track_end(active)) {
                     completed_request_ids_to_finalize.push_back(request_id);
                 }
             }

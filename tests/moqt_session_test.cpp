@@ -174,6 +174,8 @@ struct MockTransport final : PublisherTransport {
         std::vector<std::uint8_t> bytes;
         bool fin = false;
         std::size_t reset_count_before_write = 0;
+        // When write_clock is set, the time the write happened.
+        std::optional<std::chrono::steady_clock::time_point> at;
     };
     struct OpenEvent {
         StreamDirection direction = StreamDirection::kBidirectional;
@@ -263,6 +265,7 @@ struct MockTransport final : PublisherTransport {
             .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
             .fin = fin,
             .reset_count_before_write = reset_calls.size(),
+            .at = write_clock ? std::optional{write_clock()} : std::nullopt,
         });
         return TransportStatus::success();
     }
@@ -393,6 +396,7 @@ struct MockTransport final : PublisherTransport {
     std::string missing_read_error;
     std::vector<OpenEvent> opens;
     std::vector<WriteEvent> writes;
+    std::function<std::chrono::steady_clock::time_point()> write_clock;
     std::vector<ObjectWriteEvent> object_write_attempts;
     std::vector<std::pair<std::uint64_t, std::uint8_t>> reliable_stream_priorities;
     std::vector<std::chrono::milliseconds> read_timeouts;
@@ -4367,6 +4371,47 @@ int main() {
                                        return write.stream_id == 1 && write.bytes == expected_ok;
                                    }) == 1,
                      "expected draft-21 EndObject-only extension REQUEST_OK to include LARGEST_OBJECT");
+    }
+
+    {
+        // Draft-21 #1833 (section 3.3.1): a publisher does not end a subscription
+        // because the Largest Object passes the end of its Location Filter. With
+        // paced publishing the track continues after the filter end at group 1,
+        // so PUBLISH_DONE waits until the track's last object is published.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        const auto ticks = std::make_shared<std::atomic<std::int64_t>>(0);
+        const auto origin = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+        const openmoq::publisher::transport::NowFunction clock = [ticks, origin] {
+            return origin + std::chrono::milliseconds(ticks->fetch_add(1));
+        };
+        MockTransport transport;
+        transport.write_clock = [ticks, origin] { return origin + std::chrono::milliseconds(ticks->load()); };
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 20, 1, 0, 0, 0x04, 1));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .media_time_us = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 2, .subgroup_id = 0, .object_id = 0, .media_time_us = 200000, .marker = 'B'},
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 0, .media_time_us = 400000, .marker = 'C'},
+            {.track_name = "events", .group_id = 4, .subgroup_id = 0, .object_id = 0, .media_time_us = 600000, .marker = 'D'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(draft);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, /*paced=*/true,
+                            /*loop=*/false, std::chrono::seconds(5), {}, clock);
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 filter-end connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected draft-21 filter-end publish to succeed: " + status.message);
+        std::optional<std::chrono::steady_clock::time_point> done_at;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 1 && !write.bytes.empty() && write.bytes[0] == 0x0b) {
+                done_at = write.at;
+            }
+        }
+        ok &= expect(done_at.has_value(), "expected draft-21 bounded subscription to end with PUBLISH_DONE");
+        ok &= expect(done_at.has_value() && *done_at >= origin + std::chrono::milliseconds(600),
+                     "expected draft-21 PUBLISH_DONE to wait for the track's last object, not the filter end");
     }
 
     {
