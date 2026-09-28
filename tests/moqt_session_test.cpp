@@ -68,6 +68,12 @@ using openmoq::publisher::ByteSpan;
 using openmoq::publisher::CmsfObject;
 using openmoq::publisher::CmsfObjectKind;
 using openmoq::publisher::DraftVersion;
+
+// Draft-21 keeps the draft-18 control/request-stream model for everything the
+// session tests exercise, so draft-21 cases share draft-18 expectations.
+bool draft18_family(DraftVersion draft) {
+    return draft == DraftVersion::kDraft18 || draft == DraftVersion::kDraft21;
+}
 using openmoq::publisher::LiveCatalogMode;
 using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
@@ -120,7 +126,7 @@ std::vector<std::uint8_t> encode_vi64(std::uint64_t value) {
 }
 
 std::vector<std::uint8_t> encode_moqint(DraftVersion draft, std::uint64_t value) {
-    return (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18)
+    return (draft == DraftVersion::kDraft17 || draft18_family(draft))
                ? encode_vi64(value)
                : encode_varint(value);
 }
@@ -168,6 +174,8 @@ struct MockTransport final : PublisherTransport {
         std::vector<std::uint8_t> bytes;
         bool fin = false;
         std::size_t reset_count_before_write = 0;
+        // When write_clock is set, the time the write happened.
+        std::optional<std::chrono::steady_clock::time_point> at;
     };
     struct OpenEvent {
         StreamDirection direction = StreamDirection::kBidirectional;
@@ -200,6 +208,10 @@ struct MockTransport final : PublisherTransport {
             return TransportStatus::failure("not connected");
         }
 
+        if (direction == StreamDirection::kUnidirectional && fail_next_uni_open) {
+            fail_next_uni_open = false;
+            return TransportStatus::failure("injected unidirectional open failure");
+        }
         if (direction == StreamDirection::kBidirectional) {
             stream_id = next_bidi_;
             next_bidi_ += 4;
@@ -253,6 +265,7 @@ struct MockTransport final : PublisherTransport {
             .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
             .fin = fin,
             .reset_count_before_write = reset_calls.size(),
+            .at = write_clock ? std::optional{write_clock()} : std::nullopt,
         });
         return TransportStatus::success();
     }
@@ -377,11 +390,13 @@ struct MockTransport final : PublisherTransport {
     std::uint64_t next_bidi_ = 0;
     std::uint64_t next_uni_ = 2;
     std::uint64_t last_close_code = 0;
+    bool fail_next_uni_open = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reset_calls;
     std::size_t read_count = 0;
     std::string missing_read_error;
     std::vector<OpenEvent> opens;
     std::vector<WriteEvent> writes;
+    std::function<std::chrono::steady_clock::time_point()> write_clock;
     std::vector<ObjectWriteEvent> object_write_attempts;
     std::vector<std::pair<std::uint64_t, std::uint8_t>> reliable_stream_priorities;
     std::vector<std::chrono::milliseconds> read_timeouts;
@@ -564,13 +579,13 @@ std::vector<std::uint8_t> make_live_init_mp4_cenc_no_pssh() {
 
 std::vector<std::uint8_t> encode_publish_namespace_ok_message(DraftVersion draft, std::uint64_t request_id) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!draft18_family(draft)) {
         payload = encode_moqint(draft, request_id);
     }
     if (draft == DraftVersion::kDraft16) {
         const std::vector<std::uint8_t> parameter_count = encode_varint(0);
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
-    } else if (draft == DraftVersion::kDraft18) {
+    } else if (draft18_family(draft)) {
         const std::vector<std::uint8_t> parameter_count = encode_moqint(draft, 0);
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     }
@@ -596,8 +611,8 @@ std::vector<std::uint8_t> encode_subscribe_namespace_message(DraftVersion draft,
     const std::vector<std::uint8_t> parameter_count = encode_moqint(draft, 0);
     payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
 
-    std::vector<std::uint8_t> message = encode_moqint(draft, draft == DraftVersion::kDraft18 ? 0x50 : 0x11);
-    if (draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18) {
+    std::vector<std::uint8_t> message = encode_moqint(draft, draft18_family(draft) ? 0x50 : 0x11);
+    if (draft == DraftVersion::kDraft16 || draft18_family(draft)) {
         append_be16(message, static_cast<std::uint16_t>(payload.size()));
     } else {
         const std::vector<std::uint8_t> length = encode_varint(payload.size());
@@ -605,6 +620,49 @@ std::vector<std::uint8_t> encode_subscribe_namespace_message(DraftVersion draft,
     }
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
+}
+
+std::vector<std::uint8_t> encode_draft18_family_filter_value(DraftVersion draft,
+                                                            std::uint64_t filter_type,
+                                                            std::size_t start_group_id,
+                                                            std::size_t start_object_id,
+                                                            std::size_t end_group_id,
+                                                            std::optional<std::size_t> end_object_id = std::nullopt) {
+    std::vector<std::uint8_t> filter;
+    if (draft == DraftVersion::kDraft21) {
+        // Draft-21 LOCATION_FILTER: field count, not a Filter Type, selects the form.
+        switch (filter_type) {
+            case 0x01:
+                append_bytes(filter, encode_moqint(draft, 0));
+                break;
+            case 0x02:
+                append_bytes(filter, encode_moqint(draft, 0));
+                append_bytes(filter, encode_moqint(draft, 0));
+                break;
+            default:
+                append_bytes(filter, encode_moqint(draft, start_group_id));
+                append_bytes(filter, encode_moqint(draft, start_object_id));
+                if (filter_type == 0x04) {
+                    append_bytes(filter, encode_moqint(draft, end_group_id - start_group_id));
+                    if (end_object_id.has_value()) {
+                        append_bytes(filter, encode_moqint(draft, *end_object_id));
+                    }
+                }
+                break;
+        }
+        return filter;
+    }
+    append_bytes(filter, encode_moqint(draft, filter_type));
+    if (filter_type == 0x03 || filter_type == 0x04) {
+        append_bytes(filter, encode_moqint(draft, start_group_id));
+        append_bytes(filter, encode_moqint(draft, start_object_id));
+        if (filter_type == 0x04) {
+            // Drafts 17/18 encode End Group Delta; draft 16 the absolute End Group.
+            const bool delta = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+            append_bytes(filter, encode_moqint(draft, delta ? end_group_id - start_group_id : end_group_id));
+        }
+    }
+    return filter;
 }
 
 std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
@@ -619,7 +677,9 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                                                    std::size_t start_group_id = 0,
                                                    std::size_t start_object_id = 0,
                                                    std::uint64_t filter_type_value = 0x03,
-                                                   std::size_t end_group_id = 0) {
+                                                   std::size_t end_group_id = 0,
+                                                   std::optional<std::size_t> end_object_id = std::nullopt,
+                                                   bool fill_parameters = false) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     if (draft == DraftVersion::kDraft17) {
         append_bytes(payload, encode_moqint(draft, 0));
@@ -657,9 +717,9 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         // SUBGROUP_DELIVERY_TIMEOUT (0x06).
         const std::uint64_t timeout_parameter_count =
             (delivery_timeout_ms != 0 ? 1 : 0) +
-            (draft == DraftVersion::kDraft18 && subgroup_delivery_timeout_ms != 0 ? 1 : 0);
-        const std::vector<std::uint8_t> parameter_count =
-            encode_moqint(draft, 3 + timeout_parameter_count + (group_order != 0 ? 1 : 0));
+            (draft18_family(draft) && subgroup_delivery_timeout_ms != 0 ? 1 : 0);
+        const std::vector<std::uint8_t> parameter_count = encode_moqint(
+            draft, 3 + timeout_parameter_count + (group_order != 0 ? 1 : 0) + (fill_parameters ? 1 : 0));
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
         std::uint64_t previous_type = 0;
         if (delivery_timeout_ms != 0) {
@@ -669,7 +729,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             payload.insert(payload.end(), timeout_value.begin(), timeout_value.end());
             previous_type = 0x02;
         }
-        if (draft == DraftVersion::kDraft18 && subgroup_delivery_timeout_ms != 0) {
+        if (draft18_family(draft) && subgroup_delivery_timeout_ms != 0) {
             const std::vector<std::uint8_t> timeout_delta =
                 encode_moqint(draft, 0x06 - previous_type);
             const std::vector<std::uint8_t> timeout_value =
@@ -687,7 +747,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         // value as a single uint8 byte; earlier drafts use a varint.
         const std::vector<std::uint8_t> priority_delta = encode_moqint(draft, 0x20 - 0x10);
         const bool uint8_params =
-            draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+            draft == DraftVersion::kDraft17 || draft18_family(draft);
         const std::vector<std::uint8_t> priority_value =
             uint8_params ? std::vector<std::uint8_t>{subscriber_priority}
                          : encode_moqint(draft, subscriber_priority);
@@ -696,16 +756,24 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         // SUBSCRIPTION_FILTER (0x21, odd) delta=0x01
         // Value: filter type followed by its applicable locations.
         const std::vector<std::uint8_t> filter_delta = encode_moqint(draft, 0x21 - 0x20);
-        std::vector<std::uint8_t> filter_value;
-        const std::vector<std::uint8_t> ft =
-            encode_moqint(draft, filter_type_value);
-        const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
-        const std::vector<std::uint8_t> so = encode_moqint(draft, start_object_id);
-        filter_value.insert(filter_value.end(), ft.begin(), ft.end());
-        filter_value.insert(filter_value.end(), sg.begin(), sg.end());
-        filter_value.insert(filter_value.end(), so.begin(), so.end());
-        if (filter_type_value == 0x04) {
-            append_bytes(filter_value, encode_moqint(draft, end_group_id));
+        std::vector<std::uint8_t> filter_value =
+            draft == DraftVersion::kDraft21
+                ? encode_draft18_family_filter_value(
+                      draft, filter_type_value, start_group_id, start_object_id, end_group_id, end_object_id)
+                : std::vector<std::uint8_t>{};
+        if (draft != DraftVersion::kDraft21) {
+            const std::vector<std::uint8_t> ft =
+                encode_moqint(draft, filter_type_value);
+            const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
+            const std::vector<std::uint8_t> so = encode_moqint(draft, start_object_id);
+            filter_value.insert(filter_value.end(), ft.begin(), ft.end());
+            filter_value.insert(filter_value.end(), sg.begin(), sg.end());
+            filter_value.insert(filter_value.end(), so.begin(), so.end());
+            if (filter_type_value == 0x04) {
+                const bool delta = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+                append_bytes(filter_value,
+                             encode_moqint(draft, delta ? end_group_id - start_group_id : end_group_id));
+            }
         }
         const std::vector<std::uint8_t> filter_len = encode_moqint(draft, filter_value.size());
         payload.insert(payload.end(), filter_delta.begin(), filter_delta.end());
@@ -718,6 +786,10 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                              : encode_moqint(draft, group_order);
             payload.insert(payload.end(), group_order_delta.begin(), group_order_delta.end());
             payload.insert(payload.end(), group_order_value.begin(), group_order_value.end());
+        }
+        if (fill_parameters) {  // FILL_PARAMETERS (0x23), empty override block
+            append_bytes(payload, encode_moqint(draft, 0x23 - (group_order != 0 ? 0x22 : 0x21)));
+            append_bytes(payload, encode_moqint(draft, 0));
         }
     }
 
@@ -800,7 +872,7 @@ std::vector<std::uint8_t> encode_request_update_message(DraftVersion draft,
     }
     append_bytes(payload, encode_moqint(draft, 1));
     append_bytes(payload, encode_moqint(draft, parameter_type));
-    if (draft == DraftVersion::kDraft18 &&
+    if (draft18_family(draft) &&
         (parameter_type == 0x10 || parameter_type == 0x20 || parameter_type == 0x22)) {
         payload.push_back(value);
     } else {
@@ -820,21 +892,16 @@ std::vector<std::uint8_t> encode_request_update_filter_message(
     std::uint64_t filter_type,
     std::size_t start_group_id,
     std::size_t start_object_id,
-    std::size_t end_group_id = 0) {
+    std::size_t end_group_id = 0,
+    std::optional<std::size_t> end_object_id = std::nullopt) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     if (draft == DraftVersion::kDraft16) {
         append_bytes(payload, encode_moqint(draft, existing_request_id.value_or(0)));
     }
     append_bytes(payload, encode_moqint(draft, 1));
     append_bytes(payload, encode_moqint(draft, 0x21));
-    std::vector<std::uint8_t> filter = encode_moqint(draft, filter_type);
-    if (filter_type == 0x03 || filter_type == 0x04) {
-        append_bytes(filter, encode_moqint(draft, start_group_id));
-        append_bytes(filter, encode_moqint(draft, start_object_id));
-        if (filter_type == 0x04) {
-            append_bytes(filter, encode_moqint(draft, end_group_id));
-        }
-    }
+    const std::vector<std::uint8_t> filter = encode_draft18_family_filter_value(
+        draft, filter_type, start_group_id, start_object_id, end_group_id, end_object_id);
     append_bytes(payload, encode_moqint(draft, filter.size()));
     payload.insert(payload.end(), filter.begin(), filter.end());
 
@@ -885,10 +952,16 @@ std::vector<std::uint8_t> encode_malformed_request_update_parameter(
     append_bytes(payload, encode_moqint(draft, parameter_type));
     append_bytes(payload, encode_moqint(draft, 1));
     // REGISTER lacks its required alias/type; a range filter lacks all
-    // required locations. Both are malformed known key/value encodings.
-    append_bytes(payload,
-                 encode_moqint(draft,
-                               parameter_type == 0x03 ? 0x01 : 0x03));
+    // required locations. Both are malformed known key/value encodings. A
+    // draft-21 LOCATION_FILTER has no Filter Type, so its malformed form is a
+    // truncated two-byte vi64.
+    if (draft == DraftVersion::kDraft21 && parameter_type == 0x21) {
+        payload.push_back(0x80);
+    } else {
+        append_bytes(payload,
+                     encode_moqint(draft,
+                                   parameter_type == 0x03 ? 0x01 : 0x03));
+    }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
     append_be16(message, static_cast<std::uint16_t>(payload.size()));
@@ -907,13 +980,13 @@ std::vector<std::uint8_t> encode_duplicate_request_update_parameter(
     }
     append_bytes(payload, encode_moqint(draft, 2));
     append_bytes(payload, encode_moqint(draft, 0x10));
-    if (draft == DraftVersion::kDraft18) {
+    if (draft18_family(draft)) {
         payload.push_back(1);
     } else {
         append_bytes(payload, encode_moqint(draft, 1));
     }
     append_bytes(payload, encode_moqint(draft, 0));
-    if (draft == DraftVersion::kDraft18) {
+    if (draft18_family(draft)) {
         payload.push_back(1);
     } else {
         append_bytes(payload, encode_moqint(draft, 1));
@@ -962,7 +1035,7 @@ std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
                                                     std::uint64_t request_id,
                                                     std::uint8_t forward = 1) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!draft18_family(draft)) {
         payload = encode_varint(request_id);
     }
     if (draft == DraftVersion::kDraft14) {
@@ -984,7 +1057,7 @@ std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
         }
     }
 
-    std::vector<std::uint8_t> message = encode_moqint(draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
+    std::vector<std::uint8_t> message = encode_moqint(draft, draft18_family(draft) ? 0x07 : 0x1e);
     if (draft == DraftVersion::kDraft14) {
         const std::vector<std::uint8_t> length = encode_varint(payload.size());
         message.insert(message.end(), length.begin(), length.end());
@@ -1584,8 +1657,8 @@ int main() {
         .ca_path = {},
         .insecure_skip_verify = true,
     };
-    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18}) {
-        const bool modern = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        const bool modern = draft == DraftVersion::kDraft17 || draft18_family(draft);
         for (const bool provider_denial : {false, true}) {
             if (provider_denial && !modern) continue;
             MockTransport denied;
@@ -1620,6 +1693,37 @@ int main() {
     std::string authority;
     std::string path;
     std::uint64_t max_request_id = 1;
+
+    {
+        // Draft-21 LOCATION_FILTER {StartGroup=1, StartObject=0, EndGroupDelta=0,
+        // EndObject=1} is inclusive of {1,1} and excludes later objects.
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft21,
+            0, 0, 128, 0, 1, 0, 0x04, 1, std::size_t{1}));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 1, .marker = 'B'},
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 2, .marker = 'C'},
+            {.track_name = "events", .group_id = 2, .subgroup_id = 0, .object_id = 0, .marker = 'D'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft21);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 end-object session connect to succeed");
+        const TransportStatus end_object_status = session.publish(plan);
+        ok &= expect(end_object_status.ok, "expected draft-21 end-object publish to succeed: " + end_object_status.message);
+        std::string markers;
+        for (const auto& attempt : transport.object_write_attempts) {
+            if (!attempt.bytes.empty()) {
+                markers.push_back(static_cast<char>(attempt.bytes.back()));
+            }
+        }
+        ok &= expect(markers == "AB",
+                     "expected draft-21 LOCATION_FILTER EndObject to stop delivery after {1,1}, got '" + markers + "'");
+    }
 
     for (int property_case = 0; property_case < 4; ++property_case) {
         MockTransport transport;
@@ -1688,7 +1792,7 @@ int main() {
         "expected transport mapping to preserve subscriber-priority precedence");
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.on_try_write_object =
@@ -1752,14 +1856,14 @@ int main() {
                              return write.stream_id == response_stream_id &&
                                     write.bytes == expected_done &&
                                     write.fin ==
-                                        (draft == DraftVersion::kDraft18) &&
+                                        (draft18_family(draft)) &&
                                     write.reset_count_before_write == 2;
                          }) == 1,
                      "expected draft-specific TOO_FAR_BEHIND PUBLISH_DONE after every SRT subgroup reset");
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.failing_reset_streams.insert(2);
@@ -2418,7 +2522,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
         MockTransport transport;
@@ -3521,7 +3625,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
@@ -3589,7 +3693,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         for (const std::uint64_t parameter_type : {0x03ULL, 0x21ULL}) {
             MockTransport transport;
             const std::uint64_t subscription_request_id =
@@ -3657,7 +3761,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
@@ -3974,7 +4078,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t request_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -4235,6 +4339,125 @@ int main() {
                                     write.bytes == expected_ok;
                          }) == 1,
                      "expected draft-18 end-extension REQUEST_OK to include current LARGEST_OBJECT without an id");
+    }
+
+    {
+        // Draft-21: raising only EndObject within the same End Group extends the
+        // subscription end (§9.5.1), so REQUEST_OK must carry LARGEST_OBJECT.
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, DraftVersion::kDraft21,
+            0, 0, 20, 1, 0, 0, 0x04, 1, std::size_t{0});
+        append_bytes(coalesced, encode_request_update_filter_message(
+                                    DraftVersion::kDraft21, 93, std::nullopt, 0x04, 0, 0, 1, std::size_t{5}));
+        transport.reads[1].push_back(std::move(coalesced));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'E'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft21);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 EndObject extension connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected draft-21 EndObject extension to succeed: " + status.message);
+        const auto expected_ok =
+            openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft21, 93, 3, 7);
+        ok &= expect(std::count_if(transport.writes.begin(), transport.writes.end(),
+                                   [&](const MockTransport::WriteEvent& write) {
+                                       return write.stream_id == 1 && write.bytes == expected_ok;
+                                   }) == 1,
+                     "expected draft-21 EndObject-only extension REQUEST_OK to include LARGEST_OBJECT");
+    }
+
+    {
+        // Draft-21 #1833 (section 3.3.1): a publisher does not end a subscription
+        // because the Largest Object passes the end of its Location Filter. With
+        // paced publishing the track continues after the filter end at group 1,
+        // so PUBLISH_DONE waits until the track's last object is published.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        const auto ticks = std::make_shared<std::atomic<std::int64_t>>(0);
+        const auto origin = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+        const openmoq::publisher::transport::NowFunction clock = [ticks, origin] {
+            return origin + std::chrono::milliseconds(ticks->fetch_add(1));
+        };
+        MockTransport transport;
+        transport.write_clock = [ticks, origin] { return origin + std::chrono::milliseconds(ticks->load()); };
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 20, 1, 0, 0, 0x04, 1));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .media_time_us = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 2, .subgroup_id = 0, .object_id = 0, .media_time_us = 200000, .marker = 'B'},
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 0, .media_time_us = 400000, .marker = 'C'},
+            {.track_name = "events", .group_id = 4, .subgroup_id = 0, .object_id = 0, .media_time_us = 600000, .marker = 'D'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(draft);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, /*paced=*/true,
+                            /*loop=*/false, std::chrono::seconds(5), {}, clock);
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 filter-end connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected draft-21 filter-end publish to succeed: " + status.message);
+        std::optional<std::chrono::steady_clock::time_point> done_at;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 1 && !write.bytes.empty() && write.bytes[0] == 0x0b) {
+                done_at = write.at;
+            }
+        }
+        ok &= expect(done_at.has_value(), "expected draft-21 bounded subscription to end with PUBLISH_DONE");
+        ok &= expect(done_at.has_value() && *done_at >= origin + std::chrono::milliseconds(600),
+                     "expected draft-21 PUBLISH_DONE to wait for the track's last object, not the filter end");
+    }
+
+    {
+        // VOD ack site: an end-extending REQUEST_UPDATE reports LARGEST_OBJECT,
+        // so FILL_PARAMETERS on it must open, then reset, a fill fetch stream.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 20, 1, 0, 0, 0x04, 1);
+        std::vector<std::uint8_t> update_payload = encode_moqint(draft, 93);
+        append_bytes(update_payload, encode_moqint(draft, 2));
+        append_bytes(update_payload, encode_moqint(draft, 0x21));  // LOCATION_FILTER {0,0,4}
+        const std::vector<std::uint8_t> filter =
+            encode_draft18_family_filter_value(draft, 0x04, 0, 0, 4);
+        append_bytes(update_payload, encode_moqint(draft, filter.size()));
+        append_bytes(update_payload, filter);
+        append_bytes(update_payload, encode_moqint(draft, 0x23 - 0x21));  // FILL_PARAMETERS
+        append_bytes(update_payload, encode_moqint(draft, 0));
+        append_bytes(coalesced, encode_moqint(draft, 0x02));
+        append_be16(coalesced, static_cast<std::uint16_t>(update_payload.size()));
+        append_bytes(coalesced, update_payload);
+        transport.reads[1].push_back(std::move(coalesced));
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
+            {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'E'},
+        });
+        plan.draft = openmoq::publisher::draft_profile(draft);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 VOD fill connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(status.ok, "expected draft-21 VOD fill publish to succeed: " + status.message);
+        std::optional<std::uint64_t> fill_stream;
+        for (const auto& write : transport.writes) {
+            if (write.bytes == std::vector<std::uint8_t>{0x05, 93}) {
+                fill_stream = write.stream_id;
+            }
+        }
+        ok &= expect(fill_stream.has_value() &&
+                         std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                   std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x00}) !=
+                             transport.reset_calls.end(),
+                     "expected the draft-21 VOD end-extension ack to open and reset a fill fetch stream");
     }
 
     {
@@ -6505,6 +6728,112 @@ int main() {
     }
 
     {
+        // Draft-21 reserves 0x1E ("PUBLISH_OK in <= 17"); PUBLISH is answered with
+        // REQUEST_OK, so a 0x1E response on the PUBLISH stream is a violation.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, kTestTrackNamespace.size()));
+        payload.insert(payload.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> subscribe_tracks = encode_moqint(DraftVersion::kDraft21, 0x51);
+        append_be16(subscribe_tracks, static_cast<std::uint16_t>(payload.size()));
+        subscribe_tracks.insert(subscribe_tracks.end(), payload.begin(), payload.end());
+        transport.reads[1].push_back(subscribe_tracks);
+        transport.reads[4].push_back(std::vector<std::uint8_t>{0x1e, 0x00, 0x00});
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 reserved PUBLISH_OK connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft21), source_bytes);
+        const TransportStatus reserved_status = session.publish(materialized);
+        ok &= expect(!reserved_status.ok && transport.last_close_code == 0x3,
+                     "expected draft-21 reserved 0x1E PUBLISH response to close with PROTOCOL_VIOLATION");
+    }
+
+    {
+        // A draft-21 SUBSCRIBE_TRACKS may carry a LOCATION_FILTER for the tracks
+        // it publishes (§9.18.1, §3.5). Rather than over-deliver, this publisher
+        // declines it with REQUEST_ERROR NOT_SUPPORTED and keeps the session.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, kTestTrackNamespace.size()));
+        payload.insert(payload.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));     // one parameter
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0x21));  // LOCATION_FILTER
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 2));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 12));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 5));
+        std::vector<std::uint8_t> subscribe_tracks = encode_moqint(DraftVersion::kDraft21, 0x51);
+        append_be16(subscribe_tracks, static_cast<std::uint16_t>(payload.size()));
+        subscribe_tracks.insert(subscribe_tracks.end(), payload.begin(), payload.end());
+        transport.reads[1].push_back(subscribe_tracks);
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 filtered SUBSCRIBE_TRACKS connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft21), source_bytes);
+        static_cast<void>(session.publish(materialized));
+        bool saw_not_supported = false;
+        bool saw_publish = false;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 1 && message_type(write.bytes) == 0x05) {
+                openmoq::publisher::transport::RequestError error;
+                saw_not_supported =
+                    openmoq::publisher::transport::decode_request_error(write.bytes, DraftVersion::kDraft21, error) &&
+                    error.error_code == 0x3;
+            }
+            saw_publish = saw_publish || message_type(write.bytes) == 0x1d;
+        }
+        ok &= expect(saw_not_supported, "expected filtered draft-21 SUBSCRIBE_TRACKS to receive REQUEST_ERROR NOT_SUPPORTED");
+        ok &= expect(!saw_publish, "expected declined draft-21 SUBSCRIBE_TRACKS to publish no tracks");
+        ok &= expect(transport.last_close_code == 0,
+                     "expected declining SUBSCRIBE_TRACKS not to close the session with an error");
+    }
+
+    {
+        // A {0,0} Next Object LOCATION_FILTER matches PUBLISH's own delivery start
+        // (§9.8: "Delivery starts at the Next Object"), so it is accepted.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, kTestTrackNamespace.size()));
+        payload.insert(payload.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 1));     // one parameter
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0x21));  // LOCATION_FILTER {0,0}
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 2));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0));
+        append_bytes(payload, encode_moqint(DraftVersion::kDraft21, 0));
+        std::vector<std::uint8_t> subscribe_tracks = encode_moqint(DraftVersion::kDraft21, 0x51);
+        append_be16(subscribe_tracks, static_cast<std::uint16_t>(payload.size()));
+        subscribe_tracks.insert(subscribe_tracks.end(), payload.begin(), payload.end());
+        transport.reads[1].push_back(subscribe_tracks);
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 2));
+        transport.reads[8].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 4));
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 Next Object SUBSCRIBE_TRACKS connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft21), source_bytes);
+        status = session.publish(materialized);
+        bool saw_ok = false;
+        bool saw_publish = false;
+        for (const auto& write : transport.writes) {
+            saw_ok = saw_ok || (write.stream_id == 1 && message_type(write.bytes) == 0x07);
+            saw_publish = saw_publish || message_type(write.bytes) == 0x1d;
+        }
+        ok &= expect(status.ok && saw_ok && saw_publish,
+                     "expected a Next Object draft-21 SUBSCRIBE_TRACKS filter to be accepted and publish tracks");
+    }
+
+    {
         MockTransport draft18_subscribe_transport;
         draft18_subscribe_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_subscribe_transport.reads[0].push_back(
@@ -7763,7 +8092,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -7933,7 +8262,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -8012,6 +8341,246 @@ int main() {
                                         write.bytes == expected_ok;
                              }) == 1,
                      "expected a post-publication priority REQUEST_OK to carry the current largest known object in the draft-specific shape");
+    }
+
+    for (const std::uint8_t forward : {std::uint8_t{1}, std::uint8_t{0}}) {
+        // Draft-21 §3.4.1: FILL_PARAMETERS on a REQUEST_UPDATE while Forward is 1
+        // and Largest Object is known must open a fill fetch stream; with no
+        // fetchable history the publisher signals failure by resetting it right
+        // after the FETCH_HEADER. Forward=0 opens nothing.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", forward, draft,
+            0, 0, 100, 1, 0, 0, 0x04, 4));
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                current.reads[1].push_back(encode_request_update_message(draft, 93, 0, 0x23));
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        bool update_queued_without_writes = false;
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index++ != 0) {
+                    if (forward == 0 && !update_queued_without_writes) {
+                        transport.reads[1].push_back(encode_request_update_message(draft, 93, 0, 0x23));
+                        update_queued_without_writes = true;
+                    }
+                    return std::nullopt;
+                }
+                return LiveObject{
+                    .track_name = "events",
+                    .group_id = 3,
+                    .subgroup_id = 0,
+                    .object_id = 7,
+                    .payload = {'X'},
+                    .subgroup_contains_group_largest = true,
+                    .final_in_subgroup = true,
+                };
+            },
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 fill session connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        const std::vector<std::uint8_t> fetch_header{0x05, 93};
+        std::optional<std::uint64_t> fill_stream;
+        for (const auto& write : transport.writes) {
+            if (write.bytes == fetch_header) {
+                fill_stream = write.stream_id;
+            }
+        }
+        if (forward == 1) {
+            ok &= expect(status.ok, "expected draft-21 fill publish to succeed: " + status.message);
+            ok &= expect(fill_stream.has_value() &&
+                             std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                       std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x00}) !=
+                                 transport.reset_calls.end(),
+                         "expected draft-21 FILL_PARAMETERS to open a fill fetch stream and reset it with INTERNAL_ERROR");
+        } else {
+            ok &= expect(!fill_stream.has_value(), "expected FILL_PARAMETERS with Forward=0 to open no fill fetch stream");
+        }
+    }
+
+    for (const DraftVersion draft : {DraftVersion::kDraft21, DraftVersion::kDraft18}) {
+        for (const bool live : {true, false}) {
+            // Draft-21 SUBSCRIBE_OK reports the largest object already sent on
+            // the track (§9.20.18); a later SUBSCRIBE with FILL_PARAMETERS then
+            // gets a fill fetch stream that is opened and reset. Draft-18 keeps
+            // omitting LARGEST_OBJECT.
+            const bool draft21 = draft == DraftVersion::kDraft21;
+            MockTransport transport;
+            transport.keep_open_streams.insert(1);
+            transport.keep_open_streams.insert(5);
+            transport.reads[3].push_back(encode_draft18_setup_response());
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[1].push_back(encode_subscribe_message(
+                91, kTestTrackNamespace, "events", 1, draft, 0, 0, 100, 1, 0, 0, 0x04, 4));
+            bool second_queued = false;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                    if (!second_queued) {
+                        current.reads[5].push_back(encode_subscribe_message(
+                            95, kTestTrackNamespace, "events", 1, draft, 0, 0, 100, 1, 0, 0, 0x04, 4,
+                            std::nullopt, draft21));
+                        second_queued = true;
+                    }
+                    return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+                };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected SUBSCRIBE_OK largest session connect to succeed");
+            if (live) {
+                std::size_t object_index = 0;
+                LiveObjectSource source{
+                    .tracks = {LiveTrack{.track_name = "events"}},
+                    .next_object = [&]() -> std::optional<LiveObject> {
+                        const std::size_t index = object_index++;
+                        if (index > 1) {
+                            return std::nullopt;
+                        }
+                        return LiveObject{.track_name = "events", .group_id = 3, .subgroup_id = 0,
+                                          .object_id = 7 + index, .payload = {static_cast<std::uint8_t>('X' + index)},
+                                          .subgroup_contains_group_largest = index == 1,
+                                          .final_in_subgroup = index == 1};
+                    },
+                };
+                status = session.publish_live_objects(source, draft);
+            } else {
+                PublishPlan plan = make_scheduling_plan({
+                    {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'X'},
+                    {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 8, .marker = 'Y'},
+                });
+                plan.draft = openmoq::publisher::draft_profile(draft);
+                status = session.publish(plan);
+            }
+            const std::string label = openmoq::publisher::to_string(draft) + (live ? " live" : " VOD");
+            ok &= expect(status.ok, "expected " + label + " SUBSCRIBE_OK largest publish to succeed: " + status.message);
+            std::optional<std::vector<std::uint8_t>> first_ok;
+            std::optional<std::vector<std::uint8_t>> second_ok;
+            for (const auto& write : transport.writes) {
+                if (message_type(write.bytes) == 0x04) {
+                    (write.stream_id == 1 ? first_ok : second_ok) = write.bytes;
+                }
+            }
+            bool first_without_largest = false;
+            bool second_matches = false;
+            for (std::uint64_t alias = 0; alias < 8; ++alias) {
+                using openmoq::publisher::transport::encode_subscribe_ok_message;
+                first_without_largest = first_without_largest ||
+                    first_ok == encode_subscribe_ok_message(draft, 91, alias, 0, 0, false);
+                second_matches = second_matches ||
+                    second_ok == encode_subscribe_ok_message(draft, 95, alias, 3, 7, draft21);
+            }
+            ok &= expect(first_without_largest, "expected " + label + " SUBSCRIBE_OK before any object to omit LARGEST_OBJECT");
+            ok &= expect(second_queued && second_matches,
+                         "expected " + label + " SUBSCRIBE_OK after an object was sent to " +
+                             (draft21 ? "report LARGEST_OBJECT {3,7}" : "keep omitting LARGEST_OBJECT"));
+            std::optional<std::uint64_t> fill_stream;
+            for (const auto& write : transport.writes) {
+                if (write.bytes == std::vector<std::uint8_t>{0x05, 95}) {
+                    fill_stream = write.stream_id;
+                }
+            }
+            if (draft21) {
+                ok &= expect(fill_stream.has_value() &&
+                                 std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                           std::pair<std::uint64_t, std::uint64_t>{*fill_stream, 0x00}) !=
+                                     transport.reset_calls.end(),
+                             "expected " + label + " SUBSCRIBE with FILL_PARAMETERS to open and reset a fill fetch stream");
+            }
+        }
+    }
+
+    {
+        // The retained catalog is re-sent to each new subscriber, so a draft-21
+        // catalog SUBSCRIBE_OK omits LARGEST_OBJECT even after the catalog was
+        // sent; otherwise a Next Object filter would drop that re-send.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.keep_open_streams.insert(5);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "catalog", 1, draft));
+        bool second_queued = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                if (!second_queued) {
+                    current.reads[5].push_back(encode_subscribe_message(95, kTestTrackNamespace, "catalog", 1, draft));
+                    second_queued = true;
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .subgroup_id = 0, .object_id = 0, .payload = {'{', '}'}},
+            LiveObject{.track_name = "video0_vide_1", .group_id = 1, .subgroup_id = 0, .object_id = 0, .payload = {'M'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video0_vide_1"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, true, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 catalog SUBSCRIBE_OK connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        std::optional<std::vector<std::uint8_t>> second_ok;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 5 && message_type(write.bytes) == 0x04) {
+                second_ok = write.bytes;
+            }
+        }
+        bool without_largest = false;
+        for (std::uint64_t alias = 0; alias < 8; ++alias) {
+            without_largest = without_largest ||
+                second_ok == openmoq::publisher::transport::encode_subscribe_ok_message(draft, 95, alias, 0, 0, false);
+        }
+        ok &= expect(second_queued && second_ok.has_value() && without_largest,
+                     "expected a draft-21 catalog SUBSCRIBE_OK to omit LARGEST_OBJECT after the catalog was sent");
+    }
+
+    {
+        // §3.4.1: fill failure never affects the subscription, so a fill stream
+        // that cannot even be opened must not end the session.
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 100, 1, 0, 0, 0x04, 4));
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                current.reads[1].push_back(encode_request_update_message(draft, 93, 0, 0x23));
+                current.fail_next_uni_open = true;
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index++ != 0) {
+                    return std::nullopt;
+                }
+                return LiveObject{.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7,
+                                  .payload = {'X'}, .subgroup_contains_group_largest = true,
+                                  .final_in_subgroup = true};
+            },
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-21 failed-fill connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected a fill stream that cannot open to leave the session running: " + status.message);
     }
 
     for (const bool coalesced : {false, true}) {

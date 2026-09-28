@@ -28,9 +28,11 @@ struct PeerClose {
     std::string reason;
 };
 
-// Session termination codes, identical in drafts 14 through 18 except 0x7
+// Session termination codes, identical in drafts 14 through 21 except 0x7
 // (TOO_MANY_REQUESTS in 14/16, INVALID_REQUIRED_REQUEST_ID in 17, unassigned
-// in 18), which is left unnamed. Empty for unknown or greasing codes.
+// in 18+), which is left unnamed. Draft-21 retires 0x15 and adds 0x1B; neither
+// collides with another draft's meaning, so one table serves every draft.
+// Empty for unknown or greasing codes.
 inline std::string_view moqt_termination_code_name(std::uint64_t code) {
     switch (code) {
         case 0x0: return "NO_ERROR";
@@ -53,6 +55,7 @@ inline std::string_view moqt_termination_code_name(std::uint64_t code) {
         case 0x18: return "EXPIRED_AUTH_TOKEN";
         case 0x19: return "INVALID_AUTHORITY";
         case 0x1A: return "MALFORMED_AUTHORITY";
+        case 0x1B: return "TOO_MANY_REQUEST_UPDATES";
         default: return {};
     }
 }

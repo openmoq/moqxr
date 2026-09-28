@@ -1,8 +1,10 @@
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <span>
@@ -13,6 +15,7 @@
 namespace {
 
 using openmoq::publisher::DraftVersion;
+using openmoq::publisher::is_draft18_or_later;
 using openmoq::publisher::transport::MaxRequestIdMessage;
 using openmoq::publisher::transport::NamespaceMessage;
 using openmoq::publisher::transport::PublishError;
@@ -110,7 +113,7 @@ void append_vi64(std::vector<std::uint8_t>& out, std::uint64_t value) {
 }
 
 bool uses_vi64(DraftVersion draft) {
-    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+    return draft == DraftVersion::kDraft17 || is_draft18_or_later(draft);
 }
 
 void append_moqint(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint64_t value) {
@@ -311,6 +314,8 @@ std::string draft_label(DraftVersion draft) {
             return "draft-17";
         case DraftVersion::kDraft18:
             return "draft-18";
+        case DraftVersion::kDraft21:
+            return "draft-21";
     }
     return "unknown";
 }
@@ -318,7 +323,7 @@ std::string draft_label(DraftVersion draft) {
 void append_message_uint8(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint8_t value) {
     // draft-17 and draft-18 define FORWARD (0x10), SUBSCRIBER_PRIORITY (0x20)
     // and GROUP_ORDER (0x22) as uint8; earlier drafts encode them as varints.
-    if (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) {
+    if (draft == DraftVersion::kDraft17 || is_draft18_or_later(draft)) {
         out.push_back(value);
     } else {
         append_moqint(out, draft, value);
@@ -429,7 +434,7 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
                                                                           std::uint64_t subgroup_timeout_ms,
                                                                           bool include_subgroup_timeout = false) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         append_moqint(payload, draft, 55);
     }
     const bool with_subgroup = include_subgroup_timeout || subgroup_timeout_ms != 0;
@@ -457,7 +462,7 @@ std::vector<std::uint8_t> build_publish_ok_message_with_delivery_timeouts(DraftV
     append_message_uint8(payload, draft, 1);
 
     std::vector<std::uint8_t> bytes;
-    append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
+    append_moqint(bytes, draft, is_draft18_or_later(draft) ? 0x07 : 0x1e);
     bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
     bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
     bytes.insert(bytes.end(), payload.begin(), payload.end());
@@ -474,8 +479,8 @@ std::vector<std::uint8_t> build_subscribe_namespace_message(DraftVersion draft) 
     append_moqint(payload, draft, 0);  // parameters
 
     std::vector<std::uint8_t> bytes;
-    append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x50 : 0x11);
-    if (draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18) {
+    append_moqint(bytes, draft, is_draft18_or_later(draft) ? 0x50 : 0x11);
+    if (draft == DraftVersion::kDraft16 || is_draft18_or_later(draft)) {
         bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
         bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
     } else {
@@ -528,12 +533,12 @@ std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
     }
 
     const std::uint64_t parameter_count =
-        (draft == DraftVersion::kDraft18 ? 6 : 5) + (include_group_order ? 1 : 0);
+        (is_draft18_or_later(draft) ? 6 : 5) + (include_group_order ? 1 : 0);
     append_moqint(payload, draft, parameter_count);
     std::uint64_t previous_type = 0;
     auto append_numeric = [&](std::uint64_t type, std::uint64_t value) {
         append_moqint(payload, draft, type - previous_type);
-        if (draft == DraftVersion::kDraft18 &&
+        if (is_draft18_or_later(draft) &&
             (type == 0x10 || type == 0x20 || type == 0x22)) {
             payload.push_back(static_cast<std::uint8_t>(value));
         } else {
@@ -543,7 +548,7 @@ std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
     };
 
     append_numeric(0x02, zero_draft16_timeout ? 0 : 900);
-    if (draft == DraftVersion::kDraft18) {
+    if (is_draft18_or_later(draft)) {
         append_numeric(0x06, 250);
     }
     append_numeric(0x10, 1);
@@ -554,7 +559,9 @@ std::vector<std::uint8_t> build_request_update_message(DraftVersion draft,
     append_moqint(filter, draft, 0x04);
     append_moqint(filter, draft, 12);
     append_moqint(filter, draft, 5);
-    append_moqint(filter, draft, 20);
+    // Draft-16 carries an absolute End Group; drafts 17/18 carry End Group
+    // Delta from the Start Group (§5.1.2), so End Group 20 is delta 8.
+    append_moqint(filter, draft, draft == DraftVersion::kDraft16 ? 20 : 8);
     append_moqint(payload, draft, filter.size());
     payload.insert(payload.end(), filter.begin(), filter.end());
     previous_type = 0x21;
@@ -621,13 +628,13 @@ std::vector<std::uint8_t> build_request_update_duplicate_parameter(
     }
     append_moqint(payload, draft, 2);
     append_moqint(payload, draft, 0x10);
-    if (draft == DraftVersion::kDraft18) {
+    if (is_draft18_or_later(draft)) {
         payload.push_back(1);
     } else {
         append_moqint(payload, draft, 1);
     }
     append_moqint(payload, draft, 0);
-    if (draft == DraftVersion::kDraft18) {
+    if (is_draft18_or_later(draft)) {
         payload.push_back(1);
     } else {
         append_moqint(payload, draft, 1);
@@ -662,7 +669,7 @@ std::vector<std::uint8_t> build_draft18_request_update_delta_overflow() {
 
 std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     std::vector<std::uint8_t> payload;
-    if (draft != DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         append_moqint(payload, draft, 55);
     }
     if (draft == DraftVersion::kDraft14) {
@@ -694,7 +701,7 @@ std::vector<std::uint8_t> build_publish_ok_message(DraftVersion draft) {
     if (draft == DraftVersion::kDraft14) {
         append_varint_length_message(bytes, 0x1e, payload);
     } else {
-        append_moqint(bytes, draft, draft == DraftVersion::kDraft18 ? 0x07 : 0x1e);
+        append_moqint(bytes, draft, is_draft18_or_later(draft) ? 0x07 : 0x1e);
         bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
         bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
         bytes.insert(bytes.end(), payload.begin(), payload.end());
@@ -719,7 +726,7 @@ std::vector<std::uint8_t> build_publish_error_message(DraftVersion draft) {
 
 bool test_setup_serdes_for_all_drafts() {
     bool ok = true;
-    for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18}) {
+    for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
         const std::string label = draft_label(draft) + " setup";
         const SetupMessage setup{
             .draft = draft,
@@ -937,9 +944,13 @@ bool test_publisher_control_message_encoders_for_all_drafts() {
             std::uint64_t largest_object = 0;
             ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object_delta) && largest_object_delta == 0x09,
                          label + " subscribe ok largest-object parameter delta");
-            ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object_length),
-                         label + " subscribe ok largest-object length");
-            const std::size_t largest_object_end = offset + static_cast<std::size_t>(largest_object_length);
+            // LARGEST_OBJECT is a bare Location on draft-17+; draft 16 length-prefixes it.
+            std::size_t largest_object_end = frame.payload_end;
+            if (!uses_vi64(draft)) {
+                ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object_length),
+                             label + " subscribe ok largest-object length");
+                largest_object_end = offset + static_cast<std::size_t>(largest_object_length);
+            }
             ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_group) && largest_group == 3,
                          label + " subscribe ok largest group");
             ok &= expect(read_moqint(subscribe_ok, offset, draft, largest_object) && largest_object == 5,
@@ -964,7 +975,7 @@ bool test_peer_control_message_decoders_for_all_drafts() {
         ok &= expect(subscribe_namespace.request_id == 91, label + " subscribe namespace request id");
         ok &= expect(subscribe_namespace.track_namespace_prefix == std::vector<std::string>({"live", "alpha"}),
                      label + " subscribe namespace tuple");
-        if (draft == DraftVersion::kDraft18) {
+        if (is_draft18_or_later(draft)) {
             std::vector<std::uint8_t> legacy_subscribe_namespace = build_subscribe_namespace_message(draft);
             legacy_subscribe_namespace[0] = 0x11;
             ok &= expect(!decode_subscribe_namespace_message(legacy_subscribe_namespace, draft, subscribe_namespace),
@@ -986,7 +997,7 @@ bool test_peer_control_message_decoders_for_all_drafts() {
                      label + " subscribe filter fields");
 
         SubscribeTracksMessage subscribe_tracks;
-        if (draft == DraftVersion::kDraft18) {
+        if (is_draft18_or_later(draft)) {
             ok &= expect(decode_subscribe_tracks_message(build_subscribe_tracks_message(), draft, subscribe_tracks),
                          label + " subscribe tracks decode");
             ok &= expect(subscribe_tracks.request_id == 93, label + " subscribe tracks request id");
@@ -1000,7 +1011,7 @@ bool test_peer_control_message_decoders_for_all_drafts() {
 
         PublishOk publish_ok;
         ok &= expect(decode_publish_ok(build_publish_ok_message(draft), draft, publish_ok), label + " publish ok decode");
-        ok &= expect(publish_ok.request_id == (draft == DraftVersion::kDraft18 ? 0 : 55) &&
+        ok &= expect(publish_ok.request_id == (is_draft18_or_later(draft) ? 0 : 55) &&
                          publish_ok.forward == 1 &&
                          publish_ok.subscriber_priority == (draft == DraftVersion::kDraft14 ? 128 : 200) &&
                          publish_ok.filter_type == 3,
@@ -1166,7 +1177,7 @@ bool test_request_update_response_wire_shapes() {
                  "draft-16 end-extension REQUEST_OK carries request id and LARGEST_OBJECT");
 
     const std::vector<std::uint8_t> draft18_extended_ok = {
-        0x07, 0x00, 0x05, 0x01, 0x09, 0x02, 0x0c, 0x05,
+        0x07, 0x00, 0x04, 0x01, 0x09, 0x0c, 0x05,
     };
     ok &= expect(encode_request_ok_message(
                      DraftVersion::kDraft18, 101, 12, 5) ==
@@ -1227,7 +1238,7 @@ bool test_subgroup_header_and_object_serdes_for_all_drafts() {
         std::uint64_t object_status = 99;
         ok &= expect(read_varint(empty, offset, object_delta) && object_delta == 0, label + " empty object id");
         ok &= expect(read_varint(empty, offset, payload_length) && payload_length == 0, label + " empty payload length");
-        if (draft == DraftVersion::kDraft18) {
+        if (is_draft18_or_later(draft)) {
             ok &= expect(read_varint(empty, offset, object_status) && object_status == 0,
                          label + " empty object status after zero length");
         }
@@ -1279,6 +1290,42 @@ bool test_control_message_framing_and_parameter_regressions() {
     ok &= expect(!decode_subscribe_message(
                      draft14_bad_group_order_subscribe, DraftVersion::kDraft14, subscribe),
                  "draft-14 SUBSCRIBE rejects group order 0");
+
+    {
+        // Draft-21 PUBLISH_OK (REQUEST_OK) may carry only EXPIRES; subscription
+        // parameters moved to PUBLISH/REQUEST_UPDATE (§9.20.17-19, §9.20.1).
+        PublishOk rejected;
+        ok &= expect(!decode_publish_ok(build_publish_ok_message(DraftVersion::kDraft21), DraftVersion::kDraft21, rejected),
+                     "draft-21 PUBLISH_OK rejects subscription parameters");
+        for (const std::uint64_t parameter_type : {0x10ULL, 0x20ULL, 0x22ULL}) {
+            std::vector<std::uint8_t> payload;
+            append_moqint(payload, DraftVersion::kDraft21, 1);
+            append_moqint(payload, DraftVersion::kDraft21, parameter_type);
+            append_message_uint8(payload, DraftVersion::kDraft21, 1);
+            std::vector<std::uint8_t> bytes;
+            append_moqint(bytes, DraftVersion::kDraft21, 0x07);
+            bytes.push_back(0);
+            bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
+            PublishOk single;
+            ok &= expect(!decode_publish_ok(bytes, DraftVersion::kDraft21, single),
+                         "draft-21 PUBLISH_OK rejects parameter " + std::to_string(parameter_type));
+        }
+
+        std::vector<std::uint8_t> payload;
+        append_moqint(payload, DraftVersion::kDraft21, 1);
+        append_moqint(payload, DraftVersion::kDraft21, 0x08);  // EXPIRES
+        append_moqint(payload, DraftVersion::kDraft21, 30000);
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, DraftVersion::kDraft21, 0x07);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        PublishOk accepted;
+        ok &= expect(decode_publish_ok(bytes, DraftVersion::kDraft21, accepted) &&
+                         accepted.request_id == 0 && accepted.forward == 1 && accepted.subscriber_priority == 128,
+                     "draft-21 PUBLISH_OK with only EXPIRES decodes with subscription defaults");
+    }
 
     std::vector<std::uint8_t> draft14_bad_group_order_publish_ok =
         build_publish_ok_message(DraftVersion::kDraft14);
@@ -1580,10 +1627,429 @@ bool test_object_properties() {
     return ok;
 }
 
+bool test_draft21_identity() {
+    bool ok = true;
+    ok &= expect(openmoq::publisher::default_alpn(DraftVersion::kDraft21) == "moqt-21", "draft-21 ALPN token");
+    ok &= expect(openmoq::publisher::to_string(DraftVersion::kDraft21) == "draft-21", "draft-21 to_string");
+    const SetupMessage setup{.draft = DraftVersion::kDraft21, .max_request_id = 1};
+    const std::vector<std::uint8_t> bytes = encode_setup_message(setup);
+    Uint16Frame frame;
+    ok &= expect(expect_uint16_frame(bytes, 0x2f00, frame, "draft-21 setup"),
+                 "draft-21 SETUP uses the vi64 unified SETUP type 0x2f00");
+
+    // A relay may advertise MAX_REQUEST_UPDATES (even option 0x08, value only,
+    // draft-21 §9.1.7); the publisher's SETUP decode must accept it.
+    std::vector<std::uint8_t> options;
+    append_moqint(options, DraftVersion::kDraft21, 0x02);  // MAX_REQUEST_ID
+    append_moqint(options, DraftVersion::kDraft21, 64);
+    append_moqint(options, DraftVersion::kDraft21, 0x06);  // delta to MAX_REQUEST_UPDATES
+    append_moqint(options, DraftVersion::kDraft21, 4);
+    std::vector<std::uint8_t> server_setup;
+    append_moqint(server_setup, DraftVersion::kDraft21, 0x2f00);
+    server_setup.push_back(static_cast<std::uint8_t>((options.size() >> 8) & 0xff));
+    server_setup.push_back(static_cast<std::uint8_t>(options.size() & 0xff));
+    server_setup.insert(server_setup.end(), options.begin(), options.end());
+    ServerSetupMessage decoded;
+    ok &= expect(decode_setup_response_message(server_setup, DraftVersion::kDraft21, decoded),
+                 "draft-21 server SETUP with MAX_REQUEST_UPDATES decodes");
+    ok &= expect(decoded.draft == DraftVersion::kDraft21, "draft-21 server SETUP keeps the negotiated draft");
+    ServerSetupMessage as_draft18;
+    ok &= expect(!decode_setup_response_message(encode_server_setup_message({.draft = DraftVersion::kDraft21}),
+                                                DraftVersion::kDraft16, as_draft18),
+                 "draft-21 server SETUP is rejected by a draft-16 session");
+    return ok;
+}
+
+std::vector<std::uint8_t> build_draft21_subscribe_with_raw_location_filter(const std::vector<std::uint8_t>& filter) {
+    constexpr DraftVersion draft = DraftVersion::kDraft21;
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 9);
+    append_track_namespace(payload, draft, {"live"});
+    append_string(payload, draft, "video");
+    append_moqint(payload, draft, 1);     // one parameter
+    append_moqint(payload, draft, 0x21);  // LOCATION_FILTER
+    append_moqint(payload, draft, filter.size());
+    payload.insert(payload.end(), filter.begin(), filter.end());
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x03);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> build_draft21_subscribe_with_location_filter(const std::vector<std::uint64_t>& fields) {
+    std::vector<std::uint8_t> filter;
+    for (const std::uint64_t field : fields) {
+        append_moqint(filter, DraftVersion::kDraft21, field);
+    }
+    return build_draft21_subscribe_with_raw_location_filter(filter);
+}
+
+bool test_draft21_location_filter() {
+    bool ok = true;
+    struct Case {
+        std::vector<std::uint64_t> fields;
+        std::uint64_t filter_type;
+        std::size_t start_group;
+        std::size_t start_object;
+        std::size_t end_group;
+        std::optional<std::size_t> end_object;
+        std::string label;
+    };
+    const std::vector<Case> cases = {
+        {{}, 0x00, 0, 0, 0, std::nullopt, "empty LOCATION_FILTER is unfiltered"},
+        {{0}, 0x01, 0, 0, 0, std::nullopt, "StartGroup=0 is Next Group Start"},
+        {{3}, 0x02, 0, 0, 0, std::nullopt, "relative StartGroup>0 starts at the next object"},
+        {{0, 0}, 0x02, 0, 0, 0, std::nullopt, "StartGroup=StartObject=0 is Next Object"},
+        {{12, 5}, 0x03, 12, 5, 0, std::nullopt, "two fields are an absolute start"},
+        {{12, 5, 3}, 0x04, 12, 5, 15, std::nullopt, "EndGroupDelta is relative to StartGroup"},
+        {{12, 5, 3, 7}, 0x04, 12, 5, 15, std::size_t{7}, "EndObject bounds the end group"},
+    };
+    for (const Case& c : cases) {
+        SubscribeMessage subscribe;
+        const bool decoded = decode_subscribe_message(build_draft21_subscribe_with_location_filter(c.fields),
+                                                      DraftVersion::kDraft21, subscribe);
+        ok &= expect(decoded, "draft-21 decode: " + c.label);
+        ok &= expect(decoded && subscribe.filter_type == c.filter_type && subscribe.start_group_id == c.start_group &&
+                         subscribe.start_object_id == c.start_object && subscribe.end_group_id == c.end_group &&
+                         subscribe.end_object_id == c.end_object,
+                     "draft-21 mapping: " + c.label);
+    }
+    SubscribeMessage rejected;
+    ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_location_filter({1, 2, 3, 4, 5}),
+                                           DraftVersion::kDraft21, rejected),
+                 "draft-21 LOCATION_FILTER rejects a fifth field");
+    // StartGroup = 2^64-5 in the 9-byte vi64 form, StartObject = 0, EndGroupDelta = 10.
+    std::vector<std::uint8_t> overflow{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfb, 0x00, 0x0a};
+    ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_raw_location_filter(overflow),
+                                           DraftVersion::kDraft21, rejected),
+                 "draft-21 LOCATION_FILTER rejects StartGroup + EndGroupDelta overflow");
+    // 0x0c = StartGroup 12, then 0x80 opens a two-byte vi64 with no second byte.
+    ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_raw_location_filter({0x0c, 0x80}),
+                                           DraftVersion::kDraft21, rejected),
+                 "draft-21 LOCATION_FILTER rejects a truncated trailing field");
+
+    SubscribeMessage draft18;
+    std::vector<std::uint8_t> draft18_filter = build_draft21_subscribe_with_location_filter({3, 12, 5});
+    ok &= expect(decode_subscribe_message(draft18_filter, DraftVersion::kDraft18, draft18) &&
+                     draft18.filter_type == 0x03 && draft18.start_group_id == 12 && draft18.start_object_id == 5,
+                 "draft-18 keeps the Filter Type encoding for the same bytes");
+    return ok;
+}
+
+std::vector<std::uint8_t> build_draft_request_with_include_properties(DraftVersion draft,
+                                                                     std::uint64_t message_type,
+                                                                     std::uint8_t include_properties) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 11);
+    append_track_namespace(payload, draft, {"live"});
+    if (message_type == 0x03) {
+        append_string(payload, draft, "video");
+    }
+    append_moqint(payload, draft, 1);     // one parameter
+    append_moqint(payload, draft, 0x35);  // INCLUDE_PROPERTIES (uint8)
+    payload.push_back(include_properties);
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, message_type);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_include_properties() {
+    bool ok = true;
+    for (const std::uint8_t value : {std::uint8_t{0}, std::uint8_t{1}}) {
+        SubscribeMessage subscribe;
+        ok &= expect(decode_subscribe_message(build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x03, value),
+                                              DraftVersion::kDraft21, subscribe),
+                     "draft-21 SUBSCRIBE accepts INCLUDE_PROPERTIES=" + std::to_string(value));
+        SubscribeTracksMessage tracks;
+        ok &= expect(decode_subscribe_tracks_message(
+                         build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x51, value),
+                         DraftVersion::kDraft21, tracks),
+                     "draft-21 SUBSCRIBE_TRACKS accepts INCLUDE_PROPERTIES=" + std::to_string(value));
+    }
+    SubscribeMessage subscribe;
+    ok &= expect(!decode_subscribe_message(build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x03, 2),
+                                           DraftVersion::kDraft21, subscribe),
+                 "draft-21 SUBSCRIBE rejects INCLUDE_PROPERTIES outside 0..1");
+    SubscribeTracksMessage tracks;
+    ok &= expect(!decode_subscribe_tracks_message(
+                     build_draft_request_with_include_properties(DraftVersion::kDraft21, 0x51, 2),
+                     DraftVersion::kDraft21, tracks),
+                 "draft-21 SUBSCRIBE_TRACKS rejects INCLUDE_PROPERTIES outside 0..1");
+    ok &= expect(!decode_subscribe_message(build_draft_request_with_include_properties(DraftVersion::kDraft18, 0x03, 1),
+                                           DraftVersion::kDraft18, subscribe),
+                 "draft-18 SUBSCRIBE still rejects the undefined 0x35 parameter");
+    return ok;
+}
+
+std::vector<std::uint8_t> build_fill_parameters_message(DraftVersion draft, std::uint64_t message_type) {
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 11);
+    if (message_type == 0x03) {
+        append_track_namespace(payload, draft, {"live"});
+        append_string(payload, draft, "video");
+    } else if (message_type == 0x51) {
+        append_track_namespace(payload, draft, {"live"});
+    }
+    append_moqint(payload, draft, 1);     // one parameter
+    append_moqint(payload, draft, 0x23);  // FILL_PARAMETERS, length-prefixed
+    append_moqint(payload, draft, 0);     // no overriding fill parameters
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, message_type);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_fill_parameters() {
+    bool ok = true;
+    SubscribeMessage subscribe;
+    ok &= expect(decode_subscribe_message(build_fill_parameters_message(DraftVersion::kDraft21, 0x03),
+                                          DraftVersion::kDraft21, subscribe),
+                 "draft-21 SUBSCRIBE accepts FILL_PARAMETERS");
+    ok &= expect(!decode_subscribe_message(build_fill_parameters_message(DraftVersion::kDraft18, 0x03),
+                                           DraftVersion::kDraft18, subscribe),
+                 "draft-18 SUBSCRIBE still rejects the undefined 0x23 parameter");
+    RequestUpdateMessage update;
+    ok &= expect(decode_request_update_message(build_fill_parameters_message(DraftVersion::kDraft21, 0x02),
+                                               DraftVersion::kDraft21, update) &&
+                     update.request_id == 11 && update.fill_requested,
+                 "draft-21 REQUEST_UPDATE records a FILL_PARAMETERS request");
+    SubscribeTracksMessage tracks;
+    ok &= expect(decode_subscribe_tracks_message(build_fill_parameters_message(DraftVersion::kDraft21, 0x51),
+                                                 DraftVersion::kDraft21, tracks) &&
+                     tracks.fill_requested,
+                 "draft-21 SUBSCRIBE_TRACKS records a FILL_PARAMETERS request");
+    SubscribeTracksMessage draft18_tracks;
+    ok &= expect(decode_subscribe_tracks_message(build_fill_parameters_message(DraftVersion::kDraft18, 0x51),
+                                                 DraftVersion::kDraft18, draft18_tracks) &&
+                     !draft18_tracks.fill_requested,
+                 "draft-18 SUBSCRIBE_TRACKS keeps skipping unknown odd parameters");
+    RequestUpdateMessage draft18_update;
+    ok &= expect(!decode_request_update_message(build_fill_parameters_message(DraftVersion::kDraft18, 0x02),
+                                                DraftVersion::kDraft18, draft18_update),
+                 "draft-18 REQUEST_UPDATE still rejects the undefined 0x23 parameter");
+    ok &= expect(openmoq::publisher::transport::encode_fetch_header(DraftVersion::kDraft21, 93) ==
+                     std::vector<std::uint8_t>{0x05, 93},
+                 "draft-21 FETCH_HEADER is type 0x05 followed by the Request ID");
+    return ok;
+}
+
+std::vector<std::uint8_t> build_draft21_subscribe_tracks(std::optional<std::uint8_t> group_order,
+                                                         std::optional<std::vector<std::uint64_t>> filter_fields) {
+    constexpr DraftVersion draft = DraftVersion::kDraft21;
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 93);
+    append_track_namespace(payload, draft, {"live"});
+    append_moqint(payload, draft, (filter_fields ? 1 : 0) + (group_order ? 1 : 0));
+    std::uint64_t previous = 0;
+    if (filter_fields) {
+        append_moqint(payload, draft, 0x21);
+        std::vector<std::uint8_t> filter;
+        for (const std::uint64_t field : *filter_fields) {
+            append_moqint(filter, draft, field);
+        }
+        append_moqint(payload, draft, filter.size());
+        payload.insert(payload.end(), filter.begin(), filter.end());
+        previous = 0x21;
+    }
+    if (group_order) {
+        append_moqint(payload, draft, 0x22 - previous);
+        payload.push_back(*group_order);
+    }
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x51);
+    bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+    bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_subscribe_tracks_parameters() {
+    bool ok = true;
+    SubscribeTracksMessage tracks;
+    ok &= expect(decode_subscribe_tracks_message(build_draft21_subscribe_tracks(std::uint8_t{2}, std::nullopt),
+                                                 DraftVersion::kDraft21, tracks) &&
+                     tracks.group_order == 2 && !tracks.subscription_filter.has_value(),
+                 "draft-21 SUBSCRIBE_TRACKS decodes GROUP_ORDER");
+    ok &= expect(!decode_subscribe_tracks_message(build_draft21_subscribe_tracks(std::uint8_t{3}, std::nullopt),
+                                                  DraftVersion::kDraft21, tracks),
+                 "draft-21 SUBSCRIBE_TRACKS rejects GROUP_ORDER outside Ascending/Descending");
+    SubscribeTracksMessage filtered;
+    ok &= expect(decode_subscribe_tracks_message(
+                     build_draft21_subscribe_tracks(std::nullopt, std::vector<std::uint64_t>{12, 5}),
+                     DraftVersion::kDraft21, filtered) &&
+                     filtered.subscription_filter.has_value() && filtered.subscription_filter->filter_type == 0x03 &&
+                     filtered.subscription_filter->start_group_id == 12 &&
+                     filtered.subscription_filter->start_object_id == 5,
+                 "draft-21 SUBSCRIBE_TRACKS decodes a LOCATION_FILTER");
+    SubscribeTracksMessage malformed;
+    ok &= expect(!decode_subscribe_tracks_message(
+                     build_draft21_subscribe_tracks(std::nullopt, std::vector<std::uint64_t>{1, 2, 3, 4, 5}),
+                     DraftVersion::kDraft21, malformed),
+                 "draft-21 SUBSCRIBE_TRACKS rejects a malformed LOCATION_FILTER");
+    return ok;
+}
+
+bool test_draft21_publish_done_and_framing() {
+    bool ok = true;
+    // Draft-21 §9.9 widens PUBLISH_DONE Stream Count to 2^64-1, which needs the
+    // 9-byte vi64 form (0xff prefix + 8 bytes).
+    const std::vector<std::uint8_t> expected_done{
+        0x0b, 0x00, 0x0f, 0x02,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x04, 'd', 'o', 'n', 'e'};
+    ok &= expect(openmoq::publisher::transport::encode_publish_done_message(
+                     DraftVersion::kDraft21, 1, std::numeric_limits<std::uint64_t>::max(), 0x2, "done") ==
+                     expected_done,
+                 "draft-21 PUBLISH_DONE carries a 2^64-1 stream count");
+
+    // GOAWAY and the FETCH family stay opaque uint16-length frames: this
+    // publisher never decodes their fields, so draft-21's GOAWAY without a
+    // Request ID and the restructured FETCH need no parser.
+    for (const std::uint64_t message_type : {0x10ULL, 0x16ULL, 0x17ULL, 0x18ULL, 0x19ULL}) {
+        std::vector<std::uint8_t> payload;
+        append_string(payload, DraftVersion::kDraft21, "opaque");
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, DraftVersion::kDraft21, message_type);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        std::size_t message_size = 0;
+        ok &= expect(openmoq::publisher::transport::next_control_message(bytes, DraftVersion::kDraft21, message_size) &&
+                         message_size == bytes.size(),
+                     "draft-21 frames message type " + std::to_string(message_type) + " as an opaque control message");
+    }
+    return ok;
+}
+
+bool test_parameter_length_wrap_is_rejected() {
+    bool ok = true;
+    // A parameter length near 2^64 must not wrap offset + length and rewind the
+    // parser (which re-parses the same bytes for up to 2^64 parameters).
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        std::vector<std::uint8_t> payload;
+        append_moqint(payload, draft, 1);
+        append_track_namespace(payload, draft, {"live"});
+        payload.insert(payload.end(), {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff});  // 2^64-1 params
+        payload.insert(payload.end(), {0x2b, 0x00});  // odd type, length 0
+        payload.push_back(0x02);                      // delta to 0x2d (odd, length-prefixed)
+        payload.insert(payload.end(), {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf6});  // length 2^64-10
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, draft, 0x51);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        SubscribeTracksMessage tracks;
+        ok &= expect(!decode_subscribe_tracks_message(bytes, draft, tracks),
+                     draft_label(draft) + " SUBSCRIBE_TRACKS rejects a wrapping parameter length");
+    }
+    return ok;
+}
+
+bool test_draft21_subscribe_tracks_rejects_range_filters() {
+    bool ok = true;
+    // MAX_FILTER_RANGES defaults to 0 (§9.1.6), so a peer MUST NOT send range
+    // filters; 0x26/0x28 are even-typed yet length-prefixed, so they must be
+    // rejected before the even/odd dispatch rather than mis-framed.
+    for (const std::uint64_t filter_type : {0x25ULL, 0x26ULL, 0x27ULL, 0x28ULL, 0x29ULL}) {
+        constexpr DraftVersion draft = DraftVersion::kDraft21;
+        std::vector<std::uint8_t> payload;
+        append_moqint(payload, draft, 93);
+        append_track_namespace(payload, draft, {"live"});
+        append_moqint(payload, draft, 1);
+        append_moqint(payload, draft, filter_type);
+        append_moqint(payload, draft, 0);  // empty range set
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, draft, 0x51);
+        bytes.push_back(0);
+        bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        SubscribeTracksMessage tracks;
+        ok &= expect(!decode_subscribe_tracks_message(bytes, draft, tracks),
+                     "draft-21 SUBSCRIBE_TRACKS rejects range filter " + std::to_string(filter_type));
+    }
+    return ok;
+}
+
+std::vector<std::uint8_t> build_draft21_request_update_with_raw_filter(const std::vector<std::uint8_t>& filter) {
+    constexpr DraftVersion draft = DraftVersion::kDraft21;
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, 11);
+    append_moqint(payload, draft, 1);
+    append_moqint(payload, draft, 0x21);
+    append_moqint(payload, draft, filter.size());
+    payload.insert(payload.end(), filter.begin(), filter.end());
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x02);
+    bytes.push_back(0);
+    bytes.push_back(static_cast<std::uint8_t>(payload.size()));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft21_request_update_filter_errors() {
+    bool ok = true;
+    // §9.20.10: StartGroup + EndGroupDelta beyond 2^64-1 is a PROTOCOL_VIOLATION,
+    // not a key/value formatting error.
+    RequestUpdateMessage update;
+    RequestUpdateDecodeError error = RequestUpdateDecodeError::kNone;
+    ok &= expect(!decode_request_update_message(
+                     build_draft21_request_update_with_raw_filter(
+                         {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfb, 0x00, 0x0a}),
+                     DraftVersion::kDraft21, update, &error) &&
+                     error == RequestUpdateDecodeError::kSemantic,
+                 "draft-21 REQUEST_UPDATE LOCATION_FILTER overflow is a semantic (PROTOCOL_VIOLATION) error");
+    RequestUpdateMessage truncated;
+    error = RequestUpdateDecodeError::kNone;
+    ok &= expect(!decode_request_update_message(build_draft21_request_update_with_raw_filter({0x0c, 0x80}),
+                                                DraftVersion::kDraft21, truncated, &error) &&
+                     error == RequestUpdateDecodeError::kKeyValueFormatting,
+                 "draft-21 REQUEST_UPDATE truncated LOCATION_FILTER stays a key/value formatting error");
+    return ok;
+}
+
+bool test_largest_object_parameter_is_a_bare_location() {
+    bool ok = true;
+    // LARGEST_OBJECT (0x09) is "a Location" (draft-18 10.2.11, draft-21 9.20.18): two vi64s
+    // with no length prefix on drafts that define per-parameter encodings (17+). Draft 16
+    // still frames it as an odd KVP with a length.
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        ok &= expect(openmoq::publisher::transport::encode_subscribe_ok_message(draft, 9, 1, 3, 7, true) ==
+                         std::vector<std::uint8_t>{0x04, 0x00, 0x05, 0x01, 0x01, 0x09, 0x03, 0x07},
+                     draft_label(draft) + " SUBSCRIBE_OK carries LARGEST_OBJECT as a bare Location");
+        ok &= expect(encode_request_ok_message(draft, 93, 3, 7) ==
+                         std::vector<std::uint8_t>{0x07, 0x00, 0x04, 0x01, 0x09, 0x03, 0x07},
+                     draft_label(draft) + " REQUEST_UPDATE_OK carries LARGEST_OBJECT as a bare Location");
+    }
+    const std::vector<std::uint8_t> draft16 =
+        openmoq::publisher::transport::encode_subscribe_ok_message(DraftVersion::kDraft16, 9, 1, 3, 7, true);
+    const std::vector<std::uint8_t> draft16_largest{0x09, 0x02, 0x03, 0x07};
+    ok &= expect(std::search(draft16.begin(), draft16.end(), draft16_largest.begin(), draft16_largest.end()) !=
+                     draft16.end(),
+                 "draft-16 SUBSCRIBE_OK keeps LARGEST_OBJECT length-prefixed");
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_largest_object_parameter_is_a_bare_location();
+    ok &= test_draft21_request_update_filter_errors();
+    ok &= test_draft21_subscribe_tracks_rejects_range_filters();
+    ok &= test_parameter_length_wrap_is_rejected();
+    ok &= test_draft21_publish_done_and_framing();
+    ok &= test_draft21_location_filter();
+    ok &= test_draft21_subscribe_tracks_parameters();
+    ok &= test_draft21_include_properties();
+    ok &= test_draft21_fill_parameters();
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
+    ok &= test_draft21_identity();
     ok &= test_uint8_message_parameter_decoding();
     ok &= test_publisher_control_message_encoders_for_all_drafts();
     ok &= test_peer_control_message_decoders_for_all_drafts();

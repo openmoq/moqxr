@@ -77,10 +77,25 @@ struct SubscribeNamespaceMessage {
     std::vector<std::string> track_namespace_prefix;
 };
 
+struct SubscriptionFilter {
+    std::uint64_t filter_type = 0;
+    std::size_t start_group_id = 0;
+    std::size_t start_object_id = 0;
+    std::size_t end_group_id = 0;
+    std::optional<std::size_t> end_object_id;
+};
+
 struct SubscribeTracksMessage {
     std::uint64_t request_id = 0;
     std::vector<std::string> track_namespace_prefix;
     std::uint8_t forward = 1;
+    // Draft-21 initial subscription parameters for the resulting PUBLISHes
+    // (§9.18.1); 0 means GROUP_ORDER was omitted.
+    std::uint8_t group_order = 0;
+    std::optional<SubscriptionFilter> subscription_filter;
+    // FILL_PARAMETERS presence. PUBLISH never reports LARGEST_OBJECT, so the
+    // fill range is empty and no fill fetch stream is owed (§3.4).
+    bool fill_requested = false;
 };
 
 struct DeliveryTimeouts {
@@ -99,19 +114,16 @@ struct SubscribeMessage {
     std::size_t start_group_id = 0;
     std::size_t start_object_id = 0;
     std::size_t end_group_id = 0;
+    // Draft-21 LOCATION_FILTER may bound the end group at an inclusive object.
+    std::optional<std::size_t> end_object_id;
     DeliveryTimeouts delivery_timeouts;
+    // Draft-21 FILL_PARAMETERS presence.
+    bool fill_requested = false;
 };
 
 // The optional values carried by REQUEST_UPDATE are deliberately distinct
 // from SubscribeMessage defaults: an omitted parameter retains the existing
 // request value.
-struct SubscriptionFilter {
-    std::uint64_t filter_type = 0;
-    std::size_t start_group_id = 0;
-    std::size_t start_object_id = 0;
-    std::size_t end_group_id = 0;
-};
-
 struct RequestUpdateMessage {
     std::uint64_t request_id = 0;
     // Draft 16 identifies the target in the message. Draft 18 associates the
@@ -124,6 +136,9 @@ struct RequestUpdateMessage {
     std::optional<SubscriptionFilter> subscription_filter;
     std::optional<std::uint64_t> new_group_request;
     bool has_authorization_token = false;
+    // Draft-21 FILL_PARAMETERS presence; its overriding parameters are unused
+    // because this publisher can only report fill failure.
+    bool fill_requested = false;
 };
 
 // Archived positional update model retained only for pre-draft-16 session
@@ -160,6 +175,7 @@ struct PublishError {
 };
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
+std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 
 // Message-parameter ids shared by the SUBSCRIBE-family decoders. draft-17 and

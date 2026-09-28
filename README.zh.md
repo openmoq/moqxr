@@ -13,7 +13,7 @@
 - 构建 MSF/CMSF version 1 catalog、初始化数据、可选 media timeline 和 SAP event timeline。
 - 对批量输入、stdin 上的直播 fragmented MP4 和 CTE LL-DASH ingest，检测并标识已有的 CMAF CENC 内容保护。它不会加密或解密媒体。
 - 输出 catalog、初始化、媒体、probe 和发布计划文件，以便在本地检查。
-- 使用主 CLI 支持的 MOQT draft profile 发布：draft 16（默认）和 draft 18。
+- 使用主 CLI 支持的 MOQT draft profile 发布：draft 16（默认）、draft 18 和 draft 21。
 - 当 picoquic 和 picotls 可用时，通过 Raw QUIC 或 WebTransport 发布。
 - 接受来自 stdin 的直播 fragmented MP4、libsrt 可用时通过 SRT 传输的 MPEG-TS，以及通过 HTTP/1.1 CTE LL-DASH ingest（chunked 或固定长度请求）传输的 CMAF。
 - 使用 `--url` 解析 MSF URL，并使用 `--print-msf-urls` 打印 catalog discovery URL。
@@ -273,6 +273,6 @@ MSFTS 示例遵循 `examples/msfts-publisher/docs/` 中的本地文本 draft，�
 
 ## 当前状态
 
-主 `openmoq-publisher` CLI 接受 drafts 16 和 18；draft 16 仍是默认值，draft 18 提供较新的 request-stream profile。drafts 14、17 和 19 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试。
+主 `openmoq-publisher` CLI 接受 drafts 16、18 和 21；draft 16 仍是默认值，draft 18 提供较新的 request-stream profile，draft 21 在其基础上扩展（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）。draft 21 仅适用于原生后端；moq5 后端仍使用 drafts 16 和 18。drafts 14、17、19 和 20 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试。
 
 默认 picoquic backend 和可选 moq5 backend 都在进行持续的互操作性测试。有关详细功能覆盖、限制和 roadmap，请参阅 [docs/status.md](docs/status.md) 和 [docs/protocol-mapping.md](docs/protocol-mapping.md)。

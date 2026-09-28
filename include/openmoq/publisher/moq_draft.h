@@ -9,6 +9,7 @@ enum class DraftVersion {
     kDraft16,
     kDraft17,
     kDraft18,
+    kDraft21,
 };
 
 struct DraftProfile {
@@ -18,6 +19,12 @@ struct DraftProfile {
     std::string object_status_label;
     std::string notes;
 };
+
+// Draft-21 keeps draft-18's control/request-stream model; behavior shared by
+// both keys on this, and draft-21-only differences check kDraft21 directly.
+constexpr bool is_draft18_or_later(DraftVersion version) {
+    return version == DraftVersion::kDraft18 || version == DraftVersion::kDraft21;
+}
 
 DraftProfile draft_profile(DraftVersion version);
 std::string to_string(DraftVersion version);

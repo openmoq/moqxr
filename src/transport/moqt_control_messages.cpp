@@ -54,6 +54,7 @@ constexpr std::uint64_t kDraft14Version = 0xff00000eULL;
 constexpr std::uint64_t kDraft16Version = 0xff000010ULL;
 constexpr std::uint64_t kDraft17Version = 0xff000011ULL;
 constexpr std::uint64_t kDraft18Version = 0xff000012ULL;
+constexpr std::uint64_t kDraft21Version = 0xff000015ULL;
 constexpr std::uint64_t kMaxQuicVarintValue = 4611686018427387903ULL;
 constexpr std::uint64_t kSubscribeErrorTrackDoesNotExist = 0x2;
 constexpr std::uint8_t kGroupOrderAscending = 0x1;
@@ -65,7 +66,13 @@ bool decode_varint_impl(std::span<const std::uint8_t> bytes, std::size_t& offset
 bool decode_vi64_impl(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 
 bool uses_moq_vi64(DraftVersion draft) {
-    return draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
+    return draft == DraftVersion::kDraft17 || is_draft18_or_later(draft);
+}
+
+// Peer lengths are vi64 values up to 2^64-1, so offset + length can wrap and
+// rewind the parser; compare against the remaining span instead.
+bool fits(std::size_t offset, std::uint64_t length, std::size_t end) {
+    return offset <= end && length <= end - offset;
 }
 
 bool decode_moqint_impl(std::span<const std::uint8_t> bytes,
@@ -160,7 +167,7 @@ bool decode_reason_phrase(std::span<const std::uint8_t> bytes,
                           DraftVersion draft,
                           std::string& reason) {
     std::uint64_t length = 0;
-    if (!decode_moqint_impl(bytes, offset, draft, length) || offset + length > bytes.size()) {
+    if (!decode_moqint_impl(bytes, offset, draft, length) || !fits(offset, length, bytes.size())) {
         return false;
     }
     reason.assign(reinterpret_cast<const char*>(bytes.data() + offset), static_cast<std::size_t>(length));
@@ -281,7 +288,7 @@ bool decode_track_namespace(std::span<const std::uint8_t> bytes,
     track_namespace.reserve(static_cast<std::size_t>(entry_count));
     for (std::uint64_t index = 0; index < entry_count; ++index) {
         std::uint64_t length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, length) || offset + length > bytes.size()) {
+        if (!decode_moqint_impl(bytes, offset, draft, length) || !fits(offset, length, bytes.size())) {
             return false;
         }
         track_namespace.emplace_back(reinterpret_cast<const char*>(bytes.data() + offset), static_cast<std::size_t>(length));
@@ -297,7 +304,7 @@ bool decode_varint_impl(std::span<const std::uint8_t> bytes, std::size_t& offset
 
     const std::uint8_t first = bytes[offset];
     const std::size_t length = 1ULL << (first >> 6);
-    if (offset + length > bytes.size()) {
+    if (!fits(offset, length, bytes.size())) {
         return false;
     }
 
@@ -344,7 +351,7 @@ bool decode_vi64_impl(std::span<const std::uint8_t> bytes, std::size_t& offset, 
         length = 9;
         prefix_mask = 0x00;
     }
-    if (offset + length > bytes.size()) {
+    if (!fits(offset, length, bytes.size())) {
         return false;
     }
     value = first & prefix_mask;
@@ -395,6 +402,25 @@ void append_parameter_delta(std::vector<std::uint8_t>& out,
         out.insert(out.end(), value.begin(), value.end());
     }
     previous_type = type;
+}
+
+// LARGEST_OBJECT (0x09) is a Location. Drafts 17+ define per-parameter encodings, so it is
+// two bare vi64s there; draft 16 frames it as an odd Key-Value-Pair with a length.
+void append_largest_object_parameter(std::vector<std::uint8_t>& out,
+                                     DraftVersion draft,
+                                     std::uint64_t& previous_type,
+                                     std::size_t group_id,
+                                     std::size_t object_id) {
+    constexpr std::uint64_t kParamLargestObject = 0x09;
+    std::vector<std::uint8_t> location;
+    append_location(location, draft, group_id, object_id);
+    if (!uses_moq_vi64(draft)) {
+        append_parameter_delta(out, draft, previous_type, kParamLargestObject, location);
+        return;
+    }
+    append_moqint(out, draft, kParamLargestObject - previous_type);
+    out.insert(out.end(), location.begin(), location.end());
+    previous_type = kParamLargestObject;
 }
 
 enum class ParameterTypeDecodeError {
@@ -478,6 +504,8 @@ std::uint64_t draft_version_number(DraftVersion draft) {
             return kDraft17Version;
         case DraftVersion::kDraft18:
             return kDraft18Version;
+        case DraftVersion::kDraft21:
+            return kDraft21Version;
     }
 
     return kDraft18Version;
@@ -491,7 +519,7 @@ bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
                                       std::uint64_t parameter_type,
                                       std::uint64_t& value) {
     const bool is_uint8 =
-        (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) &&
+        (draft == DraftVersion::kDraft17 || is_draft18_or_later(draft)) &&
         (parameter_type == kParamForward || parameter_type == kParamSubscriberPriority ||
          parameter_type == kParamGroupOrder);
     if (!is_uint8) {
@@ -502,6 +530,27 @@ bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
     }
     value = bytes[offset++];
     return true;
+}
+
+constexpr std::uint64_t kParamIncludeProperties = 0x35;
+constexpr std::uint64_t kParamFillParameters = 0x23;
+constexpr std::uint64_t kFetchHeaderType = 0x05;
+
+// Draft-21 INCLUDE_PROPERTIES is an odd-typed uint8, an exception to the
+// odd-means-length-prefixed rule. This publisher never sends Track Properties,
+// so either legal value is already honored.
+bool decode_include_properties(std::span<const std::uint8_t> bytes, std::size_t& offset, std::size_t end) {
+    if (offset >= end) {
+        return false;
+    }
+    return bytes[offset++] <= 1;
+}
+
+std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id) {
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, kFetchHeaderType);
+    append_moqint(bytes, draft, request_id);
+    return bytes;
 }
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value) {
@@ -743,7 +792,7 @@ bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetu
     const std::size_t payload_length =
         (static_cast<std::size_t>(bytes[offset]) << 8) | static_cast<std::size_t>(bytes[offset + 1]);
     offset += 2;
-    if (offset + payload_length > bytes.size()) {
+    if (!fits(offset, payload_length, bytes.size())) {
         return false;
     }
 
@@ -826,7 +875,7 @@ bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetu
 
         std::uint64_t parameter_length = 0;
         if (!decode_moqint_impl(payload_bytes, offset, message.draft, parameter_length) ||
-            offset + parameter_length > payload_end) {
+            !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         offset += parameter_length;
@@ -855,7 +904,7 @@ bool decode_setup_response_message(std::span<const std::uint8_t> bytes,
     if (!decode_server_setup_message(bytes, message)) {
         return false;
     }
-    if (uses_moq_vi64(expected_draft) && message.draft == DraftVersion::kDraft18) {
+    if (uses_moq_vi64(expected_draft) && is_draft18_or_later(message.draft)) {
         message.draft = expected_draft;
     }
     return message.draft == expected_draft;
@@ -946,17 +995,8 @@ std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
         append_moqint(payload, draft, request_id);
     }
     append_moqint(payload, draft, 1);
-    std::vector<std::uint8_t> largest_object;
-    append_location(largest_object,
-                    draft,
-                    largest_group_id,
-                    largest_object_id);
     std::uint64_t previous_parameter_type = 0;
-    append_parameter_delta(payload,
-                           draft,
-                           previous_parameter_type,
-                           0x09,
-                           largest_object);
+    append_largest_object_parameter(payload, draft, previous_parameter_type, largest_group_id, largest_object_id);
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kRequestOkType);
@@ -999,7 +1039,7 @@ bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             }
         } else {
             std::uint64_t parameter_length = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+            if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
                 return false;
             }
             offset += static_cast<std::size_t>(parameter_length);
@@ -1059,12 +1099,12 @@ bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draf
     std::uint64_t connect_uri_length = 0;
     std::vector<std::string> redirect_namespace;
     std::uint64_t track_name_length = 0;
-    if (!decode_moqint_impl(bytes, offset, draft, connect_uri_length) || offset + connect_uri_length > payload_end) {
+    if (!decode_moqint_impl(bytes, offset, draft, connect_uri_length) || !fits(offset, connect_uri_length, payload_end)) {
         return false;
     }
     offset += static_cast<std::size_t>(connect_uri_length);
     if (!decode_track_namespace(bytes.subspan(0, payload_end), offset, draft, redirect_namespace) ||
-        !decode_moqint_impl(bytes, offset, draft, track_name_length) || offset + track_name_length > payload_end) {
+        !decode_moqint_impl(bytes, offset, draft, track_name_length) || !fits(offset, track_name_length, payload_end)) {
         return false;
     }
     offset += static_cast<std::size_t>(track_name_length);
@@ -1077,7 +1117,7 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     const std::uint64_t message_type =
-        draft == DraftVersion::kDraft18 ? kSubscribeNamespaceTypeDraft18 : kSubscribeNamespaceType;
+        is_draft18_or_later(draft) ? kSubscribeNamespaceTypeDraft18 : kSubscribeNamespaceType;
     const bool framed =
         draft == DraftVersion::kDraft14
             ? parse_varint_length_message(bytes, draft, message_type, payload_offset, payload_length)
@@ -1130,7 +1170,7 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
             continue;
         }
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         if (draft == DraftVersion::kDraft16 && parameter_type != 0x03) {
@@ -1142,7 +1182,7 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
 }
 
 std::vector<std::uint8_t> encode_subscribe_namespace_ok_message(DraftVersion draft, std::uint64_t request_id) {
-    if (draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18) {
+    if (draft == DraftVersion::kDraft16 || is_draft18_or_later(draft)) {
         return encode_request_ok_message(draft, request_id);
     }
 
@@ -1156,11 +1196,70 @@ std::vector<std::uint8_t> encode_subscribe_namespace_ok_message(DraftVersion dra
     return message_bytes;
 }
 
+// Draft-21 LOCATION_FILTER (§9.20.10): the field count, not a Filter Type,
+// selects the form. Maps onto the draft-18 filter model; a relative start more
+// than zero groups back starts at the next object because live delivery keeps
+// no history to replay.
+bool decode_location_filter(std::span<const std::uint8_t> bytes,
+                            std::size_t& offset,
+                            std::size_t end,
+                            SubscribeMessage& message,
+                            bool* overflowed = nullptr) {
+    std::uint64_t fields[4] = {};
+    std::size_t count = 0;
+    while (offset < end) {
+        if (count == 4 || !decode_moqint_impl(bytes.subspan(0, end), offset, DraftVersion::kDraft21, fields[count])) {
+            return false;
+        }
+        ++count;
+    }
+    message.filter_type = 0x00;
+    message.start_group_id = 0;
+    message.start_object_id = 0;
+    message.end_group_id = 0;
+    message.end_object_id.reset();
+    switch (count) {
+        case 0:
+            break;
+        case 1:
+            message.filter_type = fields[0] == 0 ? 0x01 : 0x02;
+            break;
+        case 2:
+            if (fields[0] == 0 && fields[1] == 0) {
+                message.filter_type = 0x02;
+                break;
+            }
+            message.filter_type = 0x03;
+            message.start_group_id = static_cast<std::size_t>(fields[0]);
+            message.start_object_id = static_cast<std::size_t>(fields[1]);
+            break;
+        default:
+            if (fields[2] > std::numeric_limits<std::uint64_t>::max() - fields[0]) {
+                if (overflowed != nullptr) {
+                    *overflowed = true;
+                }
+                return false;
+            }
+            message.filter_type = 0x04;
+            message.start_group_id = static_cast<std::size_t>(fields[0]);
+            message.start_object_id = static_cast<std::size_t>(fields[1]);
+            message.end_group_id = static_cast<std::size_t>(fields[0] + fields[2]);
+            if (count == 4) {
+                message.end_object_id = static_cast<std::size_t>(fields[3]);
+            }
+            break;
+    }
+    return offset == end;
+}
+
 bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
                              std::size_t& offset,
                              std::size_t end,
                              DraftVersion draft,
                              SubscribeMessage& message) {
+    if (draft == DraftVersion::kDraft21) {
+        return decode_location_filter(bytes, offset, end, message);
+    }
     if (!decode_moqint_impl(bytes, offset, draft, message.filter_type)) {
         return false;
     }
@@ -1180,6 +1279,14 @@ bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
             std::uint64_t end_group_id = 0;
             if (!decode_moqint_impl(bytes, offset, draft, end_group_id)) {
                 return false;
+            }
+            // Drafts 17/18 carry End Group Delta from the Start Group (§5.1.2);
+            // draft 16 carries the absolute End Group.
+            if (draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18) {
+                if (end_group_id > std::numeric_limits<std::uint64_t>::max() - group_id) {
+                    return false;
+                }
+                end_group_id += group_id;
             }
             message.end_group_id = static_cast<std::size_t>(end_group_id);
         }
@@ -1212,7 +1319,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         }
     }
     if (!decode_track_namespace(bytes.subspan(0, payload_end), offset, draft, message.track_namespace) ||
-        !decode_moqint_impl(bytes, offset, draft, track_name_length) || offset + track_name_length > payload_end) {
+        !decode_moqint_impl(bytes, offset, draft, track_name_length) || !fits(offset, track_name_length, payload_end)) {
         return false;
     }
 
@@ -1271,6 +1378,8 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
     message.start_group_id = 0;
     message.start_object_id = 0;
     message.end_group_id = 0;
+    message.end_object_id.reset();
+    message.fill_requested = false;
 
     std::uint64_t parameter_count = 0;
     if (!decode_moqint_impl(bytes, offset, draft, parameter_count)) {
@@ -1283,6 +1392,12 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
             return false;
         }
+        if (draft == DraftVersion::kDraft21 && parameter_type == kParamIncludeProperties) {
+            if (!decode_include_properties(bytes, offset, payload_end)) {
+                return false;
+            }
+            continue;
+        }
 
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
@@ -1291,11 +1406,11 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
             }
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT).
-                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
+                    if (!is_draft18_or_later(draft) && value == 0) { return false; }
                     message.delivery_timeouts.object_ms = value;
                     break;
                 case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         message.delivery_timeouts.subgroup_ms = value;
                     } else if (draft == DraftVersion::kDraft16) {
                         return false;
@@ -1326,11 +1441,17 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
 
         // Odd type: length-prefixed bytes.
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         switch (parameter_type) {
             case 0x03:  // AUTHORIZATION_TOKEN — defined in SUBSCRIBE, opaque to this publisher.
+                break;
+            case kParamFillParameters:
+                if (draft != DraftVersion::kDraft21 || message.fill_requested) {
+                    return false;
+                }
+                message.fill_requested = true;
                 break;
             case 0x21: {  // SUBSCRIPTION_FILTER
                 std::size_t filter_offset = offset;
@@ -1355,7 +1476,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
 bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                      DraftVersion draft,
                                      SubscribeTracksMessage& message) {
-    if (draft != DraftVersion::kDraft18) {
+    if (!is_draft18_or_later(draft)) {
         return false;
     }
 
@@ -1391,6 +1512,18 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                                    kParamAuthorizationToken)) {
             return false;
         }
+        // Range filters (0x25-0x29) need a MAX_FILTER_RANGES this publisher
+        // never advertises (§9.1.6); some are even-typed but length-prefixed,
+        // so reject them here instead of mis-framing them.
+        if (draft == DraftVersion::kDraft21 && parameter_type >= 0x25 && parameter_type <= 0x29) {
+            return false;
+        }
+        if (draft == DraftVersion::kDraft21 && parameter_type == kParamIncludeProperties) {
+            if (!decode_include_properties(bytes, offset, payload_end)) {
+                return false;
+            }
+            continue;
+        }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
             if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
@@ -1401,13 +1534,36 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                     return false;
                 }
                 message.forward = static_cast<std::uint8_t>(value);
+            } else if (parameter_type == kParamGroupOrder && draft == DraftVersion::kDraft21) {
+                if (value != 0x1 && value != 0x2) {
+                    return false;
+                }
+                message.group_order = static_cast<std::uint8_t>(value);
             }
             continue;
         }
 
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
+        }
+        if (parameter_type == kParamFillParameters && draft == DraftVersion::kDraft21) {
+            message.fill_requested = true;
+        }
+        if (parameter_type == 0x21 && draft == DraftVersion::kDraft21) {  // LOCATION_FILTER
+            SubscribeMessage decoded_filter;
+            std::size_t filter_offset = offset;
+            if (!decode_location_filter(bytes, filter_offset, offset + static_cast<std::size_t>(parameter_length),
+                                        decoded_filter)) {
+                return false;
+            }
+            message.subscription_filter = SubscriptionFilter{
+                .filter_type = decoded_filter.filter_type,
+                .start_group_id = decoded_filter.start_group_id,
+                .start_object_id = decoded_filter.start_object_id,
+                .end_group_id = decoded_filter.end_group_id,
+                .end_object_id = decoded_filter.end_object_id,
+            };
         }
         offset += static_cast<std::size_t>(parameter_length);
     }
@@ -1428,7 +1584,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
     if (error != nullptr) {
         *error = RequestUpdateDecodeError::kNone;
     }
-    if (draft != DraftVersion::kDraft16 && draft != DraftVersion::kDraft18) {
+    if (draft != DraftVersion::kDraft16 && !is_draft18_or_later(draft)) {
         return fail(RequestUpdateDecodeError::kSemantic);
     }
 
@@ -1490,14 +1646,14 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                     message.object_delivery_timeout_ms = value;
                     break;
                 case 0x06:
-                    if (draft != DraftVersion::kDraft18 ||
+                    if (!is_draft18_or_later(draft) ||
                         message.subgroup_delivery_timeout_ms.has_value()) {
                         return fail(RequestUpdateDecodeError::kSemantic);
                     }
                     message.subgroup_delivery_timeout_ms = value;
                     break;
                 case 0x08:  // EXPIRES is known but outside REQUEST_UPDATE.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         return fail(RequestUpdateDecodeError::kSemantic);
                     }
                     break;
@@ -1517,7 +1673,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                     // Draft 16 requires known parameters outside their message
                     // scope to be ignored. Draft 18 makes the same condition a
                     // connection-level protocol violation.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         return fail(RequestUpdateDecodeError::kSemantic);
                     }
                     break;
@@ -1550,9 +1706,15 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                 message.has_authorization_token = true;
                 break;
             case 0x09:  // LARGEST_OBJECT is known but outside REQUEST_UPDATE.
-                if (draft == DraftVersion::kDraft18) {
+                if (is_draft18_or_later(draft)) {
                     return fail(RequestUpdateDecodeError::kSemantic);
                 }
+                break;
+            case kParamFillParameters:
+                if (draft != DraftVersion::kDraft21 || message.fill_requested) {
+                    return fail(RequestUpdateDecodeError::kSemantic);
+                }
+                message.fill_requested = true;
                 break;
             case 0x21: {
                 if (message.subscription_filter.has_value()) {
@@ -1560,14 +1722,21 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                 }
                 SubscribeMessage decoded_filter;
                 std::size_t filter_offset = offset;
-                if (!decode_subscribe_filter(bytes, filter_offset, parameter_end, draft, decoded_filter)) {
-                    return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+                bool overflowed = false;
+                const bool decoded =
+                    draft == DraftVersion::kDraft21
+                        ? decode_location_filter(bytes, filter_offset, parameter_end, decoded_filter, &overflowed)
+                        : decode_subscribe_filter(bytes, filter_offset, parameter_end, draft, decoded_filter);
+                if (!decoded) {
+                    return fail(overflowed ? RequestUpdateDecodeError::kSemantic
+                                           : RequestUpdateDecodeError::kKeyValueFormatting);
                 }
                 message.subscription_filter = SubscriptionFilter{
                     .filter_type = decoded_filter.filter_type,
                     .start_group_id = decoded_filter.start_group_id,
                     .start_object_id = decoded_filter.start_object_id,
                     .end_group_id = decoded_filter.end_group_id,
+                    .end_object_id = decoded_filter.end_object_id,
                 };
                 break;
             }
@@ -1641,9 +1810,8 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
         std::uint64_t previous_parameter_type = 0;
         std::uint64_t parameter_count = 0;
         if (content_exists) {
-            std::vector<std::uint8_t> largest_object;
-            append_location(largest_object, draft, largest_group_id, largest_object_id);
-            append_parameter_delta(parameters, draft, previous_parameter_type, 0x09, largest_object);
+            append_largest_object_parameter(
+                parameters, draft, previous_parameter_type, largest_group_id, largest_object_id);
             ++parameter_count;
         }
         append_moqint(payload, draft, parameter_count);
@@ -1781,7 +1949,7 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
                                                  std::uint64_t subgroup_id,
                                                  bool end_of_group,
                                                  bool properties_present) {
-    if (properties_present && draft != DraftVersion::kDraft18) {
+    if (properties_present && !is_draft18_or_later(draft)) {
         throw std::invalid_argument("object properties require draft 18");
     }
     // Current callers always serve subgroup_id = 0 and the publisher default
@@ -1808,7 +1976,7 @@ std::vector<std::uint8_t> encode_subgroup_object(DraftVersion draft,
                                                  std::span<const ObjectProperty> properties,
                                                  bool properties_present) {
     properties_present = properties_present || !properties.empty();
-    if (properties_present && draft != DraftVersion::kDraft18) {
+    if (properties_present && !is_draft18_or_later(draft)) {
         throw std::invalid_argument("object properties require draft 18");
     }
     if (previous_object_id && object_id <= *previous_object_id) {
@@ -1860,14 +2028,14 @@ bool decode_publish_namespace_error(std::span<const std::uint8_t> bytes, Publish
 bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishOk& message) {
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
-    const bool request_ok_alias = draft == DraftVersion::kDraft18;
+    const bool request_ok_alias = is_draft18_or_later(draft);
     const bool parsed = request_ok_alias
                             ? parse_uint16_length_message(bytes, draft, kRequestOkType, payload_offset, payload_length)
                             : parse_publish_family_message(bytes, draft, kPublishOkType, payload_offset, payload_length);
     if (!parsed) {
         return false;
     }
-    if (payload_offset + payload_length > bytes.size()) {
+    if (!fits(payload_offset, payload_length, bytes.size())) {
         return false;
     }
     std::size_t offset = payload_offset;
@@ -1915,7 +2083,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             std::uint64_t parameter_length = 0;
             if (!decode_moqint_impl(bytes, offset, draft, parameter_type) ||
                 !decode_moqint_impl(bytes, offset, draft, parameter_length) ||
-                offset + parameter_length > payload_end) {
+                !fits(offset, parameter_length, payload_end)) {
                 return false;
             }
             offset += static_cast<std::size_t>(parameter_length);
@@ -1938,6 +2106,12 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
             return false;
         }
+        // Draft-21 PUBLISH_OK carries only EXPIRES: subscription parameters
+        // moved to PUBLISH and REQUEST_UPDATE, and a parameter outside its
+        // allowed messages is a PROTOCOL_VIOLATION (§9.20.1).
+        if (draft == DraftVersion::kDraft21 && parameter_type != 0x08) {
+            return false;
+        }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
             if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
@@ -1945,11 +2119,11 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             }
             switch (parameter_type) {
                 case 0x02:  // DELIVERY_TIMEOUT (draft-18: OBJECT_DELIVERY_TIMEOUT)
-                    if (draft != DraftVersion::kDraft18 && value == 0) { return false; }
+                    if (!is_draft18_or_later(draft) && value == 0) { return false; }
                     message.delivery_timeouts.object_ms = value;
                     break;
                 case 0x06:  // draft-18 SUBGROUP_DELIVERY_TIMEOUT.
-                    if (draft == DraftVersion::kDraft18) {
+                    if (is_draft18_or_later(draft)) {
                         message.delivery_timeouts.subgroup_ms = value;
                     } else if (draft == DraftVersion::kDraft16) {
                         return false;
@@ -1978,7 +2152,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         }
 
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || offset + parameter_length > payload_end) {
+        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
             return false;
         }
         switch (parameter_type) {
@@ -2006,7 +2180,7 @@ bool decode_publish_error(std::span<const std::uint8_t> bytes, DraftVersion draf
     if (!parse_publish_family_message(bytes, draft, kPublishErrorType, payload_offset, payload_length)) {
         return false;
     }
-    if (payload_offset + payload_length > bytes.size()) {
+    if (!fits(payload_offset, payload_length, bytes.size())) {
         return false;
     }
     std::size_t offset = payload_offset;

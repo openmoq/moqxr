@@ -35,6 +35,14 @@ int main() {
     // unassigned in 18, so it is left unnamed rather than guessed.
     ok &= expect(moqt_termination_code_name(0x7).empty(), "expected draft-dependent 0x7 to stay unnamed");
     ok &= expect(moqt_termination_code_name(0x9D).empty(), "expected a greasing code to stay unnamed");
+    // Draft-21 adds 0x1B, unassigned in every earlier draft.
+    ok &= expect(moqt_termination_code_name(0x1B) == "TOO_MANY_REQUEST_UPDATES",
+                 "expected 0x1B to name TOO_MANY_REQUEST_UPDATES");
+    {
+        const std::string message = describe_peer_close(PeerClose{.application_error = 0x1B});
+        ok &= expect(message.find("TOO_MANY_REQUEST_UPDATES") != std::string::npos,
+                     "expected peer close description to name TOO_MANY_REQUEST_UPDATES");
+    }
 
     {
         // moqx rejecting an expired credential.
