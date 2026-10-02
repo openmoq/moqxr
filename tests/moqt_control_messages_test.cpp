@@ -726,7 +726,7 @@ std::vector<std::uint8_t> build_publish_error_message(DraftVersion draft) {
 
 bool test_setup_serdes_for_all_drafts() {
     bool ok = true;
-    for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18}) {
         const std::string label = draft_label(draft) + " setup";
         const SetupMessage setup{
             .draft = draft,
@@ -1215,6 +1215,15 @@ bool test_subgroup_header_and_object_serdes_for_all_drafts() {
         ok &= expect(read_varint(header, offset, group) && group == 3, label + " subgroup header group placement");
         ok &= expect(offset == header.size(), label + " subgroup header contains no object fields");
 
+        const auto first_object_header = encode_subgroup_header(draft, 7, 3, 0, true, false, true);
+        offset = 0;
+        ok &= expect(read_moqint(first_object_header, offset, draft, type), label + " first-object subgroup header type");
+        const std::uint64_t expected_first_object_type =
+            draft == DraftVersion::kDraft14 ? 0x18 :
+            draft == DraftVersion::kDraft16 ? 0x38 : 0x78;
+        ok &= expect(type == expected_first_object_type,
+                     label + " sets FIRST_OBJECT only on supported drafts");
+
         const std::vector<std::uint8_t> payload = {0xaa, 0xbb, 0xcc};
         const auto first = encode_subgroup_object(draft, std::nullopt, 5, payload);
         offset = 0;
@@ -1244,6 +1253,13 @@ bool test_subgroup_header_and_object_serdes_for_all_drafts() {
         }
         ok &= expect(offset == empty.size(), label + " empty object status/payload boundary");
     }
+    const auto draft21_first_object_header =
+        encode_subgroup_header(DraftVersion::kDraft21, 7, 3, 0, true, false, true);
+    std::size_t draft21_offset = 0;
+    std::uint64_t draft21_type = 0;
+    ok &= expect(read_moqint(draft21_first_object_header, draft21_offset,
+                              DraftVersion::kDraft21, draft21_type) && draft21_type == 0x78,
+                 "draft-21 sets FIRST_OBJECT on a subgroup's first object");
     return ok;
 }
 
@@ -1660,6 +1676,123 @@ bool test_draft21_identity() {
     return ok;
 }
 
+bool test_draft18_and_21_unknown_setup_option_duplicates() {
+    bool ok = true;
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        const std::string label = draft_label(draft);
+        std::vector<std::uint8_t> payload;
+        append_moqint(payload, draft, 0x02);  // MAX_REQUEST_ID
+        append_moqint(payload, draft, 64);
+        append_moqint(payload, draft, 0x9d - 0x02);  // unknown odd option
+        append_moqint(payload, draft, 1);
+        payload.push_back(0xaa);
+        append_moqint(payload, draft, 0);
+        append_moqint(payload, draft, 1);
+        payload.push_back(0xbb);
+        append_moqint(payload, draft, 0x11c - 0x9d);  // unknown even option
+        append_moqint(payload, draft, 3);
+        append_moqint(payload, draft, 0x11c - 0x11c);  // duplicate unknown even option
+        append_moqint(payload, draft, 7);
+
+        std::vector<std::uint8_t> bytes;
+        append_moqint(bytes, draft, 0x2f00);
+        bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+        bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        ServerSetupMessage decoded;
+        ok &= expect(decode_setup_response_message(bytes, draft, decoded),
+                     label + " permits repeated unknown SETUP option types");
+
+        std::vector<std::uint8_t> duplicate_known_payload;
+        append_moqint(duplicate_known_payload, draft, 0x02);
+        append_moqint(duplicate_known_payload, draft, 64);
+        append_moqint(duplicate_known_payload, draft, 0);
+        append_moqint(duplicate_known_payload, draft, 65);
+        std::vector<std::uint8_t> duplicate_known;
+        append_moqint(duplicate_known, draft, 0x2f00);
+        duplicate_known.push_back(static_cast<std::uint8_t>((duplicate_known_payload.size() >> 8) & 0xff));
+        duplicate_known.push_back(static_cast<std::uint8_t>(duplicate_known_payload.size() & 0xff));
+        duplicate_known.insert(duplicate_known.end(), duplicate_known_payload.begin(), duplicate_known_payload.end());
+        ok &= expect(!decode_setup_response_message(duplicate_known, draft, decoded),
+                     label + " rejects duplicate known non-repeatable SETUP option");
+    }
+    return ok;
+}
+
+bool test_draft18_and_21_track_namespace_constraints() {
+    bool ok = true;
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        const std::string label = draft_label(draft);
+        const auto namespace_request = [draft](const std::vector<std::string>& fields) {
+            std::vector<std::string_view> field_views;
+            field_views.reserve(fields.size());
+            for (const std::string& field : fields) field_views.emplace_back(field);
+            std::vector<std::uint8_t> payload;
+            append_moqint(payload, draft, 1);
+            append_track_namespace(payload, draft, field_views);
+            append_moqint(payload, draft, 0);
+            std::vector<std::uint8_t> bytes;
+            append_moqint(bytes, draft, 0x50);
+            bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+            bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
+            return bytes;
+        };
+        SubscribeNamespaceMessage namespace_message;
+        ok &= expect(!decode_subscribe_namespace_message(namespace_request({""}), draft, namespace_message),
+                     label + " rejects an empty namespace field");
+        std::vector<std::string> too_many_fields(33, "x");
+        ok &= expect(!decode_subscribe_namespace_message(namespace_request(too_many_fields), draft, namespace_message),
+                     label + " rejects more than 32 namespace fields");
+        ok &= expect(!decode_subscribe_namespace_message(namespace_request({std::string(4097, 'x')}), draft, namespace_message),
+                     label + " rejects an oversized namespace");
+
+        const auto subscribe_request = [draft](const std::vector<std::string>& fields, std::string_view track_name) {
+            std::vector<std::string_view> field_views;
+            for (const std::string& field : fields) field_views.emplace_back(field);
+            std::vector<std::uint8_t> payload;
+            append_moqint(payload, draft, 1);
+            append_track_namespace(payload, draft, field_views);
+            append_string(payload, draft, track_name);
+            append_moqint(payload, draft, 0);
+            std::vector<std::uint8_t> bytes;
+            append_moqint(bytes, draft, 0x03);
+            bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+            bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
+            return bytes;
+        };
+        SubscribeMessage subscribe_message;
+        ok &= expect(!decode_subscribe_message(subscribe_request({"x"}, std::string(4096, 'n')), draft, subscribe_message),
+                     label + " rejects a full track name over 4096 bytes");
+    }
+    return ok;
+}
+
+bool test_draft18_and_21_server_setup_rejects_client_only_options() {
+    bool ok = true;
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        for (const auto [option_type, expected_error] :
+             {std::pair<std::uint64_t, std::uint64_t>{0x05, 0x19}, {0x01, 0x08}}) {
+            std::vector<std::uint8_t> payload;
+            append_moqint(payload, draft, option_type);
+            append_moqint(payload, draft, 1);
+            payload.push_back('x');
+            std::vector<std::uint8_t> bytes;
+            append_moqint(bytes, draft, 0x2f00);
+            bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
+            bytes.push_back(static_cast<std::uint8_t>(payload.size() & 0xff));
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
+            ServerSetupMessage decoded;
+            const bool decoded_ok = decode_setup_response_message(bytes, draft, decoded);
+            ok &= expect(decoded_ok, draft_label(draft) + " decodes server SETUP carrying a forbidden option");
+            ok &= expect(decoded.unsupported_server_option_error_code == expected_error,
+                         draft_label(draft) + " identifies the matching server SETUP termination code");
+        }
+    }
+    return ok;
+}
+
 std::vector<std::uint8_t> build_draft21_subscribe_with_raw_location_filter(const std::vector<std::uint8_t>& filter) {
     constexpr DraftVersion draft = DraftVersion::kDraft21;
     std::vector<std::uint8_t> payload;
@@ -1971,8 +2104,10 @@ bool test_draft21_subscribe_tracks_rejects_range_filters() {
         bytes.push_back(static_cast<std::uint8_t>(payload.size()));
         bytes.insert(bytes.end(), payload.begin(), payload.end());
         SubscribeTracksMessage tracks;
-        ok &= expect(!decode_subscribe_tracks_message(bytes, draft, tracks),
-                     "draft-21 SUBSCRIBE_TRACKS rejects range filter " + std::to_string(filter_type));
+        ok &= expect(decode_subscribe_tracks_message(bytes, draft, tracks) &&
+                         tracks.has_unnegotiated_range_filter,
+                     "draft-21 SUBSCRIBE_TRACKS identifies unnegotiated range filter " +
+                         std::to_string(filter_type));
     }
     return ok;
 }
@@ -2128,6 +2263,9 @@ int main() {
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
     ok &= test_draft21_identity();
+    ok &= test_draft18_and_21_unknown_setup_option_duplicates();
+    ok &= test_draft18_and_21_track_namespace_constraints();
+    ok &= test_draft18_and_21_server_setup_rejects_client_only_options();
     ok &= test_uint8_message_parameter_decoding();
     ok &= test_publisher_control_message_encoders_for_all_drafts();
     ok &= test_peer_control_message_decoders_for_all_drafts();
