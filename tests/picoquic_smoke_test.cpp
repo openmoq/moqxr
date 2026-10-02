@@ -362,6 +362,8 @@ bool start_server(SmokeServer& server, bool hold_unidirectional_data = true) {
     }
 
     picoquic_set_cookie_mode(server.quic, 2);
+    picoquic_set_default_tp_value(server.quic, picoquic_tp_max_datagram_frame_size,
+                                  PICOQUIC_MAX_PACKET_SIZE);
     picoquic_tp_t tp = *picoquic_get_default_tp(server.quic);
     // Hold client-initiated unidirectional data at the sender so the
     // transport's literal admission budget can be exercised without

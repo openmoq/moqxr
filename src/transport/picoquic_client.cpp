@@ -1,5 +1,7 @@
 #include "openmoq/publisher/transport/picoquic_client.h"
 
+#include "openmoq/publisher/transport/moqt_control_messages.h"
+
 #include "pending_media_queue.h"
 #include "picoquic_close_drain.h"
 
@@ -89,6 +91,7 @@ struct PicoquicClient::Impl {
         applied_reliable_stream_priorities;
     std::deque<std::pair<std::uint64_t, std::uint8_t>>
         applied_media_stream_priorities;
+    DraftVersion datagram_draft = DraftVersion::kDraft14;
     bool connected = false;
     bool failed = false;
     bool disconnected = false;
@@ -575,9 +578,34 @@ int client_callback(picoquic_cnx_t* cnx,
             impl->condition.notify_all();
             return 0;
         }
+        case picoquic_callback_datagram: {
+            if (!validate_publisher_datagram(std::span<const std::uint8_t>(bytes, length), impl->datagram_draft)) {
+                {
+                    std::lock_guard<std::mutex> lock(impl->mutex);
+                    impl->failed = true;
+                    impl->last_error = "invalid MOQT datagram (PROTOCOL_VIOLATION)";
+                    impl->condition.notify_all();
+                }
+                return picoquic_close_ex(cnx, 0x3, "invalid MOQT datagram");
+            }
+            // This publisher never subscribes to incoming tracks. Every received
+            // Object alias is unknown, which MOQT permits us to discard.
+            return 0;
+        }
         case picoquic_callback_almost_ready:
+            return 0;
         case picoquic_callback_ready: {
-            trace(event == picoquic_callback_ready ? "callback ready" : "callback almost_ready");
+            trace("callback ready");
+            const auto* peer = picoquic_get_transport_parameters(cnx, 0);
+            if (peer == nullptr || peer->max_datagram_frame_size == 0) {
+                {
+                    std::lock_guard<std::mutex> lock(impl->mutex);
+                    impl->failed = true;
+                    impl->last_error = "QUIC DATAGRAM not negotiated: peer omitted max_datagram_frame_size";
+                    impl->condition.notify_all();
+                }
+                return picoquic_close_ex(cnx, 0x3, "QUIC DATAGRAM not negotiated");
+            }
             std::lock_guard<std::mutex> lock(impl->mutex);
             impl->connected = true;
             impl->condition.notify_all();
@@ -811,6 +839,16 @@ PicoquicClient::~PicoquicClient() {
 
 TransportStatus PicoquicClient::configure(const EndpointConfig& endpoint, const TlsConfig& tls) {
     endpoint_ = endpoint;
+    impl_->datagram_draft = DraftVersion::kDraft14;
+    // Publisher preserves the MOQT profile here even with an ALPN override.
+    const auto& protocol = endpoint.application_protocol.empty() ? endpoint.alpn : endpoint.application_protocol;
+    for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft17,
+                             DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        if (protocol == default_alpn(draft)) {
+            impl_->datagram_draft = draft;
+            break;
+        }
+    }
     tls_ = tls;
     state_ = ConnectionState::kIdle;
     next_bidirectional_stream_id_ = 0;
@@ -905,6 +943,15 @@ TransportStatus PicoquicClient::connect() {
         picoquic_set_null_verifier(impl_->quic);
     }
 
+    // RFC 9221 negotiation is mandatory even for stream-only MOQT publishers.
+    if (picoquic_set_default_tp_value(impl_->quic, picoquic_tp_max_datagram_frame_size,
+                                      PICOQUIC_MAX_PACKET_SIZE) != 0) {
+        picoquic_free(impl_->quic);
+        impl_->quic = nullptr;
+        state_ = ConnectionState::kFailed;
+        return TransportStatus::failure("failed to enable QUIC DATAGRAM");
+    }
+
     impl_->cnx = picoquic_create_cnx(impl_->quic, picoquic_null_connection_id, picoquic_null_connection_id,
                                      reinterpret_cast<struct sockaddr*>(&impl_->server_address), current_time, 0,
                                      sni, alpn, 1);
@@ -995,7 +1042,7 @@ TransportStatus PicoquicClient::connect() {
             }
         }
 
-        if (impl_->connected) {
+        if (impl_->connected && !impl_->failed && !impl_->disconnected) {
             state_ = ConnectionState::kConnected;
             return TransportStatus::success();
         }

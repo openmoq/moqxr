@@ -2036,8 +2036,86 @@ bool test_largest_object_parameter_is_a_bare_location() {
     return ok;
 }
 
+bool test_publisher_datagrams() {
+    using openmoq::publisher::transport::validate_publisher_datagram;
+    using openmoq::publisher::transport::encode_varint;
+    bool ok = true;
+    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17,
+                             DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        const auto validate = [draft](std::initializer_list<std::uint8_t> bytes) {
+            return validate_publisher_datagram(std::vector<std::uint8_t>(bytes), draft);
+        };
+        // Every valid type must have its own mandatory fields, including the
+        // draft-14 priority byte. Payload may be empty.
+        for (std::uint64_t type = 0; type < 256; ++type) {
+            const std::vector<std::uint64_t> valid_types = draft == DraftVersion::kDraft14
+                ? std::vector<std::uint64_t>{0, 1, 2, 3, 4, 5, 6, 7, 0x20, 0x21}
+                : std::vector<std::uint64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                             0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d};
+            const bool expected = std::find(valid_types.begin(), valid_types.end(), type) != valid_types.end();
+            std::vector<std::uint8_t> bytes;
+            if (draft == DraftVersion::kDraft21) {
+                append_moqint(bytes, draft, type);
+            } else {
+                const auto encoded = encode_varint(type);
+                bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+            }
+            append_moqint(bytes, draft, 16384); // multi-byte alias
+            append_moqint(bytes, draft, 128); // multi-byte group ID
+            if ((type & 4) == 0) append_moqint(bytes, draft, 129);
+            if (draft == DraftVersion::kDraft14 || (type & 8) == 0) bytes.push_back(255);
+            if ((type & 1) != 0) {
+                bytes.insert(bytes.end(), {2, 2, 0}); // numeric property
+            }
+            if ((type & 0x20) != 0) bytes.push_back(0);
+            ok &= expect(validate_publisher_datagram(bytes, draft) == expected,
+                         draft_label(draft) + " datagram type " + std::to_string(type));
+        }
+        ok &= expect(!validate({}), "empty datagram rejected");
+        ok &= expect(!validate({0, 1, 2}), "missing ID/priority rejected");
+        ok &= expect(!validate({1, 1, 2, 3, 0, 0}), "zero properties length rejected");
+        ok &= expect(!validate({1, 1, 2, 3, 0, 3, 1, 2, 0}), "truncated byte property rejected");
+        ok &= expect(!validate({0x20, 1, 2, 3, 0, 2}), "unknown status rejected");
+        ok &= expect(!validate({0x20, 1, 2, 3, 0, 3, 0}), "status with trailing payload rejected");
+        ok &= expect(validate({0x20, 1, 2, 3, 0, 3}), "End of Group status accepted");
+        if (draft != DraftVersion::kDraft14) {
+            ok &= expect(!validate({0x2d, 1, 2, 2, 2, 0, 3}), "non-Normal status with properties rejected");
+        }
+        if (draft == DraftVersion::kDraft17 || is_draft18_or_later(draft)) {
+            ok &= expect(!validate({0x0c, 0xff}), "truncated vi64 rejected");
+            // The older test encoder only handles vi64 through 28 bits.
+            std::vector<std::uint8_t> properties{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe};
+            append_moqint(properties, draft, 0);
+            append_moqint(properties, draft, 2); // wraps delta Type
+            append_moqint(properties, draft, 0);
+            std::vector<std::uint8_t> bytes{0x0d, 1, 2};
+            append_moqint(bytes, draft, properties.size());
+            bytes.insert(bytes.end(), properties.begin(), properties.end());
+            ok &= expect(!validate_publisher_datagram(bytes, draft), "property Type overflow rejected");
+            properties.clear();
+            append_moqint(properties, draft, 1);
+            append_moqint(properties, draft, 65536);
+            properties.resize(properties.size() + 65536);
+            bytes = {0x0d, 1, 2};
+            append_moqint(bytes, draft, properties.size());
+            bytes.insert(bytes.end(), properties.begin(), properties.end());
+            ok &= expect(!validate_publisher_datagram(bytes, draft), "oversized property value rejected");
+        }
+        if (is_draft18_or_later(draft)) {
+            std::vector<std::uint8_t> padding;
+            if (draft == DraftVersion::kDraft21) padding = {0xf0, 0x13, 0x2b, 0x3e, 0x29};
+            else padding = encode_varint(0x132B3E29);
+            ok &= expect(validate_publisher_datagram(padding, draft), "empty padding accepted");
+            padding.insert(padding.end(), {0, 0, 0x42});
+            ok &= expect(validate_publisher_datagram(padding, draft), "padding contents discarded");
+        }
+    }
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_publisher_datagrams();
     ok &= test_largest_object_parameter_is_a_bare_location();
     ok &= test_draft21_request_update_filter_errors();
     ok &= test_draft21_subscribe_tracks_rejects_range_filters();

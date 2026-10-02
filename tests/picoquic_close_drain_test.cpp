@@ -162,6 +162,8 @@ bool start_server(DrainServer& server) {
         return false;
     }
     picoquic_set_cookie_mode(server.quic, 2);
+    picoquic_set_default_tp_value(server.quic, picoquic_tp_max_datagram_frame_size,
+                                  PICOQUIC_MAX_PACKET_SIZE);
     server.thread = std::thread([&server] {
         const int ret = picoquic_packet_loop(server.quic, 0, AF_INET, 0, 0, 1, drain_server_loop_callback, &server);
         static_cast<void>(ret);
