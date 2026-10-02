@@ -30,6 +30,8 @@ struct SetupMessage {
 struct ServerSetupMessage {
     DraftVersion draft = DraftVersion::kDraft14;
     std::uint64_t max_request_id = 0;
+    std::optional<std::uint64_t> unsupported_server_option_error_code;
+    bool malformed_authorization_token = false;
 };
 
 struct MaxRequestIdMessage {
@@ -75,6 +77,8 @@ struct RequestError {
 struct SubscribeNamespaceMessage {
     std::uint64_t request_id = 0;
     std::vector<std::string> track_namespace_prefix;
+    bool malformed_authorization_token = false;
+    bool authorization_token_cache_overflow = false;
 };
 
 struct SubscriptionFilter {
@@ -93,9 +97,12 @@ struct SubscribeTracksMessage {
     // (§9.18.1); 0 means GROUP_ORDER was omitted.
     std::uint8_t group_order = 0;
     std::optional<SubscriptionFilter> subscription_filter;
+    bool has_unnegotiated_range_filter = false;
     // FILL_PARAMETERS presence. PUBLISH never reports LARGEST_OBJECT, so the
     // fill range is empty and no fill fetch stream is owed (§3.4).
     bool fill_requested = false;
+    bool malformed_authorization_token = false;
+    bool authorization_token_cache_overflow = false;
 };
 
 struct DeliveryTimeouts {
@@ -119,6 +126,8 @@ struct SubscribeMessage {
     DeliveryTimeouts delivery_timeouts;
     // Draft-21 FILL_PARAMETERS presence.
     bool fill_requested = false;
+    bool malformed_authorization_token = false;
+    bool authorization_token_cache_overflow = false;
 };
 
 // The optional values carried by REQUEST_UPDATE are deliberately distinct
@@ -226,6 +235,7 @@ enum class RequestUpdateDecodeError {
     kNone,
     kKeyValueFormatting,
     kSemantic,
+    kAuthTokenCacheOverflow,
 };
 bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                                    DraftVersion draft,
@@ -261,7 +271,8 @@ std::vector<std::uint8_t> encode_subgroup_header(DraftVersion draft,
                                                  std::uint64_t group_id,
                                                  std::uint64_t subgroup_id,
                                                  bool end_of_group,
-                                                 bool properties_present = false);
+                                                 bool properties_present = false,
+                                                 bool first_object = false);
 
 // Object fields to append to an already-open subgroup stream. The first object
 // on the stream carries its absolute Object ID (pass std::nullopt for

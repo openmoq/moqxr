@@ -1755,7 +1755,7 @@ int main() {
         if (property_case == 0 || property_case == 3) {
             ok &= expect(data.size() == 3, "three captured objects in property subgroup");
             if (data.size() == 3) {
-                ok &= expect(data[0][0] == (property_case == 0 ? 0x39 : 0x38), "captured subgroup property mode");
+                ok &= expect(data[0][0] == (property_case == 0 ? 0x79 : 0x78), "captured subgroup property mode");
                 const std::vector<std::uint8_t> expected = property_case == 0
                     ? std::vector<std::uint8_t>{0, 0, 2, 'V', '1'}
                     : std::vector<std::uint8_t>{0, 2, 'V', '1'};
@@ -3054,7 +3054,7 @@ int main() {
             openmoq::publisher::transport::priority_scheduler_internal::
                 end_generation_availability_storage_tracking_for_testing();
         ok &= expect(status.ok,
-                     "expected archived availability-isolation publish to succeed");
+                     "expected archived availability-isolation publish to succeed: " + status.message);
         ok &= expect(peak_entries == 0,
                      "expected archived drafts not to construct priority/deadline availability state");
     }
@@ -4348,12 +4348,19 @@ int main() {
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
-        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
+        transport.reads[1].push_back(encode_subscribe_message(
             91, kTestTrackNamespace, "events", 1, DraftVersion::kDraft21,
-            0, 0, 20, 1, 0, 0, 0x04, 1, std::size_t{0});
-        append_bytes(coalesced, encode_request_update_filter_message(
-                                    DraftVersion::kDraft21, 93, std::nullopt, 0x04, 0, 0, 1, std::size_t{5}));
-        transport.reads[1].push_back(std::move(coalesced));
+            0, 0, 20, 1, 0, 0, 0x04, 1, std::size_t{0}));
+        bool update_queued = false;
+        transport.on_try_write_object = [&](MockTransport& current,
+                                            const MockTransport::ObjectWriteEvent&) {
+            if (!update_queued) {
+                current.reads[1].push_back(encode_request_update_filter_message(
+                    DraftVersion::kDraft21, 93, std::nullopt, 0x04, 0, 0, 1, std::size_t{5}));
+                update_queued = true;
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
         PublishPlan plan = make_scheduling_plan({
             {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
             {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'E'},
@@ -4365,12 +4372,12 @@ int main() {
         status = session.publish(plan);
         ok &= expect(status.ok, "expected draft-21 EndObject extension to succeed: " + status.message);
         const auto expected_ok =
-            openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft21, 93, 3, 7);
+            openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft21, 93, 1, 0);
         ok &= expect(std::count_if(transport.writes.begin(), transport.writes.end(),
                                    [&](const MockTransport::WriteEvent& write) {
                                        return write.stream_id == 1 && write.bytes == expected_ok;
                                    }) == 1,
-                     "expected draft-21 EndObject-only extension REQUEST_OK to include LARGEST_OBJECT");
+                     "expected draft-21 EndObject-only extension REQUEST_OK to include the largest sent object");
     }
 
     {
@@ -4422,8 +4429,8 @@ int main() {
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
-        std::vector<std::uint8_t> coalesced = encode_subscribe_message(
-            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 20, 1, 0, 0, 0x04, 1);
+        transport.reads[1].push_back(encode_subscribe_message(
+            91, kTestTrackNamespace, "events", 1, draft, 0, 0, 20, 1, 0, 0, 0x04, 1));
         std::vector<std::uint8_t> update_payload = encode_moqint(draft, 93);
         append_bytes(update_payload, encode_moqint(draft, 2));
         append_bytes(update_payload, encode_moqint(draft, 0x21));  // LOCATION_FILTER {0,0,4}
@@ -4433,10 +4440,18 @@ int main() {
         append_bytes(update_payload, filter);
         append_bytes(update_payload, encode_moqint(draft, 0x23 - 0x21));  // FILL_PARAMETERS
         append_bytes(update_payload, encode_moqint(draft, 0));
-        append_bytes(coalesced, encode_moqint(draft, 0x02));
-        append_be16(coalesced, static_cast<std::uint16_t>(update_payload.size()));
-        append_bytes(coalesced, update_payload);
-        transport.reads[1].push_back(std::move(coalesced));
+        std::vector<std::uint8_t> update_message = encode_moqint(draft, 0x02);
+        append_be16(update_message, static_cast<std::uint16_t>(update_payload.size()));
+        append_bytes(update_message, update_payload);
+        bool update_queued = false;
+        transport.on_try_write_object = [&](MockTransport& current,
+                                            const MockTransport::ObjectWriteEvent&) {
+            if (!update_queued) {
+                current.reads[1].push_back(update_message);
+                update_queued = true;
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
         PublishPlan plan = make_scheduling_plan({
             {.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'A'},
             {.track_name = "events", .group_id = 3, .subgroup_id = 0, .object_id = 7, .marker = 'E'},
@@ -4602,7 +4617,7 @@ int main() {
                      "expected draft-17 priority-isolation session connect to succeed");
         status = session.publish_live_objects(source, DraftVersion::kDraft17);
         ok &= expect(status.ok,
-                     "expected draft-17 priority-isolation publish to succeed");
+                     "expected draft-17 priority-isolation publish to succeed: " + status.message);
         ok &= expect(transport.reliable_stream_priorities.empty(),
                      "expected draft-17 reliable writes to retain archived transport behavior");
     }
@@ -6925,6 +6940,98 @@ int main() {
                      "expected draft-18 SUBSCRIBE_NAMESPACE REQUEST_OK on the inbound request stream");
     }
 
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+        const std::string draft_name = draft == DraftVersion::kDraft18 ? "draft-18" : "draft-21";
+        const auto run_missing_request = [&](bool namespace_request) {
+            MockTransport transport;
+            transport.reads[3].push_back(draft == DraftVersion::kDraft18
+                                             ? encode_draft18_setup_response()
+                                             : encode_server_setup_message({.draft = draft, .max_request_id = 32}));
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            if (namespace_request) {
+                transport.reads[1].push_back(
+                    encode_subscribe_namespace_message(draft, 91, "unknown-prefix"));
+            } else {
+                transport.reads[1].push_back(
+                    encode_subscribe_message(91, kTestTrackNamespace, "unknown-track", 1, draft));
+            }
+
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                               std::chrono::seconds(1));
+            if (!session.connect(endpoint, tls).ok) return false;
+            const PublishPlan materialized = materialize_publish_plan(
+                make_span_backed_plan(draft), source_bytes);
+            if (!session.publish(materialized).ok) return false;
+
+            for (const auto& write : transport.writes) {
+                if (write.stream_id != 1 || message_type(write.bytes) != 0x05) continue;
+                openmoq::publisher::transport::RequestError error;
+                if (openmoq::publisher::transport::decode_request_error(write.bytes, draft, error)) {
+                    return error.error_code == 0x10;
+                }
+            }
+            return false;
+        };
+        ok &= expect(run_missing_request(false), draft_name + " uses DOES_NOT_EXIST for an unknown track");
+        ok &= expect(run_missing_request(true), draft_name + " uses DOES_NOT_EXIST for an unknown namespace prefix");
+    }
+
+    {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(
+            encode_subscribe_namespace_message(DraftVersion::kDraft18, 91, kTestTrackNamespace));
+        transport.reads[5].push_back(
+            encode_subscribe_namespace_message(DraftVersion::kDraft18, 93, kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected namespace-overlap test connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft18), source_bytes);
+        const TransportStatus publish_status = session.publish(materialized);
+        std::optional<std::uint64_t> second_namespace_error;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id != 5 || message_type(write.bytes) != 0x05) continue;
+            openmoq::publisher::transport::RequestError error;
+            if (openmoq::publisher::transport::decode_request_error(
+                    write.bytes, DraftVersion::kDraft18, error)) {
+                second_namespace_error = error.error_code;
+            }
+        }
+        ok &= expect(publish_status.ok, "expected namespace overlap to be a request-level rejection");
+        ok &= expect(second_namespace_error == 0x30,
+                     "expected overlapping draft-18 SUBSCRIBE_NAMESPACE to use PREFIX_OVERLAP");
+    }
+
+    {
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[1].push_back(
+            encode_subscribe_message(91, kTestTrackNamespace, "vide_1", 1, DraftVersion::kDraft18));
+        transport.reads[5].push_back(
+            encode_subscribe_message(93, kTestTrackNamespace, "vide_1", 1, DraftVersion::kDraft18));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected duplicate-subscription test connect to succeed");
+        const PublishPlan materialized =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft18), source_bytes);
+        const TransportStatus publish_status = session.publish(materialized);
+        std::optional<std::uint64_t> second_subscribe_error;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id != 5 || message_type(write.bytes) != 0x05) continue;
+            openmoq::publisher::transport::RequestError error;
+            if (openmoq::publisher::transport::decode_request_error(
+                    write.bytes, DraftVersion::kDraft18, error)) {
+                second_subscribe_error = error.error_code;
+            }
+        }
+        ok &= expect(publish_status.ok, "expected duplicate SUBSCRIBE to be a request-level rejection");
+        ok &= expect(second_subscribe_error == 0x19,
+                     "expected duplicate draft-18 SUBSCRIBE to use DUPLICATE_SUBSCRIPTION");
+    }
+
     {
         MockTransport draft18_legacy_subscribe_namespace_transport;
         draft18_legacy_subscribe_namespace_transport.reads[3].push_back(encode_draft18_setup_response());
@@ -8469,6 +8576,7 @@ int main() {
             }
             bool first_without_largest = false;
             bool second_matches = false;
+            std::optional<std::uint64_t> second_request_error;
             for (std::uint64_t alias = 0; alias < 8; ++alias) {
                 using openmoq::publisher::transport::encode_subscribe_ok_message;
                 first_without_largest = first_without_largest ||
@@ -8476,10 +8584,19 @@ int main() {
                 second_matches = second_matches ||
                     second_ok == encode_subscribe_ok_message(draft, 95, alias, 3, 7, draft21);
             }
+            for (const auto& write : transport.writes) {
+                if (write.stream_id == 5 && message_type(write.bytes) == 0x05) {
+                    openmoq::publisher::transport::RequestError error;
+                    if (openmoq::publisher::transport::decode_request_error(write.bytes, draft, error)) {
+                        second_request_error = error.error_code;
+                    }
+                }
+            }
             ok &= expect(first_without_largest, "expected " + label + " SUBSCRIBE_OK before any object to omit LARGEST_OBJECT");
-            ok &= expect(second_queued && second_matches,
-                         "expected " + label + " SUBSCRIBE_OK after an object was sent to " +
-                             (draft21 ? "report LARGEST_OBJECT {3,7}" : "keep omitting LARGEST_OBJECT"));
+            ok &= expect(second_queued &&
+                             (draft21 ? second_matches : second_request_error == 0x19),
+                         "expected " + label + " second SUBSCRIBE to " +
+                             (draft21 ? "report LARGEST_OBJECT {3,7}" : "be rejected as a duplicate"));
             std::optional<std::uint64_t> fill_stream;
             for (const auto& write : transport.writes) {
                 if (write.bytes == std::vector<std::uint8_t>{0x05, 95}) {
