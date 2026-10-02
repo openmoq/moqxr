@@ -177,6 +177,9 @@ struct PublishError {
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
 std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
+// Validates datagram framing before a publisher discards unknown-alias objects.
+// Padding is consumed without interpreting its contents.
+bool validate_publisher_datagram(std::span<const std::uint8_t> bytes, DraftVersion draft);
 
 // Message-parameter ids shared by the SUBSCRIBE-family decoders. draft-17 and
 // draft-18 define these three as uint8 on the wire (draft-17 sections 9.3.5,

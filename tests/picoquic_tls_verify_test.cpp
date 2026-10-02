@@ -168,6 +168,9 @@ bool start_server(TlsTestServer& server, const std::string& cert_path, const std
         return false;
     }
 
+    picoquic_set_default_tp_value(server.quic, picoquic_tp_max_datagram_frame_size,
+                                  PICOQUIC_MAX_PACKET_SIZE);
+
     server.thread = std::thread([&server] {
         const int ret =
             picoquic_packet_loop(server.quic, server.port, AF_INET, 0, 0, 1, tls_test_server_loop_callback, &server);

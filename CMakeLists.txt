@@ -6,7 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(openmoq_publisher
-    VERSION 0.4.0
+    VERSION 0.4.1
     DESCRIPTION "OpenMOQ contribution project: C++20 publisher for fragmented MP4 to CMSF/MOQT"
     LANGUAGES C CXX)
 
@@ -935,6 +935,22 @@ if(OPENMOQ_BUILD_TESTS)
     endif()
 
     if(OPENMOQ_HAS_PICOQUIC AND OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS)
+        add_executable(openmoq-publisher-picoquic-datagram-tests tests/picoquic_datagram_test.cpp)
+        target_link_libraries(openmoq-publisher-picoquic-datagram-tests PRIVATE openmoq_publisher_lib)
+        target_include_directories(openmoq-publisher-picoquic-datagram-tests PRIVATE
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_compile_definitions(openmoq-publisher-picoquic-datagram-tests PRIVATE
+            OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}")
+        get_target_property(_openmoq_datagram_test_core_type picoquic-core TYPE)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+                _openmoq_datagram_test_core_type STREQUAL "STATIC_LIBRARY")
+            target_link_options(openmoq-publisher-picoquic-datagram-tests PRIVATE
+                "-Wl,--wrap=picoquic_prepare_transport_extensions")
+            target_compile_definitions(openmoq-publisher-picoquic-datagram-tests PRIVATE
+                OPENMOQ_TEST_WRAP_TRANSPORT_PARAMETERS=1)
+        endif()
+        add_test(NAME openmoq-publisher-picoquic-datagram-tests COMMAND openmoq-publisher-picoquic-datagram-tests)
+
         add_executable(openmoq-publisher-picoquic-smoke-tests
             tests/picoquic_smoke_test.cpp
         )
@@ -974,6 +990,8 @@ if(OPENMOQ_BUILD_TESTS)
         add_test(NAME openmoq-publisher-picoquic-close-drain-tests COMMAND openmoq-publisher-picoquic-close-drain-tests)
 
         if(OPENMOQ_PICOQUIC_THREAD_CHECK)
+            target_compile_definitions(openmoq-publisher-picoquic-datagram-tests
+                PRIVATE PICOQUIC_WITH_THREAD_CHECK)
             target_compile_definitions(openmoq-publisher-picoquic-smoke-tests
                 PRIVATE PICOQUIC_WITH_THREAD_CHECK)
             target_compile_definitions(openmoq-publisher-webtransport-close-tests

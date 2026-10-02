@@ -513,6 +513,90 @@ std::uint64_t draft_version_number(DraftVersion draft) {
 
 }  // namespace
 
+namespace {
+
+bool validate_datagram_properties(std::span<const std::uint8_t> bytes, DraftVersion draft) {
+    std::size_t offset = 0;
+    std::uint64_t previous_type = 0;
+    while (offset < bytes.size()) {
+        std::uint64_t type = 0, value = 0;
+        if (!decode_moqint_impl(bytes, offset, draft, type)) {
+            return false;
+        }
+        if (draft != DraftVersion::kDraft14) {
+            if (type > std::numeric_limits<std::uint64_t>::max() - previous_type) {
+                return false;
+            }
+            type += previous_type;
+            previous_type = type;
+        }
+        if (!decode_moqint_impl(bytes, offset, draft, value)) {
+            return false;
+        }
+        if ((type & 1) != 0) {
+            if (value > 65535 || !fits(offset, value, bytes.size())) {
+                return false;
+            }
+            offset += static_cast<std::size_t>(value);
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool validate_publisher_datagram(std::span<const std::uint8_t> bytes, DraftVersion draft) {
+    std::size_t offset = 0;
+    std::uint64_t type = 0, ignored = 0;
+    // Drafts 17/18 still encode Type as a QUIC varint; draft 21 uses vi64.
+    if (!(draft == DraftVersion::kDraft21
+              ? decode_vi64_impl(bytes, offset, type)
+              : decode_varint_impl(bytes, offset, type))) {
+        return false;
+    }
+    if (is_draft18_or_later(draft) && type == 0x132B3E29) {
+        return true;
+    }
+    const bool legacy = draft == DraftVersion::kDraft14;
+    const bool valid_type = legacy ? (type <= 7 || type == 0x20 || type == 0x21)
+                                   : ((type & ~std::uint64_t{0x2f}) == 0 && (type & 0x22) != 0x22);
+    if (!valid_type || !decode_moqint_impl(bytes, offset, draft, ignored) ||
+        !decode_moqint_impl(bytes, offset, draft, ignored)) {
+        return false;
+    }
+    if ((type & 4) == 0 && !decode_moqint_impl(bytes, offset, draft, ignored)) {
+        return false;
+    }
+    if (legacy || (type & 8) == 0) {
+        if (offset == bytes.size()) {
+            return false;
+        }
+        ++offset;
+    }
+    if ((type & 1) != 0) {
+        std::uint64_t length = 0;
+        if (!decode_moqint_impl(bytes, offset, draft, length) || length == 0 ||
+            !fits(offset, length, bytes.size()) ||
+            !validate_datagram_properties(bytes.subspan(offset, static_cast<std::size_t>(length)), draft)) {
+            return false;
+        }
+        offset += static_cast<std::size_t>(length);
+    }
+    if ((type & 0x20) != 0) {
+        std::uint64_t status = 0;
+        if (!decode_moqint_impl(bytes, offset, draft, status) || offset != bytes.size()) {
+            return false;
+        }
+        if (status != 0 && status != 3 && status != 4 && !(legacy && status == 1)) {
+            return false;
+        }
+        if ((type & 1) != 0 && status != 0 && (!legacy || status == 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool decode_numeric_message_parameter(std::span<const std::uint8_t> bytes,
                                       std::size_t& offset,
                                       DraftVersion draft,
