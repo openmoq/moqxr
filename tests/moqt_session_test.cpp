@@ -788,7 +788,10 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
                              encode_moqint(draft, delta ? end_group_id - start_group_id : end_group_id));
             }
         }
-        const std::vector<std::uint8_t> filter_len = encode_moqint(draft, filter_value.size());
+        // Draft-22 LOCATION_FILTER carries no Length (section 9.20.9).
+        const std::vector<std::uint8_t> filter_len = draft == DraftVersion::kDraft22
+                                                         ? std::vector<std::uint8_t>{}
+                                                         : encode_moqint(draft, filter_value.size());
         payload.insert(payload.end(), filter_delta.begin(), filter_delta.end());
         payload.insert(payload.end(), filter_len.begin(), filter_len.end());
         payload.insert(payload.end(), filter_value.begin(), filter_value.end());
@@ -915,7 +918,9 @@ std::vector<std::uint8_t> encode_request_update_filter_message(
     append_bytes(payload, encode_moqint(draft, 0x21));
     const std::vector<std::uint8_t> filter = encode_draft18_family_filter_value(
         draft, filter_type, start_group_id, start_object_id, end_group_id, end_object_id);
-    append_bytes(payload, encode_moqint(draft, filter.size()));
+    if (draft != DraftVersion::kDraft22) {  // draft-22 LOCATION_FILTER carries no Length
+        append_bytes(payload, encode_moqint(draft, filter.size()));
+    }
     payload.insert(payload.end(), filter.begin(), filter.end());
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
@@ -4449,7 +4454,9 @@ int main() {
         append_bytes(update_payload, encode_moqint(draft, 0x21));  // LOCATION_FILTER {0,0,4}
         const std::vector<std::uint8_t> filter =
             encode_draft18_family_filter_value(draft, 0x04, 0, 0, 4);
-        append_bytes(update_payload, encode_moqint(draft, filter.size()));
+        if (draft != DraftVersion::kDraft22) {  // draft-22 LOCATION_FILTER carries no Length
+            append_bytes(update_payload, encode_moqint(draft, filter.size()));
+        }
         append_bytes(update_payload, filter);
         append_bytes(update_payload, encode_moqint(draft, 0x23 - 0x21));  // FILL_PARAMETERS
         append_bytes(update_payload, encode_moqint(draft, 0));

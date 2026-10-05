@@ -1799,7 +1799,10 @@ bool test_draft18_and_21_server_setup_rejects_client_only_options() {
     return ok;
 }
 
-std::vector<std::uint8_t> build_draft21_subscribe_with_raw_location_filter(const std::vector<std::uint8_t>& filter) {
+// Draft-22 LOCATION_FILTER carries no Length (section 9.20.9); pass
+// length_prefixed=false to build that form.
+std::vector<std::uint8_t> build_draft21_subscribe_with_raw_location_filter(const std::vector<std::uint8_t>& filter,
+                                                                            bool length_prefixed = true) {
     constexpr DraftVersion draft = DraftVersion::kDraft21;
     std::vector<std::uint8_t> payload;
     append_moqint(payload, draft, 9);
@@ -1807,7 +1810,9 @@ std::vector<std::uint8_t> build_draft21_subscribe_with_raw_location_filter(const
     append_string(payload, draft, "video");
     append_moqint(payload, draft, 1);     // one parameter
     append_moqint(payload, draft, 0x21);  // LOCATION_FILTER
-    append_moqint(payload, draft, filter.size());
+    if (length_prefixed) {
+        append_moqint(payload, draft, filter.size());
+    }
     payload.insert(payload.end(), filter.begin(), filter.end());
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, 0x03);
@@ -1817,12 +1822,13 @@ std::vector<std::uint8_t> build_draft21_subscribe_with_raw_location_filter(const
     return bytes;
 }
 
-std::vector<std::uint8_t> build_draft21_subscribe_with_location_filter(const std::vector<std::uint64_t>& fields) {
+std::vector<std::uint8_t> build_draft21_subscribe_with_location_filter(const std::vector<std::uint64_t>& fields,
+                                                                        bool length_prefixed = true) {
     std::vector<std::uint8_t> filter;
     for (const std::uint64_t field : fields) {
         append_moqint(filter, DraftVersion::kDraft21, field);
     }
-    return build_draft21_subscribe_with_raw_location_filter(filter);
+    return build_draft21_subscribe_with_raw_location_filter(filter, length_prefixed);
 }
 
 bool test_draft22_location_filter() {
@@ -1836,7 +1842,7 @@ bool test_draft22_location_filter() {
     for (const auto& c : std::vector<Case>{{{0},0}, {{1,0},1}, {{1,3},2}, {{2,0,0},3},
                                           {{2,12,5},3}, {{3,12,5,3},4}, {{4,12,5,3,7},4}, {{5},2}}) {
         SubscribeMessage message;
-        ok &= expect(decode_subscribe_message(build_draft21_subscribe_with_location_filter(c.fields),
+        ok &= expect(decode_subscribe_message(build_draft21_subscribe_with_location_filter(c.fields, false),
                                                DraftVersion::kDraft22, message) && message.filter_type == c.mapped,
                      "draft-22 explicit location filter form");
         if (c.fields[0] == 3 || c.fields[0] == 4)
@@ -1844,9 +1850,13 @@ bool test_draft22_location_filter() {
     }
     for (const auto& fields : std::vector<std::vector<std::uint64_t>>{{}, {6}, {0,1}, {1}, {2,1}, {3,1,2}, {4,1,2,3}, {5,0}}) {
         SubscribeMessage message;
-        ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_location_filter(fields),
+        ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_location_filter(fields, false),
                                                 DraftVersion::kDraft22, message), "invalid draft-22 filter rejected");
     }
+    SubscribeMessage prefixed;
+    ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_location_filter({4, 12, 5, 3, 7}),
+                                           DraftVersion::kDraft22, prefixed),
+                 "length-prefixed filter rejected on draft-22");
     return ok;
 }
 
