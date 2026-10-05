@@ -1337,6 +1337,43 @@ std::vector<std::uint8_t> encode_subscribe_namespace_ok_message(DraftVersion dra
     return message_bytes;
 }
 
+// Draft-22 LOCATION_FILTER has no Length (section 9.20.9): the Location
+// Filter Type selects how many fields follow. Returns the offset just past the
+// value, or nullopt for an unknown type or a field that runs past limit.
+std::optional<std::size_t> draft22_location_filter_end(std::span<const std::uint8_t> bytes,
+                                                       std::size_t offset,
+                                                       std::size_t limit) {
+    constexpr std::size_t counts[] = {0, 1, 2, 3, 4, 0};
+    std::uint64_t type = 0;
+    if (!decode_moqint_impl(bytes.subspan(0, limit), offset, DraftVersion::kDraft22, type) || type > 5) {
+        return std::nullopt;
+    }
+    for (std::size_t i = 0; i < counts[type]; ++i) {
+        std::uint64_t field = 0;
+        if (!decode_moqint_impl(bytes.subspan(0, limit), offset, DraftVersion::kDraft22, field)) {
+            return std::nullopt;
+        }
+    }
+    return offset;
+}
+
+// Reads a message parameter's Length, bounded by limit. Draft-22
+// LOCATION_FILTER has none, so its length is derived from its type.
+bool read_parameter_length(std::span<const std::uint8_t> bytes,
+                           std::size_t& offset,
+                           std::size_t limit,
+                           DraftVersion draft,
+                           std::uint64_t parameter_type,
+                           std::uint64_t& length) {
+    if (draft == DraftVersion::kDraft22 && parameter_type == 0x21) {
+        const auto typed_end = draft22_location_filter_end(bytes, offset, limit);
+        if (!typed_end) return false;
+        length = *typed_end - offset;
+        return true;
+    }
+    return decode_moqint_impl(bytes, offset, draft, length) && fits(offset, length, limit);
+}
+
 // Draft-21 selects the LOCATION_FILTER form by field count; draft-22
 // prefixes an explicit type and requires the corresponding field count. Maps onto the draft-18 filter model; a relative start more
 // than zero groups back starts at the next object because live delivery keeps
@@ -1478,14 +1515,12 @@ bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
             }
             case 0x21: {  // LOCATION_FILTER
                 std::uint64_t length = 0;
-                if (!decode_moqint_impl(bytes.subspan(0, end), offset, draft, length) ||
-                    length > end - offset) return false;
+                if (!read_parameter_length(bytes.subspan(0, end), offset, end, draft, type, length)) return false;
+                const std::size_t filter_end = offset + static_cast<std::size_t>(length);
                 SubscribeMessage filter;
                 std::size_t filter_offset = offset;
-                if (!decode_location_filter(bytes, filter_offset,
-                                            offset + static_cast<std::size_t>(length),
-                                            filter, draft)) return false;
-                offset += static_cast<std::size_t>(length);
+                if (!decode_location_filter(bytes, filter_offset, filter_end, filter, draft)) return false;
+                offset = filter_end;
                 break;
             }
             case 0x25:  // SUBGROUP_FILTER
@@ -1658,9 +1693,9 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
             continue;
         }
 
-        // Odd type: length-prefixed bytes.
+        // Odd type: length-prefixed bytes (draft-22 LOCATION_FILTER is self-delimiting).
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
+        if (!read_parameter_length(bytes, offset, payload_end, draft, parameter_type, parameter_length)) {
             return false;
         }
         switch (parameter_type) {
@@ -1785,7 +1820,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         }
 
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
+        if (!read_parameter_length(bytes, offset, payload_end, draft, parameter_type, parameter_length)) {
             return false;
         }
         if (parameter_type == kParamAuthorizationToken) {
@@ -1950,8 +1985,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
         }
 
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) ||
-            parameter_length > payload_end - offset) {
+        if (!read_parameter_length(bytes, offset, payload_end, draft, parameter_type, parameter_length)) {
             return fail(RequestUpdateDecodeError::kKeyValueFormatting);
         }
         const std::size_t parameter_end = offset + static_cast<std::size_t>(parameter_length);
@@ -2434,7 +2468,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         }
 
         std::uint64_t parameter_length = 0;
-        if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
+        if (!read_parameter_length(bytes, offset, payload_end, draft, parameter_type, parameter_length)) {
             return false;
         }
         switch (parameter_type) {
