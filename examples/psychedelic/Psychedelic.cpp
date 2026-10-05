@@ -63,7 +63,7 @@ struct Args {
     int seconds = 15;
     bool insecure = false;
     bool help = false;
-    openmoq::publisher::DraftVersion draft = openmoq::publisher::DraftVersion::kDraft16;
+    openmoq::publisher::DraftVersion draft = openmoq::publisher::DraftVersion::kDraft18;
 };
 
 Args parse_args(int argc, char** argv) {

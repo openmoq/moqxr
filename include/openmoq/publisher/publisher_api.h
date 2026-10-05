@@ -43,7 +43,7 @@ struct DrmSystemConfig {
 };
 
 struct PublisherConfig {
-    DraftVersion draft_version = DraftVersion::kDraft16;
+    DraftVersion draft_version = DraftVersion::kDraft18;
     std::string track_namespace = "media";
     bool forward = false;
     bool publish_catalog = false;

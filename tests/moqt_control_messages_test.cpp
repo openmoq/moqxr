@@ -300,6 +300,10 @@ std::uint64_t draft_version_number(DraftVersion draft) {
             return kDraft17Version;
         case DraftVersion::kDraft18:
             return kDraft18Version;
+        case DraftVersion::kDraft21:
+            return 0xff000015ULL;
+        case DraftVersion::kDraft22:
+            return 0xff000016ULL;
     }
     return 0;
 }
@@ -316,6 +320,8 @@ std::string draft_label(DraftVersion draft) {
             return "draft-18";
         case DraftVersion::kDraft21:
             return "draft-21";
+        case DraftVersion::kDraft22:
+            return "draft-22";
     }
     return "unknown";
 }
@@ -1678,7 +1684,7 @@ bool test_draft21_identity() {
 
 bool test_draft18_and_21_unknown_setup_option_duplicates() {
     bool ok = true;
-    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         const std::string label = draft_label(draft);
         std::vector<std::uint8_t> payload;
         append_moqint(payload, draft, 0x02);  // MAX_REQUEST_ID
@@ -1721,7 +1727,7 @@ bool test_draft18_and_21_unknown_setup_option_duplicates() {
 
 bool test_draft18_and_21_track_namespace_constraints() {
     bool ok = true;
-    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         const std::string label = draft_label(draft);
         const auto namespace_request = [draft](const std::vector<std::string>& fields) {
             std::vector<std::string_view> field_views;
@@ -1771,7 +1777,7 @@ bool test_draft18_and_21_track_namespace_constraints() {
 
 bool test_draft18_and_21_server_setup_rejects_client_only_options() {
     bool ok = true;
-    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         for (const auto [option_type, expected_error] :
              {std::pair<std::uint64_t, std::uint64_t>{0x05, 0x19}, {0x01, 0x08}}) {
             std::vector<std::uint8_t> payload;
@@ -1817,6 +1823,31 @@ std::vector<std::uint8_t> build_draft21_subscribe_with_location_filter(const std
         append_moqint(filter, DraftVersion::kDraft21, field);
     }
     return build_draft21_subscribe_with_raw_location_filter(filter);
+}
+
+bool test_draft22_location_filter() {
+    bool ok = true;
+    ok &= expect(openmoq::publisher::default_alpn(DraftVersion::kDraft22) == "moqt-22", "draft-22 ALPN");
+    ServerSetupMessage setup;
+    ok &= expect(decode_setup_response_message(encode_server_setup_message({.draft = DraftVersion::kDraft22}),
+                                               DraftVersion::kDraft22, setup) && setup.draft == DraftVersion::kDraft22,
+                 "draft-22 SETUP retains selected draft");
+    struct Case { std::vector<std::uint64_t> fields; std::uint64_t mapped; };
+    for (const auto& c : std::vector<Case>{{{0},0}, {{1,0},1}, {{1,3},2}, {{2,0,0},3},
+                                          {{2,12,5},3}, {{3,12,5,3},4}, {{4,12,5,3,7},4}, {{5},2}}) {
+        SubscribeMessage message;
+        ok &= expect(decode_subscribe_message(build_draft21_subscribe_with_location_filter(c.fields),
+                                               DraftVersion::kDraft22, message) && message.filter_type == c.mapped,
+                     "draft-22 explicit location filter form");
+        if (c.fields[0] == 3 || c.fields[0] == 4)
+            ok &= expect(message.end_group_id == 15, "draft-22 end group delta");
+    }
+    for (const auto& fields : std::vector<std::vector<std::uint64_t>>{{}, {6}, {0,1}, {1}, {2,1}, {3,1,2}, {4,1,2,3}, {5,0}}) {
+        SubscribeMessage message;
+        ok &= expect(!decode_subscribe_message(build_draft21_subscribe_with_location_filter(fields),
+                                                DraftVersion::kDraft22, message), "invalid draft-22 filter rejected");
+    }
+    return ok;
 }
 
 bool test_draft21_location_filter() {
@@ -2065,7 +2096,7 @@ bool test_parameter_length_wrap_is_rejected() {
     bool ok = true;
     // A parameter length near 2^64 must not wrap offset + length and rewind the
     // parser (which re-parses the same bytes for up to 2^64 parameters).
-    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         std::vector<std::uint8_t> payload;
         append_moqint(payload, draft, 1);
         append_track_namespace(payload, draft, {"live"});
@@ -2154,7 +2185,7 @@ bool test_largest_object_parameter_is_a_bare_location() {
     // LARGEST_OBJECT (0x09) is "a Location" (draft-18 10.2.11, draft-21 9.20.18): two vi64s
     // with no length prefix on drafts that define per-parameter encodings (17+). Draft 16
     // still frames it as an odd KVP with a length.
-    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         ok &= expect(openmoq::publisher::transport::encode_subscribe_ok_message(draft, 9, 1, 3, 7, true) ==
                          std::vector<std::uint8_t>{0x04, 0x00, 0x05, 0x01, 0x01, 0x09, 0x03, 0x07},
                      draft_label(draft) + " SUBSCRIBE_OK carries LARGEST_OBJECT as a bare Location");
@@ -2176,7 +2207,7 @@ bool test_publisher_datagrams() {
     using openmoq::publisher::transport::encode_varint;
     bool ok = true;
     for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17,
-                             DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+                             DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         const auto validate = [draft](std::initializer_list<std::uint8_t> bytes) {
             return validate_publisher_datagram(std::vector<std::uint8_t>(bytes), draft);
         };
@@ -2189,7 +2220,7 @@ bool test_publisher_datagrams() {
                                              0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d};
             const bool expected = std::find(valid_types.begin(), valid_types.end(), type) != valid_types.end();
             std::vector<std::uint8_t> bytes;
-            if (draft == DraftVersion::kDraft21) {
+            if (openmoq::publisher::is_draft21_or_later(draft)) {
                 append_moqint(bytes, draft, type);
             } else {
                 const auto encoded = encode_varint(type);
@@ -2238,7 +2269,7 @@ bool test_publisher_datagrams() {
         }
         if (is_draft18_or_later(draft)) {
             std::vector<std::uint8_t> padding;
-            if (draft == DraftVersion::kDraft21) padding = {0xf0, 0x13, 0x2b, 0x3e, 0x29};
+            if (openmoq::publisher::is_draft21_or_later(draft)) padding = {0xf0, 0x13, 0x2b, 0x3e, 0x29};
             else padding = encode_varint(0x132B3E29);
             ok &= expect(validate_publisher_datagram(padding, draft), "empty padding accepted");
             padding.insert(padding.end(), {0, 0, 0x42});
@@ -2257,6 +2288,7 @@ int main() {
     ok &= test_parameter_length_wrap_is_rejected();
     ok &= test_draft21_publish_done_and_framing();
     ok &= test_draft21_location_filter();
+    ok &= test_draft22_location_filter();
     ok &= test_draft21_subscribe_tracks_parameters();
     ok &= test_draft21_include_properties();
     ok &= test_draft21_fill_parameters();

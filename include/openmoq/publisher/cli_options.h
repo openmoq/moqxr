@@ -48,7 +48,7 @@ struct CliOptions {
     std::size_t retry_count = 0;
     transport::TransportKind transport = transport::TransportKind::kRawQuic;
     transport::TlsConfig tls;
-    DraftVersion draft_version = DraftVersion::kDraft16;
+    DraftVersion draft_version = DraftVersion::kDraft18;
     std::string track_namespace = "media";
     // Retained for source compatibility; decoded into authorization before
     // parse_cli_options returns. Never include this value in diagnostics.

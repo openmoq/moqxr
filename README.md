@@ -13,7 +13,7 @@ It packages file and live media for Media over QUIC Transport (MOQT), builds MSF
 - Builds MSF/CMSF version 1 catalogs, initialization data, optional media timelines, and SAP event timelines.
 - Detects and signals existing CMAF CENC content protection for batch input, live fragmented MP4 on stdin, and CTE LL-DASH ingest. It does not encrypt or decrypt media.
 - Emits catalog, initialization, media, probe, and publish-plan files for local inspection.
-- Publishes with the main CLI's supported MOQT draft profiles: draft 16 (default), draft 18, and draft 21.
+- Publishes with the main CLI's supported MOQT draft profiles: draft 16, draft 18 (default), draft 21, and draft 22.
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
 - Accepts live fragmented MP4 from stdin, MPEG-TS over SRT when libsrt is available, and CMAF over HTTP/1.1 CTE LL-DASH ingest (chunked or fixed-length requests).
 - Parses MSF URLs with `--url` and prints the catalog discovery URL with `--print-msf-urls`.
@@ -73,19 +73,19 @@ checkout with LOCMAF support, run
 [C++ API configuration](docs/publisher-api.md#optional-locmaf-packaging), and
 [validation coverage](docs/testing.md#locmaf-tests).
 
-LOC-04 publishing is available with `--packaging loc --draft 18` (or `--draft 21`) on the native
+LOC-04 publishing is available with `--packaging loc --draft 18` (or `--draft 21` / `--draft 22`) on the native
 backend. It sends individual H.264/AAC frames with timestamp, timescale, and
 codec configuration properties; CMAF remains the default. See the
 [LOC quickstart](docs/quickstart.md#opt-in-to-loc) for scope and constraints.
 
-Publish to a relay with the default draft-16 profile:
+Publish to a relay with the default draft-18 profile:
 
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --input sample.mp4 \
   --endpoint moqt://relay.example.com:443/moq \
   --namespace media \
-  --draft 16 \
+  --draft 18 \
   --forward 0 \
   --timeout 30 \
   --paced
@@ -343,7 +343,7 @@ Localized Publisher API guides are available in [Spanish](docs/publisher-api.es.
 
 ## Current Status
 
-The main `openmoq-publisher` CLI accepts drafts 16, 18, and 21; draft 16 remains the default, draft 18 provides the newer request-stream profile, and draft 21 extends it (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). Draft 21 is native-backend only; the moq5 backend stays on drafts 16 and 18. Text for drafts 14, 17, 19, and 20 remains in `docs/` for implementation history and protocol review, but those versions are not selectable in the main CLI. The separate MSFTS example retains draft 14/16/17/18 selection for draft-specific testing.
+The main `openmoq-publisher` CLI accepts drafts 16, 18, 21, and 22; draft 18 is the default and provides the newer request-stream profile, and draft 21 extends it (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). Draft 22 adds explicit LOCATION_FILTER types while retaining draft-21 publishing semantics. Drafts 21 and 22 are native-backend only; the moq5 backend stays on drafts 16 and 18. Text for drafts 14, 17, 19, and 20 remains in `docs/` for implementation history and protocol review, but those versions are not selectable in the main CLI. The separate MSFTS example retains draft 14/16/17/18 selection for draft-specific testing.
 
 The default picoquic backend and the opt-in moq5 backend are both under active interoperability testing. For detailed feature coverage, limitations, and roadmap work, see [docs/status.md](docs/status.md) and [docs/protocol-mapping.md](docs/protocol-mapping.md).
 

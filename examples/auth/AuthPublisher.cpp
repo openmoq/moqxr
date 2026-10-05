@@ -41,7 +41,7 @@ struct Args {
     int seconds = 3;
     bool forward = true;
     bool insecure_skip_verify = false;
-    publisher::DraftVersion draft = publisher::DraftVersion::kDraft16;
+    publisher::DraftVersion draft = publisher::DraftVersion::kDraft18;
     auth_example::TokenEncoding token_encoding = auth_example::TokenEncoding::kAuto;
     std::optional<TokenWrapper> token_wrapper;
     publisher::cat4moq::Profile profile = publisher::cat4moq::Profile::kMoqxCompat;
@@ -292,7 +292,7 @@ void print_usage(const char* argv0) {
         << "  --endpoint URL                  Default: https://127.0.0.1:4433/moq\n"
         << "  --namespace NAME                Default: cat4moq.example\n"
         << "  --track NAME                    Default: video\n"
-        << "  --draft 14|16|17|18             Default: 16\n"
+        << "  --draft 14|16|17|18             Default: 18\n"
         << "  --seconds N                     Default: 3\n"
         << "  --forward 0|1                   Default: 1\n"
         << "  --token-file PATH               Use one token for setup and action requests\n"

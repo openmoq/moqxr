@@ -10,20 +10,24 @@ enum class DraftVersion {
     kDraft17,
     kDraft18,
     kDraft21,
+    kDraft22,
 };
 
 struct DraftProfile {
-    DraftVersion version = DraftVersion::kDraft16;
+    DraftVersion version = DraftVersion::kDraft18;
     std::string subscribe_namespace_label;
     std::string track_alias_label;
     std::string object_status_label;
     std::string notes;
 };
 
-// Draft-21 keeps draft-18's control/request-stream model; behavior shared by
-// both keys on this, and draft-21-only differences check kDraft21 directly.
+// Modern drafts share the draft-18 control/request-stream model.
+constexpr bool is_draft21_or_later(DraftVersion version) {
+    return version == DraftVersion::kDraft21 || version == DraftVersion::kDraft22;
+}
+
 constexpr bool is_draft18_or_later(DraftVersion version) {
-    return version == DraftVersion::kDraft18 || version == DraftVersion::kDraft21;
+    return version == DraftVersion::kDraft18 || is_draft21_or_later(version);
 }
 
 DraftProfile draft_profile(DraftVersion version);

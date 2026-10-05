@@ -97,6 +97,8 @@ struct MockTransport final : PublisherTransport {
 
 int main() {
     bool ok = true;
+    ok &= expect(PublisherConfig{}.draft_version == DraftVersion::kDraft18,
+                 "publisher API defaults to draft-18");
 
     {
         PublisherConfig invalid;
@@ -253,38 +255,40 @@ int main() {
                      "expected draft-18 webtransport to offer a structured WT protocol token");
     }
 
-    for (const TransportKind kind : {TransportKind::kWebTransport, TransportKind::kRawQuic}) {
-        PublisherConfig config;
-        config.draft_version = DraftVersion::kDraft21;
+    for (const auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+        for (const TransportKind kind : {TransportKind::kWebTransport, TransportKind::kRawQuic}) {
+            PublisherConfig config;
+            config.draft_version = draft;
 
-        const auto state = std::make_shared<MockTransport::State>();
-        Publisher publisher(
-            config,
-            [state, kind](TransportKind requested) -> std::unique_ptr<PublisherTransport> {
-                if (requested != kind) {
-                    return nullptr;
-                }
-                return std::make_unique<MockTransport>(state);
-            });
+            const auto state = std::make_shared<MockTransport::State>();
+            Publisher publisher(
+                config,
+                [state, kind](TransportKind requested) -> std::unique_ptr<PublisherTransport> {
+                    if (requested != kind) {
+                        return nullptr;
+                    }
+                    return std::make_unique<MockTransport>(state);
+                });
 
-        PreparedPublish prepared;
-        prepared.plan = PublishPlan{.draft = draft_profile(DraftVersion::kDraft21)};
+            PreparedPublish prepared;
+            prepared.plan = PublishPlan{.draft = draft_profile(draft)};
 
-        EndpointConfig endpoint;
-        endpoint.transport = kind;
-        endpoint.host = "relay.example.com";
-        endpoint.port = 443;
-        endpoint.path = "/moq";
-        endpoint.path_explicit = true;
+            EndpointConfig endpoint;
+            endpoint.transport = kind;
+            endpoint.host = "relay.example.com";
+            endpoint.port = 443;
+            endpoint.path = "/moq";
+            endpoint.path_explicit = true;
 
-        const TransportStatus status = publisher.publish(prepared, endpoint);
-        ok &= expect(!status.ok, "expected mock connect failure to propagate for draft-21");
-        if (kind == TransportKind::kWebTransport) {
-            ok &= expect(state->configured_endpoint.alpn == "h3", "expected default ALPN h3 for draft-21 webtransport");
-            ok &= expect(state->configured_endpoint.application_protocol == "\"moqt-21\"",
-                         "expected draft-21 webtransport to offer the moqt-21 WT protocol token");
-        } else {
-            ok &= expect(state->configured_endpoint.alpn == "moqt-21", "expected draft-21 raw QUIC ALPN moqt-21");
+            const TransportStatus status = publisher.publish(prepared, endpoint);
+            ok &= expect(!status.ok, "expected mock connect failure to propagate for selected draft");
+            if (kind == TransportKind::kWebTransport) {
+                ok &= expect(state->configured_endpoint.alpn == "h3", "expected default ALPN h3 for selected draft webtransport");
+                ok &= expect(state->configured_endpoint.application_protocol == "\"" + default_alpn(draft) + "\"",
+                             "expected selected draft webtransport to offer the selected WT protocol token");
+            } else {
+                ok &= expect(state->configured_endpoint.alpn == default_alpn(draft), "expected selected draft raw QUIC ALPN");
+            }
         }
     }
 

@@ -23,6 +23,8 @@ int main() {
     try {
         PublisherConfig config;
         config.media_packaging = MediaPackaging::kLoc;
+        check(config.draft_version == DraftVersion::kDraft18, "publisher defaults to draft18");
+        config.draft_version = DraftVersion::kDraft16;
         bool rejected = false;
         try { Publisher invalid(config); } catch (const std::runtime_error&) { rejected = true; }
         check(rejected, "LOC must reject draft16 at API boundary");
