@@ -72,7 +72,7 @@ using openmoq::publisher::DraftVersion;
 // Draft-21 keeps the draft-18 control/request-stream model for everything the
 // session tests exercise, so draft-21 cases share draft-18 expectations.
 bool draft18_family(DraftVersion draft) {
-    return draft == DraftVersion::kDraft18 || draft == DraftVersion::kDraft21;
+    return draft == DraftVersion::kDraft18 || openmoq::publisher::is_draft21_or_later(draft);
 }
 using openmoq::publisher::LiveCatalogMode;
 using openmoq::publisher::LiveObject;
@@ -629,7 +629,20 @@ std::vector<std::uint8_t> encode_draft18_family_filter_value(DraftVersion draft,
                                                             std::size_t end_group_id,
                                                             std::optional<std::size_t> end_object_id = std::nullopt) {
     std::vector<std::uint8_t> filter;
-    if (draft == DraftVersion::kDraft21) {
+    if (draft == DraftVersion::kDraft22) {
+        const auto type = filter_type == 0 ? 0 : filter_type == 1 ? 1 : filter_type == 2 ? 5 :
+                          filter_type == 3 ? 2 : end_object_id ? 4 : 3;
+        append_bytes(filter, encode_moqint(draft, type));
+        if (type == 1) append_bytes(filter, encode_moqint(draft, 0));
+        if (type >= 2 && type <= 4) {
+            append_bytes(filter, encode_moqint(draft, start_group_id));
+            append_bytes(filter, encode_moqint(draft, start_object_id));
+            if (type >= 3) append_bytes(filter, encode_moqint(draft, end_group_id - start_group_id));
+            if (type == 4) append_bytes(filter, encode_moqint(draft, *end_object_id));
+        }
+        return filter;
+    }
+    if (openmoq::publisher::is_draft21_or_later(draft)) {
         // Draft-21 LOCATION_FILTER: field count, not a Filter Type, selects the form.
         switch (filter_type) {
             case 0x01:
@@ -757,11 +770,11 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
         // Value: filter type followed by its applicable locations.
         const std::vector<std::uint8_t> filter_delta = encode_moqint(draft, 0x21 - 0x20);
         std::vector<std::uint8_t> filter_value =
-            draft == DraftVersion::kDraft21
+            openmoq::publisher::is_draft21_or_later(draft)
                 ? encode_draft18_family_filter_value(
                       draft, filter_type_value, start_group_id, start_object_id, end_group_id, end_object_id)
                 : std::vector<std::uint8_t>{};
-        if (draft != DraftVersion::kDraft21) {
+        if (!openmoq::publisher::is_draft21_or_later(draft)) {
             const std::vector<std::uint8_t> ft =
                 encode_moqint(draft, filter_type_value);
             const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
@@ -955,7 +968,7 @@ std::vector<std::uint8_t> encode_malformed_request_update_parameter(
     // required locations. Both are malformed known key/value encodings. A
     // draft-21 LOCATION_FILTER has no Filter Type, so its malformed form is a
     // truncated two-byte vi64.
-    if (draft == DraftVersion::kDraft21 && parameter_type == 0x21) {
+    if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type == 0x21) {
         payload.push_back(0x80);
     } else {
         append_bytes(payload,
@@ -1657,7 +1670,7 @@ int main() {
         .ca_path = {},
         .insecure_skip_verify = true,
     };
-    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (const auto draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         const bool modern = draft == DraftVersion::kDraft17 || draft18_family(draft);
         for (const bool provider_denial : {false, true}) {
             if (provider_denial && !modern) continue;
@@ -1792,7 +1805,7 @@ int main() {
         "expected transport mapping to preserve subscriber-priority precedence");
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.on_try_write_object =
@@ -1863,7 +1876,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.failing_reset_streams.insert(2);
@@ -2522,7 +2535,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
         MockTransport transport;
@@ -3625,7 +3638,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
@@ -3693,7 +3706,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         for (const std::uint64_t parameter_type : {0x03ULL, 0x21ULL}) {
             MockTransport transport;
             const std::uint64_t subscription_request_id =
@@ -3761,7 +3774,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
@@ -4078,7 +4091,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         MockTransport transport;
         const std::uint64_t request_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -6940,7 +6953,7 @@ int main() {
                      "expected draft-18 SUBSCRIBE_NAMESPACE REQUEST_OK on the inbound request stream");
     }
 
-    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         const std::string draft_name = draft == DraftVersion::kDraft18 ? "draft-18" : "draft-21";
         const auto run_missing_request = [&](bool namespace_request) {
             MockTransport transport;
@@ -8199,7 +8212,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -8369,7 +8382,7 @@ int main() {
     }
 
     for (const DraftVersion draft :
-         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+         {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
@@ -8519,7 +8532,7 @@ int main() {
             // the track (§9.20.18); a later SUBSCRIBE with FILL_PARAMETERS then
             // gets a fill fetch stream that is opened and reset. Draft-18 keeps
             // omitting LARGEST_OBJECT.
-            const bool draft21 = draft == DraftVersion::kDraft21;
+            const bool draft21 = openmoq::publisher::is_draft21_or_later(draft);
             MockTransport transport;
             transport.keep_open_streams.insert(1);
             transport.keep_open_streams.insert(5);

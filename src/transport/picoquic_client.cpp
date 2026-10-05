@@ -843,7 +843,7 @@ TransportStatus PicoquicClient::configure(const EndpointConfig& endpoint, const 
     // Publisher preserves the MOQT profile here even with an ALPN override.
     const auto& protocol = endpoint.application_protocol.empty() ? endpoint.alpn : endpoint.application_protocol;
     for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft17,
-                             DraftVersion::kDraft18, DraftVersion::kDraft21}) {
+                             DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         if (protocol == default_alpn(draft)) {
             impl_->datagram_draft = draft;
             break;

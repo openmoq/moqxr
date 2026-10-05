@@ -1647,7 +1647,7 @@ void open_failed_fill_stream(PublisherTransport& transport,
                              std::uint64_t request_id,
                              std::uint8_t forward,
                              bool largest_reported) {
-    if (draft != openmoq::publisher::DraftVersion::kDraft21 || !fill_requested || forward != 1 ||
+    if (!openmoq::publisher::is_draft21_or_later(draft) || !fill_requested || forward != 1 ||
         !largest_reported) {
         return;
     }
@@ -1681,7 +1681,7 @@ void open_failed_fill_stream(PublisherTransport& transport,
 // own delivery start (§9.8), is declined rather than over-delivered.
 bool declines_subscribe_tracks_filter(openmoq::publisher::DraftVersion draft,
                                       const SubscribeTracksMessage& subscribe_tracks) {
-    return draft == openmoq::publisher::DraftVersion::kDraft21 &&
+    return openmoq::publisher::is_draft21_or_later(draft) &&
            (subscribe_tracks.has_unnegotiated_range_filter ||
             (subscribe_tracks.subscription_filter.has_value() &&
              subscribe_tracks.subscription_filter->filter_type != 0 &&
@@ -3498,7 +3498,7 @@ std::optional<std::pair<std::size_t, std::size_t>> subscribe_ok_largest(
     openmoq::publisher::DraftVersion draft,
     const std::string& track_name,
     std::optional<std::pair<std::size_t, std::size_t>> largest_sent) {
-    if (draft != openmoq::publisher::DraftVersion::kDraft21 || track_name == "catalog") {
+    if (!openmoq::publisher::is_draft21_or_later(draft) || track_name == "catalog") {
         return std::nullopt;
     }
     return largest_sent;
@@ -4051,7 +4051,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         return generation_availability.object_available_at(active.loop_cycle, *last_index);
     };
     const auto held_until_track_end = [&](const ActiveSubscription& active) {
-        if (draft != openmoq::publisher::DraftVersion::kDraft21) {
+        if (!openmoq::publisher::is_draft21_or_later(draft)) {
             return false;
         }
         const auto end_at = track_end_at(active);
@@ -4072,7 +4072,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             largest_object_for_response;
         const auto note_current_largest = [&](const SubscribeMessage& subscribe,
                                               const PublishedTrack& track) {
-            if (draft == openmoq::publisher::DraftVersion::kDraft21) {
+            if (openmoq::publisher::is_draft21_or_later(draft)) {
                 if (largest_sent) {
                     largest_object_for_response = largest_sent(track.name);
                 }
@@ -4362,7 +4362,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         enqueue_active_candidate(
                             subscribe.request_id,
                             active_subscriptions.at(subscribe.request_id));
-                    } else if (draft == openmoq::publisher::DraftVersion::kDraft21) {
+                    } else if (openmoq::publisher::is_draft21_or_later(draft)) {
                         // Nothing matches yet; the subscription still lasts until the
                         // track ends (see held_until_track_end).
                         active.completed = true;

@@ -516,6 +516,8 @@ std::uint64_t draft_version_number(DraftVersion draft) {
             return kDraft18Version;
         case DraftVersion::kDraft21:
             return kDraft21Version;
+        case DraftVersion::kDraft22:
+            return 0xff000016ULL;
     }
 
     return kDraft18Version;
@@ -559,7 +561,7 @@ bool validate_publisher_datagram(std::span<const std::uint8_t> bytes, DraftVersi
     std::size_t offset = 0;
     std::uint64_t type = 0, ignored = 0;
     // Drafts 17/18 still encode Type as a QUIC varint; draft 21 uses vi64.
-    if (!(draft == DraftVersion::kDraft21
+    if (!(openmoq::publisher::is_draft21_or_later(draft)
               ? decode_vi64_impl(bytes, offset, type)
               : decode_varint_impl(bytes, offset, type))) {
         return false;
@@ -879,7 +881,7 @@ static bool decode_server_setup_message_for_draft(std::span<const std::uint8_t> 
     }
     const DraftVersion message_draft =
         message_type == kSetupType
-            ? (expected_draft == DraftVersion::kDraft21 ? DraftVersion::kDraft21 : DraftVersion::kDraft18)
+            ? (is_draft18_or_later(expected_draft) ? expected_draft : DraftVersion::kDraft18)
             : DraftVersion::kDraft16;
     if (message_type != kServerSetupType && message_type != kSetupType) {
         return false;
@@ -915,7 +917,7 @@ static bool decode_server_setup_message_for_draft(std::span<const std::uint8_t> 
                 option_type == kSetupParamPath || option_type == kSetupParamMaxRequestId ||
                 option_type == kParamAuthorizationToken || option_type == 0x04 ||
                 option_type == kSetupParamAuthority || option_type == 0x07 ||
-                (message_draft == DraftVersion::kDraft21 &&
+                (openmoq::publisher::is_draft21_or_later(message_draft) &&
                  (option_type == 0x06 || option_type == 0x08));
             if (option_type_delta == 0 && known_option && option_type != kParamAuthorizationToken) {
                 return false;
@@ -1169,7 +1171,7 @@ bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
 
     // Draft 21 forbids Track Properties in REQUEST_OK-family messages. Keep
     // the legacy parser's trailing-byte behavior for earlier drafts.
-    return draft == DraftVersion::kDraft21 ? offset == payload_end : offset <= payload_end;
+    return openmoq::publisher::is_draft21_or_later(draft) ? offset == payload_end : offset <= payload_end;
 }
 
 bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draft, RequestError& message) {
@@ -1211,7 +1213,7 @@ bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draf
         !decode_reason_phrase(bytes.subspan(0, payload_end), offset, draft, message.reason)) {
         return false;
     }
-    if (draft == DraftVersion::kDraft21 && message.reason.size() > 1024) {
+    if (openmoq::publisher::is_draft21_or_later(draft) && message.reason.size() > 1024) {
         return false;
     }
 
@@ -1335,15 +1337,22 @@ std::vector<std::uint8_t> encode_subscribe_namespace_ok_message(DraftVersion dra
     return message_bytes;
 }
 
-// Draft-21 LOCATION_FILTER (§9.20.10): the field count, not a Filter Type,
-// selects the form. Maps onto the draft-18 filter model; a relative start more
+// Draft-21 selects the LOCATION_FILTER form by field count; draft-22
+// prefixes an explicit type and requires the corresponding field count. Maps onto the draft-18 filter model; a relative start more
 // than zero groups back starts at the next object because live delivery keeps
 // no history to replay.
 bool decode_location_filter(std::span<const std::uint8_t> bytes,
                             std::size_t& offset,
                             std::size_t end,
                             SubscribeMessage& message,
+                            DraftVersion draft,
                             bool* overflowed = nullptr) {
+    std::optional<std::uint64_t> explicit_type;
+    if (draft == DraftVersion::kDraft22) {
+        std::uint64_t type = 0;
+        if (!decode_moqint_impl(bytes.subspan(0, end), offset, draft, type) || type > 5) return false;
+        explicit_type = type;
+    }
     std::uint64_t fields[4] = {};
     std::size_t count = 0;
     while (offset < end) {
@@ -1351,6 +1360,10 @@ bool decode_location_filter(std::span<const std::uint8_t> bytes,
             return false;
         }
         ++count;
+    }
+    if (explicit_type) {
+        constexpr std::size_t counts[] = {0, 1, 2, 3, 4, 0};
+        if (count != counts[*explicit_type]) return false;
     }
     message.filter_type = 0x00;
     message.start_group_id = 0;
@@ -1388,6 +1401,12 @@ bool decode_location_filter(std::span<const std::uint8_t> bytes,
             }
             break;
     }
+    if (explicit_type == 5) message.filter_type = 0x02;
+    if (explicit_type == 2) {
+        message.filter_type = 0x03;
+        message.start_group_id = static_cast<std::size_t>(fields[0]);
+        message.start_object_id = static_cast<std::size_t>(fields[1]);
+    }
     return offset == end;
 }
 
@@ -1396,8 +1415,8 @@ bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
                              std::size_t end,
                              DraftVersion draft,
                              SubscribeMessage& message) {
-    if (draft == DraftVersion::kDraft21) {
-        return decode_location_filter(bytes, offset, end, message);
+    if (openmoq::publisher::is_draft21_or_later(draft)) {
+        return decode_location_filter(bytes, offset, end, message, draft);
     }
     if (!decode_moqint_impl(bytes, offset, draft, message.filter_type)) {
         return false;
@@ -1441,7 +1460,7 @@ bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
                               std::size_t begin,
                               std::size_t end,
                               DraftVersion draft) {
-    if (draft != DraftVersion::kDraft21) return false;
+    if (!openmoq::publisher::is_draft21_or_later(draft)) return false;
     std::size_t offset = begin;
     std::uint64_t previous_type = 0;
     while (offset < end) {
@@ -1465,7 +1484,7 @@ bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
                 std::size_t filter_offset = offset;
                 if (!decode_location_filter(bytes, filter_offset,
                                             offset + static_cast<std::size_t>(length),
-                                            filter)) return false;
+                                            filter, draft)) return false;
                 offset += static_cast<std::size_t>(length);
                 break;
             }
@@ -1592,7 +1611,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
             return false;
         }
-        if (draft == DraftVersion::kDraft21 && parameter_type == kParamIncludeProperties) {
+        if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type == kParamIncludeProperties) {
             if (!decode_include_properties(bytes, offset, payload_end)) {
                 return false;
             }
@@ -1660,7 +1679,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
                 }
                 break;
             case kParamFillParameters:
-                if (draft != DraftVersion::kDraft21 || message.fill_requested ||
+                if (!openmoq::publisher::is_draft21_or_later(draft) || message.fill_requested ||
                     !validate_fill_parameters(bytes, offset,
                                               offset + static_cast<std::size_t>(parameter_length),
                                               draft)) {
@@ -1730,7 +1749,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         // Range filters need MAX_FILTER_RANGES, which this publisher does not
         // advertise. Preserve a well-framed request so the session can return
         // INVALID_FILTER instead of treating it as malformed.
-        if (draft == DraftVersion::kDraft21 && parameter_type >= 0x25 && parameter_type <= 0x29) {
+        if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type >= 0x25 && parameter_type <= 0x29) {
             std::uint64_t parameter_length = 0;
             if (!decode_moqint_impl(bytes, offset, draft, parameter_length) ||
                 parameter_length > payload_end - offset) {
@@ -1740,7 +1759,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
             offset += static_cast<std::size_t>(parameter_length);
             continue;
         }
-        if (draft == DraftVersion::kDraft21 && parameter_type == kParamIncludeProperties) {
+        if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type == kParamIncludeProperties) {
             if (!decode_include_properties(bytes, offset, payload_end)) {
                 return false;
             }
@@ -1756,7 +1775,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                     return false;
                 }
                 message.forward = static_cast<std::uint8_t>(value);
-            } else if (parameter_type == kParamGroupOrder && draft == DraftVersion::kDraft21) {
+            } else if (parameter_type == kParamGroupOrder && openmoq::publisher::is_draft21_or_later(draft)) {
                 if (value != 0x1 && value != 0x2) {
                     return false;
                 }
@@ -1782,7 +1801,7 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
             }
         }
         if (parameter_type == kParamFillParameters) {
-            if (draft == DraftVersion::kDraft21) {
+            if (openmoq::publisher::is_draft21_or_later(draft)) {
                 if (!validate_fill_parameters(bytes, offset,
                                               offset + static_cast<std::size_t>(parameter_length),
                                               draft)) {
@@ -1791,11 +1810,11 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
                 message.fill_requested = true;
             }
         }
-        if (parameter_type == 0x21 && draft == DraftVersion::kDraft21) {  // LOCATION_FILTER
+        if (parameter_type == 0x21 && openmoq::publisher::is_draft21_or_later(draft)) {  // LOCATION_FILTER
             SubscribeMessage decoded_filter;
             std::size_t filter_offset = offset;
             if (!decode_location_filter(bytes, filter_offset, offset + static_cast<std::size_t>(parameter_length),
-                                        decoded_filter)) {
+                                        decoded_filter, draft)) {
                 return false;
             }
             message.subscription_filter = SubscriptionFilter{
@@ -1971,7 +1990,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                 }
                 break;
             case kParamFillParameters:
-                if (draft != DraftVersion::kDraft21 || message.fill_requested ||
+                if (!openmoq::publisher::is_draft21_or_later(draft) || message.fill_requested ||
                     !validate_fill_parameters(bytes, offset, parameter_end, draft)) {
                     return fail(RequestUpdateDecodeError::kSemantic);
                 }
@@ -1985,8 +2004,8 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                 std::size_t filter_offset = offset;
                 bool overflowed = false;
                 const bool decoded =
-                    draft == DraftVersion::kDraft21
-                        ? decode_location_filter(bytes, filter_offset, parameter_end, decoded_filter, &overflowed)
+                    openmoq::publisher::is_draft21_or_later(draft)
+                        ? decode_location_filter(bytes, filter_offset, parameter_end, decoded_filter, draft, &overflowed)
                         : decode_subscribe_filter(bytes, filter_offset, parameter_end, draft, decoded_filter);
                 if (!decoded) {
                     return fail(overflowed ? RequestUpdateDecodeError::kSemantic
@@ -2372,7 +2391,7 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         // Draft-21 PUBLISH_OK carries only EXPIRES: subscription parameters
         // moved to PUBLISH and REQUEST_UPDATE, and a parameter outside its
         // allowed messages is a PROTOCOL_VIOLATION (§9.20.1).
-        if (draft == DraftVersion::kDraft21 && parameter_type != 0x08) {
+        if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type != 0x08) {
             return false;
         }
         if ((parameter_type & 0x1ULL) == 0) {

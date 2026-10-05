@@ -45,7 +45,7 @@ private:
                                moq_auth_token_t* out, std::size_t capacity,
                                std::size_t* count) noexcept;
     cat4moq::AuthorizationConfig config_;
-    DraftVersion draft_ = DraftVersion::kDraft16;
+    DraftVersion draft_ = DraftVersion::kDraft18;
     moq_auth_source_t setup_{};
     moq_auth_source_t requests_{};
     // [0] is the credential, [1] the DPoP proof of a cnf-bound credential.

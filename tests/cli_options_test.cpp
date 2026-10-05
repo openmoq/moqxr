@@ -189,7 +189,7 @@ int main() {
     ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "unknown"},
                       "--auth-profile", "unknown profile must be rejected");
     for (const auto* type : {"", "-1", "+1", "1x", "4611686018427387904", "18446744073709551616"}) {
-        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "moqx-compat", "--auth-token-type", type},
+        ok &= parse_throws({"prog", "--input", "sample.mp4", "--auth-profile", "moqx-compat", "--auth-token-type", type, "--draft", "16"},
                           "--auth-token-type", "malformed or out-of-range token type must be rejected");
     }
     for (const auto* token : {"", "A", "AB", "AA=", "AA===", "AA+_", "AA AA", "+_8="}) {
@@ -410,6 +410,14 @@ int main() {
             {"openmoq-publisher", "--input", "sample.mp4", "--endpoint", "203.0.113.10:443", "--sni", "moq-relay.red5.net"});
         ok &= expect(options.endpoint.has_value(), "expected endpoint to be present when parsing --sni");
         ok &= expect(options.endpoint->sni == "moq-relay.red5.net", "expected --sni to populate endpoint SNI");
+    }
+
+    try {
+        const auto options = parse({"openmoq-publisher", "--input", "sample.mp4", "--draft", "22"});
+        ok &= expect(options.draft_version == openmoq::publisher::DraftVersion::kDraft22,
+                     "expected --draft 22 to select draft-22 mode");
+    } catch (const std::exception& error) {
+        ok &= expect(false, std::string("--draft 22 must parse: ") + error.what());
     }
 
     {
@@ -1083,6 +1091,15 @@ int main() {
                      "expected usage to list --version");
     }
 
+    ok &= expect(parse({"publisher", "--input", "sample.mp4"}).draft_version ==
+                     openmoq::publisher::DraftVersion::kDraft18,
+                 "CLI defaults to draft-18");
+    try {
+        parse({"publisher", "--input", "sample.mp4", "--packaging", "loc"});
+    } catch (const std::exception& error) {
+        ok &= expect(false, std::string("default draft must support LOC: ") + error.what());
+    }
+
     try {
         const auto loc = parse({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "18"});
         ok &= expect(loc.media_packaging != openmoq::publisher::MediaPackaging::kCmaf &&
@@ -1096,8 +1113,8 @@ int main() {
     } catch (const std::exception& error) {
         ok &= expect(false, std::string("LOC-04 CLI should accept draft 21: ") + error.what());
     }
-    ok &= expect(parse_throws({"publisher", "--input", "sample.mp4", "--packaging", "loc"},
-                              "draft 18", "LOC must reject the default draft16"), "LOC draft gate");
+    ok &= expect(parse_throws({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "16"},
+                              "draft 18", "LOC must reject explicit draft16"), "LOC draft gate");
     for (const auto flag : {"--coalesce-cmaf-chunks", "--stream-per-object"}) {
         ok &= expect(parse_throws({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "18", flag},
                                   "LOC", "LOC must reject incompatible chunk delivery"), "LOC delivery gate");
