@@ -231,6 +231,8 @@ jobs:
         uses: vmactions/freebsd-vm@v1
         with:
           release: "14.4"
+          mem: 8192
+          cpu: 2
           envs: release_version package_root archive
           prepare: |
             pkg install -y cmake ninja git pkgconf openssl
@@ -241,7 +243,7 @@ jobs:
               -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
               -DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF
             cmake --build build --parallel 2
-            ctest --test-dir build --output-on-failure
+            ctest --test-dir build --output-on-failure --timeout 600
 
             mkdir -p "${package_root}/lib"
             cp build/openmoq-publisher "${package_root}/"
