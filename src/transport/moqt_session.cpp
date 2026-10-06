@@ -8450,57 +8450,64 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                         "LOCMAF requires one traf per moof; demux or use separate_moof");
                                 }
                             }
-                            // Build fragment (group_id=0 placeholder, we'll assign below)
-                            auto fragment = openmoq::publisher::build_live_fragment(
-                                pending_moof, box->bytes, tracks, 0);
-                            const auto track = std::find_if(tracks.begin(), tracks.end(), [&](const auto& item) {
-                                return item.track_name == fragment.track_name;
-                            });
-                            if (track != tracks.end() && track->packaging == "locmaf") {
-                                pending_chunk.insert(pending_chunk.end(), box->bytes.begin(), box->bytes.end());
-                                fragment.payload.owned_bytes = std::move(pending_chunk);
-                            }
-                            pending_chunk.clear();
-
-                            if (locmaf_audio_only && !object_id_in_group.empty()) {
-                                ++shared_group_id;
-                                object_id_in_group.clear();
-                            }
-
-                            // Keyframe-based grouping:
-                            // When a video keyframe arrives, start a new group for ALL tracks.
-                            if (fragment.is_video_keyframe) {
-                                if (first_keyframe_seen) {
-                                    ++shared_group_id;
+                            // ffmpeg without +separate_moof packs every track into one moof;
+                            // the fragment builder handles one traf, so split first.
+                            auto parts = retain_locmaf_boxes
+                                ? std::vector<openmoq::publisher::LiveFragmentPart>{{pending_moof, box->bytes}}
+                                : openmoq::publisher::split_live_fragment_by_traf(pending_moof, box->bytes, tracks);
+                            for (auto& part : parts) {
+                                // Build fragment (group_id=0 placeholder, we'll assign below)
+                                auto fragment = openmoq::publisher::build_live_fragment(
+                                    part.moof, part.mdat, tracks, 0);
+                                const auto track = std::find_if(tracks.begin(), tracks.end(), [&](const auto& item) {
+                                    return item.track_name == fragment.track_name;
+                                });
+                                if (track != tracks.end() && track->packaging == "locmaf") {
+                                    pending_chunk.insert(pending_chunk.end(), part.mdat.begin(), part.mdat.end());
+                                    fragment.payload.owned_bytes = std::move(pending_chunk);
                                 }
-                                first_keyframe_seen = true;
-                                // Reset object counters for all tracks on new group
-                                object_id_in_group.clear();
-                            }
+                                pending_chunk.clear();
 
-                            if (!first_keyframe_seen) {
-                                // Drop fragments before first keyframe (can't decode without IDR)
-                                pending_moof.clear();
-                                continue;
-                            }
+                                if (locmaf_audio_only && !object_id_in_group.empty()) {
+                                    ++shared_group_id;
+                                    object_id_in_group.clear();
+                                }
 
-                            // Assign shared group_id and per-track object_id
-                            fragment.group_id = shared_group_id;
-                            fragment.object_id = object_id_in_group[fragment.track_name]++;
+                                // Keyframe-based grouping:
+                                // When a video keyframe arrives, start a new group for ALL tracks.
+                                if (fragment.is_video_keyframe) {
+                                    if (first_keyframe_seen) {
+                                        ++shared_group_id;
+                                    }
+                                    first_keyframe_seen = true;
+                                    // Reset object counters for all tracks on new group
+                                    object_id_in_group.clear();
+                                }
 
-                            {
-                                std::lock_guard<std::mutex> lock(queue->mutex);
-                                queue->fragments.push_back(std::move(fragment));
-                                // Trim queue: keep only fragments from the latest 2 groups.
-                                // This prevents unbounded backlog when ffmpeg encodes
-                                // faster than realtime, while keeping enough data for
-                                // A/V sync (audio from the previous group).
-                                if (!queue->fragments.empty()) {
-                                    const std::size_t latest = queue->fragments.back().group_id;
-                                    const std::size_t min_keep = latest > 1 ? latest - 1 : 0;
-                                    while (!queue->fragments.empty() &&
-                                           queue->fragments.front().group_id < min_keep) {
-                                        queue->fragments.pop_front();
+                                if (!first_keyframe_seen) {
+                                    // Drop fragments before first keyframe (can't decode without IDR)
+                                    pending_moof.clear();
+                                    continue;
+                                }
+
+                                // Assign shared group_id and per-track object_id
+                                fragment.group_id = shared_group_id;
+                                fragment.object_id = object_id_in_group[fragment.track_name]++;
+
+                                {
+                                    std::lock_guard<std::mutex> lock(queue->mutex);
+                                    queue->fragments.push_back(std::move(fragment));
+                                    // Trim queue: keep only fragments from the latest 2 groups.
+                                    // This prevents unbounded backlog when ffmpeg encodes
+                                    // faster than realtime, while keeping enough data for
+                                    // A/V sync (audio from the previous group).
+                                    if (!queue->fragments.empty()) {
+                                        const std::size_t latest = queue->fragments.back().group_id;
+                                        const std::size_t min_keep = latest > 1 ? latest - 1 : 0;
+                                        while (!queue->fragments.empty() &&
+                                               queue->fragments.front().group_id < min_keep) {
+                                            queue->fragments.pop_front();
+                                        }
                                     }
                                 }
                             }

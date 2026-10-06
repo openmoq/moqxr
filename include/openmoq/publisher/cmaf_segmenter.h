@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -63,6 +65,20 @@ std::size_t payload_size(const PayloadBuffer& payload);
 // Build a MediaFragment from a single moof+mdat pair for live streaming.
 // group_id is assigned by the caller (incremented per track).
 // The fragment owns the combined moof+mdat bytes.
+struct LiveFragmentPart {
+    std::vector<std::uint8_t> moof;
+    std::vector<std::uint8_t> mdat;  // complete mdat box
+};
+
+// Split a live moof+mdat pair that carries several trafs (ffmpeg without
+// +separate_moof) into one single-traf moof+mdat pair per track. A pair with
+// at most one traf is returned unchanged. Throws std::runtime_error when the
+// layout cannot be split (saio present, base_data_offset, missing data_offset,
+// unknown sample sizes, data outside the mdat).
+std::vector<LiveFragmentPart> split_live_fragment_by_traf(std::span<const std::uint8_t> moof_bytes,
+                                                          std::span<const std::uint8_t> mdat_bytes,
+                                                          const std::vector<TrackDescription>& tracks);
+
 MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
                                   std::span<const std::uint8_t> mdat_bytes,
                                   const std::vector<TrackDescription>& tracks,
