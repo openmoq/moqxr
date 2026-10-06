@@ -1473,6 +1473,137 @@ std::size_t payload_size(const PayloadBuffer& payload) {
     return payload.owned_bytes.empty() ? payload.span.size : payload.owned_bytes.size();
 }
 
+std::vector<LiveFragmentPart> split_live_fragment_by_traf(std::span<const std::uint8_t> moof_bytes,
+                                                          std::span<const std::uint8_t> mdat_bytes,
+                                                          const std::vector<TrackDescription>& tracks) {
+    const std::vector<Mp4Box> boxes = parse_mp4_boxes(moof_bytes);
+    if (boxes.empty() || boxes.front().type != "moof") {
+        throw std::runtime_error("split_live_fragment_by_traf: expected moof box");
+    }
+    const Mp4Box& moof = boxes.front();
+    const std::vector<const Mp4Box*> trafs = find_boxes(moof.children, "traf");
+    const std::vector<std::uint8_t> original_moof(moof_bytes.begin(), moof_bytes.end());
+    const std::vector<std::uint8_t> original_mdat(mdat_bytes.begin(), mdat_bytes.end());
+    if (trafs.size() <= 1) {
+        return {LiveFragmentPart{original_moof, original_mdat}};
+    }
+    const Mp4Box* mfhd = find_child_box(moof, "mfhd");
+    if (mfhd == nullptr || mdat_bytes.size() < 8) {
+        throw std::runtime_error("split_live_fragment_by_traf: missing mfhd or truncated mdat");
+    }
+    // A size field of 1 means a 64-bit largesize follows the type.
+    const std::size_t mdat_header = read_be32(mdat_bytes, 0) == 1 ? 16 : 8;
+    if (mdat_bytes.size() < mdat_header) {
+        throw std::runtime_error("split_live_fragment_by_traf: truncated mdat header");
+    }
+    const std::size_t payload_origin = moof_bytes.size() + mdat_header;  // relative to the moof start
+    const std::size_t payload_size = mdat_bytes.size() - mdat_header;
+
+    std::vector<LiveFragmentPart> parts;
+    std::size_t previous_end = payload_origin;
+    for (const Mp4Box* traf : trafs) {
+        const Mp4Box* tfhd = find_child_box(*traf, "tfhd");
+        const std::vector<const Mp4Box*> truns = find_boxes(traf->children, "trun");
+        if (tfhd == nullptr || tfhd->payload.size < 8 || truns.size() != 1) {
+            throw std::runtime_error("split_live_fragment_by_traf: traf needs one tfhd and one trun");
+        }
+        if (find_child_box(*traf, "saio") != nullptr) {
+            throw std::runtime_error("split_live_fragment_by_traf: traf with saio is not supported");
+        }
+        const Mp4Box& trun = *truns.front();
+        if (trun.payload.size < 8) {
+            throw std::runtime_error("split_live_fragment_by_traf: truncated trun");
+        }
+
+        const std::uint32_t tfhd_flags = read_full_box_flags(*tfhd, moof_bytes);
+        if ((tfhd_flags & 0x000001U) != 0) {
+            throw std::runtime_error("split_live_fragment_by_traf: tfhd base_data_offset is not supported");
+        }
+        const std::uint32_t track_id = read_be32(moof_bytes, tfhd->payload.offset + 4);
+        std::size_t cursor = tfhd->payload.offset + 8;
+        if ((tfhd_flags & 0x000002U) != 0) cursor += 4;
+        if ((tfhd_flags & 0x000008U) != 0) cursor += 4;
+        std::uint32_t default_size = 0;
+        if ((tfhd_flags & 0x000010U) != 0) {
+            if (cursor + 4 > moof_bytes.size()) {
+                throw std::runtime_error("split_live_fragment_by_traf: truncated tfhd");
+            }
+            default_size = read_be32(moof_bytes, cursor);
+        } else {
+            for (const auto& track : tracks) {
+                if (track.track_id == track_id && track.fragment_defaults.has_value()) {
+                    default_size = track.fragment_defaults->sample_size;
+                }
+            }
+        }
+
+        const std::uint32_t trun_flags = read_full_box_flags(trun, moof_bytes);
+        if ((trun_flags & 0x000001U) == 0) {
+            throw std::runtime_error("split_live_fragment_by_traf: trun has no data_offset");
+        }
+        std::size_t trun_cursor = trun.payload.offset + 4;
+        const std::uint32_t sample_count = read_be32(moof_bytes, trun_cursor);
+        trun_cursor += 4;
+        const std::size_t data_offset_position = trun_cursor;
+        const std::int32_t data_offset = static_cast<std::int32_t>(read_be32(moof_bytes, trun_cursor));
+        trun_cursor += 4;
+        if ((trun_flags & 0x000004U) != 0) trun_cursor += 4;
+
+        std::uint64_t total = 0;
+        for (std::uint32_t index = 0; index < sample_count; ++index) {
+            std::uint32_t size = default_size;
+            if ((trun_flags & 0x000100U) != 0) trun_cursor += 4;
+            if ((trun_flags & 0x000200U) != 0) {
+                if (trun_cursor + 4 > moof_bytes.size()) {
+                    throw std::runtime_error("split_live_fragment_by_traf: truncated trun samples");
+                }
+                size = read_be32(moof_bytes, trun_cursor);
+                trun_cursor += 4;
+            }
+            if ((trun_flags & 0x000400U) != 0) trun_cursor += 4;
+            if ((trun_flags & 0x000800U) != 0) trun_cursor += 4;
+            if (size == 0) {
+                throw std::runtime_error("split_live_fragment_by_traf: unknown sample size");
+            }
+            total += size;
+        }
+
+        // default-base-moof (0x020000) puts the base at the moof start; without
+        // it the base is the moof start for the first traf and the end of the
+        // previous traf's data afterwards.
+        const std::int64_t base = ((tfhd_flags & 0x020000U) != 0 || parts.empty())
+                                      ? 0
+                                      : static_cast<std::int64_t>(previous_end);
+        const std::int64_t position = base + data_offset;
+        if (position < static_cast<std::int64_t>(payload_origin) ||
+            static_cast<std::uint64_t>(position - static_cast<std::int64_t>(payload_origin)) + total > payload_size) {
+            throw std::runtime_error("split_live_fragment_by_traf: trun data lies outside the mdat");
+        }
+        const std::size_t slice_start = static_cast<std::size_t>(position) - payload_origin;
+        previous_end = static_cast<std::size_t>(position) + static_cast<std::size_t>(total);
+
+        std::vector<std::uint8_t> traf_bytes(moof_bytes.begin() + traf->span.offset,
+                                             moof_bytes.begin() + traf->span.offset + traf->span.size);
+        const std::vector<std::uint8_t> mfhd_bytes(moof_bytes.begin() + mfhd->span.offset,
+                                                   moof_bytes.begin() + mfhd->span.offset + mfhd->span.size);
+        const std::uint32_t new_data_offset =
+            static_cast<std::uint32_t>(8 + mfhd_bytes.size() + traf_bytes.size() + 8);
+        const std::size_t patch_at = data_offset_position - traf->span.offset;
+        for (int shift = 0; shift < 4; ++shift) {
+            traf_bytes[patch_at + static_cast<std::size_t>(shift)] =
+                static_cast<std::uint8_t>((new_data_offset >> (24 - 8 * shift)) & 0xFFU);
+        }
+
+        std::vector<std::uint8_t> moof_payload = mfhd_bytes;
+        moof_payload.insert(moof_payload.end(), traf_bytes.begin(), traf_bytes.end());
+        std::vector<std::uint8_t> mdat_payload(
+            mdat_bytes.begin() + static_cast<std::ptrdiff_t>(mdat_header + slice_start),
+            mdat_bytes.begin() + static_cast<std::ptrdiff_t>(mdat_header + slice_start + total));
+        parts.push_back(LiveFragmentPart{make_box("moof", moof_payload), make_box("mdat", mdat_payload)});
+    }
+    return parts;
+}
+
 MediaFragment build_live_fragment(std::span<const std::uint8_t> moof_bytes,
                                   std::span<const std::uint8_t> mdat_bytes,
                                   const std::vector<TrackDescription>& tracks,

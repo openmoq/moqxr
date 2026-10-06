@@ -2476,5 +2476,59 @@ int main() {
                               "expected the configured robustness to reach the live catalog");
     }
 
+    // One moof carrying two trafs (ffmpeg without +separate_moof) is split into
+    // one single-traf moof+mdat pair per track, with data offsets re-based.
+    {
+        const auto be32 = [](std::uint32_t value) {
+            std::vector<std::uint8_t> out;
+            append_be32(out, value);
+            return out;
+        };
+        const auto build_moof = [&](std::uint32_t offset_a, std::uint32_t offset_b) {
+            const auto traf = [&](std::uint32_t track_id, std::uint32_t data_offset, std::uint32_t size) {
+                const auto tfhd = make_full_box_with_flags(
+                    "tfhd", 0, 0x020038, concat({be32(track_id), be32(1000), be32(size), be32(0x02000000)}));
+                const auto tfdt = make_full_box("tfdt", be32(0));
+                const auto trun = make_full_box_with_flags("trun", 0, 0x000201,
+                                                           concat({be32(1), be32(data_offset), be32(size)}));
+                return make_box("traf", concat({tfhd, tfdt, trun}));
+            };
+            return make_box("moof", concat({make_full_box("mfhd", be32(1)), traf(1, offset_a, 3), traf(2, offset_b, 2)}));
+        };
+        const std::size_t moof_size = build_moof(0, 0).size();
+        const auto moof = build_moof(static_cast<std::uint32_t>(moof_size + 8),
+                                     static_cast<std::uint32_t>(moof_size + 8 + 3));
+        const auto mdat = make_box("mdat", {'V', 'V', 'V', 'A', 'A'});
+
+        std::vector<TrackDescription> tracks(2);
+        tracks[0].track_id = 1;
+        tracks[0].track_name = "vide_1";
+        tracks[0].handler_type = "vide";
+        tracks[0].timescale = 1000;
+        tracks[1].track_id = 2;
+        tracks[1].track_name = "soun_2";
+        tracks[1].handler_type = "soun";
+        tracks[1].timescale = 1000;
+
+        const auto parts = split_live_fragment_by_traf(moof, mdat, tracks);
+        ok &= expect(parts.size() == 2, "expected a two-traf moof to split into two fragments");
+        if (parts.size() == 2) {
+            const std::vector<std::uint8_t> video_mdat = make_box("mdat", {'V', 'V', 'V'});
+            const std::vector<std::uint8_t> audio_mdat = make_box("mdat", {'A', 'A'});
+            ok &= expect(parts[0].mdat == video_mdat, "expected the first traf to keep its own samples");
+            ok &= expect(parts[1].mdat == audio_mdat, "expected the second traf to keep its own samples");
+            const auto video = build_live_fragment(parts[0].moof, parts[0].mdat, tracks, 0);
+            const auto audio = build_live_fragment(parts[1].moof, parts[1].mdat, tracks, 0);
+            ok &= expect(video.track_name == "vide_1" && audio.track_name == "soun_2",
+                         "expected each split fragment to resolve to its own track");
+            ok &= expect(payload_size(video.payload) > 0 && payload_size(audio.payload) > 0,
+                         "expected each split fragment to build a payload");
+        }
+
+        const auto single = split_live_fragment_by_traf(parts.empty() ? moof : parts[0].moof,
+                                                        parts.empty() ? mdat : parts[0].mdat, tracks);
+        ok &= expect(single.size() == 1, "expected a single-traf moof to pass through unchanged");
+    }
+
     return ok ? 0 : 1;
 }

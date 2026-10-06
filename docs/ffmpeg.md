@@ -64,8 +64,8 @@ keeps the default CMAF output. See the
 - `+frag_keyframe` starts a new fragment on keyframes
 - `+empty_moov` writes initialization metadata up front
 - `+default_base_moof` and `+separate_moof` produce a layout that is easier for fragmented-MP4 pipelines to consume
-- retain `+separate_moof` for LOCMAF; it is required for the publisher to accept multi-track fragmented input
-- when audio appears in the catalog but no audio media objects are sent, regenerate with `+separate_moof`
+- retain `+separate_moof` for LOCMAF; LOCMAF requires one `traf` per `moof`
+- the live stdin path splits a multi-track `moof` into one fragment per track, but `+separate_moof` is still preferred; a multi-track `moof` whose `traf` carries `saio`, a `base_data_offset`, or no `trun` data offset cannot be split and is dropped with a logged parse error
 - for HEVC, prefer streams that are already `hvc1`-compatible
 - if a source is tagged `hev1` but keeps VPS/SPS/PPS only in the init segment, the publisher normalizes the advertised codec and emitted init segment to `hvc1`
 - if HEVC samples include in-band parameter sets, the publisher preserves `hev1`
@@ -75,7 +75,7 @@ keeps the default CMAF output. See the
 
 For live encoder pipelines, the publisher can consume fragmented MP4 directly from standard input.
 
-This live path expects ffmpeg to emit track-separated fragments, where each `moof` + `mdat` pair belongs to a single media track. Use `+separate_moof` when generating the stream. Without `+separate_moof`, audio and video may be carried inside the same `moof`, which is not the intended input layout for the current live parser.
+This live path works best when ffmpeg emits track-separated fragments, where each `moof` + `mdat` pair belongs to a single media track. Use `+separate_moof` when generating the stream. Without `+separate_moof`, audio and video may be carried inside the same `moof`; the publisher splits those into per-track fragments, but LOCMAF and fragments it cannot split still require `+separate_moof`.
 
 ```bash
 ffmpeg -stream_loop -1 -re -i bbb_sunflower_1080p_30fps_normal.mp4 \
