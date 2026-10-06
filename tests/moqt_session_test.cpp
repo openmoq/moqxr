@@ -8830,6 +8830,61 @@ int main() {
     }
 
     {
+        // File-input publish through a relay: PUBLISH_OK forward=0 on every
+        // track, then the relay flips forward=1 for the catalog with a
+        // REQUEST_UPDATE on its PUBLISH request stream. The file path must
+        // read that update (it used to ignore it and deliver nothing).
+        MockTransport file_forward_transport;
+        file_forward_transport.reads[3].push_back(encode_draft18_setup_response());
+        file_forward_transport.reads[0].push_back(
+            encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        file_forward_transport.reads[4].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 2, 0));
+        file_forward_transport.reads[8].push_back(
+            encode_publish_ok_message(DraftVersion::kDraft18, 4, 0));
+
+        std::size_t catalog_stream_read_count = 0;
+        bool update_queued = false;
+        file_forward_transport.on_read = [&](MockTransport& transport, std::uint64_t stream_id) {
+            if (stream_id != 4 || update_queued || ++catalog_stream_read_count < 2) {
+                return;
+            }
+            update_queued = true;
+            transport.reads[4].push_back(
+                encode_request_update_message(DraftVersion::kDraft18, 1, 1));
+        };
+
+        MoqtSession file_forward_session(
+            file_forward_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = file_forward_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-18 file-forward session connect to succeed");
+
+        const PublishPlan file_forward_plan =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft18), source_bytes);
+        static_cast<void>(file_forward_session.publish(file_forward_plan));
+        ok &= expect(update_queued, "expected the file publish path to poll the PUBLISH request stream");
+        ok &= expect(std::any_of(file_forward_transport.writes.begin(), file_forward_transport.writes.end(),
+                                 [](const auto& write) { return is_data_stream_write(write); }),
+                     "expected forward=1 REQUEST_UPDATE to release the catalog object");
+
+        const auto expected_file_update_ok =
+            openmoq::publisher::transport::encode_request_ok_message(
+                DraftVersion::kDraft18, 1);
+        ok &= expect(std::count_if(
+                         file_forward_transport.writes.begin(),
+                         file_forward_transport.writes.end(),
+                         [&](const MockTransport::WriteEvent& write) {
+                             return write.stream_id == 4 && write.bytes == expected_file_update_ok;
+                         }) == 1,
+                     "expected one REQUEST_OK answering the file-path REQUEST_UPDATE");
+    }
+
+    {
         MockTransport draft18_priority_update_transport;
         draft18_priority_update_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_priority_update_transport.reads[0].push_back(

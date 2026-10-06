@@ -5732,6 +5732,82 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
     std::size_t loop_cycle = 0;
     std::size_t cycle_start_index = 0;
 
+    // Draft-18+ relays answer PUBLISH_OK forward=0 until a subscriber shows up,
+    // then flip it with a REQUEST_UPDATE on the PUBLISH request stream.
+    std::map<std::uint64_t, std::vector<std::uint8_t>> pending_publish_request_bytes;
+    std::set<std::uint64_t> terminated_publish_request_ids;
+    PeerRequestIdValidator peer_request_ids(plan.draft.version, local_max_request_id);
+    std::set<std::string> logged_not_forwarding;
+    const auto poll_forward_updates = [&]() -> TransportStatus {
+        return poll_retained_publish_request_updates(
+            transport,
+            plan.draft.version,
+            request_id_by_track,
+            publish_stream_ids,
+            pending_publish_request_bytes,
+            terminated_publish_request_ids,
+            peer_request_ids,
+            [&](const std::string& track_name,
+                std::uint64_t request_id,
+                std::uint64_t response_stream_id,
+                const RequestUpdateMessage& update) -> TransportStatus {
+                PublishOk& publish_ok = publish_ok_by_request_id.at(request_id);
+                if (update.forward.has_value()) {
+                    if (publish_ok.forward == 0 && *update.forward == 1) {
+                        sender_by_track[track_name].renew_peer_stopped_subgroups(transport);
+                        logged_not_forwarding.erase(track_name);
+                    }
+                    publish_ok.forward = *update.forward;
+                }
+                if (update.subscriber_priority.has_value()) {
+                    publish_ok.subscriber_priority = *update.subscriber_priority;
+                }
+                if (update.object_delivery_timeout_ms.has_value()) {
+                    publish_ok.delivery_timeouts.object_ms = *update.object_delivery_timeout_ms;
+                }
+                if (update.subgroup_delivery_timeout_ms.has_value()) {
+                    publish_ok.delivery_timeouts.subgroup_ms = *update.subgroup_delivery_timeout_ms;
+                }
+                std::cerr << "[moqt-session] publish request update track=" << track_name
+                          << " request_id=" << request_id
+                          << " forward=" << static_cast<unsigned>(publish_ok.forward) << '\n';
+                return transport.write_stream(
+                    response_stream_id,
+                    encode_request_ok_message(plan.draft.version, update.request_id),
+                    false);
+            },
+            [](const std::string&, std::uint64_t) {});
+    };
+    const auto any_forwarding = [&]() {
+        return std::any_of(publish_ok_by_request_id.begin(),
+                           publish_ok_by_request_id.end(),
+                           [](const auto& entry) { return entry.second.forward != 0; });
+    };
+    // Blocks (bounded by subscriber_timeout) until some track is switched to
+    // forward=1, instead of spinning through objects that cannot be sent.
+    const auto await_forward = [&]() -> TransportStatus {
+        if (!is_draft18_or_later(plan.draft.version) || any_forwarding()) {
+            return TransportStatus::success();
+        }
+        std::cerr << "[moqt-session] waiting for forward=1 REQUEST_UPDATE on "
+                  << request_id_by_track.size() << " track(s) timeout_ms="
+                  << subscriber_timeout.count() << '\n';
+        const auto deadline = std::chrono::steady_clock::now() + subscriber_timeout;
+        while (!any_forwarding() && std::chrono::steady_clock::now() < deadline &&
+               terminated_publish_request_ids.size() < request_id_by_track.size()) {
+            const TransportStatus poll_status = poll_forward_updates();
+            if (!poll_status.ok) {
+                return poll_status;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return TransportStatus::success();
+    };
+    status = await_forward();
+    if (!status.ok) {
+        return status;
+    }
+
     while (true) {
         status = dispatch_peer_stopped_media_streams(transport,
                                                      sender_by_track);
@@ -5744,13 +5820,19 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             if (track_it == tracks_by_name.end()) {
                 continue;
             }
+            status = poll_forward_updates();
+            if (!status.ok) {
+                return status;
+            }
             const auto publish_ok_it = publish_ok_by_request_id.find(request_id_by_track.at(source_object.track_name));
             if (publish_ok_it == publish_ok_by_request_id.end()) {
                 return TransportStatus::failure("missing PUBLISH_OK for published track");
             }
             if (publish_ok_it->second.forward == 0) {
-                std::cerr << "[moqt-session] publish accepted without forwarding track=" << source_object.track_name
-                          << " request_id=" << request_id_by_track.at(source_object.track_name) << '\n';
+                if (logged_not_forwarding.insert(source_object.track_name).second) {
+                    std::cerr << "[moqt-session] publish accepted without forwarding track=" << source_object.track_name
+                              << " request_id=" << request_id_by_track.at(source_object.track_name) << '\n';
+                }
                 downgraded_tracks_by_name.emplace(track_it->first, track_it->second);
                 continue;
             }
@@ -5819,6 +5901,16 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             }
         }
         if (cycle_start_index >= plan.objects.size()) {
+            break;
+        }
+        // Nothing was (or can be) sent this cycle: wait for a forward update
+        // rather than restarting immediately, or fall through to the
+        // downgraded-track handling below.
+        status = await_forward();
+        if (!status.ok) {
+            return status;
+        }
+        if (!any_forwarding()) {
             break;
         }
         ++loop_cycle;
