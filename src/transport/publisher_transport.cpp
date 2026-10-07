@@ -3,7 +3,8 @@
 namespace openmoq::publisher::transport {
 
 TransportStatus TransportStatus::success() {
-    return {.ok = true, .message = {}, .failure_kind = FailureKind::kNone};
+    return {.ok = true, .message = {}, .failure_kind = FailureKind::kNone,
+            .migration_uri = std::nullopt, .migration_timeout_ms = std::nullopt};
 }
 
 TransportStatus TransportStatus::failure(std::string_view error_message,
@@ -12,6 +13,8 @@ TransportStatus TransportStatus::failure(std::string_view error_message,
         .ok = false,
         .message = std::string(error_message),
         .failure_kind = failure_kind,
+        .migration_uri = std::nullopt,
+        .migration_timeout_ms = std::nullopt,
     };
 }
 

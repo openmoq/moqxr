@@ -121,6 +121,9 @@ public:
     // Try to extract the next complete top-level box from the buffer.
     // Returns std::nullopt if not enough data is available yet.
     std::optional<StreamingBoxResult> next_box();
+    std::span<const std::uint8_t> pending_bytes() const {
+        return std::span<const std::uint8_t>(buffer_).subspan(consumed_);
+    }
 
 private:
     std::vector<std::uint8_t> buffer_;

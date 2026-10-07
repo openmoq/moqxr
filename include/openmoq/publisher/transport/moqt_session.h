@@ -11,6 +11,7 @@
 #include <atomic>
 #include <functional>
 #include <iosfwd>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <chrono>
@@ -53,6 +54,8 @@ struct LiveSrtCallerOptions {
 
 struct LiveIngestOptions {
     bool use_stdin = false;
+    std::vector<std::uint8_t> resume_bytes;
+    std::uint64_t resume_group_floor = 0;
     std::vector<LiveSrtCallerOptions> srt_callers;
 };
 
@@ -88,7 +91,9 @@ public:
     TransportStatus publish_live(std::istream& input,
                                  openmoq::publisher::DraftVersion draft_version,
                                  bool split_cmaf_chunks,
-                                 bool stream_per_object = false);
+                                 bool stream_per_object = false,
+                                 std::span<const std::uint8_t> resume_bytes = {},
+                                 std::uint64_t resume_group_floor = 0);
     TransportStatus publish_live(const LiveIngestOptions& ingest,
                                  std::istream* stdin_input,
                                  openmoq::publisher::DraftVersion draft_version,
@@ -124,6 +129,17 @@ public:
     TransportStatus end_broadcast(openmoq::publisher::EndBroadcastMode mode,
                                   openmoq::publisher::DraftVersion draft_version);
     PublishStats publish_stats() const;
+    const std::vector<std::uint8_t>& live_resume_bytes() const { return live_resume_bytes_; }
+    std::optional<std::uint64_t> live_resume_group_floor() const {
+        auto floor = live_resume_group_floor_;
+        for (const auto& [track, largest] : largest_sent_by_track_) {
+            if (track == "catalog") continue;
+            if (largest.first == std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
+            if (largest.first >= floor) floor = largest.first + 1;
+        }
+        return floor;
+    }
+
 
     // MSF section 5.3: when non-zero, publish_live() periodically re-emits an
     // independent catalog (via CatalogPublisher::force_independent) even when
@@ -191,6 +207,8 @@ private:
     bool namespace_stream_open_ = false;
     std::map<std::uint64_t, std::uint64_t> publish_stream_id_by_request_id_;
     PublishStats publish_stats_{};
+    std::vector<std::uint8_t> live_resume_bytes_;
+    std::uint64_t live_resume_group_floor_ = 0;
     std::unordered_map<std::string, std::uint64_t> last_group_by_track_;
     std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> largest_sent_by_track_;
     std::atomic<bool> stop_requested_{false};

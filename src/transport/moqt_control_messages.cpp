@@ -479,14 +479,17 @@ bool valid_authorization_token(std::span<const std::uint8_t> bytes,
                                std::size_t offset,
                                std::size_t parameter_end,
                                DraftVersion draft,
-                               bool* is_register = nullptr) {
+                               bool* is_register = nullptr,
+                               bool* uses_alias = nullptr) {
     if (is_register != nullptr) *is_register = false;
+    if (uses_alias != nullptr) *uses_alias = false;
     const auto parameter_bytes = bytes.first(parameter_end);
     std::uint64_t alias_type = 0;
     if (!decode_moqint_impl(parameter_bytes, offset, draft, alias_type)) {
         return false;
     }
     if (is_register != nullptr) *is_register = alias_type == 0x01;
+    if (uses_alias != nullptr) *uses_alias = alias_type == 0x00 || alias_type == 0x02;
 
     std::uint64_t ignored = 0;
     switch (alias_type) {
@@ -657,8 +660,45 @@ std::vector<std::uint8_t> encode_varint(std::uint64_t value) {
     return bytes;
 }
 
+bool decode_vi64(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value) {
+    return decode_vi64_impl(bytes, offset, value);
+}
+
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value) {
     return decode_varint_impl(bytes, offset, value);
+}
+
+bool decode_goaway_message(std::span<const std::uint8_t> bytes, DraftVersion draft, GoawayMessage& message) {
+    std::size_t offset = 0, length = 0;
+    if (draft != DraftVersion::kDraft22 ||
+        !parse_uint16_length_message(bytes, draft, 0x10, offset, length)) return false;
+    std::uint64_t uri_length = 0;
+    if (!decode_moqint_impl(bytes, offset, draft, uri_length) || uri_length > 8192 ||
+        !fits(offset, uri_length, bytes.size())) return false;
+    GoawayMessage decoded;
+    decoded.new_session_uri.assign(reinterpret_cast<const char*>(bytes.data() + offset),
+                                   static_cast<std::size_t>(uri_length));
+    offset += static_cast<std::size_t>(uri_length);
+    if (!decode_moqint_impl(bytes, offset, draft, decoded.timeout_ms) || offset != bytes.size()) return false;
+    message = std::move(decoded);
+    return true;
+}
+
+std::vector<std::uint8_t> encode_namespace_notification(DraftVersion draft, std::span<const std::string> suffix) {
+    if (draft != DraftVersion::kDraft22 || suffix.size() > 32) return {};
+    std::vector<std::uint8_t> payload;
+    append_moqint(payload, draft, suffix.size());
+    std::size_t namespace_length = 0;
+    for (const auto& field : suffix) {
+        if (field.empty() || field.size() > 4096 - namespace_length) return {};
+        namespace_length += field.size();
+        append_string(payload, draft, field);
+    }
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, 0x08);
+    append_uint16(bytes, static_cast<std::uint16_t>(payload.size()));
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
 }
 
 bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draft, std::size_t& message_size) {
@@ -666,6 +706,13 @@ bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draf
     std::uint64_t type = 0;
     if (!decode_moqint_impl(bytes, offset, draft, type)) {
         return false;
+    }
+
+    if (is_draft18_or_later(draft)) {
+        if (!fits(offset, 2, bytes.size())) return false;
+        const std::size_t length = (static_cast<std::size_t>(bytes[offset]) << 8) | bytes[offset + 1];
+        message_size = offset + 2 + length;
+        return bytes.size() >= message_size;
     }
 
     switch (type) {
@@ -1307,11 +1354,14 @@ bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,
         }
         if (parameter_type == kParamAuthorizationToken) {
             bool is_register = false;
+            bool uses_alias = false;
             if (!valid_authorization_token(bytes, offset,
                                           offset + static_cast<std::size_t>(parameter_length),
-                                          draft, &is_register)) {
+                                          draft, &is_register, &uses_alias)) {
                 message.malformed_authorization_token = true;
             } else {
+                message.unknown_authorization_token_alias =
+                    message.unknown_authorization_token_alias || (is_draft18_or_later(draft) && uses_alias);
                 message.authorization_token_cache_overflow =
                     message.authorization_token_cache_overflow ||
                     (is_draft18_or_later(draft) && is_register);
@@ -1646,6 +1696,14 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
         if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
             return false;
         }
+        if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type >= 0x25 && parameter_type <= 0x29) {
+            std::uint64_t length = 0;
+            if (!decode_moqint_impl(bytes.first(payload_end), offset, draft, length) ||
+                !fits(offset, length, payload_end)) return false;
+            message.has_unnegotiated_range_filter |= length != 0;
+            offset += static_cast<std::size_t>(length);
+            continue;
+        }
         if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type == kParamIncludeProperties) {
             if (!decode_include_properties(bytes, offset, payload_end)) {
                 return false;
@@ -1702,11 +1760,14 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
             case 0x03:  // AUTHORIZATION_TOKEN
                 {
                     bool is_register = false;
+                    bool uses_alias = false;
                     if (!valid_authorization_token(bytes, offset,
                                                    offset + static_cast<std::size_t>(parameter_length),
-                                                   draft, &is_register)) {
+                                                   draft, &is_register, &uses_alias)) {
                         message.malformed_authorization_token = true;
                     } else {
+                        message.unknown_authorization_token_alias =
+                            message.unknown_authorization_token_alias || (is_draft18_or_later(draft) && uses_alias);
                         message.authorization_token_cache_overflow =
                             message.authorization_token_cache_overflow ||
                             (is_draft18_or_later(draft) && is_register);
@@ -1786,11 +1847,11 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         // INVALID_FILTER instead of treating it as malformed.
         if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type >= 0x25 && parameter_type <= 0x29) {
             std::uint64_t parameter_length = 0;
-            if (!decode_moqint_impl(bytes, offset, draft, parameter_length) ||
-                parameter_length > payload_end - offset) {
+            if (!decode_moqint_impl(bytes.first(payload_end), offset, draft, parameter_length) ||
+                !fits(offset, parameter_length, payload_end)) {
                 return false;
             }
-            message.has_unnegotiated_range_filter = true;
+            message.has_unnegotiated_range_filter |= parameter_length != 0;
             offset += static_cast<std::size_t>(parameter_length);
             continue;
         }
@@ -1825,11 +1886,14 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
         }
         if (parameter_type == kParamAuthorizationToken) {
             bool is_register = false;
+            bool uses_alias = false;
             if (!valid_authorization_token(bytes, offset,
                                           offset + static_cast<std::size_t>(parameter_length),
-                                          draft, &is_register)) {
+                                          draft, &is_register, &uses_alias)) {
                 message.malformed_authorization_token = true;
             } else {
+                message.unknown_authorization_token_alias =
+                    message.unknown_authorization_token_alias || (is_draft18_or_later(draft) && uses_alias);
                 message.authorization_token_cache_overflow =
                     message.authorization_token_cache_overflow ||
                     (is_draft18_or_later(draft) && is_register);
@@ -1869,7 +1933,8 @@ bool decode_subscribe_tracks_message(std::span<const std::uint8_t> bytes,
 bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                                    DraftVersion draft,
                                    RequestUpdateMessage& message,
-                                   RequestUpdateDecodeError* error) {
+                                   RequestUpdateDecodeError* error,
+                                   std::uint64_t discovery_request_type) {
     const auto fail = [error](RequestUpdateDecodeError failure) {
         if (error != nullptr) {
             *error = failure;
@@ -1927,6 +1992,23 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                     : RequestUpdateDecodeError::kKeyValueFormatting);
         }
 
+        if (draft == DraftVersion::kDraft22 && parameter_type == 0x34 &&
+            (discovery_request_type == 0x50 || discovery_request_type == 0x51)) {
+            std::vector<std::string> prefix;
+            if (message.track_namespace_prefix ||
+                !decode_track_namespace(bytes.subspan(0, payload_end), offset, draft, prefix))
+                return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+            message.track_namespace_prefix = std::move(prefix);
+            continue;
+        }
+        if (draft == DraftVersion::kDraft22 && parameter_type == 0x29 && discovery_request_type == 0x51) {
+            std::uint64_t length = 0;
+            if (!read_parameter_length(bytes, offset, payload_end, draft, parameter_type, length))
+                return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+            message.has_unnegotiated_range_filter |= length != 0;
+            offset += static_cast<std::size_t>(length);
+            continue;
+        }
         if ((parameter_type & 0x1ULL) == 0) {
             std::uint64_t value = 0;
             if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, value)) {
@@ -2004,6 +2086,9 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                     std::uint64_t token_type = 0;
                     if (!decode_moqint_impl(bytes, token_offset, draft, alias_type)) {
                         return fail(RequestUpdateDecodeError::kKeyValueFormatting);
+                    }
+                    if (alias_type == 0x00 || alias_type == 0x02) {
+                        return fail(RequestUpdateDecodeError::kUnknownAuthTokenAlias);
                     }
                     if (alias_type == 0x01 &&
                         (!decode_moqint_impl(bytes, token_offset, draft, alias) ||

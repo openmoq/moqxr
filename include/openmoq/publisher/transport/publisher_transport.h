@@ -80,6 +80,9 @@ struct TransportStatus {
     bool ok = true;
     std::string message;
     FailureKind failure_kind = FailureKind::kFatal;
+    // Engaged for GOAWAY migration; an empty URI reuses the current endpoint.
+    std::optional<std::string> migration_uri = std::nullopt;
+    std::optional<std::uint64_t> migration_timeout_ms = std::nullopt;
 
     static TransportStatus success();
     static TransportStatus failure(std::string_view error_message,

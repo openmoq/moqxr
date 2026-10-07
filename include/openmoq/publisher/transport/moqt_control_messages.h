@@ -34,6 +34,11 @@ struct ServerSetupMessage {
     bool malformed_authorization_token = false;
 };
 
+struct GoawayMessage {
+    std::string new_session_uri;
+    std::uint64_t timeout_ms = 0;
+};
+
 struct MaxRequestIdMessage {
     std::uint64_t max_request_id = 0;
 };
@@ -79,6 +84,7 @@ struct SubscribeNamespaceMessage {
     std::vector<std::string> track_namespace_prefix;
     bool malformed_authorization_token = false;
     bool authorization_token_cache_overflow = false;
+    bool unknown_authorization_token_alias = false;
 };
 
 struct SubscriptionFilter {
@@ -103,6 +109,7 @@ struct SubscribeTracksMessage {
     bool fill_requested = false;
     bool malformed_authorization_token = false;
     bool authorization_token_cache_overflow = false;
+    bool unknown_authorization_token_alias = false;
 };
 
 struct DeliveryTimeouts {
@@ -126,8 +133,10 @@ struct SubscribeMessage {
     DeliveryTimeouts delivery_timeouts;
     // Draft-21 FILL_PARAMETERS presence.
     bool fill_requested = false;
+    bool has_unnegotiated_range_filter = false;
     bool malformed_authorization_token = false;
     bool authorization_token_cache_overflow = false;
+    bool unknown_authorization_token_alias = false;
 };
 
 // The optional values carried by REQUEST_UPDATE are deliberately distinct
@@ -144,6 +153,8 @@ struct RequestUpdateMessage {
     std::optional<std::uint8_t> forward;
     std::optional<SubscriptionFilter> subscription_filter;
     std::optional<std::uint64_t> new_group_request;
+    std::optional<std::vector<std::string>> track_namespace_prefix;
+    bool has_unnegotiated_range_filter = false;
     bool has_authorization_token = false;
     // Draft-21 FILL_PARAMETERS presence; its overriding parameters are unused
     // because this publisher can only report fill failure.
@@ -185,6 +196,7 @@ struct PublishError {
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
 std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id);
+bool decode_vi64(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 // Validates datagram framing before a publisher discards unknown-alias objects.
 // Padding is consumed without interpreting its contents.
@@ -214,6 +226,8 @@ bool decode_setup_response_message(std::span<const std::uint8_t> bytes,
                                    ServerSetupMessage& message);
 std::vector<std::uint8_t> encode_server_setup_message(const ServerSetupMessage& message);
 bool decode_max_request_id_message(std::span<const std::uint8_t> bytes, MaxRequestIdMessage& message);
+bool decode_goaway_message(std::span<const std::uint8_t> bytes, DraftVersion draft, GoawayMessage& message);
+std::vector<std::uint8_t> encode_namespace_notification(DraftVersion draft, std::span<const std::string> suffix);
 bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draft, std::size_t& message_size);
 std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& message);
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uint64_t request_id);
@@ -236,11 +250,13 @@ enum class RequestUpdateDecodeError {
     kKeyValueFormatting,
     kSemantic,
     kAuthTokenCacheOverflow,
+    kUnknownAuthTokenAlias,
 };
 bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                                    DraftVersion draft,
                                    RequestUpdateMessage& message,
-                                   RequestUpdateDecodeError* error = nullptr);
+                                   RequestUpdateDecodeError* error = nullptr,
+                                   std::uint64_t discovery_request_type = 0);
 bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
                                      SubscribeUpdateMessage& message);
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,

@@ -2138,7 +2138,8 @@ bool test_draft21_subscribe_tracks_rejects_range_filters() {
         append_track_namespace(payload, draft, {"live"});
         append_moqint(payload, draft, 1);
         append_moqint(payload, draft, filter_type);
-        append_moqint(payload, draft, 0);  // empty range set
+        append_moqint(payload, draft, 1);  // nonempty range set
+        append_moqint(payload, draft, 0);  // open-ended range from 0
         std::vector<std::uint8_t> bytes;
         append_moqint(bytes, draft, 0x51);
         bytes.push_back(0);
@@ -2289,7 +2290,129 @@ bool test_publisher_datagrams() {
     return ok;
 }
 
+bool test_draft22_generic_framing_and_subscribe_range() {
+    bool ok = true;
+    for (auto draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+        for (auto type : {0x7e, 0x0d, 0x22, 0x0f}) {
+            std::vector<std::uint8_t> bytes{static_cast<std::uint8_t>(type), 0, 1, 9, 0x10, 0, 0};
+            std::size_t size = 0;
+            ok &= expect(next_control_message(bytes, draft, size) && size == 4,
+                         "generic framing consumes one complete unknown/status message");
+            ok &= expect(!next_control_message(std::span(bytes).first(3), draft, size),
+                         "generic framing waits for the body");
+        }
+    }
+    for (auto type : {0x25, 0x26, 0x27, 0x28, 0x29}) {
+        std::vector<std::uint8_t> bytes{3, 0, 9, 1, 1, 1, 'n', 1, 't', 1,
+                                       static_cast<std::uint8_t>(type), 0};
+        SubscribeMessage sub;
+        ok &= expect(decode_subscribe_message(bytes, DraftVersion::kDraft22, sub),
+                     "SUBSCRIBE accepts empty range parameter framing");
+        ok &= expect(!sub.has_unnegotiated_range_filter, "empty range means no filter in draft22");
+        bytes[2] = 10;
+        bytes.back() = 1;
+        bytes.push_back(0);
+        ok &= expect(decode_subscribe_message(bytes, DraftVersion::kDraft22, sub),
+                     "SUBSCRIBE accepts nonempty range parameter framing");
+        ok &= expect(sub.has_unnegotiated_range_filter, "nonempty range exceeds zero negotiated limit");
+        bytes.back() = 0xff;
+        bytes[bytes.size() - 2] = 2;
+        ok &= expect(!decode_subscribe_message(bytes, DraftVersion::kDraft22, sub),
+                     "SUBSCRIBE rejects truncated range length");
+    }
+    for (auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+        const std::vector<std::uint8_t> empty_range{0x51,0,7,1,1,1,'n',1,0x26,0};
+        SubscribeTracksMessage msg;
+        ok &= expect(decode_subscribe_tracks_message(empty_range,draft,msg) && !msg.has_unnegotiated_range_filter,
+                     "empty SUBSCRIBE_TRACKS range means no filter");
+    }
+    return ok;
+}
+
+bool test_draft22_wire_api_boundaries() {
+    using openmoq::publisher::transport::GoawayMessage;
+    using openmoq::publisher::transport::decode_goaway_message;
+    using openmoq::publisher::transport::decode_vi64;
+    using openmoq::publisher::transport::encode_namespace_notification;
+    bool ok = true;
+    for (std::size_t length = 5; length <= 9; ++length) {
+        std::vector<std::uint8_t> bytes(length, 0xff);
+        bytes.front() = static_cast<std::uint8_t>(0xff << (9 - length));
+        std::size_t offset = 0;
+        std::uint64_t value = 0;
+        ok &= expect(decode_vi64(bytes, offset, value) && offset == length,
+                     "full vi64 accepts long integer");
+        offset = 0;
+        ok &= expect(!decode_vi64(std::span(bytes).first(length - 1), offset, value) && offset == 0,
+                     "truncated vi64 does not consume bytes");
+        if (length == 9) ok &= expect(value == UINT64_MAX, "vi64 preserves full uint64 domain");
+    }
+    GoawayMessage goaway;
+    const std::vector<std::uint8_t> valid{0x10,0,5,3,'u','r','i',7};
+    ok &= expect(decode_goaway_message(valid, DraftVersion::kDraft22, goaway) &&
+                 goaway.new_session_uri == "uri" && goaway.timeout_ms == 7, "GOAWAY URI and timeout decode");
+    ok &= expect(decode_goaway_message(std::vector<std::uint8_t>{0x10,0,2,0,0}, DraftVersion::kDraft22, goaway) &&
+                 goaway.new_session_uri.empty(), "GOAWAY empty URI reuses endpoint");
+    ok &= expect(!decode_goaway_message(std::vector<std::uint8_t>{0x10,0,1,0}, DraftVersion::kDraft22, goaway),
+                 "GOAWAY requires timeout");
+    auto trailing = valid; trailing.push_back(0); trailing[2]++;
+    ok &= expect(!decode_goaway_message(trailing, DraftVersion::kDraft22, goaway), "GOAWAY rejects trailing payload");
+    std::vector<std::uint8_t> oversized_uri{0x10,0,0};
+    append_vi64(oversized_uri, 8193);
+    oversized_uri.insert(oversized_uri.end(), 8193, 'a'); oversized_uri.push_back(0);
+    oversized_uri[1] = static_cast<std::uint8_t>((oversized_uri.size()-3)>>8);
+    oversized_uri[2] = static_cast<std::uint8_t>(oversized_uri.size()-3);
+    ok &= expect(!decode_goaway_message(oversized_uri, DraftVersion::kDraft22, goaway), "GOAWAY bounds URI at 8192");
+    oversized_uri.erase(oversized_uri.end() - 2);
+    oversized_uri[3] = 0xa0; oversized_uri[4] = 0;
+    oversized_uri[1] = static_cast<std::uint8_t>((oversized_uri.size()-3)>>8);
+    oversized_uri[2] = static_cast<std::uint8_t>(oversized_uri.size()-3);
+    ok &= expect(decode_goaway_message(oversized_uri, DraftVersion::kDraft22, goaway) &&
+                 goaway.new_session_uri.size() == 8192, "GOAWAY accepts maximum URI");
+    const std::vector<std::string> suffix{"live","video"};
+    ok &= expect(encode_namespace_notification(DraftVersion::kDraft22, suffix) ==
+                 std::vector<std::uint8_t>({8,0,12,2,4,'l','i','v','e',5,'v','i','d','e','o'}),
+                 "NAMESPACE serializes suffix without request id or prefix");
+    ok &= expect(encode_namespace_notification(DraftVersion::kDraft22, {}) == std::vector<std::uint8_t>({8,0,1,0}),
+                 "NAMESPACE empty suffix represents matching prefix");
+    ok &= expect(encode_namespace_notification(DraftVersion::kDraft22, std::vector<std::string>{""}).empty(),
+                 "NAMESPACE rejects empty tuple field");
+    ok &= expect(encode_namespace_notification(DraftVersion::kDraft22, std::vector<std::string>(33,"n")).empty(),
+                 "NAMESPACE rejects excessive tuple count");
+    ok &= expect(encode_namespace_notification(DraftVersion::kDraft22, std::vector<std::string>{std::string(4097,'n')}).empty(),
+                 "NAMESPACE rejects excessive suffix length");
+    for (auto draft : {DraftVersion::kDraft18,DraftVersion::kDraft21,DraftVersion::kDraft22}) {
+        for (std::uint8_t alias_type : {0,2}) {
+            const std::vector<std::uint8_t> sub_bytes{3,0,11,1,1,1,'n',1,'t',1,3,2,alias_type,0};
+            SubscribeMessage sub;
+            ok &= expect(decode_subscribe_message(sub_bytes,draft,sub) && sub.unknown_authorization_token_alias &&
+                         !sub.malformed_authorization_token, "SUBSCRIBE detects unregistered valid token alias");
+            for (auto type : {0x50,0x51}) {
+                const std::vector<std::uint8_t> bytes{static_cast<std::uint8_t>(type),0,9,1,1,1,'n',1,3,2,alias_type,0};
+                if (type == 0x50) {
+                    SubscribeNamespaceMessage msg;
+                    ok &= expect(decode_subscribe_namespace_message(bytes,draft,msg) && msg.unknown_authorization_token_alias,
+                                 "SUBSCRIBE_NAMESPACE detects unregistered alias");
+                } else {
+                    SubscribeTracksMessage msg;
+                    ok &= expect(decode_subscribe_tracks_message(bytes,draft,msg) && msg.unknown_authorization_token_alias,
+                                 "SUBSCRIBE_TRACKS detects unregistered alias");
+                }
+            }
+            RequestUpdateMessage update;
+            RequestUpdateDecodeError error;
+            const std::vector<std::uint8_t> bytes{2,0,6,3,1,3,2,alias_type,0};
+            ok &= expect(!decode_request_update_message(bytes,draft,update,&error) &&
+                         error == RequestUpdateDecodeError::kUnknownAuthTokenAlias,
+                         "REQUEST_UPDATE rejects unregistered token alias");
+        }
+    }
+    return ok;
+}
+
 int main() {
+    bool wire_ok = test_draft22_generic_framing_and_subscribe_range();
+    wire_ok &= test_draft22_wire_api_boundaries();
     bool ok = true;
     ok &= test_publisher_datagrams();
     ok &= test_largest_object_parameter_is_a_bare_location();
@@ -2315,5 +2438,5 @@ int main() {
     ok &= test_request_update_response_wire_shapes();
     ok &= test_subgroup_header_and_object_serdes_for_all_drafts();
     ok &= test_control_message_framing_and_parameter_regressions();
-    return ok ? 0 : 1;
+    return ok && wire_ok ? 0 : 1;
 }

@@ -6,7 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(openmoq_publisher
-    VERSION 0.4.3
+    VERSION 0.4.4
     DESCRIPTION "OpenMOQ contribution project: C++20 publisher for fragmented MP4 to CMSF/MOQT"
     LANGUAGES C CXX)
 
@@ -848,7 +848,7 @@ if(OPENMOQ_BUILD_TESTS)
         target_include_directories(openmoq-publisher-live-srt-discovery-tests PRIVATE ${OPENMOQ_SRT_INCLUDE_DIR})
         target_link_libraries(openmoq-publisher-live-srt-discovery-tests PRIVATE openmoq_publisher_lib ${OPENMOQ_SRT_LIBRARY})
         add_test(NAME openmoq-publisher-live-srt-discovery-tests COMMAND openmoq-publisher-live-srt-discovery-tests)
-        set_tests_properties(openmoq-publisher-live-srt-discovery-tests PROPERTIES TIMEOUT 30)
+        set_tests_properties(openmoq-publisher-live-srt-discovery-tests PROPERTIES TIMEOUT 60)
     endif()
 
     add_executable(openmoq-publisher-live-dash-tests

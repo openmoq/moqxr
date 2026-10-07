@@ -16,7 +16,7 @@ This covers:
 - progressive MP4 remux into CMAF-style objects
 - CLI option parsing and validation
 - ordered endpoint parsing, retry-count validation, retry/failover sequencing, failure classification, cancellation, and bounded live-object replay
-- MOQT setup and control-message encoding/decoding for drafts 14, 16, 17, and 18
+- MOQT setup and control-message encoding/decoding for drafts 14, 16, 17, 18, 21, and 22
 - binary namespace announcement plus subscribe-serving or forward-publish control/object sequencing
 - draft-18 fragmented request-stream reads and same-stream `SUBSCRIBE_OK` responses
 - draft-16 LL-DASH await-subscribe behavior with catalog plus multiple FFmpeg-style representation paths
@@ -27,6 +27,24 @@ This covers:
   PAT/PMT `initData`, catalog fields, whole-packet object payloads, and invalid
   partial-packet rejection
 - QUIC varint boundary coverage
+- draft-22 control framing, fragmented vi64 padding streams, unsupported TRACK_STATUS,
+  token aliases, range-filter rejection, discovery notifications, prefix updates,
+  overlap checks, retained request updates, and GOAWAY validation
+- draft-22 migration across native QUIC and WebTransport, preserving credentials,
+  TLS configuration, stdin parser state, and caller-supplied catalog chains
+
+The draft-22 migration loop creates a fresh session and allows at most eight
+consecutive GOAWAY migrations. Caller-supplied catalogs retain the latest
+independent object and its same-group deltas, up to 64 objects or 16 MiB;
+migration fails explicitly if a complete catalog chain cannot be replayed.
+Live input can resume at the next independent media group. This publisher does
+not retain FETCH history.
+
+With SRT enabled, the discovery tests use FFmpeg and a real localhost SRT sender
+to check namespace notification, track discovery, updates, overlap, range filters,
+and unknown token aliases. FFmpeg must be available to exercise those cases.
+The WebTransport close tests check malformed and unknown datagrams against a
+real localhost peer, including delivery of the protocol-error close.
 
 Publish-plan numbering notes:
 

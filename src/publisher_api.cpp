@@ -11,6 +11,8 @@
 #include "openmoq/publisher/transport/libmoq_publisher.h"
 #endif
 
+#include <algorithm>
+#include <charconv>
 #include <stdexcept>
 #include <sstream>
 #include <set>
@@ -98,6 +100,85 @@ transport::FailureKind publish_failure_kind(
         return transport::FailureKind::kRetryable;
     }
     return transport::FailureKind::kFatal;
+}
+
+constexpr std::size_t kMaxGoawayMigrations = 8;
+
+transport::EndpointConfig migration_endpoint(const transport::EndpointConfig& current, std::string_view uri) {
+    if (uri.empty())
+        return current;
+    const std::string_view scheme = uri.starts_with("moqt://") ? "moqt://" : "https://";
+    if ((!uri.starts_with("moqt://") && !uri.starts_with("https://")) || uri.find('#') != std::string_view::npos ||
+        uri.find_first_of("\r\n\t ") != std::string_view::npos) {
+        throw std::runtime_error("unsupported migration URI scheme or syntax");
+    }
+    uri.remove_prefix(scheme.size());
+    const auto path_start = uri.find_first_of("/?");
+    const auto authority = uri.substr(0, path_start);
+    if (authority.empty() || authority.find('@') != std::string_view::npos) {
+        throw std::runtime_error("invalid migration URI authority");
+    }
+    std::string_view host, port_text;
+    if (authority.front() == '[') {
+        const auto end = authority.find(']');
+        if (end == std::string_view::npos || end == 1)
+            throw std::runtime_error("invalid migration URI IPv6 host");
+        host = authority.substr(1, end - 1);
+        const auto rest = authority.substr(end + 1);
+        if (!rest.empty()) {
+            if (rest.front() != ':' || rest.size() == 1)
+                throw std::runtime_error("invalid migration URI port");
+            port_text = rest.substr(1);
+        }
+    } else {
+        const auto colon = authority.find(':');
+        host = authority.substr(0, colon);
+        if (host.empty() || host.find_first_of("[]") != std::string_view::npos)
+            throw std::runtime_error("invalid migration URI host");
+        if (colon != std::string_view::npos) {
+            port_text = authority.substr(colon + 1);
+            if (port_text.empty())
+                throw std::runtime_error("invalid migration URI port");
+        }
+    }
+    unsigned port = 443;
+    if (!port_text.empty()) {
+        const auto [end, error] = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
+        if (error != std::errc{} || end != port_text.data() + port_text.size() || port == 0 || port > 65535) {
+            throw std::runtime_error("invalid migration URI port");
+        }
+    }
+    auto endpoint = current;
+    endpoint.transport =
+        scheme == "moqt://" ? transport::TransportKind::kRawQuic : transport::TransportKind::kWebTransport;
+    if (endpoint.transport != current.transport) {
+        endpoint.alpn =
+            endpoint.transport == transport::TransportKind::kRawQuic ? default_alpn(DraftVersion::kDraft22) : "h3";
+        endpoint.application_protocol = endpoint.transport == transport::TransportKind::kRawQuic
+                                            ? default_alpn(DraftVersion::kDraft22)
+                                            : webtransport_protocol_offer(DraftVersion::kDraft22);
+    }
+    endpoint.host = std::string(host);
+    endpoint.port = static_cast<std::uint16_t>(port);
+    endpoint.sni = endpoint.host;
+    endpoint.path = path_start == std::string_view::npos ? "/" : std::string(uri.substr(path_start));
+    if (endpoint.path.front() == '?')
+        endpoint.path.insert(endpoint.path.begin(), '/');
+    endpoint.path_explicit = true;
+    return endpoint;
+}
+
+transport::TransportStatus prepare_migration(const transport::TransportStatus& status, std::size_t migrations,
+                                             transport::EndpointConfig& endpoint) {
+    if (migrations == kMaxGoawayMigrations) {
+        return transport::TransportStatus::failure("GOAWAY migration limit exceeded");
+    }
+    try {
+        endpoint = migration_endpoint(endpoint, *status.migration_uri);
+        return transport::TransportStatus::success();
+    } catch (const std::runtime_error& error) {
+        return transport::TransportStatus::failure(error.what());
+    }
 }
 
 }  // namespace
@@ -227,54 +308,68 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
     if (!transport_factory_) {
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
-    auto active = std::make_shared<ActiveSession>();
-    active->transport = transport_factory_(endpoint.transport);
-    if (!active->transport) {
-        return transport::TransportStatus::failure("failed to create requested transport");
-    }
+    auto resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
+    for (std::size_t migrations = 0; ; ++migrations) {
+        auto active = std::make_shared<ActiveSession>();
+        active->transport = transport_factory_(resolved_endpoint.transport);
+        if (!active->transport) {
+            return transport::TransportStatus::failure("failed to create requested transport");
+        }
 
-    active->session = std::make_unique<transport::MoqtSession>(
-        *active->transport,
-        config_.track_namespace,
-        config_.forward,
-        config_.publish_catalog,
-        config_.paced,
-        config_.loop,
-        config_.subscriber_timeout,
-        config_.authorization);
-    active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
-    active->session->set_preannounce_tracks(config_.preannounce_tracks);
-    active->session->set_media_packaging(config_.media_packaging);
+        active->session = std::make_unique<transport::MoqtSession>(
+            *active->transport,
+            config_.track_namespace,
+            config_.forward,
+            config_.publish_catalog,
+            config_.paced,
+            config_.loop,
+            config_.subscriber_timeout,
+            config_.authorization);
+        active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
+        active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_media_packaging(config_.media_packaging);
 
-    const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
-    set_active_session(active, resolved_endpoint, false);
-    transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
-    if (!status.ok) {
-        const std::string error = "transport connect failed: " + status.message;
-        clear_active_session(active, false, error);
-        return transport::TransportStatus::failure(
-            error, transport::FailureKind::kRetryable);
-    }
+        set_active_session(active, resolved_endpoint, false);
+        transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
+        if (!status.ok) {
+            const std::string error = "transport connect failed: " + status.message;
+            clear_active_session(active, false, error);
+            return transport::TransportStatus::failure(
+                error, transport::FailureKind::kRetryable);
+        }
 
-    const PublishPlan materialized = materialize_publish_plan(prepared.plan, prepared.input_bytes);
-    status = active->session->publish(materialized);
-    if (!status.ok) {
-        const std::string error = "transport publish failed: " + status.message;
-        const transport::FailureKind failure_kind =
-            publish_failure_kind(status, *active->transport);
-        static_cast<void>(active->session->close(0));
-        clear_active_session(active, true, error);
-        return transport::TransportStatus::failure(error, failure_kind);
-    }
-    {
-        const auto batch_stats = summarize_batch_publish_stats(materialized);
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        stats_.bytes_published = batch_stats.bytes_published;
-        stats_.objects_published = batch_stats.objects_published;
-        stats_.groups_published = batch_stats.groups_published;
-    }
+        const PublishPlan materialized = materialize_publish_plan(prepared.plan, prepared.input_bytes);
+        status = active->session->publish(materialized);
+        if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
+            static_cast<void>(active->session->close(0));
+            clear_active_session(active, false, {});
+            const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
+            if (!migration_status.ok) {
+                clear_active_session(active, false, migration_status.message);
+                return migration_status;
+            }
+            continue;
+        }
+        if (!status.ok) {
+            const std::string error = "transport publish failed: " + status.message;
+            const transport::FailureKind failure_kind =
+                publish_failure_kind(status, *active->transport);
+            static_cast<void>(active->session->close(0));
+            clear_active_session(active, true, error);
+            status.message = error;
+            status.failure_kind = failure_kind;
+            return status;
+        }
+        {
+            const auto batch_stats = summarize_batch_publish_stats(materialized);
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            stats_.bytes_published = batch_stats.bytes_published;
+            stats_.objects_published = batch_stats.objects_published;
+            stats_.groups_published = batch_stats.groups_published;
+        }
 
-    return transport::TransportStatus::success();
+        return transport::TransportStatus::success();
+    }
 }
 
 transport::TransportStatus Publisher::publish_file(const std::filesystem::path& path,
@@ -403,78 +498,111 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     if (!transport_factory_) {
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
-    auto active = std::make_shared<ActiveSession>();
-    active->transport = transport_factory_(endpoint.transport);
-    if (!active->transport) {
-        return transport::TransportStatus::failure("failed to create requested transport");
-    }
+    auto resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
+    std::uint64_t prior_bytes = 0, prior_objects = 0, prior_groups = 0;
+    std::vector<std::uint8_t> resume_bytes;
+    std::uint64_t resume_group_floor = 0;
+    for (std::size_t migrations = 0; ; ++migrations) {
+        auto active = std::make_shared<ActiveSession>();
+        active->transport = transport_factory_(resolved_endpoint.transport);
+        if (!active->transport) {
+            return transport::TransportStatus::failure("failed to create requested transport");
+        }
 
-    active->session = std::make_unique<transport::MoqtSession>(
-        *active->transport,
-        config_.track_namespace,
-        config_.forward,
-        config_.publish_catalog,
-        config_.paced,
-        config_.loop,
-        config_.subscriber_timeout,
-        config_.authorization);
-    active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
-    active->session->set_preannounce_tracks(config_.preannounce_tracks);
-    active->session->set_media_packaging(config_.media_packaging);
+        active->session = std::make_unique<transport::MoqtSession>(
+            *active->transport,
+            config_.track_namespace,
+            config_.forward,
+            config_.publish_catalog,
+            config_.paced,
+            config_.loop,
+            config_.subscriber_timeout,
+            config_.authorization);
+        active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
+        active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_media_packaging(config_.media_packaging);
 
-    const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
-    set_active_session(active, resolved_endpoint, true);
-    transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
-    if (!status.ok) {
-        const std::string error = "transport connect failed: " + status.message;
-        clear_active_session(active, false, error);
-        return transport::TransportStatus::failure(
-            error, transport::FailureKind::kRetryable);
-    }
+        set_active_session(active, resolved_endpoint, true);
+        transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
+        if (!status.ok) {
+            const std::string error = "transport connect failed: " + status.message;
+            clear_active_session(active, false, error);
+            return transport::TransportStatus::failure(
+                error, transport::FailureKind::kRetryable);
+        }
 
-    transport::LiveIngestOptions session_ingest;
-    session_ingest.use_stdin = ingest.use_stdin;
-    session_ingest.srt_callers.reserve(ingest.srt_callers.size());
-    for (const auto& caller : ingest.srt_callers) {
-        transport::LiveSrtCallerOptions session_caller;
-        session_caller.id = caller.id;
-        session_caller.endpoint = caller.endpoint;
-        session_caller.mode = caller.mode;
-        session_caller.fragment_on_keyframe = caller.fragment_on_keyframe;
-        session_caller.empty_moov = caller.empty_moov;
-        session_caller.default_base_moof = caller.default_base_moof;
-        session_caller.separate_moof_per_track = caller.separate_moof_per_track;
-        session_caller.target_fragment_duration_ms = caller.target_fragment_duration_ms;
-        session_caller.latency_ms = caller.latency_ms;
-        session_caller.auto_detect_program = caller.auto_detect_program;
-        session_caller.program_number = caller.program_number;
-        session_caller.video_pid = caller.video_pid;
-        session_caller.audio_pid = caller.audio_pid;
-        session_ingest.srt_callers.push_back(std::move(session_caller));
-    }
+        transport::LiveIngestOptions session_ingest;
+        session_ingest.use_stdin = ingest.use_stdin;
+        session_ingest.resume_bytes = resume_bytes;
+        session_ingest.resume_group_floor = resume_group_floor;
+        session_ingest.srt_callers.reserve(ingest.srt_callers.size());
+        for (const auto& caller : ingest.srt_callers) {
+            transport::LiveSrtCallerOptions session_caller;
+            session_caller.id = caller.id;
+            session_caller.endpoint = caller.endpoint;
+            session_caller.mode = caller.mode;
+            session_caller.fragment_on_keyframe = caller.fragment_on_keyframe;
+            session_caller.empty_moov = caller.empty_moov;
+            session_caller.default_base_moof = caller.default_base_moof;
+            session_caller.separate_moof_per_track = caller.separate_moof_per_track;
+            session_caller.target_fragment_duration_ms = caller.target_fragment_duration_ms;
+            session_caller.latency_ms = caller.latency_ms;
+            session_caller.auto_detect_program = caller.auto_detect_program;
+            session_caller.program_number = caller.program_number;
+            session_caller.video_pid = caller.video_pid;
+            session_caller.audio_pid = caller.audio_pid;
+            session_ingest.srt_callers.push_back(std::move(session_caller));
+        }
 
-    status = active->session->publish_live(session_ingest,
-                                           stdin_input,
-                                           config_.draft_version,
-                                           config_.split_cmaf_chunks,
-                                           config_.live_stream_per_object);
-    if (!status.ok) {
-        const std::string error = "transport live publish failed: " + status.message;
-        const transport::FailureKind failure_kind =
-            publish_failure_kind(status, *active->transport);
-        static_cast<void>(active->session->close(0));
-        clear_active_session(active, true, error);
-        return transport::TransportStatus::failure(error, failure_kind);
-    }
-    {
-        const auto live_stats = active->session->publish_stats();
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        stats_.bytes_published = live_stats.bytes_published;
-        stats_.objects_published = live_stats.objects_published;
-        stats_.groups_published = live_stats.groups_published;
-    }
+        status = active->session->publish_live(session_ingest,
+                                               stdin_input,
+                                               config_.draft_version,
+                                               config_.split_cmaf_chunks,
+                                               config_.live_stream_per_object);
+        if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
+            const auto snapshot = active->session->publish_stats();
+            prior_bytes += snapshot.bytes_published;
+            prior_objects += snapshot.objects_published;
+            prior_groups += snapshot.groups_published;
+            resume_bytes = active->session->live_resume_bytes();
+            const auto next_group_floor = active->session->live_resume_group_floor();
+            if (!next_group_floor) {
+                static_cast<void>(active->session->close(0));
+                const auto exhausted = transport::TransportStatus::failure("live migration exhausted group IDs");
+                clear_active_session(active, false, exhausted.message);
+                return exhausted;
+            }
+            resume_group_floor = *next_group_floor;
 
-    return transport::TransportStatus::success();
+            static_cast<void>(active->session->close(0));
+            clear_active_session(active, false, {});
+            const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
+            if (!migration_status.ok) {
+                clear_active_session(active, false, migration_status.message);
+                return migration_status;
+            }
+            continue;
+        }
+        if (!status.ok) {
+            const std::string error = "transport live publish failed: " + status.message;
+            const transport::FailureKind failure_kind =
+                publish_failure_kind(status, *active->transport);
+            static_cast<void>(active->session->close(0));
+            clear_active_session(active, true, error);
+            status.message = error;
+            status.failure_kind = failure_kind;
+            return status;
+        }
+        {
+            const auto live_stats = active->session->publish_stats();
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            stats_.bytes_published = prior_bytes + live_stats.bytes_published;
+            stats_.objects_published = prior_objects + live_stats.objects_published;
+            stats_.groups_published = prior_groups + live_stats.groups_published;
+        }
+
+        return transport::TransportStatus::success();
+    }
 }
 
 transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSource& source,
@@ -548,53 +676,120 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
     if (!transport_factory_) {
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
-    auto active = std::make_shared<ActiveSession>();
-    active->transport = transport_factory_(endpoint.transport);
-    if (!active->transport) {
-        return transport::TransportStatus::failure("failed to create requested transport");
+    auto resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
+    std::uint64_t prior_bytes = 0, prior_objects = 0, prior_groups = 0;
+    // Caller catalogs are opaque: replay an independent object plus its deltas,
+    // preserving their IDs rather than treating the latest delta as a full catalog.
+    constexpr std::size_t kMaxCatalogReplayObjects = 64;
+    constexpr std::size_t kMaxCatalogReplayBytes = 16 * 1024 * 1024;
+    std::vector<LiveObject> catalog_chain;
+    std::size_t catalog_bytes = 0;
+    bool catalog_seen = false;
+    bool catalog_chain_complete = false;
+    std::optional<std::size_t> replay_catalog_index;
+    auto resumable_source = source;
+    if (source_supplies_catalog && source.next_object && config_.draft_version == DraftVersion::kDraft22) {
+        resumable_source.next_object = [&]() -> std::optional<LiveObject> {
+            if (replay_catalog_index && *replay_catalog_index < catalog_chain.size()) {
+                return catalog_chain[(*replay_catalog_index)++];
+            }
+            replay_catalog_index.reset();
+            auto object = source.next_object();
+            if (object && object->track_name == "catalog") {
+                catalog_seen = true;
+                if (object->object_id == 0) {
+                    catalog_chain.clear();
+                    catalog_bytes = 0;
+                    catalog_chain_complete = true;
+                } else if (catalog_chain.empty() || object->group_id != catalog_chain.back().group_id) {
+                    catalog_chain_complete = false;
+                }
+                if (catalog_chain_complete && catalog_chain.size() < kMaxCatalogReplayObjects &&
+                    object->payload.size() <= kMaxCatalogReplayBytes - catalog_bytes) {
+                    catalog_chain.push_back(*object);
+                    catalog_bytes += object->payload.size();
+                } else {
+                    catalog_chain_complete = false;
+                    catalog_chain.clear();
+                    catalog_bytes = 0;
+                }
+            }
+            return object;
+        };
     }
+    for (std::size_t migrations = 0; ; ++migrations) {
+        auto active = std::make_shared<ActiveSession>();
+        active->transport = transport_factory_(resolved_endpoint.transport);
+        if (!active->transport) {
+            return transport::TransportStatus::failure("failed to create requested transport");
+        }
 
-    active->session = std::make_unique<transport::MoqtSession>(
-        *active->transport,
-        config_.track_namespace,
-        config_.forward,
-        config_.publish_catalog,
-        config_.paced,
-        config_.loop,
-        config_.subscriber_timeout,
-        config_.authorization);
-    active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
-    active->session->set_preannounce_tracks(config_.preannounce_tracks);
-    active->session->set_media_packaging(config_.media_packaging);
+        active->session = std::make_unique<transport::MoqtSession>(
+            *active->transport,
+            config_.track_namespace,
+            config_.forward,
+            config_.publish_catalog,
+            config_.paced,
+            config_.loop,
+            config_.subscriber_timeout,
+            config_.authorization);
+        active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
+        active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_media_packaging(config_.media_packaging);
 
-    const transport::EndpointConfig resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
-    set_active_session(active, resolved_endpoint, true);
-    transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
-    if (!status.ok) {
-        const std::string error = "transport connect failed: " + status.message;
-        clear_active_session(active, false, error);
-        return transport::TransportStatus::failure(
-            error, transport::FailureKind::kRetryable);
+        set_active_session(active, resolved_endpoint, true);
+        transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
+        if (!status.ok) {
+            const std::string error = "transport connect failed: " + status.message;
+            clear_active_session(active, false, error);
+            return transport::TransportStatus::failure(
+                error, transport::FailureKind::kRetryable);
+        }
+
+        status = active->session->publish_live_objects(
+            source_supplies_catalog && config_.draft_version == DraftVersion::kDraft22 ? resumable_source : source,
+            config_.draft_version);
+        if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
+            const auto snapshot = active->session->publish_stats();
+            prior_bytes += snapshot.bytes_published;
+            prior_objects += snapshot.objects_published;
+            prior_groups += snapshot.groups_published;
+            static_cast<void>(active->session->close(0));
+            clear_active_session(active, false, {});
+            const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
+            if (!migration_status.ok) {
+                clear_active_session(active, false, migration_status.message);
+                return migration_status;
+            }
+            if (source_supplies_catalog && catalog_seen && !catalog_chain_complete) {
+                const auto failure = transport::TransportStatus::failure(
+                    "source catalog migration requires a fresh independent catalog (replay limit exceeded or missing base)");
+                clear_active_session(active, false, failure.message);
+                return failure;
+            }
+            if (source_supplies_catalog && !catalog_chain.empty()) replay_catalog_index = 0;
+            continue;
+        }
+        if (!status.ok) {
+            const std::string error = "transport live object publish failed: " + status.message;
+            const transport::FailureKind failure_kind =
+                publish_failure_kind(status, *active->transport);
+            static_cast<void>(active->session->close(0));
+            clear_active_session(active, true, error);
+            status.message = error;
+            status.failure_kind = failure_kind;
+            return status;
+        }
+        {
+            const auto live_stats = active->session->publish_stats();
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            stats_.bytes_published = prior_bytes + live_stats.bytes_published;
+            stats_.objects_published = prior_objects + live_stats.objects_published;
+            stats_.groups_published = prior_groups + live_stats.groups_published;
+        }
+
+        return transport::TransportStatus::success();
     }
-
-    status = active->session->publish_live_objects(source, config_.draft_version);
-    if (!status.ok) {
-        const std::string error = "transport live object publish failed: " + status.message;
-        const transport::FailureKind failure_kind =
-            publish_failure_kind(status, *active->transport);
-        static_cast<void>(active->session->close(0));
-        clear_active_session(active, true, error);
-        return transport::TransportStatus::failure(error, failure_kind);
-    }
-    {
-        const auto live_stats = active->session->publish_stats();
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        stats_.bytes_published = live_stats.bytes_published;
-        stats_.objects_published = live_stats.objects_published;
-        stats_.groups_published = live_stats.groups_published;
-    }
-
-    return transport::TransportStatus::success();
 }
 
 transport::TransportStatus Publisher::disconnect(std::uint64_t application_error_code) const {

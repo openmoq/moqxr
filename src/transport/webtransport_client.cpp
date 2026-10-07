@@ -1,5 +1,7 @@
 #include "openmoq/publisher/transport/webtransport_client.h"
 
+#include "openmoq/publisher/transport/moqt_control_messages.h"
+
 #include "pending_media_queue.h"
 #include "picoquic_close_drain.h"
 
@@ -92,8 +94,10 @@ struct WebTransportClient::Impl {
     std::deque<std::pair<std::uint64_t, std::uint8_t>>
         applied_media_stream_priorities;
     bool connected = false;
+    DraftVersion datagram_draft = DraftVersion::kDraft14;
     bool failed = false;
     bool disconnected = false;
+    bool protocol_error_close = false;
     bool close_requested = false;
     bool close_sent = false;
     std::uint64_t close_error_code = 0;
@@ -332,7 +336,7 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
 
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
-        if (impl.failed) {
+        if (impl.failed && !impl.protocol_error_close) {
             return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
         }
     }
@@ -663,10 +667,55 @@ int webtransport_callback(picoquic_cnx_t* cnx,
         case picohttp_callback_get:
         case picohttp_callback_post:
         case picohttp_callback_connect:
-        case picohttp_callback_post_datagram:
         case picohttp_callback_provide_datagram:
         case picohttp_callback_connecting:
             return 0;
+        case picohttp_callback_post_datagram: {
+            // h3zero has already removed the HTTP Datagram quarter-stream ID.
+            if (validate_publisher_datagram(std::span<const std::uint8_t>(bytes, length),
+                                            impl->datagram_draft)) {
+                // This publisher has no incoming subscriptions, so valid
+                // objects use unknown aliases and can be discarded.
+                return 0;
+            }
+            {
+                std::lock_guard<std::mutex> lock(impl->mutex);
+                if (impl->failed || impl->close_requested) {
+                    return 0;
+                }
+                impl->failed = true;
+                impl->protocol_error_close = true;
+                impl->close_requested = true;
+                impl->close_error_code = 0x3;
+                // Session termination is reliable even when the negotiated
+                // media delivery timeout is shorter than a network RTT.
+                impl->close_drain.bound = (std::max)(impl->close_drain.bound, kDefaultCloseDrainTimeout);
+                impl->close_drain.arm();
+                impl->last_error = "invalid MOQT datagram (PROTOCOL_VIOLATION)";
+                for (auto* open : impl->pending_opens) {
+                    if (open != nullptr) {
+                        open->failed = true;
+                        open->completed = true;
+                        open->error = impl->last_error;
+                    }
+                }
+                impl->pending_opens.clear();
+                impl->condition.notify_all();
+            }
+            // A MoQT WebTransport session ends with a capsule, not a QUIC
+            // application close (draft-22 section 6.6). Keep QUIC alive so
+            // the capsule and CONNECT FIN can reach the peer; close() drains
+            // this queued stream data before tearing the connection down.
+            if (impl->control_stream_ctx != nullptr) {
+                const int ret = picowt_send_close_session_message(
+                    cnx, impl->control_stream_ctx, 0x3, "invalid MOQT datagram");
+                trace("invalid datagram close session capsule queued ret=" + std::to_string(ret));
+                if (ret == 0) {
+                    return 0;
+                }
+            }
+            return picoquic_close_ex(cnx, 0x3, "invalid MOQT datagram");
+        }
         case picohttp_callback_free: {
             if (stream_ctx != nullptr) {
                 std::lock_guard<std::mutex> lock(impl->mutex);
@@ -810,7 +859,7 @@ int loop_callback(picoquic_quic_t* quic,
         }
         case picoquic_packet_loop_after_send: {
             std::lock_guard<std::mutex> lock(impl->mutex);
-            if (impl->failed) {
+            if (impl->failed && !impl->protocol_error_close) {
                 return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
             }
             if (!impl->connected && control_stream_connect_established(*impl)) {
@@ -893,6 +942,16 @@ WebTransportClient::~WebTransportClient() {
 
 TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, const TlsConfig& tls) {
     endpoint_ = endpoint;
+    impl_->datagram_draft = DraftVersion::kDraft14;
+    const auto& protocol = endpoint.application_protocol;
+    for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft17,
+                             DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+        const auto alpn = default_alpn(draft);
+        if (protocol == alpn || protocol == "\"" + alpn + "\"") {
+            impl_->datagram_draft = draft;
+            break;
+        }
+    }
     tls_ = tls;
     state_ = ConnectionState::kIdle;
     next_bidirectional_stream_id_ = 0;
@@ -902,6 +961,7 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->connected = false;
     impl_->failed = false;
     impl_->disconnected = false;
+    impl_->protocol_error_close = false;
     impl_->close_requested = false;
     impl_->close_sent = false;
     impl_->close_error_code = 0;
@@ -1154,6 +1214,10 @@ TransportStatus WebTransportClient::open_stream(StreamDirection direction, std::
     pending_open.direction = direction;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->failed) {
+            return TransportStatus::failure(impl_->last_error.empty()
+                                               ? "webtransport connection failed" : impl_->last_error);
+        }
         impl_->pending_opens.push_back(&pending_open);
     }
     // No picoquic call here: the packet loop polls pending work every 10 ms
@@ -1654,8 +1718,10 @@ TransportStatus WebTransportClient::close(std::uint64_t application_error_code) 
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->close_requested = true;
-        impl_->close_error_code = application_error_code;
-        impl_->close_drain.arm();
+        if (!impl_->protocol_error_close) {
+            impl_->close_error_code = application_error_code;
+            impl_->close_drain.arm();
+        }
     }
     // Loop-thread pickup within one 10 ms time_check tick; see open_stream.
     impl_->condition.notify_all();

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <filesystem>
 #include <fstream>
@@ -1708,6 +1709,134 @@ int main() {
 
     const std::vector<std::uint8_t> source_bytes = {'I', 'N', 'I', 'T', 'M', 'S', 'G'};
     auto status = TransportStatus::success();
+    {
+        const auto frame = [](std::uint8_t type, std::vector<std::uint8_t> body) {
+            std::vector<std::uint8_t> bytes{type};
+            append_be16(bytes, static_cast<std::uint16_t>(body.size()));
+            bytes.insert(bytes.end(), body.begin(), body.end());
+            return bytes;
+        };
+        const auto namespace_body = [](std::uint8_t id, std::uint8_t params = 0) {
+            return std::vector<std::uint8_t>{id, 1, 7, 'i','n','t','e','r','o','p', params};
+        };
+        for (const std::string scenario : {"track-status", "track-status-parity", "padding-fragmented",
+                 "namespace-notification", "namespace-duplicate-goaway", "tracks-overlap",
+                 "tracks-invalid-forward", "tracks-invalid-priority", "tracks-prefix-update", "tracks-prefix-pause", "namespace-prefix-update", "namespace-responder-update", "subscribe-fin",
+                 "unknown-control", "unknown-request", "unknown-alias", "unknown-stream-high-bits", "control-goaway", "control-duplicate-goaway", "control-fin"}) {
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft22, .max_request_id = 100}));
+            transport.keep_open_streams.insert(3);
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft22, 0));
+            if (scenario == "unknown-stream-high-bits") {
+                transport.reads[7].push_back({0x81, 0x10});
+            } else if (scenario.starts_with("control-")) {
+                auto goaway = scenario == "control-fin" ? std::vector<std::uint8_t>{} : frame(0x10, {0, 0});
+                if (scenario == "control-fin") transport.keep_open_streams.erase(3);
+                if (scenario == "control-duplicate-goaway") append_bytes(goaway, frame(0x10, {0, 0}));
+                transport.reads[3].push_back(goaway);
+            } else if (scenario.starts_with("track-status")) {
+                auto body = namespace_body(scenario == "track-status" ? 1 : 2);
+                body.pop_back();
+                append_bytes(body, {6, 'v','i','d','e','_','1', 0});
+                transport.reads[1].push_back(frame(0x0d, body));
+            } else if (scenario == "padding-fragmented") {
+                transport.reads[7] = {{0xf0, 0x13}, {0x2b, 0x3e, 0x28, 0}, {0, 0}};
+                transport.reads[1].push_back(encode_subscribe_message(1, "interop", "vide_1", 1, DraftVersion::kDraft22));
+            } else if (scenario.starts_with("namespace-")) {
+                auto request = frame(0x50, namespace_body(1));
+                if (scenario == "namespace-duplicate-goaway") {
+                    append_bytes(request, frame(0x10, {0, 0}));
+                    append_bytes(request, frame(0x10, {0, 0}));
+                }
+                if (scenario == "namespace-prefix-update")
+                    append_bytes(request, frame(0x02, {3, 1, 0x34, 0}));
+                transport.reads[1].push_back(request);
+                transport.keep_open_streams.insert(1);
+                if (scenario == "namespace-responder-update") {
+                    transport.reads[0].push_back(frame(0x02, {3, 0}));
+                }
+            } else if (scenario.starts_with("tracks-")) {
+                auto body = namespace_body(1, 1);
+                append_bytes(body, {0x10, 0});
+                auto request = frame(0x51, body);
+                if (scenario == "tracks-invalid-forward")
+                    append_bytes(request, frame(0x02, {3, 1, 0x10, 255}));
+                if (scenario == "tracks-invalid-priority")
+                    append_bytes(request, frame(0x02, {3, 1, 0x20, 100}));
+                if (scenario == "tracks-prefix-update" || scenario == "tracks-prefix-pause")
+                    append_bytes(request, frame(0x02, {3, 2, 0x10, 1, 0x24, 1, 5, 'o','t','h','e','r'}));
+                if (scenario == "tracks-prefix-pause")
+                    append_bytes(request, frame(0x02, {5, 2, 0x10, 0, 0x24, 1, 7, 'i','n','t','e','r','o','p'}));
+                transport.reads[1].push_back(request);
+                transport.keep_open_streams.insert(1);
+                if (scenario == "tracks-overlap") {
+                    body[0] = 3;
+                    transport.reads[5].push_back(frame(0x51, body));
+                    transport.keep_open_streams.insert(5);
+                }
+            } else if (scenario == "unknown-alias") {
+                auto body = namespace_body(1);
+                body.pop_back();
+                append_bytes(body, {6, 'v','i','d','e','_','1', 1, 3, 2, 2, 0});
+                transport.reads[1].push_back(frame(0x03, body));
+            } else {
+                auto request = encode_subscribe_message(1, "interop", "vide_1", 1, DraftVersion::kDraft22);
+                if (scenario == "subscribe-fin") {
+                    append_bytes(request, frame(0x02, {3, 1, 0x20, 100}));
+                    transport.reads[1] = {request, {}};
+                } else {
+                    if (scenario == "unknown-control") transport.reads[3].push_back(frame(0x7e, {}));
+                    if (scenario == "unknown-request") append_bytes(request, frame(0x7e, {}));
+                    transport.reads[1].push_back(request);
+                    transport.keep_open_streams.insert(1);
+                }
+            }
+            MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "D22 " + scenario + " connects");
+            const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft22), source_bytes));
+            const bool violates = scenario == "namespace-duplicate-goaway" || scenario == "tracks-invalid-forward" || scenario == "tracks-invalid-priority" ||
+                scenario == "namespace-responder-update" || scenario == "unknown-control" || scenario == "unknown-request" ||
+                scenario == "unknown-stream-high-bits" || scenario == "control-duplicate-goaway" || scenario == "control-fin";
+            if (violates) {
+                ok &= expect(!result.ok && transport.last_close_code == 3, "D22 " + scenario + " closes PROTOCOL_VIOLATION");
+            } else if (scenario == "control-goaway") {
+                ok &= expect(!result.ok && result.migration_uri == std::optional<std::string>("") && transport.state() == ConnectionState::kConnected,
+                             "D22 control GOAWAY requests migration without PROTOCOL_VIOLATION");
+            } else if (scenario == "unknown-alias") {
+                ok &= expect(!result.ok && transport.last_close_code == 0x17, "D22 unknown alias closes UNKNOWN_AUTH_TOKEN_ALIAS");
+            } else if (scenario == "track-status-parity") {
+                ok &= expect(!result.ok && transport.last_close_code == 4, "D22 TRACK_STATUS validates Request ID parity");
+            } else {
+                ok &= expect(result.ok && transport.state() == ConnectionState::kConnected, "D22 " + scenario + " keeps session: " + result.message);
+            }
+            if (scenario == "track-status" || scenario == "tracks-overlap") {
+                const auto stream = scenario == "track-status" ? 1 : 5;
+                const auto error_code = scenario == "track-status" ? 3 : 0x30;
+                bool found = false;
+                for (const auto& write : transport.writes) {
+                    openmoq::publisher::transport::RequestError error;
+                    if (write.stream_id == stream && openmoq::publisher::transport::decode_request_error(write.bytes, DraftVersion::kDraft22, error) && error.error_code == static_cast<std::uint64_t>(error_code)) found = true;
+                }
+                ok &= expect(found, "D22 " + scenario + " gets correct REQUEST_ERROR");
+            }
+            if (scenario == "namespace-notification") {
+                ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+                    return write.stream_id == 1 && write.bytes == std::vector<std::uint8_t>{8, 0, 1, 0};
+                }), "D22 NAMESPACE sends empty relative suffix");
+            }
+            if (scenario == "namespace-prefix-update") {
+                ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+                    return write.stream_id == 1 && write.bytes == std::vector<std::uint8_t>{8, 0, 9, 1, 7, 'i','n','t','e','r','o','p'};
+                }), "D22 updated NAMESPACE uses the new relative prefix");
+            }
+            if (scenario == "tracks-prefix-update" || scenario == "tracks-prefix-pause") {
+                ok &= expect(std::none_of(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+                    return write.bytes.size() > 2 && write.bytes[0] == 0x1d;
+                }), "D22 updated track prefix prevents publication outside that prefix");
+            }
+        }
+    }
+    if (std::getenv("OPENMOQ_D22_ONLY") != nullptr) return ok ? 0 : 1;
     std::string authority;
     std::string path;
     std::uint64_t max_request_id = 1;

@@ -86,7 +86,35 @@ struct SilentServer {
     std::string close_session_reason;
     h3zero_stream_ctx_t* control_stream_ctx = nullptr;
     bool close_session_sent = false;
+    std::optional<std::vector<std::uint8_t>> datagram;
+    bool datagram_sent = false;
+    bool datagram_acked = false;
+    picowt_capsule_t received_capsule{};
+    std::optional<std::uint32_t> received_close_code;
+    std::optional<std::uint64_t> received_connection_close_code;
 };
+
+int observing_h3_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes,
+                          size_t length, picoquic_call_back_event_t event,
+                          void* callback_ctx, void* stream_ctx) {
+    auto* h3_ctx = static_cast<h3zero_callback_ctx_t*>(callback_ctx);
+    if (event == picoquic_callback_datagram_acked && h3_ctx != nullptr && h3_ctx->path_table_nb != 0) {
+        auto* server = static_cast<SilentServer*>(h3_ctx->path_table[0].path_app_ctx);
+        std::lock_guard<std::mutex> lock(server->mutex);
+        server->datagram_acked = true;
+        server->condition.notify_all();
+    }
+    if ((event == picoquic_callback_application_close || event == picoquic_callback_close) &&
+        h3_ctx != nullptr && h3_ctx->path_table_nb != 0) {
+        auto* server = static_cast<SilentServer*>(h3_ctx->path_table[0].path_app_ctx);
+        std::lock_guard<std::mutex> lock(server->mutex);
+        std::uint64_t local = 0, remote = 0, local_application = 0, remote_application = 0;
+        picoquic_get_close_reasons(cnx, &local, &remote, &local_application, &remote_application);
+        server->received_connection_close_code = remote_application;
+        server->condition.notify_all();
+    }
+    return h3zero_callback(cnx, stream_id, bytes, length, event, callback_ctx, stream_ctx);
+}
 
 // WebTransport path callback for the server. Accepts the CONNECT and then
 // ignores everything: no session close, no QUIC close.
@@ -113,6 +141,7 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         }
         stream_ctx->path_callback = silent_path_callback;
         stream_ctx->path_callback_ctx = server;
+        picoquic_set_callback(cnx, observing_h3_callback, h3_ctx);
         std::lock_guard<std::mutex> lock(server->mutex);
         server->control_stream_ctx = stream_ctx;
         server->connect_accepted = true;
@@ -121,6 +150,32 @@ int silent_path_callback(picoquic_cnx_t* cnx,
         // Count application stream bytes so the drain scenario can verify
         // everything written before close() actually arrived.
         std::lock_guard<std::mutex> lock(server->mutex);
+        if (stream_ctx == server->control_stream_ctx && bytes != nullptr && length != 0) {
+            if (picowt_receive_capsule(cnx, bytes, bytes + length, &server->received_capsule) != 0) {
+                return -1;
+            }
+            if (server->received_capsule.h3_capsule.is_stored &&
+                server->received_capsule.h3_capsule.capsule_type == picowt_capsule_close_webtransport_session) {
+                server->received_close_code = server->received_capsule.error_code;
+            }
+        }
+        if (server->datagram.has_value() && !server->datagram_sent &&
+            stream_ctx != nullptr && stream_ctx != server->control_stream_ctx && length != 0) {
+            // h3zero strips this HTTP Datagram quarter-stream ID before
+            // delivering the MoQT payload to the client's path callback.
+            std::vector<std::uint8_t> wire(8);
+            const auto prefix_length = picoquic_varint_encode(wire.data(), wire.size(),
+                                                              server->control_stream_ctx->stream_id / 4);
+            if (prefix_length == 0) {
+                return -1;
+            }
+            wire.resize(prefix_length);
+            wire.insert(wire.end(), server->datagram->begin(), server->datagram->end());
+            server->datagram_sent = true;
+            if (picoquic_queue_datagram_frame(cnx, wire.size(), wire.data()) != 0) {
+                return -1;
+            }
+        }
         if (server->close_session_code.has_value() && !server->close_session_sent &&
             stream_ctx != nullptr && stream_ctx != server->control_stream_ctx && length != 0 &&
             server->control_stream_ctx != nullptr) {
@@ -295,12 +350,93 @@ void stop_server(SilentServer& server) {
         picoquic_free(server.quic);
         server.quic = nullptr;
     }
+    picowt_release_capsule(&server.received_capsule);
+}
+
+bool datagram_scenario(std::vector<std::uint8_t> payload, bool valid,
+                       const std::string& protocol = "moqt-22", bool close_immediately = false) {
+    SilentServer server;
+    server.datagram = std::move(payload);
+    if (!expect(start_server(server), "expected datagram WebTransport server to start")) {
+        stop_server(server);
+        return false;
+    }
+    WebTransportClient client;
+    bool ok = expect(client.configure(EndpointConfig{.transport = TransportKind::kWebTransport,
+                                                     .host = "127.0.0.1", .port = server.port,
+                                                     .alpn = "h3", .application_protocol = protocol,
+                                                     .path = "/moq"},
+                                     TlsConfig{.insecure_skip_verify = true}).ok,
+                     "expected datagram WebTransport configure to succeed");
+    const auto connected = client.connect();
+    ok &= expect(connected.ok, "expected datagram WebTransport CONNECT: " + connected.message);
+    if (connected.ok) {
+        std::uint64_t stream = 0;
+        ok &= expect(client.open_stream(StreamDirection::kBidirectional, stream).ok,
+                     "expected datagram trigger stream to open");
+        ok &= expect(client.write_stream(stream, std::vector<std::uint8_t>{0}, false).ok,
+                     "expected datagram trigger write to succeed");
+        if (close_immediately) {
+            // Publisher closes immediately when its blocked request read
+            // reports a transport error; it cannot wait for peer observation.
+            std::vector<std::uint8_t> response;
+            bool fin = false;
+            const auto read = client.read_stream(stream, response, fin, std::chrono::seconds(3));
+            ok &= expect(!read.ok && read.message.find("invalid MOQT datagram") != std::string::npos,
+                         "expected invalid datagram to release the pending publisher read");
+            ok &= expect(client.close(0).ok, "expected immediate publisher cleanup to finish");
+        }
+        std::unique_lock<std::mutex> lock(server.mutex);
+        server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+            return server.received_close_code.has_value() || (valid && server.datagram_acked);
+        });
+        if (close_immediately) {
+            server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                return server.received_connection_close_code.has_value();
+            });
+            ok &= expect(server.received_connection_close_code == 0x3,
+                         "expected immediate cleanup to preserve the protocol error and deliver QUIC closure");
+        }
+        if (valid) {
+            ok &= expect(server.datagram_acked && !server.received_close_code.has_value(),
+                         "expected valid unknown-alias object or padding to be received without session close");
+            lock.unlock();
+            ok &= expect(client.write_stream(stream, std::vector<std::uint8_t>{1}, false).ok,
+                         "expected valid datagram to leave the WebTransport session writable");
+        } else {
+            ok &= expect(server.received_close_code == 0x3,
+                         "expected invalid datagram to send CLOSE_WEBTRANSPORT_SESSION with PROTOCOL_VIOLATION");
+            lock.unlock();
+            std::vector<std::uint8_t> response;
+            bool fin = false;
+            if (!close_immediately) {
+                const auto read = client.read_stream(stream, response, fin, std::chrono::milliseconds(100));
+                ok &= expect(!read.ok && read.message.find("invalid MOQT datagram") != std::string::npos,
+                             "expected invalid datagram to fail pending reads: " + read.message);
+            }
+        }
+    }
+    ok &= expect(client.close(0).ok, "expected datagram WebTransport close to finish");
+    stop_server(server);
+    return ok;
 }
 
 }  // namespace
 
 int main() {
     bool ok = true;
+
+    ok &= datagram_scenario({0xf0, 0x13, 0x2b, 0x3e, 0x2a}, false);
+    ok &= datagram_scenario({0xf0, 0x13, 0x2b, 0x3e, 0x2a}, false, "moqt-22", true);
+    ok &= datagram_scenario({0x0c, 1, 2, 0x42}, true);
+    ok &= datagram_scenario({0xf0, 0x13, 0x2b, 0x3e, 0x29, 0, 0}, true);
+    std::vector<std::uint8_t> padded_datagram = {0xf0, 0x13, 0x2b, 0x3e, 0x29};
+    padded_datagram.resize(64, 0);
+    ok &= datagram_scenario(std::move(padded_datagram), true, "\"moqt-22\"");
+    ok &= datagram_scenario({0x0c, 0x80}, false);
+    ok &= datagram_scenario({}, false);
+    ok &= datagram_scenario({0x0c, 1, 2, 0x42}, true, "moqt-16");
+    ok &= datagram_scenario({0x0c, 1, 2, 0x42}, true, "\"moqt-16\"");
 
     SilentServer server;
     ok &= expect(start_server(server), "expected local webtransport server to start");
