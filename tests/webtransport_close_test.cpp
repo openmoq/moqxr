@@ -15,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -274,6 +275,9 @@ bool start_server(SilentServer& server,
     server.path_item.path_length = 4;
     server.path_item.path_callback = silent_path_callback;
     server.path_item.path_app_ctx = &server;
+    // picoquic serves extended CONNECT only on routes that name the protocol.
+    server.path_item.connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL;
+    server.path_item.connect_protocol_length = std::strlen(H3ZERO_WEBTRANSPORT_H3_PROTOCOL);
     server.params.path_table = &server.path_item;
     server.params.path_table_nb = 1;
 
