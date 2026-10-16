@@ -55,6 +55,18 @@ int main() {
                      "expected the failure to name the missing reset_stream_at parameter");
         ok &= expect(message.find("draft-ietf-webtrans-http3") != std::string::npos,
                      "expected the failure to cite the WebTransport over HTTP/3 requirements");
+        ok &= expect(message.find("--webtransport-allow-missing-reset-stream-at") != std::string::npos,
+                     "expected the failure to point at the reset_stream_at opt-out");
+    }
+
+    {
+        // The opt-out cannot help when something else is missing too.
+        auto peer = compliant_server();
+        peer.reset_stream_at = false;
+        peer.max_datagram_frame_size = 0;
+        const auto message = describe_webtransport_requirements_failure(peer);
+        ok &= expect(message.find("--webtransport-allow-missing-reset-stream-at") == std::string::npos,
+                     "expected no opt-out hint when reset_stream_at is not the only gap");
     }
 
     {

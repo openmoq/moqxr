@@ -58,7 +58,21 @@ a request. The publisher then reports the gap by name, for example:
 webtransport CONNECT not sent: server does not meet the WebTransport over HTTP/3 requirements (draft-ietf-webtrans-http3 section 3.1); missing reset_stream_at transport parameter
 ```
 
-That is a server configuration problem, not a relay rejection. The check lives
+That is a server configuration problem, not a relay rejection.
+
+`--webtransport-allow-missing-reset-stream-at` relaxes only the
+`reset_stream_at` requirement, for interop testing against relays that omit
+it. The publisher logs a warning and sends the CONNECT anyway. picoquic has no
+switch for this, so the client marks the peer's parameter as advertised once
+the transport parameters arrive, before the SETTINGS that release the
+deferred CONNECT. picoquic decides whether RESET_STREAM_AT may be used when it
+processes the transport parameters, so it stays disabled: `picowt_reset_stream`
+fails and the client falls back to plain RESET_STREAM. A reset WebTransport
+stream may therefore lose its stream-type and session-ID header, and the relay
+cannot tell which session the stream belonged to. The other requirements stay
+mandatory, and the flag requires `--transport webtransport`.
+
+The check lives
 in `src/transport/webtransport_requirements.h` and mirrors picoquic's
 `picowt_webtransport_requirements_met()`; keep the two in step when picoquic
 changes. MoQT itself does not need RESET_STREAM_AT on raw QUIC (draft 18
@@ -172,10 +186,11 @@ Before changing wire behavior, verify each of these:
 ## Current risk focus
 
 The current WebTransport path interoperates with the tested Red5
-draft-16/draft-18 relay paths. It cannot currently reach moqx over WebTransport,
+draft-16/draft-18 relay paths. It cannot reach moqx over WebTransport by default,
 because moqx omits the `reset_stream_at` transport parameter (see below and
 [openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)); raw QUIC to
-moqx is unaffected. Draft-17 is selectable and codec-tested, but has less relay
+moqx is unaffected, and `--webtransport-allow-missing-reset-stream-at` lets the
+CONNECT through for interop testing. Draft-17 is selectable and codec-tested, but has less relay
 coverage. Remaining risk is now concentrated in broader
 coverage rather than initial session establishment:
 

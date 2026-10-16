@@ -61,6 +61,9 @@ struct CliOptions {
     // --print-msf-urls: a URL should only assert a connection requirement the
     // operator actually chose, never an unstated default.
     bool transport_explicit = false;
+    // --webtransport-allow-missing-reset-stream-at; copied into every
+    // endpoint (EndpointConfig::webtransport_allow_missing_reset_stream_at).
+    bool webtransport_allow_missing_reset_stream_at = false;
     bool forward = false;
     bool publish_catalog = false;
     bool include_sap = false;
