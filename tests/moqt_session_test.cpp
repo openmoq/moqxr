@@ -2948,6 +2948,79 @@ int main() {
     }
 
     {
+        // LOCMAF and LOC carry their timestamps outside a tfdt: the LOCMAF
+        // base media decode time (field 10) in the payload, and the LOC
+        // presentation timestamp in object property 16. Both must advance by
+        // one cycle (1 s at 90 kHz) per loop, growing their varints as needed.
+        const auto capture_loop_objects = [&](MockTransport& transport, const PublishPlan& plan) {
+            constexpr std::size_t kLoopCycles = 4;
+            std::vector<std::vector<std::uint8_t>> sent;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+                    sent.push_back(event.bytes);
+                    if (current.object_write_attempts.size() >= kLoopCycles) {
+                        return ObjectWriteResult{ObjectWriteDisposition::kFailed, "loop capture complete"};
+                    }
+                    return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+                };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, true,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected loop capture session connect to succeed");
+            const TransportStatus capture_status = session.publish(plan);
+            ok &= expect(!capture_status.ok && capture_status.message == "loop capture complete",
+                         "expected loop capture to stop after the configured cycle count: " + capture_status.message);
+            return sent;
+        };
+        const auto ends_with = [](const std::vector<std::uint8_t>& bytes, const std::vector<std::uint8_t>& suffix) {
+            return bytes.size() >= suffix.size() && std::equal(suffix.begin(), suffix.end(), bytes.end() - suffix.size());
+        };
+
+        {
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "locmaf", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "locmaf", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'M'},
+            });
+            plan.tracks[0].packaging = "locmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.objects[0].media_duration_us = 1'000'000;
+            // Full anchor: type 2, 2 bytes of properties (field 10 = 5), then the payload.
+            plan.objects[0].owned_payload = {2, 2, 0x0A, 0x05, 'M'};
+            const auto sent = capture_loop_objects(transport, plan);
+            ok &= expect(sent.size() == 4 && ends_with(sent[0], {2, 2, 0x0A, 0x05, 'M'}) &&
+                             ends_with(sent[1], {2, 4, 0x0A, 0xC1, 0x5F, 0x95, 'M'}) &&
+                             ends_with(sent[2], {2, 4, 0x0A, 0xC2, 0xBF, 0x25, 'M'}) &&
+                             ends_with(sent[3], {2, 4, 0x0A, 0xC4, 0x1E, 0xB5, 'M'}),
+                         "expected each loop cycle to advance the LOCMAF base media decode time");
+        }
+
+        {
+            MockTransport transport;
+            transport.keep_open_streams.insert(1);
+            transport.reads[3].push_back(encode_draft18_setup_response());
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+            transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "loc", 1, DraftVersion::kDraft18));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "loc", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'L'},
+            });
+            plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+            plan.tracks[0].packaging = "loc";
+            plan.tracks[0].timescale = 90000;
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[0].properties = {{16, std::uint64_t{3003}}};
+            const auto sent = capture_loop_objects(transport, plan);
+            // properties length, id delta 16, PTS, payload length, payload.
+            ok &= expect(sent.size() == 4 && ends_with(sent[0], {3, 16, 0x8B, 0xBB, 1, 'L'}) &&
+                             ends_with(sent[1], {4, 16, 0xC1, 0x6B, 0x4B, 1, 'L'}) &&
+                             ends_with(sent[2], {4, 16, 0xC2, 0xCA, 0xDB, 1, 'L'}) &&
+                             ends_with(sent[3], {4, 16, 0xC4, 0x2A, 0x6B, 1, 'L'}),
+                         "expected each loop cycle to advance the LOC presentation timestamp");
+        }
+    }
+
+    {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
         MockTransport transport;
