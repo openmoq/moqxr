@@ -78,6 +78,7 @@ struct SilentServer {
     bool stream_fin_received = false;
     std::set<std::uint64_t> stream_fins;
     std::map<std::uint64_t, std::uint64_t> stream_reset_errors;
+    std::set<std::uint64_t> streams_with_data;
     std::set<std::uint64_t> stop_sending_stream_ids;
     std::set<std::uint64_t> stop_sending_sent_streams;
     picohttp_server_path_item_t path_item{};
@@ -189,6 +190,9 @@ int silent_path_callback(picoquic_cnx_t* cnx,
             }
         }
         server->stream_bytes_received += length;
+        if (stream_ctx != nullptr && length != 0) {
+            server->streams_with_data.insert(stream_ctx->stream_id);
+        }
         if (stream_ctx != nullptr && length != 0 &&
             server->stop_sending_stream_ids.contains(stream_ctx->stream_id) &&
             !server->stop_sending_sent_streams.contains(stream_ctx->stream_id)) {
@@ -1192,8 +1196,27 @@ int main() {
                          "expected opted-out client media stream to open");
             ok &= expect(lenient_client.write_stream(media_stream_id, std::vector<std::uint8_t>{0x04}, false).ok,
                          "expected opted-out client media write to succeed");
-            ok &= expect(lenient_client.reset_stream(media_stream_id, 0).ok,
+            // RESET_STREAM discards unsent data, so let the stream's header
+            // arrive first; otherwise the server cannot tie the reset to the session.
+            {
+                std::unique_lock<std::mutex> lock(no_reset_at_server.mutex);
+                ok &= expect(no_reset_at_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                                 return no_reset_at_server.streams_with_data.contains(media_stream_id);
+                             }),
+                             "expected the opted-out client's media bytes to reach the server");
+            }
+            ok &= expect(lenient_client.reset_stream(media_stream_id, 0x02).ok,
                          "expected opted-out client reset to fall back to RESET_STREAM");
+            {
+                std::unique_lock<std::mutex> lock(no_reset_at_server.mutex);
+                ok &= expect(no_reset_at_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                                 return no_reset_at_server.stream_reset_errors.contains(media_stream_id);
+                             }),
+                             "expected the server to receive the opted-out client's RESET_STREAM");
+                const auto reset = no_reset_at_server.stream_reset_errors.find(media_stream_id);
+                ok &= expect(reset != no_reset_at_server.stream_reset_errors.end() && reset->second == 0x02,
+                             "expected the RESET_STREAM to carry the WebTransport error code 0x02");
+            }
         }
         ok &= expect(lenient_client.close(0).ok, "expected opted-out client close to succeed");
         stop_server(no_reset_at_server);
