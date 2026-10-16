@@ -972,7 +972,8 @@ struct TrackLoopInfo {
     std::uint32_t timescale = 0;
     std::string packaging;
     // Set once a looped object of this track could not be rebased, so the
-    // warning is logged once per track.
+    // warning is logged once per track. Mutable because LoopState is passed
+    // as const; this is safe only because a publish sends from one thread.
     mutable bool rebase_failed = false;
 };
 
@@ -1103,6 +1104,15 @@ LoopState build_loop_state(const openmoq::publisher::PublishPlan& plan, bool loo
         if (it != state.tracks.end()) {
             it->second.timescale = description.timescale;
             it->second.packaging = description.packaging;
+        }
+        // A timeline track's single object describes one pass of the input
+        // and is resent unchanged, so seeking by it lands on first-pass groups.
+        if ((description.packaging == "mediatimeline" || description.packaging == "eventtimeline") &&
+            it != state.tracks.end() && it->second.has_loopable_objects) {
+            std::cerr << "[moqt-session] warning: timeline track " << description.track_name
+                      << " is not rebased across loop cycles; it repeats the first pass, so seeking by it "
+                         "may request groups from that pass"
+                      << std::endl;
         }
     }
 

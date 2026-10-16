@@ -40,6 +40,14 @@ int main() {
             catch (const std::runtime_error&) { refused = true; }
             require(refused, "API accepted incompatible LOCMAF delivery options");
         }
+        {
+            // Looping with timeline tracks warns at publish time, not here.
+            PublisherConfig looped;
+            looped.loop = true;
+            looped.include_sap = true;
+            looped.include_msf_timeline = true;
+            Publisher accepted(looped);
+        }
         std::istringstream locmaf_input(input);
         const auto compact = Publisher(config).prepare_stream(locmaf_input, "fixture");
         const auto catalog = std::find_if(compact.plan.objects.begin(), compact.plan.objects.end(),
