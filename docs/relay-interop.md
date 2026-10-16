@@ -195,3 +195,4 @@ Rows include `pacing_before`, `pacing_after`, `enqueue`, and `served`/`sent` eve
 - WebTransport still sends HTTP authority from the configured endpoint host
 - `--webtransport-allow-missing-reset-stream-at` sends the WebTransport CONNECT even when the relay omits the `reset_stream_at` transport parameter; the publisher logs a warning and stream resets use plain RESET_STREAM (see [WebTransport compliance](webtransport-compliance.md))
 - `--paced` applies pacing only to media-object sends; setup and publish control messages are sent immediately
+- `--loop` replays the input until the subscriber leaves. Each cycle advances group IDs and the media timestamps carried in each object (the CMAF `tfdt`, the LOCMAF base media decode time, or the LOC presentation timestamp) by the input's duration, so players see one continuous timeline. MSF and SAP timeline track contents still repeat each cycle

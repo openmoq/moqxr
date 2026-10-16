@@ -2872,6 +2872,82 @@ int main() {
     }
 
     {
+        // --loop must advance each sent fragment's tfdt by the cycle length in
+        // the track timescale, leaving the plan's own payload untouched.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "video", 1, DraftVersion::kDraft16,
+            0, 0, 10, 1));
+        std::vector<std::uint8_t> tfdt_payload;
+        append_be32(tfdt_payload, 3003);
+        std::vector<std::uint8_t> traf = make_box("traf", [&] {
+            std::vector<std::uint8_t> tfhd;
+            append_be32(tfhd, 1);
+            std::vector<std::uint8_t> children = make_full_box("tfhd", tfhd);
+            const auto tfdt = make_full_box("tfdt", tfdt_payload);
+            children.insert(children.end(), tfdt.begin(), tfdt.end());
+            return children;
+        }());
+        std::vector<std::uint8_t> mfhd;
+        append_be32(mfhd, 1);
+        std::vector<std::uint8_t> moof_children = make_full_box("mfhd", mfhd);
+        moof_children.insert(moof_children.end(), traf.begin(), traf.end());
+        std::vector<std::uint8_t> fragment = make_box("moof", moof_children);
+        const auto mdat = make_box("mdat", {0x42});
+        fragment.insert(fragment.end(), mdat.begin(), mdat.end());
+
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "video", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'V'},
+        });
+        plan.tracks[0].packaging = "cmaf";
+        plan.tracks[0].timescale = 90000;
+        plan.objects[0].media_duration_us = 1'000'000;
+        plan.objects[0].owned_payload = fragment;
+
+        constexpr std::size_t kLoopCycles = 4;
+        std::vector<std::uint32_t> sent_tfdt;
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                const std::string_view type = "tfdt";
+                const auto it = std::search(event.bytes.begin(), event.bytes.end(),
+                                            type.begin(), type.end());
+                if (it != event.bytes.end() && event.bytes.end() - it >= 12) {
+                    const std::size_t value = static_cast<std::size_t>(it - event.bytes.begin()) + 8;
+                    sent_tfdt.push_back((std::uint32_t{event.bytes[value]} << 24U) |
+                                        (std::uint32_t{event.bytes[value + 1]} << 16U) |
+                                        (std::uint32_t{event.bytes[value + 2]} << 8U) |
+                                        std::uint32_t{event.bytes[value + 3]});
+                }
+                if (current.object_write_attempts.size() >= kLoopCycles) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "loop timestamp test complete"};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            true,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected loop timestamp session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(!status.ok && status.message == "loop timestamp test complete",
+                     "expected loop timestamp test to stop after the configured cycle count");
+        ok &= expect(sent_tfdt == std::vector<std::uint32_t>{3003, 93003, 183003, 273003},
+                     "expected each loop cycle to advance tfdt by one second at 90 kHz");
+        ok &= expect(plan.objects[0].owned_payload == fragment,
+                     "expected loop rebasing to leave the plan payload unchanged");
+    }
+
+    {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
         MockTransport transport;

@@ -1,5 +1,6 @@
 #include "openmoq/publisher/transport/libmoq_publisher.h"
 #include "tls_verification.h"
+#include "../loop_timestamps.h"
 
 #ifdef OPENMOQ_HAS_LIBMOQ
 
@@ -415,6 +416,12 @@ LibmoqPlanTranslation translate_plan_for_libmoq(const PublishPlan& plan) {
         apply_sap(o, obj.has_sap_type, obj.sap_type);  // carry SAP into the send object
         o.decode_time_us = obj.media_time_us;
         o.presentation_time_us = obj.media_time_us;
+        for (const auto& td : plan.tracks) {
+            if (td.track_name == obj.track_name) {
+                o.timescale = td.timescale;
+                break;
+            }
+        }
         if (!obj.owned_payload.empty()) {
             o.payload = obj.owned_payload;
         }
@@ -1271,8 +1278,18 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
                 std::this_thread::sleep_until(
                     pacing_start + std::chrono::microseconds(so.decode_time_us - first_media_time_us));
             }
+            // Advance the payload's tfdt with the send-object times, so the
+            // media timeline keeps increasing across loop passes.
+            const std::vector<std::uint8_t>* payload = &o.payload;
+            std::vector<std::uint8_t> rebased;
+            if (cycle > 0 && o.timescale != 0) {
+                rebased = o.payload;
+                if (rebase_cmaf_timestamps(rebased, loop_offset_ticks(tr.cycle_duration_us, cycle, o.timescale))) {
+                    payload = &rebased;
+                }
+            }
             moq_rcbuf_t* buf = nullptr;
-            rc = moq_rcbuf_create(alloc, o.payload.data(), o.payload.size(), &buf);
+            rc = moq_rcbuf_create(alloc, payload->data(), payload->size(), &buf);
             if (rc != MOQ_OK || buf == nullptr) {
                 return teardown(sender, ep, "payload buffer allocation failed");
             }
