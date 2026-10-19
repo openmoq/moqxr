@@ -7,6 +7,7 @@
 #include "openmoq/publisher/publisher_api.h"
 #include "../live_media_queue.h"
 #include "../loc_packager.h"
+#include "stream_reset_codes.h"
 
 #include <algorithm>
 #include <array>
@@ -3240,6 +3241,10 @@ template <typename VisitSenders>
     }
     for (const std::uint64_t stream_id :
          transport.media_stream_peer_stop_events()) {
+        if (const auto code = transport.media_stream_peer_stop_error(stream_id)) {
+            std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
+                      << describe_stream_reset_code(*code) << '\n';
+        }
         bool owned = false;
         visit_senders([&](SubgroupSenderState& sender) {
             if (!owned) {

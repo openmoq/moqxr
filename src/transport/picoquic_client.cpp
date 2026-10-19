@@ -30,6 +30,7 @@
 #include <picosocks.h>
 
 #include "peer_close.h"
+#include "picoquic_stream_errors.h"
 #include "tls_verification.h"
 #endif
 
@@ -83,6 +84,9 @@ struct PicoquicClient::Impl {
     std::set<std::uint64_t> media_streams_with_pending;
     std::set<std::uint64_t> timed_out_media_streams;
     std::set<std::uint64_t> peer_stopped_media_streams;
+    // Raw QUIC carries MoQT stream codes unmapped.
+    std::map<std::uint64_t, std::uint64_t> peer_stop_errors;
+    std::map<std::uint64_t, std::uint64_t> peer_reset_errors;
     std::deque<AcceptedWrite> accepted_writes_waiting_for_send;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> accepted_streams;
@@ -688,6 +692,7 @@ int client_callback(picoquic_cnx_t* cnx,
         }
         case picoquic_callback_stream_reset: {
             std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->peer_reset_errors.insert_or_assign(stream_id, picoquic_get_remote_stream_error(cnx, stream_id));
             impl->pending_media.clear_stream(stream_id);
             impl->subgroup_deadlines.cancel(stream_id);
             impl->pending_media_activations.erase(stream_id);
@@ -702,6 +707,7 @@ int client_callback(picoquic_cnx_t* cnx,
             impl->pending_media_activations.erase(stream_id);
             impl->media_streams_with_pending.erase(stream_id);
             impl->peer_stopped_media_streams.insert(stream_id);
+            impl->peer_stop_errors.insert_or_assign(stream_id, picoquic_remote_stop_error(cnx, stream_id));
             impl->pending_resets.push_back(
                 {.stream_id = stream_id,
                  .error_code = kPeerStopErrorCode});
@@ -874,6 +880,8 @@ TransportStatus PicoquicClient::configure(const EndpointConfig& endpoint, const 
         impl_->media_streams_with_pending.clear();
         impl_->timed_out_media_streams.clear();
         impl_->peer_stopped_media_streams.clear();
+        impl_->peer_stop_errors.clear();
+        impl_->peer_reset_errors.clear();
         impl_->accepted_writes_waiting_for_send.clear();
         impl_->pending_reliable_stream_priorities.clear();
         impl_->applied_reliable_stream_priorities.clear();
@@ -1510,11 +1518,32 @@ void PicoquicClient::acknowledge_media_stream_peer_stopped(
     if (impl_ != nullptr) {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->peer_stopped_media_streams.erase(stream_id);
+        impl_->peer_stop_errors.erase(stream_id);
         impl_->condition.notify_all();
     }
 #else
     static_cast<void>(stream_id);
 #endif
+}
+
+std::optional<std::uint64_t> PicoquicClient::media_stream_peer_stop_error(
+    std::uint64_t stream_id) const {
+    if (impl_ == nullptr) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->peer_stop_errors.find(stream_id);
+    return it == impl_->peer_stop_errors.end() ? std::nullopt : std::optional<std::uint64_t>(it->second);
+}
+
+std::optional<std::uint64_t> PicoquicClient::stream_peer_reset_error(
+    std::uint64_t stream_id) const {
+    if (impl_ == nullptr) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->peer_reset_errors.find(stream_id);
+    return it == impl_->peer_reset_errors.end() ? std::nullopt : std::optional<std::uint64_t>(it->second);
 }
 
 std::size_t PicoquicClient::peer_stopped_media_stream_count_for_testing()

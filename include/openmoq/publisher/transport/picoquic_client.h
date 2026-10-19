@@ -54,6 +54,8 @@ public:
     std::vector<std::uint64_t> media_stream_peer_stop_events() const override;
     void acknowledge_media_stream_peer_stopped(
         std::uint64_t stream_id) override;
+    std::optional<std::uint64_t> media_stream_peer_stop_error(std::uint64_t stream_id) const override;
+    std::optional<std::uint64_t> stream_peer_reset_error(std::uint64_t stream_id) const override;
     std::size_t peer_stopped_media_stream_count_for_testing() const;
     TransportStatus close(std::uint64_t application_error_code) override;
 

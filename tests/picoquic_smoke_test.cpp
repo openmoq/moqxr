@@ -788,6 +788,8 @@ int main() {
     ok &= expect(delivery_client.media_stream_peer_stopped(
                      peer_stopped_stream_id),
                  "expected raw-QUIC peer-stop state to remain queryable");
+    ok &= expect(delivery_client.media_stream_peer_stop_error(peer_stopped_stream_id) == std::optional<std::uint64_t>(0x01),
+                 "expected raw-QUIC STOP_SENDING to carry CANCELLED 0x01 unmapped");
     const auto peer_stop_snapshot =
         delivery_client.media_stream_peer_stop_events();
     ok &= expect(std::find(peer_stop_snapshot.begin(),
