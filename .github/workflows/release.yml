@@ -74,7 +74,19 @@ jobs:
             Start-Sleep -Seconds (10 * $attempt)
           }
           if (-not $installed) {
-            Write-Error "pkg-config is not available: choco install pkgconfiglite failed after 5 attempts"
+            # The feed can stay down for a while. MSYS2 is on the runner image
+            # and pulls pkgconf from its own mirrors; its path goes to CMake
+            # directly, so MSYS2 does not join PATH ahead of the MSVC tools.
+            Write-Host "choco could not install pkgconfiglite; trying pkgconf from MSYS2"
+            & C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-pkgconf"
+            $pkgconf = "C:\msys64\mingw64\bin\pkgconf.exe"
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $pkgconf)) {
+              "PKG_CONFIG_EXECUTABLE=$pkgconf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              $installed = $true
+            }
+          }
+          if (-not $installed) {
+            Write-Error "pkg-config is not available: choco install pkgconfiglite and MSYS2 pkgconf both failed"
             exit 1
           }
 
@@ -114,6 +126,9 @@ jobs:
           )
           if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
             args+=("-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}")
+          fi
+          if [ -n "${PKG_CONFIG_EXECUTABLE:-}" ]; then
+            args+=("-DPKG_CONFIG_EXECUTABLE=${PKG_CONFIG_EXECUTABLE}")
           fi
           "${args[@]}"
 
