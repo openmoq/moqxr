@@ -248,6 +248,63 @@ function(openmoq_sanitize_target_link_directories target_name)
     endforeach()
 endfunction()
 
+# libmoq (moq5) is fetched before picoquic and picotls. Its picoquic adapter
+# does not compile against upstream picoquic: it needs the patches libmoq
+# tracks (patches/picoquic) and was written against the picoquic and picotls
+# revisions its scripts/setup_picoquic_deps.sh pins. Fetching it first lets the
+# managed picoquic and picotls below take that revision and patch series.
+set(_openmoq_libmoq_pins "")
+if(NOT OPENMOQ_LIBMOQ_SOURCE_DIR AND OPENMOQ_USE_LIBMOQ_PUBLISHER)
+    set(OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/_deps/moq5-src")
+    FetchContent_Declare(moq5
+        GIT_REPOSITORY https://github.com/openmoq/moq5.git
+        GIT_TAG main
+        GIT_SHALLOW TRUE
+        GIT_PROGRESS TRUE
+        GIT_SUBMODULES_RECURSE TRUE
+        GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
+        # Populate the checkout without adding it automatically. The actual
+        # root is added further down with EXCLUDE_FROM_ALL so standalone moq5
+        # examples do not become part of moqxr's default build.
+        SOURCE_SUBDIR openmoq-fetch-only
+        SOURCE_DIR "${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}")
+    FetchContent_MakeAvailable(moq5)
+    set(_openmoq_libmoq_pins "${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}/scripts/setup_picoquic_deps.sh")
+endif()
+
+# Revision and patch series for a managed dependency of libmoq. Sets
+# <prefix>_TAG to the pinned commit (or branch when libmoq is not managed),
+# <prefix>_SHALLOW, and <prefix>_PATCH, the PATCH_COMMAND arguments (empty
+# when no patches apply).
+function(openmoq_libmoq_dependency_pin prefix var provider source_dir default_tag)
+    set(tag "${default_tag}")
+    set(shallow TRUE)
+    set(patch "")
+    if(_openmoq_libmoq_pins AND EXISTS "${_openmoq_libmoq_pins}")
+        file(READ "${_openmoq_libmoq_pins}" pin_text)
+        if(pin_text MATCHES "${var}:-([0-9a-f]+)\\}")
+            set(tag "${CMAKE_MATCH_1}")
+            set(shallow FALSE)   # a commit id cannot be fetched shallow by name
+        else()
+            message(FATAL_ERROR
+                "libmoq pins no ${var} in ${_openmoq_libmoq_pins}; update the pin lookup")
+        endif()
+        set(patch_dir "${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}/patches/${provider}")
+        if(EXISTS "${patch_dir}/series")
+            find_package(Git REQUIRED)
+            set(patch ${CMAKE_COMMAND}
+                -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+                -DPATCH_DIR=${patch_dir}
+                -DSOURCE_DIR=${source_dir}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenMoqApplyPatches.cmake)
+        endif()
+    endif()
+    set(${prefix}_TAG "${tag}" PARENT_SCOPE)
+    set(${prefix}_SHALLOW "${shallow}" PARENT_SCOPE)
+    set(${prefix}_PATCH "${patch}" PARENT_SCOPE)
+endfunction()
+
 if(OPENMOQ_ENABLE_PICOQUIC AND OPENMOQ_USE_SYSTEM_PICOQUIC)
     # Installed package: nothing is fetched or built here. The export's link
     # interfaces carry picotls/OpenSSL/threads, and the save-ticket ABI shim in
@@ -287,13 +344,16 @@ elseif(OPENMOQ_ENABLE_PICOQUIC)
     else()
         set(OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR
             "${CMAKE_CURRENT_BINARY_DIR}/_deps/picotls-src")
+        openmoq_libmoq_dependency_pin(_openmoq_picotls PICOTLS_REF picotls
+            "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}" master)
         FetchContent_Declare(picotls
             GIT_REPOSITORY https://github.com/h2o/picotls.git
-            GIT_TAG master
-            GIT_SHALLOW TRUE
+            GIT_TAG ${_openmoq_picotls_TAG}
+            GIT_SHALLOW ${_openmoq_picotls_SHALLOW}
             GIT_PROGRESS TRUE
             GIT_SUBMODULES_RECURSE TRUE
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
+            PATCH_COMMAND ${_openmoq_picotls_PATCH}
             SOURCE_DIR "${OPENMOQ_RESOLVED_PICOTLS_SOURCE_DIR}"
             ${_openmoq_fetchcontent_exclude_from_all})
         set(_openmoq_managed_dependency_used ON)
@@ -364,13 +424,16 @@ elseif(OPENMOQ_ENABLE_PICOQUIC)
     else()
         set(OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR
             "${CMAKE_CURRENT_BINARY_DIR}/_deps/picoquic-src")
+        openmoq_libmoq_dependency_pin(_openmoq_picoquic PICOQUIC_REF picoquic
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}" master)
         FetchContent_Declare(picoquic
             GIT_REPOSITORY https://github.com/private-octopus/picoquic.git
-            GIT_TAG master
-            GIT_SHALLOW TRUE
+            GIT_TAG ${_openmoq_picoquic_TAG}
+            GIT_SHALLOW ${_openmoq_picoquic_SHALLOW}
             GIT_PROGRESS TRUE
             GIT_SUBMODULES_RECURSE TRUE
             GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
+            PATCH_COMMAND ${_openmoq_picoquic_PATCH}
             SOURCE_DIR "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
             ${_openmoq_fetchcontent_exclude_from_all})
         openmoq_make_dependency_available(picoquic)
@@ -419,20 +482,9 @@ if(OPENMOQ_LIBMOQ_SOURCE_DIR)
     endif()
     set(_openmoq_configure_libmoq ON)
 elseif(OPENMOQ_USE_LIBMOQ_PUBLISHER)
+    # Declared and fetched above, ahead of picoquic and picotls.
     set(OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/_deps/moq5-src")
-    FetchContent_Declare(moq5
-        GIT_REPOSITORY https://github.com/openmoq/moq5.git
-        GIT_TAG main
-        GIT_SHALLOW TRUE
-        GIT_PROGRESS TRUE
-        GIT_SUBMODULES_RECURSE TRUE
-        GIT_REMOTE_UPDATE_STRATEGY CHECKOUT
-        # Populate the checkout without adding it automatically. We add the
-        # actual root below with EXCLUDE_FROM_ALL so standalone moq5 examples
-        # do not become part of moqxr's default build.
-        SOURCE_SUBDIR openmoq-fetch-only
-        SOURCE_DIR "${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}")
     set(_openmoq_configure_libmoq ON)
     set(_openmoq_managed_libmoq ON)
     set(_openmoq_managed_dependency_used ON)
@@ -523,12 +575,12 @@ elseif(OPENMOQ_HAS_PICOQUIC)
     if(OPENMOQ_PICOQUIC_SOURCE_DIR)
         set(_openmoq_picoquic_ref "local override")
     else()
-        set(_openmoq_picoquic_ref "master")
+        set(_openmoq_picoquic_ref "${_openmoq_picoquic_TAG}")
     endif()
     if(OPENMOQ_PICOTLS_SOURCE_DIR)
         set(_openmoq_picotls_ref "local override")
     else()
-        set(_openmoq_picotls_ref "master")
+        set(_openmoq_picotls_ref "${_openmoq_picotls_TAG}")
     endif()
     openmoq_report_git_dependency(picoquic
         "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}" "${_openmoq_picoquic_ref}")
