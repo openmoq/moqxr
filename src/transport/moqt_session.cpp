@@ -4061,7 +4061,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     std::uint64_t local_max_request_id = 100,
                                     std::uint64_t subscribe_tracks_next_request_id = 2,
                                     const TrackAuthorization& authorization_token = {},
-                                    const NowFunction& now_function = steady_now_function()) {
+                                    const NowFunction& now_function = steady_now_function(),
+                                    // Carries the peer request ids an earlier phase already
+                                    // accepted, so draft-16's strictly sequential ids continue
+                                    // across the hand-off instead of restarting at 1.
+                                    PeerRequestIdValidator* inherited_peer_request_ids = nullptr) {
     std::vector<std::uint8_t> buffer = std::move(pending_control_bytes);
     pending_control_bytes.clear();
     std::set<std::uint64_t> completed_request_ids;
@@ -4135,7 +4139,9 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 .priority = priority,
             });
         };
-    PeerRequestIdValidator peer_request_ids(draft, local_max_request_id);
+    PeerRequestIdValidator own_peer_request_ids(draft, local_max_request_id);
+    PeerRequestIdValidator& peer_request_ids =
+        inherited_peer_request_ids != nullptr ? *inherited_peer_request_ids : own_peer_request_ids;
     bool fin = false;
     bool served_any_subscription = false;
     std::optional<std::chrono::steady_clock::time_point> catalog_last_served_at;
@@ -6061,6 +6067,11 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             // loop observes through its own writes; just stop reading.
             if (fin || chunk.empty()) break;
         }
+        // Only REQUEST_UPDATEs are handled here. Anything else (a downstream
+        // SUBSCRIBE, say) stays buffered, with what follows it, for
+        // serve_subscriptions: handling later messages first would break the
+        // strictly sequential peer request ids, and dropping it would lose a
+        // request the relay is waiting on.
         std::size_t size = 0;
         while (next_control_message(pending_control_bytes, plan.draft.version, size)) {
             const std::span<const std::uint8_t> bytes(pending_control_bytes.data(), size);
@@ -6069,23 +6080,24 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             if (!decode_moqint(bytes, offset, plan.draft.version, type)) {
                 return protocol_violation(transport, "received invalid control message");
             }
-            if (type == 0x02) {
-                const auto status = process_draft16_control_request_update(
-                    transport, bytes, control_stream_id, peer_request_ids,
-                    [&](std::uint64_t existing_request_id,
-                        std::uint64_t response_stream_id,
-                        const RequestUpdateMessage& update) -> TransportStatus {
-                        const auto track_it = std::find_if(
-                            request_id_by_track.begin(), request_id_by_track.end(),
-                            [&](const auto& entry) { return entry.second == existing_request_id; });
-                        if (track_it == request_id_by_track.end()) {
-                            return protocol_violation(
-                                transport, "REQUEST_UPDATE specified an invalid existing subscription");
-                        }
-                        return apply_forward_update(track_it->first, existing_request_id, response_stream_id, update);
-                    });
-                if (!status.ok) return status;
+            if (type != 0x02) {
+                break;
             }
+            const auto status = process_draft16_control_request_update(
+                transport, bytes, control_stream_id, peer_request_ids,
+                [&](std::uint64_t existing_request_id,
+                    std::uint64_t response_stream_id,
+                    const RequestUpdateMessage& update) -> TransportStatus {
+                    const auto track_it = std::find_if(
+                        request_id_by_track.begin(), request_id_by_track.end(),
+                        [&](const auto& entry) { return entry.second == existing_request_id; });
+                    if (track_it == request_id_by_track.end()) {
+                        return protocol_violation(
+                            transport, "REQUEST_UPDATE specified an invalid existing subscription");
+                    }
+                    return apply_forward_update(track_it->first, existing_request_id, response_stream_id, update);
+                });
+            if (!status.ok) return status;
             pending_control_bytes.erase(pending_control_bytes.begin(), pending_control_bytes.begin() + size);
         }
         return TransportStatus::success();
@@ -6297,7 +6309,8 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                      local_max_request_id,
                                      2,
                                      authorization_token,
-                                     now_function);
+                                     now_function,
+                                     &peer_request_ids);
         if (!status.ok) {
             return status;
         }

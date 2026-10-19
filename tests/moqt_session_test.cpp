@@ -9058,6 +9058,36 @@ int main() {
     }
 
     {
+        // The relay's REQUEST_UPDATE (peer request id 1) is consumed while the
+        // publish waits for forward=1; a later downstream SUBSCRIBE (id 3)
+        // for a track still at forward=0 must continue that sequence rather
+        // than restart it, or the session is closed with INVALID_REQUEST_ID.
+        MockTransport draft16_handoff_transport;
+        draft16_handoff_transport.reads[0].push_back(
+            encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+        queue_publish_ok_responses(draft16_handoff_transport, DraftVersion::kDraft16, {2, 4}, 0);
+        draft16_handoff_transport.reads[0].push_back(
+            encode_request_update_message(DraftVersion::kDraft16, 1, 1, 0x10, 2));
+        draft16_handoff_transport.reads[0].push_back(
+            encode_subscribe_message(3, kTestTrackNamespace, "vide_1", 1, DraftVersion::kDraft16));
+
+        MoqtSession draft16_handoff_session(
+            draft16_handoff_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = draft16_handoff_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-16 request-id hand-off session connect to succeed");
+        const PublishPlan draft16_handoff_plan =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft16), source_bytes);
+        static_cast<void>(draft16_handoff_session.publish(draft16_handoff_plan));
+        ok &= expect(draft16_handoff_transport.last_close_code != 0x04,
+                     "expected the draft-16 request-id sequence to continue across the forward-to-subscribe hand-off");
+    }
+
+    {
         MockTransport draft18_priority_update_transport;
         draft18_priority_update_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_priority_update_transport.reads[0].push_back(
