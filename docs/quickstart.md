@@ -362,7 +362,7 @@ Useful DASH ingest flags:
 - `--dash-path <prefix>` limits accepted request paths to that prefix
 - `--dash-queue-depth <count>` controls how many pending live objects are retained when publishers run ahead of subscribers
 - `--publish-catalog` publishes the CMSF catalog track
-- `--forward 1` forwards media objects immediately after publishing to the relay
+- `--forward 1` forwards media objects immediately after publishing to the relay; if the relay answers `PUBLISH_OK` with forward=0, the publisher waits for the relay to switch the track on (see [Relay interop](relay-interop.md))
 - `--forward 0` waits for subscriber interest before media is sent
 
 When `--forward 0` is used, `connection_id=` confirms that the transport connection and MOQT setup completed. It is printed before namespace acceptance and does not indicate subscriber interest. The publisher completes the draft-specific namespace and track signaling, then withholds media until the relay forwards a subscription for a catalog or media track. Draft 16 carries that interest on the control stream; draft 18 uses a bidirectional request stream, which may deliver the request in multiple reads. The publisher reassembles a draft-18 request and sends `SUBSCRIBE_OK` on the same request stream.

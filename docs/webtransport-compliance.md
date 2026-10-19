@@ -138,6 +138,28 @@ The CONNECT stream is different:
 - it can carry capsule traffic
 - it is not the MoQ control stream
 
+### 6. Stream error codes
+
+draft-ietf-webtrans-http3 section 4.4: WebTransport stream error codes are
+32-bit application values that share the QUIC error space with HTTP/3, so
+RESET_STREAM and STOP_SENDING carry them remapped into the
+`WT_APPLICATION_ERROR` range (`0x52e4a40fa8db` to `0x52e5ac983162`), skipping
+the HTTP/3 greasing codepoints. picoquic does not remap, so the client does:
+
+- outgoing resets map the MoQT stream reset code (draft 18 section 3.3.3) in
+  `WebTransportClient::apply_reset`; codes above 32 bits clamp to the maximum
+- incoming RESET_STREAM and STOP_SENDING codes are mapped back and exposed
+  through `PublisherTransport::stream_peer_reset_error()` and
+  `media_stream_peer_stop_error()`; a code outside the range carries no
+  application error code and yields no value
+- the mapping lives in `src/transport/webtransport_error_codes.h`; raw QUIC
+  uses the MoQT codes unmapped
+- picoquic keeps the STOP_SENDING code in `stream->remote_stop_error` and has
+  no public getter, so `src/transport/picoquic_stream_errors.h` reads it from
+  the stream head on the loop thread
+- the session logs the named code when a peer stops a media stream; an unknown
+  code is treated as INTERNAL_ERROR and never closes the session
+
 ## What picoquic already does for us
 
 The current picoquic WebTransport helpers cover a large part of the protocol surface:
