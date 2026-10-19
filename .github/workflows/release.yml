@@ -59,7 +59,24 @@ jobs:
         run: |
           # picotls requires pkg-config at configure time (even on Windows where
           # brotli is absent); install the lightweight pkgconfiglite shim.
-          choco install pkgconfiglite --no-progress -y
+          # The Chocolatey community feed returns 503 now and then, and a failed
+          # choco install does not fail this step, so retry and then check that
+          # pkg-config is there: a missing one otherwise surfaces much later as
+          # "Could NOT find PkgConfig" at configure time.
+          $installed = $false
+          foreach ($attempt in 1..5) {
+            choco install pkgconfiglite --no-progress -y
+            if ($LASTEXITCODE -eq 0 -and (Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+              $installed = $true
+              break
+            }
+            Write-Host "pkgconfiglite install attempt $attempt failed; retrying"
+            Start-Sleep -Seconds (10 * $attempt)
+          }
+          if (-not $installed) {
+            Write-Error "pkg-config is not available: choco install pkgconfiglite failed after 5 attempts"
+            exit 1
+          }
 
           $candidates = @(
             "C:\Program Files\OpenSSL",
