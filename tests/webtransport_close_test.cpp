@@ -1216,8 +1216,8 @@ int main() {
                              }),
                              "expected the server to receive the opted-out client's RESET_STREAM");
                 const auto reset = no_reset_at_server.stream_reset_errors.find(media_stream_id);
-                ok &= expect(reset != no_reset_at_server.stream_reset_errors.end() && reset->second == 0x02,
-                             "expected the RESET_STREAM to carry the WebTransport error code 0x02");
+                ok &= expect(reset != no_reset_at_server.stream_reset_errors.end() && reset->second == webtransport_code_to_http_code(0x02),
+                             "expected the RESET_STREAM to carry the WebTransport error code 0x02, remapped");
             }
         }
         ok &= expect(lenient_client.close(0).ok, "expected opted-out client close to succeed");
