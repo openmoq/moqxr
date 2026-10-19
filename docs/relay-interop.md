@@ -188,6 +188,7 @@ Rows include `pacing_before`, `pacing_after`, `enqueue`, and `served`/`sent` eve
 - `--coalesce-cmaf-chunks` disables that split and falls back to one media object per group
 - when multiple tracks are subscribed, matching objects are served in publish-plan order so time-aligned audio/video stay interleaved
 - `--forward 1` proactively publishes tracks and objects after namespace setup completes
+- a relay may answer `PUBLISH_OK` with forward=0 until a subscriber arrives, then switch the track on with a `REQUEST_UPDATE`: on the control stream for draft 16 (naming the PUBLISH request id), on the PUBLISH request stream for draft 18 and later. The file publish waits for it, up to `--timeout` from the last switch, and replays a track switched on after its first pass from the start of the plan; a looping publish picks it up on its next cycle. Draft 14 and 15 do not wait. A downstream `SUBSCRIBE` that arrives while it waits is served afterwards
 - `--timeout <seconds>` controls how long the publisher waits for inbound `SUBSCRIBE` requests; the default is 30 seconds
 - repeated `--endpoint` options define the ordered failover list; `--retry <count>` is the number of retries after each endpoint's initial attempt
 - `--sni <value>` overrides the TLS SNI sent to the relay, useful when `--endpoint` uses a raw IP address
