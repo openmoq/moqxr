@@ -9028,6 +9028,36 @@ int main() {
     }
 
     {
+        // Draft-16 file-input publish: PUBLISH_OK forward=0 on every track,
+        // then the relay flips forward=1 for the catalog with a control-stream
+        // REQUEST_UPDATE naming the PUBLISH request id (issue #54).
+        MockTransport draft16_file_forward_transport;
+        draft16_file_forward_transport.reads[0].push_back(
+            encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+        queue_publish_ok_responses(draft16_file_forward_transport, DraftVersion::kDraft16, {2, 4}, 0);
+        draft16_file_forward_transport.reads[0].push_back(
+            encode_request_update_message(DraftVersion::kDraft16, 1, 1, 0x10, 2));
+
+        MoqtSession draft16_file_forward_session(
+            draft16_file_forward_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(1));
+        status = draft16_file_forward_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-16 file-forward session connect to succeed");
+
+        const PublishPlan draft16_file_forward_plan =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft16), source_bytes);
+        static_cast<void>(draft16_file_forward_session.publish(draft16_file_forward_plan));
+        ok &= expect(std::any_of(draft16_file_forward_transport.writes.begin(),
+                                 draft16_file_forward_transport.writes.end(),
+                                 [](const auto& write) { return is_data_stream_write(write); }),
+                     "expected draft-16 control-stream REQUEST_UPDATE forward=1 to release the catalog object");
+    }
+
+    {
         MockTransport draft18_priority_update_transport;
         draft18_priority_update_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_priority_update_transport.reads[0].push_back(

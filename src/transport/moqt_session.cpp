@@ -6010,24 +6010,10 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
     std::set<std::uint64_t> request_goaways;
     std::set<std::string> logged_not_forwarding;
     PeerUnidirectionalStreams peer_unidirectional_streams;
-    const auto poll_forward_updates = [&]() -> TransportStatus {
-        const auto uni_status = peer_unidirectional_streams.poll(transport, plan.draft.version);
-        if (!uni_status.ok) return uni_status;
-        const auto control_status = session_control.poll(transport, plan.draft.version, peer_control_stream_id, pending_control_bytes);
-        if (!control_status.ok) return control_status;
-        return poll_retained_publish_request_updates(
-            transport,
-            plan.draft.version,
-                request_goaways,
-            request_id_by_track,
-            publish_stream_ids,
-            pending_publish_request_bytes,
-            terminated_publish_request_ids,
-            peer_request_ids,
-            [&](const std::string& track_name,
-                std::uint64_t request_id,
-                std::uint64_t response_stream_id,
-                const RequestUpdateMessage& update) -> TransportStatus {
+    const auto apply_forward_update = [&](const std::string& track_name,
+                                          std::uint64_t request_id,
+                                          std::uint64_t response_stream_id,
+                                          const RequestUpdateMessage& update) -> TransportStatus {
                 PublishOk& publish_ok = publish_ok_by_request_id.at(request_id);
                 if (update.forward.has_value()) {
                     if (publish_ok.forward == 0 && *update.forward == 1) {
@@ -6052,7 +6038,71 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                     response_stream_id,
                     encode_request_ok_message(plan.draft.version, update.request_id),
                     false);
-            },
+    };
+    // Draft-16 has no PUBLISH request stream: the relay names the PUBLISH
+    // request id as Existing Request ID in a REQUEST_UPDATE on the control
+    // stream (draft-16 section 9.11).
+    const auto poll_draft16_control_updates = [&]() -> TransportStatus {
+        std::vector<std::uint8_t> chunk;
+        bool fin = false;
+        while (true) {
+            const auto read_status = transport.read_stream(control_stream_id, chunk, fin, std::chrono::milliseconds(0));
+            if (!read_status.ok) {
+                if (!no_stream_data(read_status)) return read_status;
+                break;
+            }
+            pending_control_bytes.insert(pending_control_bytes.end(), chunk.begin(), chunk.end());
+            // A FIN here is the peer ending the session, which the publish
+            // loop observes through its own writes; just stop reading.
+            if (fin || chunk.empty()) break;
+        }
+        std::size_t size = 0;
+        while (next_control_message(pending_control_bytes, plan.draft.version, size)) {
+            const std::span<const std::uint8_t> bytes(pending_control_bytes.data(), size);
+            std::size_t offset = 0;
+            std::uint64_t type = 0;
+            if (!decode_moqint(bytes, offset, plan.draft.version, type)) {
+                return protocol_violation(transport, "received invalid control message");
+            }
+            if (type == 0x02) {
+                const auto status = process_draft16_control_request_update(
+                    transport, bytes, control_stream_id, peer_request_ids,
+                    [&](std::uint64_t existing_request_id,
+                        std::uint64_t response_stream_id,
+                        const RequestUpdateMessage& update) -> TransportStatus {
+                        const auto track_it = std::find_if(
+                            request_id_by_track.begin(), request_id_by_track.end(),
+                            [&](const auto& entry) { return entry.second == existing_request_id; });
+                        if (track_it == request_id_by_track.end()) {
+                            return protocol_violation(
+                                transport, "REQUEST_UPDATE specified an invalid existing subscription");
+                        }
+                        return apply_forward_update(track_it->first, existing_request_id, response_stream_id, update);
+                    });
+                if (!status.ok) return status;
+            }
+            pending_control_bytes.erase(pending_control_bytes.begin(), pending_control_bytes.begin() + size);
+        }
+        return TransportStatus::success();
+    };
+    const auto poll_forward_updates = [&]() -> TransportStatus {
+        if (plan.draft.version == DraftVersion::kDraft16) {
+            return poll_draft16_control_updates();
+        }
+        const auto uni_status = peer_unidirectional_streams.poll(transport, plan.draft.version);
+        if (!uni_status.ok) return uni_status;
+        const auto control_status = session_control.poll(transport, plan.draft.version, peer_control_stream_id, pending_control_bytes);
+        if (!control_status.ok) return control_status;
+        return poll_retained_publish_request_updates(
+            transport,
+            plan.draft.version,
+            request_goaways,
+            request_id_by_track,
+            publish_stream_ids,
+            pending_publish_request_bytes,
+            terminated_publish_request_ids,
+            peer_request_ids,
+            apply_forward_update,
             [](const std::string&, std::uint64_t) {});
     };
     const auto any_forwarding = [&]() {
@@ -6063,7 +6113,9 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
     // Blocks (bounded by subscriber_timeout) until some track is switched to
     // forward=1, instead of spinning through objects that cannot be sent.
     const auto await_forward = [&]() -> TransportStatus {
-        if (!is_draft18_or_later(plan.draft.version) || any_forwarding()) {
+        const bool can_receive_updates =
+            is_draft18_or_later(plan.draft.version) || plan.draft.version == DraftVersion::kDraft16;
+        if (!can_receive_updates || any_forwarding()) {
             return TransportStatus::success();
         }
         std::cerr << "[moqt-session] waiting for forward=1 REQUEST_UPDATE on "
