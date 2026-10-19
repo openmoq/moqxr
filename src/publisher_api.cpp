@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <mutex>
 #include <stdexcept>
 #include <sstream>
 #include <set>
@@ -186,6 +187,19 @@ transport::TransportStatus prepare_migration(const transport::TransportStatus& s
 struct Publisher::ActiveSession {
     std::unique_ptr<transport::PublisherTransport> transport;
     std::unique_ptr<transport::MoqtSession> session;
+
+    // Closes the session once. disconnect() can run on another thread while a
+    // publish closes the same session on its failure path, and the transport
+    // frees its QUIC context in close(): a second caller waits for the first
+    // close and gets its status.
+    transport::TransportStatus close(std::uint64_t application_error_code) {
+        std::call_once(close_once_, [&] { close_status_ = session->close(application_error_code); });
+        return close_status_;
+    }
+
+private:
+    std::once_flag close_once_;
+    transport::TransportStatus close_status_ = transport::TransportStatus::success();
 };
 
 Publisher::Publisher(PublisherConfig config, TransportFactory transport_factory)
@@ -346,7 +360,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         const PublishPlan materialized = materialize_publish_plan(prepared.plan, prepared.input_bytes);
         status = active->session->publish(materialized);
         if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
-            static_cast<void>(active->session->close(0));
+            static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
             const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
             if (!migration_status.ok) {
@@ -359,7 +373,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
             const std::string error = "transport publish failed: " + status.message;
             const transport::FailureKind failure_kind =
                 publish_failure_kind(status, *active->transport);
-            static_cast<void>(active->session->close(0));
+            static_cast<void>(active->close(0));
             clear_active_session(active, true, error);
             status.message = error;
             status.failure_kind = failure_kind;
@@ -577,14 +591,14 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
             resume_bytes = active->session->live_resume_bytes();
             const auto next_group_floor = active->session->live_resume_group_floor();
             if (!next_group_floor) {
-                static_cast<void>(active->session->close(0));
+                static_cast<void>(active->close(0));
                 const auto exhausted = transport::TransportStatus::failure("live migration exhausted group IDs");
                 clear_active_session(active, false, exhausted.message);
                 return exhausted;
             }
             resume_group_floor = *next_group_floor;
 
-            static_cast<void>(active->session->close(0));
+            static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
             const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
             if (!migration_status.ok) {
@@ -597,7 +611,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
             const std::string error = "transport live publish failed: " + status.message;
             const transport::FailureKind failure_kind =
                 publish_failure_kind(status, *active->transport);
-            static_cast<void>(active->session->close(0));
+            static_cast<void>(active->close(0));
             clear_active_session(active, true, error);
             status.message = error;
             status.failure_kind = failure_kind;
@@ -768,7 +782,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
             prior_bytes += snapshot.bytes_published;
             prior_objects += snapshot.objects_published;
             prior_groups += snapshot.groups_published;
-            static_cast<void>(active->session->close(0));
+            static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
             const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
             if (!migration_status.ok) {
@@ -788,7 +802,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
             const std::string error = "transport live object publish failed: " + status.message;
             const transport::FailureKind failure_kind =
                 publish_failure_kind(status, *active->transport);
-            static_cast<void>(active->session->close(0));
+            static_cast<void>(active->close(0));
             clear_active_session(active, true, error);
             status.message = error;
             status.failure_kind = failure_kind;
@@ -829,7 +843,7 @@ transport::TransportStatus Publisher::disconnect(std::uint64_t application_error
         stats_.publishing_live = false;
         return transport::TransportStatus::success();
     }
-    const auto status = active->session->close(application_error_code);
+    const auto status = active->close(application_error_code);
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (active_session_ == active) {
         if (active_session_->transport) {

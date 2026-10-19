@@ -3,7 +3,9 @@
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 
 #include <algorithm>
+#include <atomic>
 #include <set>
+#include <thread>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -228,6 +230,107 @@ struct MigrationTransport final : PublisherTransport {
         return TransportStatus::success();
     }
 };
+
+// A transport that completes SETUP and then has nothing to read until it is
+// closed, as picoquic does while a live publish waits for its first
+// subscriber. After close() a read reports the closed connection. close()
+// counts its calls and holds for a moment, as picoquic's close drain does.
+struct ClosingTransport final : PublisherTransport {
+    struct Record {
+        std::atomic<int> close_calls{0};
+        std::atomic<bool> setup_read{false};
+        std::atomic<bool> closed{false};
+    };
+    explicit ClosingTransport(std::shared_ptr<Record> record) : record(std::move(record)) {}
+    std::shared_ptr<Record> record;
+    std::uint64_t next_stream = 0;
+    bool setup_accepted = false;
+    TransportStatus configure(const EndpointConfig&, const TlsConfig&) override { return TransportStatus::success(); }
+    TransportStatus connect() override { return TransportStatus::success(); }
+    ConnectionState state() const override { return ConnectionState::kConnected; }
+    TransportStatus open_stream(StreamDirection, std::uint64_t& stream) override {
+        stream = next_stream;
+        next_stream += 4;
+        return TransportStatus::success();
+    }
+    TransportStatus accept_stream(StreamDirection direction, std::uint64_t& stream,
+                                  std::chrono::milliseconds) override {
+        if (direction == StreamDirection::kUnidirectional && !setup_accepted) {
+            setup_accepted = true;
+            stream = 3;
+            return TransportStatus::success();
+        }
+        return idle();
+    }
+    TransportStatus write_stream(std::uint64_t, std::span<const std::uint8_t>, bool) override {
+        return record->closed ? TransportStatus::failure("transport closed") : TransportStatus::success();
+    }
+    TransportStatus read_stream(std::uint64_t stream, std::vector<std::uint8_t>& bytes, bool& fin,
+                                std::chrono::milliseconds) override {
+        fin = false;
+        if (stream == 3 && !record->setup_read) {
+            bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = DraftVersion::kDraft22});
+            record->setup_read = true;
+            return TransportStatus::success();
+        }
+        return idle();
+    }
+    TransportStatus reset_stream(std::uint64_t, std::uint64_t) override { return TransportStatus::success(); }
+    std::string connection_id() const override { return "closing-test"; }
+    TransportStatus close(std::uint64_t) override {
+        ++record->close_calls;
+        record->closed = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return TransportStatus::success();
+    }
+
+private:
+    TransportStatus idle() {
+        if (record->closed) {
+            return TransportStatus::failure("transport closed");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return TransportStatus::failure("timed out waiting for stream data");
+    }
+};
+
+// disconnect() from another thread interrupts a live publish that waits for
+// its first subscriber. The publish then fails on the closed transport, and
+// its failure path must not close the session a second time: the transport
+// frees its QUIC context in close().
+bool test_disconnect_during_live_publish_closes_once() {
+    bool ok = true;
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft22;
+    config.track_namespace = "app";
+    auto record = std::make_shared<ClosingTransport::Record>();
+    Publisher publisher(config, [record](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        return std::make_unique<ClosingTransport>(record);
+    });
+    LiveObjectSource source{
+        .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}},
+        .next_object = []() -> std::optional<LiveObject> {
+            return LiveObject{.track_name = "video", .payload = {0x00}};
+        },
+    };
+    EndpointConfig endpoint;
+    endpoint.transport = TransportKind::kRawQuic;
+    endpoint.host = "relay.example";
+    endpoint.port = 443;
+
+    std::thread publishing([&] { static_cast<void>(publisher.publish_live_objects(source, endpoint)); });
+    for (int i = 0; i < 2000 && !record->setup_read; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ok &= expect(record->setup_read.load(), "expected the live publish to complete SETUP");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    static_cast<void>(publisher.disconnect(0));
+    publishing.join();
+    ok &= expect(record->close_calls == 1,
+                 "expected one transport close when disconnect() interrupts a live publish, got " +
+                     std::to_string(record->close_calls.load()));
+    return ok;
+}
 
 bool test_goaway_recreates_publisher_transport() {
     bool ok = true;
@@ -544,6 +647,7 @@ bool test_live_stdin_migration_keeps_object_identity() {
 
 int main() {
     bool ok = test_goaway_recreates_publisher_transport();
+    ok &= test_disconnect_during_live_publish_closes_once();
     ok &= test_goaway_migration_bound_and_uri_validation();
     ok &= test_live_source_goaway_continues_and_replays_catalog();
     ok &= test_live_source_goaway_continues_and_replays_catalog(true);
