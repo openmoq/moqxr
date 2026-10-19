@@ -828,6 +828,30 @@ int main() {
     }
 
     {
+        // libmoq runs its own WebTransport client, so the reset_stream_at
+        // opt-out would be silently ignored; it is refused instead.
+        Publisher publisher(PublisherConfig{});  // no injected factory
+
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = []() { return std::nullopt; },
+        };
+
+        EndpointConfig endpoint;
+        endpoint.transport = TransportKind::kWebTransport;
+        endpoint.host = "relay.example.com";
+        endpoint.port = 443;
+        endpoint.path = "/moq";
+        endpoint.path_explicit = true;
+        endpoint.webtransport_allow_missing_reset_stream_at = true;
+
+        const TransportStatus status = publisher.publish_live_objects(source, endpoint);
+        ok &= expect(!status.ok, "expected the reset_stream_at opt-out to fail on the libmoq route");
+        ok &= expect(status.message.find("--webtransport-allow-missing-reset-stream-at") != std::string::npos,
+                     "expected the libmoq route to name the unsupported reset_stream_at opt-out");
+    }
+
+    {
         Publisher publisher(PublisherConfig{});  // no injected factory
 
         LiveObjectSource source{

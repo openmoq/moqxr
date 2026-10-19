@@ -78,6 +78,12 @@ inline std::string describe_webtransport_requirements_failure(const WebTransport
         }
         message += missing[i];
     }
+    // The opt-out only helps when reset_stream_at is the sole gap.
+    if (missing.size() == 1 && peer.settings_received && peer.transport_parameters_known &&
+        !peer.reset_stream_at) {
+        message +=
+            " (use --webtransport-allow-missing-reset-stream-at to connect anyway, or --transport raw)";
+    }
     return message;
 }
 

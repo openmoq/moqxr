@@ -15,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -70,11 +71,14 @@ struct SilentServer {
     bool stop_requested = false;
     bool loop_exited = false;
     bool connect_accepted = false;
+    // Cleared to stand in for relays (moqx, moxygen) that omit reset_stream_at.
+    bool advertise_reset_stream_at = true;
     std::size_t stream_bytes_received = 0;
     std::size_t request_stream_bytes_received = 0;
     bool stream_fin_received = false;
     std::set<std::uint64_t> stream_fins;
     std::map<std::uint64_t, std::uint64_t> stream_reset_errors;
+    std::set<std::uint64_t> streams_with_data;
     std::set<std::uint64_t> stop_sending_stream_ids;
     std::set<std::uint64_t> stop_sending_sent_streams;
     picohttp_server_path_item_t path_item{};
@@ -186,6 +190,9 @@ int silent_path_callback(picoquic_cnx_t* cnx,
             }
         }
         server->stream_bytes_received += length;
+        if (stream_ctx != nullptr && length != 0) {
+            server->streams_with_data.insert(stream_ctx->stream_id);
+        }
         if (stream_ctx != nullptr && length != 0 &&
             server->stop_sending_stream_ids.contains(stream_ctx->stream_id) &&
             !server->stop_sending_sent_streams.contains(stream_ctx->stream_id)) {
@@ -274,6 +281,9 @@ bool start_server(SilentServer& server,
     server.path_item.path_length = 4;
     server.path_item.path_callback = silent_path_callback;
     server.path_item.path_app_ctx = &server;
+    // picoquic serves extended CONNECT only on routes that name the protocol.
+    server.path_item.connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL;
+    server.path_item.connect_protocol_length = std::strlen(H3ZERO_WEBTRANSPORT_H3_PROTOCOL);
     server.params.path_table = &server.path_item;
     server.params.path_table_nb = 1;
 
@@ -288,7 +298,7 @@ bool start_server(SilentServer& server,
     // support and reset_stream_at before they will send the CONNECT.
     picoquic_tp_t tp = *picoquic_get_default_tp(server.quic);
     tp.max_datagram_frame_size = PICOQUIC_MAX_PACKET_SIZE;
-    tp.is_reset_stream_at_enabled = 1;
+    tp.is_reset_stream_at_enabled = server.advertise_reset_stream_at ? 1 : 0;
     if (max_idle_timeout_ms != 0) {
         tp.max_idle_timeout = max_idle_timeout_ms;
     }
@@ -1152,6 +1162,64 @@ int main() {
                      "expected the capsule's reason in the read error, got: " + read_status.message);
         ok &= expect(closing_client.close(0).ok, "expected session-closing client close to succeed");
         stop_server(closing_server);
+    }
+
+    {
+        // A relay that omits reset_stream_at gets no CONNECT unless the
+        // operator opts out; with the opt-out, resets fall back to RESET_STREAM.
+        SilentServer no_reset_at_server;
+        no_reset_at_server.advertise_reset_stream_at = false;
+        ok &= expect(start_server(no_reset_at_server),
+                     "expected reset_stream_at-less webtransport server to start");
+        EndpointConfig no_reset_at_endpoint = endpoint;
+        no_reset_at_endpoint.port = no_reset_at_server.port;
+
+        WebTransportClient strict_client;
+        ok &= expect(strict_client.configure(no_reset_at_endpoint, tls).ok,
+                     "expected strict client configure to succeed");
+        const auto strict_connect = strict_client.connect();
+        ok &= expect(!strict_connect.ok, "expected CONNECT to be withheld without reset_stream_at");
+        ok &= expect(strict_connect.message.find("reset_stream_at") != std::string::npos,
+                     "expected the failure to name reset_stream_at, got: " + strict_connect.message);
+        static_cast<void>(strict_client.close(0));
+
+        no_reset_at_endpoint.webtransport_allow_missing_reset_stream_at = true;
+        WebTransportClient lenient_client;
+        ok &= expect(lenient_client.configure(no_reset_at_endpoint, tls).ok,
+                     "expected opted-out client configure to succeed");
+        const auto lenient_connect = lenient_client.connect();
+        ok &= expect(lenient_connect.ok,
+                     "expected CONNECT with the reset_stream_at opt-out, got: " + lenient_connect.message);
+        if (lenient_connect.ok) {
+            std::uint64_t media_stream_id = 0;
+            ok &= expect(lenient_client.open_stream(StreamDirection::kUnidirectional, media_stream_id).ok,
+                         "expected opted-out client media stream to open");
+            ok &= expect(lenient_client.write_stream(media_stream_id, std::vector<std::uint8_t>{0x04}, false).ok,
+                         "expected opted-out client media write to succeed");
+            // RESET_STREAM discards unsent data, so let the stream's header
+            // arrive first; otherwise the server cannot tie the reset to the session.
+            {
+                std::unique_lock<std::mutex> lock(no_reset_at_server.mutex);
+                ok &= expect(no_reset_at_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                                 return no_reset_at_server.streams_with_data.contains(media_stream_id);
+                             }),
+                             "expected the opted-out client's media bytes to reach the server");
+            }
+            ok &= expect(lenient_client.reset_stream(media_stream_id, 0x02).ok,
+                         "expected opted-out client reset to fall back to RESET_STREAM");
+            {
+                std::unique_lock<std::mutex> lock(no_reset_at_server.mutex);
+                ok &= expect(no_reset_at_server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                                 return no_reset_at_server.stream_reset_errors.contains(media_stream_id);
+                             }),
+                             "expected the server to receive the opted-out client's RESET_STREAM");
+                const auto reset = no_reset_at_server.stream_reset_errors.find(media_stream_id);
+                ok &= expect(reset != no_reset_at_server.stream_reset_errors.end() && reset->second == 0x02,
+                             "expected the RESET_STREAM to carry the WebTransport error code 0x02");
+            }
+        }
+        ok &= expect(lenient_client.close(0).ok, "expected opted-out client close to succeed");
+        stop_server(no_reset_at_server);
     }
     return ok ? 0 : 1;
 }

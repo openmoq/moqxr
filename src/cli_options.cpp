@@ -468,6 +468,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.tls.ca_path = std::string(require_value("--ca"));
         } else if (argument == "--insecure") {
             options.tls.insecure_skip_verify = true;
+        } else if (argument == "--webtransport-allow-missing-reset-stream-at") {
+            options.webtransport_allow_missing_reset_stream_at = true;
         } else if (argument == "--draft") {
             options.draft_version = parse_draft(require_value("--draft"));
         } else if (argument == "--namespace") {
@@ -682,10 +684,20 @@ CliOptions parse_cli_options(int argc, char** argv) {
         options.transport_explicit = true;
     }
 
+    if (options.webtransport_allow_missing_reset_stream_at &&
+        options.transport != transport::TransportKind::kWebTransport) {
+        throw std::runtime_error(
+            "--webtransport-allow-missing-reset-stream-at requires --transport webtransport");
+    }
+
     if (options.endpoint.has_value()) {
         options.endpoint->transport = options.transport;
+        options.endpoint->webtransport_allow_missing_reset_stream_at =
+            options.webtransport_allow_missing_reset_stream_at;
         for (auto& endpoint : options.endpoints) {
             endpoint.transport = options.transport;
+            endpoint.webtransport_allow_missing_reset_stream_at =
+                options.webtransport_allow_missing_reset_stream_at;
         }
     }
     if (options.transport == transport::TransportKind::kWebTransport) {
@@ -739,6 +751,7 @@ std::string build_usage(const char* argv0) {
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
+           " [--webtransport-allow-missing-reset-stream-at]"
            " [--retry <count>]"
            " [--auth-profile c4m-01|moqx-compat|red5-cose-compat] [--auth-token-file <path>]"
            " [--auth-setup-token-file <path>] [--auth-action-token-file <path>] [--auth-token-type <uint>]"

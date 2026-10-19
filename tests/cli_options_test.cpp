@@ -331,7 +331,31 @@ int main() {
         ok &= expect(options.endpoint->transport == openmoq::publisher::transport::TransportKind::kWebTransport,
                      "expected endpoint transport kind to follow the CLI transport selection");
         ok &= expect(options.endpoint->path == "/moq", "expected WebTransport endpoint path to be preserved");
+        ok &= expect(!options.endpoint->webtransport_allow_missing_reset_stream_at,
+                     "expected reset_stream_at to be required by default");
     }
+
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--transport", "webtransport",
+                   "--webtransport-allow-missing-reset-stream-at",
+                   "--endpoint", "https://primary.example.com:443/moq",
+                   "--endpoint", "https://backup.example.com:443/moq"});
+        ok &= expect(options.webtransport_allow_missing_reset_stream_at,
+                     "expected --webtransport-allow-missing-reset-stream-at to be parsed");
+        ok &= expect(options.endpoint->webtransport_allow_missing_reset_stream_at &&
+                         options.endpoints.size() == 2 &&
+                         options.endpoints[0].webtransport_allow_missing_reset_stream_at &&
+                         options.endpoints[1].webtransport_allow_missing_reset_stream_at,
+                     "expected the reset_stream_at opt-out to reach every endpoint");
+    }
+
+    ok &= expect(parse_throws({"openmoq-publisher", "--input", "sample.mp4",
+                               "--webtransport-allow-missing-reset-stream-at",
+                               "--endpoint", "relay.example.com:4433"},
+                              "requires --transport webtransport",
+                              "expected the reset_stream_at opt-out to be rejected on raw QUIC"),
+                 "reset_stream_at opt-out transport gate");
 
     {
         const CliOptions options =

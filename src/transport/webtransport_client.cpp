@@ -106,6 +106,10 @@ struct WebTransportClient::Impl {
     CloseDrainTracker close_drain;
     bool loop_ready = false;
     bool loop_exited = false;
+    // EndpointConfig::webtransport_allow_missing_reset_stream_at, and whether
+    // the peer's transport parameters have been checked against it yet.
+    bool allow_missing_reset_stream_at = false;
+    bool reset_stream_at_checked = false;
     // QUIC error codes mirrored from the packet-loop thread each cycle.
     // picoquic_get_local_error/get_remote_error may only run on the loop
     // thread, so connect()'s failure path reads these caches instead.
@@ -889,6 +893,26 @@ int loop_callback(picoquic_quic_t* quic,
     }
 }
 
+// Runs on the packet-loop thread once the peer's transport parameters are
+// known, before h3zero sees the SETTINGS that release the deferred CONNECT.
+// picoquic withholds that CONNECT unless the peer advertised
+// reset_stream_at, with no way to opt out. When the operator has opted out,
+// mark the parameter as advertised so the CONNECT is sent. picoquic decided
+// whether RESET_STREAM_AT may actually be used (cnx->is_reset_stream_at_enabled)
+// while processing the transport parameters, so that stays off:
+// picowt_reset_stream then fails and apply_reset falls back to RESET_STREAM.
+void allow_missing_reset_stream_at(picoquic_cnx_t* cnx, WebTransportClient::Impl& impl) {
+    if (!impl.allow_missing_reset_stream_at || impl.reset_stream_at_checked) {
+        return;
+    }
+    impl.reset_stream_at_checked = true;
+    std::cerr << "[webtransport-client] warning: relay does not advertise the reset_stream_at "
+                 "transport parameter; proceeding without RESET_STREAM_AT (stream resets use "
+                 "RESET_STREAM)"
+              << std::endl;
+    cnx->remote_parameters.is_reset_stream_at_enabled = 1;
+}
+
 int webtransport_connection_callback(picoquic_cnx_t* cnx,
                                      uint64_t stream_id,
                                      uint8_t* bytes,
@@ -896,6 +920,20 @@ int webtransport_connection_callback(picoquic_cnx_t* cnx,
                                      picoquic_call_back_event_t fin_or_event,
                                      void* callback_ctx,
                                      void* v_stream_ctx) {
+    // Checked ahead of every event: the server may send SETTINGS as 0.5-RTT
+    // data, which h3zero can process before picoquic_callback_almost_ready.
+    // Compliant peers, and opted-out ones once patched, skip the lookup.
+    if (cnx->remote_parameters_received && cnx->remote_parameters.is_reset_stream_at_enabled == 0) {
+        WebTransportClient::Impl* impl = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_connection_impl_mutex);
+            const auto it = g_connection_impls.find(cnx);
+            impl = it == g_connection_impls.end() ? nullptr : it->second;
+        }
+        if (impl != nullptr) {
+            allow_missing_reset_stream_at(cnx, *impl);
+        }
+    }
     if (fin_or_event == picoquic_callback_close || fin_or_event == picoquic_callback_application_close ||
         fin_or_event == picoquic_callback_stateless_reset) {
         WebTransportClient::Impl* impl = nullptr;
@@ -1095,6 +1133,8 @@ TransportStatus WebTransportClient::connect() {
         return TransportStatus::failure("failed to queue webtransport CONNECT request");
     }
 
+    impl_->allow_missing_reset_stream_at = endpoint_->webtransport_allow_missing_reset_stream_at;
+    impl_->reset_stream_at_checked = false;
     register_connection_impl(impl_->cnx, impl_.get());
     picoquic_set_callback(impl_->cnx, webtransport_connection_callback, impl_->h3_ctx);
 

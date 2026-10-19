@@ -275,6 +275,11 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
                         [](const auto& track) { return track.packaging == "loc" || track.packaging == "locmaf"; })) {
             return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
         }
+        // libmoq runs its own WebTransport client, which this opt-out cannot reach.
+        if (endpoint.webtransport_allow_missing_reset_stream_at) {
+            return transport::TransportStatus::failure(
+                "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
+        }
         const transport::EndpointConfig resolved_endpoint =
             resolve_endpoint(endpoint, endpoint_alpn_overridden);
         const PublishPlan materialized =
@@ -406,6 +411,11 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
     if (!transport_factory_injected_ && (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf)) {
         return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
+    }
+    if (!transport_factory_injected_ && ingest.use_stdin && ingest.srt_callers.empty() &&
+        endpoint.webtransport_allow_missing_reset_stream_at) {
+        return transport::TransportStatus::failure(
+            "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
     }
     // Live stdin and SRT publishing prefer the libmoq service tier unless a
     // custom TransportFactory was injected. (publish_live_objects routes to
@@ -634,6 +644,10 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
             std::any_of(source.tracks.begin(), source.tracks.end(),
                         [](const auto& track) { return track.packaging == LivePackaging::kLoc || track.packaging == LivePackaging::kLocmaf; })) {
             return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
+        }
+        if (endpoint.webtransport_allow_missing_reset_stream_at) {
+            return transport::TransportStatus::failure(
+                "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
         }
         for (const auto& track : source.tracks) {
             if (!transport::live_track_has_media_metadata(track)) {

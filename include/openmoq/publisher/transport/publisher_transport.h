@@ -61,6 +61,10 @@ struct EndpointConfig {
     std::string sni;
     std::string path = "/";
     bool path_explicit = false;
+    // WebTransport only: send the CONNECT even when the server omits the
+    // reset_stream_at transport parameter. Stream resets then use plain
+    // RESET_STREAM, so a reset stream's WebTransport header may not arrive.
+    bool webtransport_allow_missing_reset_stream_at = false;
 };
 
 struct TlsConfig {
