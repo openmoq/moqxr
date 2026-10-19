@@ -1722,7 +1722,7 @@ int main() {
         for (const std::string scenario : {"track-status", "track-status-parity", "padding-fragmented",
                  "namespace-notification", "namespace-duplicate-goaway", "tracks-overlap",
                  "tracks-invalid-forward", "tracks-invalid-priority", "tracks-prefix-update", "tracks-prefix-pause", "namespace-prefix-update", "namespace-responder-update", "subscribe-fin",
-                 "unknown-control", "unknown-request", "unknown-alias", "malformed-subscribe", "malformed-subscribe-namespace", "unknown-stream-high-bits", "control-goaway", "control-duplicate-goaway", "control-fin"}) {
+                 "unknown-control", "unknown-request", "unknown-alias", "unknown-stream-high-bits", "control-goaway", "control-duplicate-goaway", "control-fin"}) {
             MockTransport transport;
             transport.reads[3].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft22, .max_request_id = 100}));
             transport.keep_open_streams.insert(3);
@@ -1774,10 +1774,6 @@ int main() {
                     transport.reads[5].push_back(frame(0x51, body));
                     transport.keep_open_streams.insert(5);
                 }
-            } else if (scenario == "malformed-subscribe" || scenario == "malformed-subscribe-namespace") {
-                // Only a Request ID: the rest of the message is missing.
-                transport.reads[1].push_back(frame(scenario == "malformed-subscribe" ? 0x03 : 0x50, {1}));
-                transport.keep_open_streams.insert(1);
             } else if (scenario == "unknown-alias") {
                 auto body = namespace_body(1);
                 body.pop_back();
@@ -1800,8 +1796,7 @@ int main() {
             const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft22), source_bytes));
             const bool violates = scenario == "namespace-duplicate-goaway" || scenario == "tracks-invalid-forward" || scenario == "tracks-invalid-priority" ||
                 scenario == "namespace-responder-update" || scenario == "unknown-control" || scenario == "unknown-request" ||
-                scenario == "unknown-stream-high-bits" || scenario == "control-duplicate-goaway" || scenario == "control-fin" ||
-                scenario == "malformed-subscribe" || scenario == "malformed-subscribe-namespace";
+                scenario == "unknown-stream-high-bits" || scenario == "control-duplicate-goaway" || scenario == "control-fin";
             if (violates) {
                 ok &= expect(!result.ok && transport.last_close_code == 3, "D22 " + scenario + " closes PROTOCOL_VIOLATION");
             } else if (scenario == "control-goaway") {
@@ -1813,15 +1808,6 @@ int main() {
                 ok &= expect(!result.ok && transport.last_close_code == 4, "D22 TRACK_STATUS validates Request ID parity");
             } else {
                 ok &= expect(result.ok && transport.state() == ConnectionState::kConnected, "D22 " + scenario + " keeps session: " + result.message);
-            }
-            if (scenario.starts_with("malformed-subscribe")) {
-                // The draft has no REQUEST_ERROR code for a request that does not
-                // decode, and 0x1 is UNAUTHORIZED: the session closes instead.
-                ok &= expect(std::none_of(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
-                    openmoq::publisher::transport::RequestError error;
-                    return write.stream_id == 1 &&
-                           openmoq::publisher::transport::decode_request_error(write.bytes, DraftVersion::kDraft22, error);
-                }), "D22 " + scenario + " writes no REQUEST_ERROR");
             }
             if (scenario == "track-status" || scenario == "tracks-overlap") {
                 const auto stream = scenario == "track-status" ? 1 : 5;

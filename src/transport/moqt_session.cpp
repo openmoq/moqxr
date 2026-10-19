@@ -4506,9 +4506,13 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (request_type == 0x03) {
                     SubscribeMessage subscribe;
                     if (!decode_subscribe_message(message_bytes, draft, subscribe)) {
-                        // A request that does not decode is a protocol violation. The draft has no
-                        // REQUEST_ERROR code for it, and 0x1 would read as UNAUTHORIZED.
-                        return protocol_violation(transport, "received invalid SUBSCRIBE");
+                        const TransportStatus write_status =
+                            transport.write_stream(request_stream_id,
+                                                   encode_request_error_message(
+                                                       draft, 0, 0x1, 0, "invalid SUBSCRIBE"),
+                                                   true);
+                        return write_status.ok ? protocol_violation(transport, "received invalid SUBSCRIBE")
+                                               : write_status;
                     }
                     const TransportStatus token_status = authorization_token_status(
                         transport, subscribe.malformed_authorization_token,
@@ -4637,9 +4641,13 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (request_type == 0x50) {
                     SubscribeNamespaceMessage subscribe_namespace;
                     if (!decode_subscribe_namespace_message(message_bytes, draft, subscribe_namespace)) {
-                        // A request that does not decode is a protocol violation. The draft has no
-                        // REQUEST_ERROR code for it, and 0x1 would read as UNAUTHORIZED.
-                        return protocol_violation(transport, "received invalid SUBSCRIBE_NAMESPACE");
+                        const TransportStatus write_status =
+                            transport.write_stream(request_stream_id,
+                                                   encode_request_error_message(
+                                                       draft, 0, 0x1, 0, "invalid SUBSCRIBE_NAMESPACE"),
+                                                   true);
+                        return write_status.ok ? protocol_violation(transport, "received invalid SUBSCRIBE_NAMESPACE")
+                                               : write_status;
                     }
                     const TransportStatus token_status = authorization_token_status(
                         transport, subscribe_namespace.malformed_authorization_token,
@@ -9653,9 +9661,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 if (request_type == 0x03) {
                     SubscribeMessage subscribe;
                     if (!decode_subscribe_message(request_bytes, draft_version, subscribe)) {
-                        // A request that does not decode is a protocol violation. The draft has no
-                        // REQUEST_ERROR code for it, and 0x1 would read as UNAUTHORIZED.
-                        return {protocol_violation(transport_, "received invalid SUBSCRIBE"), 0};
+                        TransportStatus write_status =
+                            transport_.write_stream(request_stream_id,
+                                                    encode_request_error_message(
+                                                        draft_version, 0, 0x1, 0, "invalid SUBSCRIBE"),
+                                                    true);
+                        return {write_status.ok ? protocol_violation(transport_, "received invalid SUBSCRIBE")
+                                                : write_status,
+                                0};
                     }
                     const TransportStatus token_status = authorization_token_status(
                         transport_, subscribe.malformed_authorization_token,
@@ -9778,9 +9791,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 if (request_type == 0x50) {
                     SubscribeNamespaceMessage subscribe_namespace;
                     if (!decode_subscribe_namespace_message(request_bytes, draft_version, subscribe_namespace)) {
-                        // A request that does not decode is a protocol violation. The draft has no
-                        // REQUEST_ERROR code for it, and 0x1 would read as UNAUTHORIZED.
-                        return {protocol_violation(transport_, "received invalid SUBSCRIBE_NAMESPACE"), 0};
+                        TransportStatus write_status =
+                            transport_.write_stream(request_stream_id,
+                                                    encode_request_error_message(
+                                                        draft_version, 0, 0x1, 0, "invalid SUBSCRIBE_NAMESPACE"),
+                                                    true);
+                        return {write_status.ok ? protocol_violation(transport_, "received invalid SUBSCRIBE_NAMESPACE")
+                                                : write_status,
+                                0};
                     }
                     const TransportStatus token_status = authorization_token_status(
                         transport_, subscribe_namespace.malformed_authorization_token,
@@ -10929,9 +10947,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 if (request_type == 0x03) {
                     SubscribeMessage subscribe;
                     if (!decode_subscribe_message(request_bytes, draft_version, subscribe)) {
-                        // A request that does not decode is a protocol violation. The draft has no
-                        // REQUEST_ERROR code for it, and 0x1 would read as UNAUTHORIZED.
-                        return protocol_violation(transport_, "received invalid SUBSCRIBE");
+                        TransportStatus write_status =
+                            transport_.write_stream(request_stream_id,
+                                                    encode_request_error_message(
+                                                        draft_version, 0, 0x1, 0, "invalid SUBSCRIBE"),
+                                                    true);
+                        return write_status.ok ? protocol_violation(transport_, "received invalid SUBSCRIBE")
+                                                : write_status;
                     }
                     const TransportStatus token_status = authorization_token_status(
                         transport_, subscribe.malformed_authorization_token,
@@ -10966,9 +10988,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 if (request_type == 0x50) {
                     SubscribeNamespaceMessage subscribe_namespace;
                     if (!decode_subscribe_namespace_message(request_bytes, draft_version, subscribe_namespace)) {
-                        // A request that does not decode is a protocol violation. The draft has no
-                        // REQUEST_ERROR code for it, and 0x1 would read as UNAUTHORIZED.
-                        return protocol_violation(transport_, "received invalid SUBSCRIBE_NAMESPACE");
+                        TransportStatus write_status =
+                            transport_.write_stream(request_stream_id,
+                                                    encode_request_error_message(
+                                                        draft_version, 0, 0x1, 0, "invalid SUBSCRIBE_NAMESPACE"),
+                                                    true);
+                        return write_status.ok ? protocol_violation(transport_, "received invalid SUBSCRIBE_NAMESPACE")
+                                                : write_status;
                     }
                     const TransportStatus token_status = authorization_token_status(
                         transport_, subscribe_namespace.malformed_authorization_token,
