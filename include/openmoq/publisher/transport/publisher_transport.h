@@ -195,6 +195,22 @@ public:
         std::uint64_t stream_id) {
         static_cast<void>(stream_id);
     }
+    // The MoQT stream reset code (draft 18 section 3.3.3) the peer sent with
+    // STOP_SENDING for this media stream, while the peer-stop notification is
+    // unacknowledged. Empty when the transport could not attribute a code,
+    // for example a WebTransport code outside the WT_APPLICATION_ERROR range.
+    virtual std::optional<std::uint64_t> media_stream_peer_stop_error(
+        std::uint64_t stream_id) const {
+        static_cast<void>(stream_id);
+        return std::nullopt;
+    }
+    // The MoQT stream reset code carried by a RESET_STREAM received on this
+    // stream, with the same attribution rules as above.
+    virtual std::optional<std::uint64_t> stream_peer_reset_error(
+        std::uint64_t stream_id) const {
+        static_cast<void>(stream_id);
+        return std::nullopt;
+    }
     virtual TransportStatus close(std::uint64_t application_error_code) = 0;
 };
 

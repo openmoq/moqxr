@@ -1,3 +1,4 @@
+#include "stream_reset_codes.h"
 #include "webtransport_error_codes.h"
 #include "webtransport_requirements.h"
 
@@ -149,6 +150,14 @@ int main() {
         }
         ok &= expect(!http_code_to_webtransport_code(grease).has_value(),
                      "expected a reserved greasing codepoint to be rejected");
+    }
+
+    {
+        using openmoq::publisher::transport::describe_stream_reset_code;
+        ok &= expect(describe_stream_reset_code(0x1) == "CANCELLED(0x1)", "expected CANCELLED to be named");
+        ok &= expect(describe_stream_reset_code(0x12) == "MALFORMED_TRACK(0x12)", "expected a multi-digit code to be named");
+        ok &= expect(describe_stream_reset_code(0x8) == "unknown(0x8)", "expected the unassigned 0x8 to read as unknown");
+        ok &= expect(describe_stream_reset_code(0) == "INTERNAL_ERROR(0x0)", "expected code 0 to be INTERNAL_ERROR");
     }
 
     if (!ok) {

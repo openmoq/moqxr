@@ -83,6 +83,8 @@ struct SilentServer {
     std::set<std::uint64_t> streams_with_data;
     std::set<std::uint64_t> stop_sending_stream_ids;
     std::set<std::uint64_t> stop_sending_sent_streams;
+    // Streams the server resets (with the mapped code) once data arrives on them.
+    std::map<std::uint64_t, std::uint64_t> reset_on_data_streams;
     picohttp_server_path_item_t path_item{};
     picohttp_server_parameters_t params{};
     // When set, answer the client's first application-stream bytes with a
@@ -199,8 +201,18 @@ int silent_path_callback(picoquic_cnx_t* cnx,
             server->stop_sending_stream_ids.contains(stream_ctx->stream_id) &&
             !server->stop_sending_sent_streams.contains(stream_ctx->stream_id)) {
             server->stop_sending_sent_streams.insert(stream_ctx->stream_id);
-            if (picoquic_stop_sending(cnx, stream_ctx->stream_id, 0x01) != 0) {
+            if (picoquic_stop_sending(cnx, stream_ctx->stream_id, webtransport_code_to_http_code(0x01)) != 0) {
                 return -1;
+            }
+        }
+        if (stream_ctx != nullptr && length != 0) {
+            const auto reset_it = server->reset_on_data_streams.find(stream_ctx->stream_id);
+            if (reset_it != server->reset_on_data_streams.end()) {
+                const std::uint64_t reset_code = reset_it->second;
+                server->reset_on_data_streams.erase(reset_it);
+                if (picoquic_reset_stream(cnx, stream_ctx->stream_id, reset_code) != 0) {
+                    return -1;
+                }
             }
         }
         if (stream_ctx != nullptr && stream_ctx->stream_id != 0 &&
@@ -680,6 +692,8 @@ int main() {
         ok &= expect(drain_client->media_stream_peer_stopped(
                          peer_stopped_stream_id),
                      "expected WebTransport peer-stop state to remain queryable");
+        ok &= expect(drain_client->media_stream_peer_stop_error(peer_stopped_stream_id) == std::optional<std::uint64_t>(0x01),
+                     "expected the WebTransport STOP_SENDING code to be mapped back to CANCELLED 0x01");
         const auto peer_stop_snapshot =
             drain_client->media_stream_peer_stop_events();
         ok &= expect(std::find(peer_stop_snapshot.begin(),
@@ -701,6 +715,30 @@ int main() {
                              peer_stopped_stream_id) &&
                          drain_client->peer_stopped_media_stream_count_for_testing() == 0,
                      "expected WebTransport acknowledgement to release retained peer-stop state");
+        ok &= expect(!drain_client->media_stream_peer_stop_error(peer_stopped_stream_id).has_value(),
+                     "expected WebTransport acknowledgement to release the retained STOP_SENDING code");
+
+        {
+            // A RESET_STREAM from the peer arrives with its code mapped back
+            // from the WT_APPLICATION_ERROR range.
+            std::uint64_t reset_stream_id = 0;
+            ok &= expect(drain_client->open_stream(StreamDirection::kBidirectional, reset_stream_id).ok,
+                         "expected peer-reset WebTransport stream open to succeed");
+            {
+                std::lock_guard<std::mutex> lock(server.mutex);
+                server.reset_on_data_streams[reset_stream_id] = webtransport_code_to_http_code(0x03);
+            }
+            ok &= expect(drain_client->write_stream(reset_stream_id, std::vector<std::uint8_t>{0x01}, false).ok,
+                         "expected peer-reset WebTransport stream write to succeed");
+            std::optional<std::uint64_t> peer_reset;
+            const auto reset_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!(peer_reset = drain_client->stream_peer_reset_error(reset_stream_id)).has_value() &&
+                   std::chrono::steady_clock::now() < reset_deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            ok &= expect(peer_reset == std::optional<std::uint64_t>(0x03),
+                         "expected the WebTransport RESET_STREAM code to be mapped back to SESSION_CLOSED 0x03");
+        }
 
         constexpr std::size_t kPeerStopStressCount = 24;
         std::vector<std::uint64_t> peer_stop_stress_streams;

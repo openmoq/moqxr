@@ -35,6 +35,7 @@
 
 #include "tls_verification.h"
 #include "peer_close.h"
+#include "picoquic_stream_errors.h"
 #include "webtransport_error_codes.h"
 #include "webtransport_requirements.h"
 #endif
@@ -67,6 +68,9 @@ struct WebTransportClient::Impl {
     struct ReceivedStreamData {
         std::vector<std::uint8_t> bytes;
         bool fin = false;
+        // MoQT code of a RESET_STREAM from the peer; empty if none was sent
+        // or the WebTransport code could not be mapped back.
+        std::optional<std::uint64_t> reset_error;
     };
 
     struct PendingReset {
@@ -86,6 +90,7 @@ struct WebTransportClient::Impl {
     std::set<std::uint64_t> media_streams_with_pending;
     std::set<std::uint64_t> timed_out_media_streams;
     std::set<std::uint64_t> peer_stopped_media_streams;
+    std::map<std::uint64_t, std::uint64_t> peer_stop_errors;
     std::map<std::uint64_t, ReceivedStreamData> received_streams;
     std::set<std::uint64_t> application_streams;
     std::set<std::uint64_t> accepted_streams;
@@ -792,7 +797,10 @@ int webtransport_callback(picoquic_cnx_t* cnx,
                 impl->subgroup_deadlines.cancel(stream_ctx->stream_id);
                 impl->pending_media_activations.erase(stream_ctx->stream_id);
                 impl->media_streams_with_pending.erase(stream_ctx->stream_id);
-                impl->received_streams[stream_ctx->stream_id].fin = true;
+                auto& received = impl->received_streams[stream_ctx->stream_id];
+                received.fin = true;
+                received.reset_error = http_code_to_webtransport_code(
+                    picoquic_get_remote_stream_error(cnx, stream_ctx->stream_id));
                 impl->condition.notify_all();
             }
             return 0;
@@ -806,6 +814,11 @@ int webtransport_callback(picoquic_cnx_t* cnx,
                 impl->pending_media_activations.erase(stream_id);
                 impl->media_streams_with_pending.erase(stream_id);
                 impl->peer_stopped_media_streams.insert(stream_id);
+                if (const auto code = http_code_to_webtransport_code(picoquic_remote_stop_error(cnx, stream_id))) {
+                    impl->peer_stop_errors.insert_or_assign(stream_id, *code);
+                } else {
+                    impl->peer_stop_errors.erase(stream_id);
+                }
                 impl->pending_resets.push_back(
                     {.stream_id = stream_id,
                      .error_code = kPeerStopErrorCode});
@@ -1025,6 +1038,7 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->media_streams_with_pending.clear();
     impl_->timed_out_media_streams.clear();
     impl_->peer_stopped_media_streams.clear();
+    impl_->peer_stop_errors.clear();
     impl_->received_streams.clear();
     impl_->pending_reliable_stream_priorities.clear();
     impl_->applied_reliable_stream_priorities.clear();
@@ -1726,11 +1740,32 @@ void WebTransportClient::acknowledge_media_stream_peer_stopped(
     if (impl_ != nullptr) {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->peer_stopped_media_streams.erase(stream_id);
+        impl_->peer_stop_errors.erase(stream_id);
         impl_->condition.notify_all();
     }
 #else
     static_cast<void>(stream_id);
 #endif
+}
+
+std::optional<std::uint64_t> WebTransportClient::media_stream_peer_stop_error(
+    std::uint64_t stream_id) const {
+    if (impl_ == nullptr) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->peer_stop_errors.find(stream_id);
+    return it == impl_->peer_stop_errors.end() ? std::nullopt : std::optional<std::uint64_t>(it->second);
+}
+
+std::optional<std::uint64_t> WebTransportClient::stream_peer_reset_error(
+    std::uint64_t stream_id) const {
+    if (impl_ == nullptr) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->received_streams.find(stream_id);
+    return it == impl_->received_streams.end() ? std::nullopt : it->second.reset_error;
 }
 
 std::size_t WebTransportClient::peer_stopped_media_stream_count_for_testing()
