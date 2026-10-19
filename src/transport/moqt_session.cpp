@@ -6001,7 +6001,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
 
     std::map<std::string, SubgroupSenderState> sender_by_track;
     std::map<std::string, PublishedTrack> downgraded_tracks_by_name;
-    const auto pacing_start = std::chrono::steady_clock::now();
+    auto pacing_start = std::chrono::steady_clock::now();
     std::uint64_t first_media_time_us = 0;
     bool first_media_time_set = false;
     std::size_t loop_cycle = 0;
@@ -6149,16 +6149,16 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
         return status;
     }
 
-    while (true) {
-        status = dispatch_peer_stopped_media_streams(transport,
-                                                     sender_by_track);
-        if (!status.ok) {
-            return status;
-        }
-        for (std::size_t object_index = cycle_start_index; object_index < plan.objects.size(); ++object_index) {
+    // Sends one pass over the plan from start_index. Tracks named in
+    // only_tracks are the only ones sent when it is given.
+    const auto run_pass = [&](std::size_t start_index,
+                              const std::set<std::string>* only_tracks) -> TransportStatus {
+        TransportStatus status = TransportStatus::success();
+        for (std::size_t object_index = start_index; object_index < plan.objects.size(); ++object_index) {
             const auto& source_object = plan.objects[object_index];
             const auto track_it = tracks_by_name.find(source_object.track_name);
-            if (track_it == tracks_by_name.end()) {
+            if (track_it == tracks_by_name.end() ||
+                (only_tracks != nullptr && !only_tracks->contains(source_object.track_name))) {
                 continue;
             }
             status = poll_forward_updates();
@@ -6229,6 +6229,19 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                       << '\n';
             trace_csv_write_served("sent", send_seq, trace_elapsed_ms(std::chrono::steady_clock::now()), object);
         }
+        return TransportStatus::success();
+    };
+
+    while (true) {
+        status = dispatch_peer_stopped_media_streams(transport,
+                                                     sender_by_track);
+        if (!status.ok) {
+            return status;
+        }
+        status = run_pass(cycle_start_index, nullptr);
+        if (!status.ok) {
+            return status;
+        }
 
         if (!loop_state.enabled) {
             break;
@@ -6255,6 +6268,64 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             break;
         }
         ++loop_cycle;
+    }
+
+    // A relay answers PUBLISH_OK forward=0 until a subscriber shows up, so a
+    // track can be switched to forward=1 only after its single pass was
+    // skipped. Replay such tracks from the start of the plan. A looping
+    // publish needs none of this: its next cycle picks the track up.
+    if (!loop_state.enabled &&
+        (is_draft18_or_later(plan.draft.version) || plan.draft.version == DraftVersion::kDraft16)) {
+        std::set<std::string> replayed;
+        const auto not_forwarding = [&]() {
+            std::size_t count = 0;
+            for (const auto& track : tracks) {
+                const auto request_id = request_id_by_track.at(track.name);
+                if (!replayed.contains(track.name) && publish_ok_by_request_id.at(request_id).forward == 0 &&
+                    !terminated_publish_request_ids.contains(request_id)) {
+                    ++count;
+                }
+            }
+            return count;
+        };
+        auto deadline = std::chrono::steady_clock::now() + subscriber_timeout;
+        while (not_forwarding() != 0 && std::chrono::steady_clock::now() < deadline) {
+            status = poll_forward_updates();
+            if (!status.ok) {
+                return status;
+            }
+            // A control message that is not an update (a downstream SUBSCRIBE)
+            // is waiting; serve_subscriptions below takes it from here.
+            if (plan.draft.version == DraftVersion::kDraft16 && !pending_control_bytes.empty()) {
+                break;
+            }
+            std::set<std::string> flipped;
+            for (const auto& track : tracks) {
+                const auto request_id = request_id_by_track.at(track.name);
+                if (!replayed.contains(track.name) && publish_ok_by_request_id.at(request_id).forward != 0 &&
+                    downgraded_tracks_by_name.contains(track.name)) {
+                    flipped.insert(track.name);
+                }
+            }
+            if (flipped.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            std::cerr << "[moqt-session] replaying " << flipped.size()
+                      << " track(s) switched to forward=1 after the first pass" << '\n';
+            for (const auto& name : flipped) {
+                downgraded_tracks_by_name.erase(name);
+                replayed.insert(name);
+            }
+            // The replay starts at the head of the plan, so pace it from now.
+            pacing_start = std::chrono::steady_clock::now();
+            first_media_time_set = false;
+            status = run_pass(0, &flipped);
+            if (!status.ok) {
+                return status;
+            }
+            deadline = std::chrono::steady_clock::now() + subscriber_timeout;
+        }
     }
 
     for (const auto& track : tracks) {

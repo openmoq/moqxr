@@ -9088,6 +9088,52 @@ int main() {
     }
 
     {
+        // A second subscriber arrives after the single pass is over: the relay
+        // flips vide_1 to forward=1 only then, and the track is replayed from
+        // the start of the plan instead of the update being lost.
+        MockTransport draft16_late_flip_transport;
+        draft16_late_flip_transport.reads[0].push_back(
+            encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+        queue_publish_ok_responses(draft16_late_flip_transport, DraftVersion::kDraft16, {2, 4}, 0);
+        draft16_late_flip_transport.reads[0].push_back(
+            encode_request_update_message(DraftVersion::kDraft16, 1, 1, 0x10, 2));
+
+        std::size_t control_reads = 0;
+        bool late_update_queued = false;
+        draft16_late_flip_transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            // The first pass polls the control stream a handful of times; the
+            // late-flip wait keeps polling every millisecond after it.
+            if (stream_id != 0 || late_update_queued || ++control_reads < 60) {
+                return;
+            }
+            late_update_queued = true;
+            current.reads[0].push_back(encode_request_update_message(DraftVersion::kDraft16, 3, 1, 0x10, 4));
+        };
+
+        MoqtSession draft16_late_flip_session(
+            draft16_late_flip_transport,
+            std::string(kTestTrackNamespace),
+            true,
+            false,
+            false,
+            std::chrono::seconds(2));
+        status = draft16_late_flip_session.connect(endpoint, tls);
+        ok &= expect(status.ok, "expected draft-16 late-flip session connect to succeed");
+        const PublishPlan draft16_late_flip_plan =
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft16), source_bytes);
+        static_cast<void>(draft16_late_flip_session.publish(draft16_late_flip_plan));
+        ok &= expect(late_update_queued, "expected the late-flip wait to keep polling the control stream");
+        std::set<std::uint64_t> data_streams;
+        for (const auto& write : draft16_late_flip_transport.writes) {
+            if (is_data_stream_write(write)) {
+                data_streams.insert(write.stream_id);
+            }
+        }
+        ok &= expect(data_streams.size() >= 2,
+                     "expected a track switched to forward=1 after the first pass to be replayed");
+    }
+
+    {
         MockTransport draft18_priority_update_transport;
         draft18_priority_update_transport.reads[3].push_back(encode_draft18_setup_response());
         draft18_priority_update_transport.reads[0].push_back(
