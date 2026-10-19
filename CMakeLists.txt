@@ -968,6 +968,7 @@ if(OPENMOQ_BUILD_TESTS)
         )
         target_link_libraries(openmoq-publisher-webtransport-close-tests PRIVATE openmoq_publisher_lib picohttp-core picoquic-log)
         target_include_directories(openmoq-publisher-webtransport-close-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/transport"
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picohttp"
         )

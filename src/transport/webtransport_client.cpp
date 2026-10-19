@@ -35,6 +35,7 @@
 
 #include "tls_verification.h"
 #include "peer_close.h"
+#include "webtransport_error_codes.h"
 #include "webtransport_requirements.h"
 #endif
 
@@ -445,17 +446,20 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
     }
 
     const auto apply_reset = [&](const WebTransportClient::Impl::PendingReset& reset) {
+        // Neither picowt_reset_stream nor the plain RESET_STREAM fallback
+        // remaps the code, so map it into the WT_APPLICATION_ERROR range here.
+        const std::uint64_t wire_error_code = webtransport_code_to_http_code(reset.error_code);
         h3zero_stream_ctx_t* stream_ctx = find_local_stream_context(impl, reset.stream_id);
         if (stream_ctx != nullptr) {
             const int webtransport_result =
-                picowt_reset_stream(impl.cnx, stream_ctx, reset.error_code);
+                picowt_reset_stream(impl.cnx, stream_ctx, wire_error_code);
             if (webtransport_result == 0 ||
                 webtransport_result == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
                 return 0;
             }
         }
         const int fallback_result =
-            picoquic_reset_stream(impl.cnx, reset.stream_id, reset.error_code);
+            picoquic_reset_stream(impl.cnx, reset.stream_id, wire_error_code);
         return fallback_result == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED
                    ? 0
                    : fallback_result;
