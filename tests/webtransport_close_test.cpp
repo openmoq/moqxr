@@ -10,6 +10,7 @@
 // asserts close() completes in bounded time.
 
 #include "openmoq/publisher/transport/webtransport_client.h"
+#include "webtransport_error_codes.h"
 
 #include <array>
 #include <chrono>
@@ -49,6 +50,7 @@ using openmoq::publisher::transport::StreamDirection;
 using openmoq::publisher::transport::TlsConfig;
 using openmoq::publisher::transport::TransportKind;
 using openmoq::publisher::transport::WebTransportClient;
+using openmoq::publisher::transport::webtransport_code_to_http_code;
 
 constexpr const char* kPicoquicSourceDir = OPENMOQ_PICOQUIC_SOURCE_DIR;
 
@@ -657,7 +659,7 @@ int main() {
             const auto reset =
                 server.stream_reset_errors.find(peer_stopped_stream_id);
             if (reset != server.stream_reset_errors.end()) {
-                ok &= expect(reset->second == 0x01,
+                ok &= expect(reset->second == webtransport_code_to_http_code(0x01),
                              "expected WebTransport peer-stop reset error CANCELLED 0x01");
             }
             ok &= expect(server.stream_bytes_received - bytes_before_stop <
@@ -880,7 +882,7 @@ int main() {
                          "expected the webtransport subgroup timer to reset its stream");
             const auto reset = server.stream_reset_errors.find(timeout_stream_id);
             if (reset != server.stream_reset_errors.end()) {
-                ok &= expect(reset->second == 0x02,
+                ok &= expect(reset->second == webtransport_code_to_http_code(0x02),
                              "expected webtransport timer-wins reset error 0x02");
             }
         }
@@ -963,7 +965,7 @@ int main() {
             const auto reset =
                 server.stream_reset_errors.find(close_expired_stream_id);
             ok &= expect(reset != server.stream_reset_errors.end() &&
-                             reset->second == 0x02,
+                             reset->second == webtransport_code_to_http_code(0x02),
                          "expected activation-time WebTransport expiry reset before connection close");
         }
     }

@@ -1,3 +1,4 @@
+#include "webtransport_error_codes.h"
 #include "webtransport_requirements.h"
 
 #include <iostream>
@@ -105,6 +106,37 @@ int main() {
         const auto missing = missing_webtransport_requirements(peer);
         ok &= expect(missing.size() == 1 && missing[0] == "server transport parameters",
                      "expected unknown transport parameters to be reported instead of each field");
+    }
+
+    {
+        using openmoq::publisher::transport::http_code_to_webtransport_code;
+        using openmoq::publisher::transport::webtransport_code_to_http_code;
+        // draft-ietf-webtrans-http3-16 section 4.4: the range ends map to the
+        // range ends, and codes either side of a greasing codepoint skip it.
+        ok &= expect(webtransport_code_to_http_code(0) == 0x52e4a40fa8dbULL, "expected code 0 to map to the range start");
+        ok &= expect(webtransport_code_to_http_code(0xffffffffULL) == 0x52e5ac983162ULL,
+                     "expected code 0xffffffff to map to the range end");
+        ok &= expect(webtransport_code_to_http_code(0x1d) + 2 == webtransport_code_to_http_code(0x1e),
+                     "expected the mapping to skip one codepoint across 0x1e");
+        ok &= expect(webtransport_code_to_http_code(0x1ffffffffULL) == webtransport_code_to_http_code(0xffffffffULL),
+                     "expected a code above 32 bits to clamp to the maximum");
+        bool round_trips = true;
+        for (std::uint64_t code = 0; code < 100000; ++code) {
+            const auto back = http_code_to_webtransport_code(webtransport_code_to_http_code(code));
+            round_trips = round_trips && back.has_value() && *back == code;
+        }
+        ok &= expect(round_trips, "expected mapped codes to round-trip");
+        ok &= expect(!http_code_to_webtransport_code(0x52e4a40fa8daULL).has_value() &&
+                         !http_code_to_webtransport_code(0x52e5ac983163ULL).has_value() &&
+                         !http_code_to_webtransport_code(0x01).has_value(),
+                     "expected codes outside the WT_APPLICATION_ERROR range to be rejected");
+        // First greasing codepoint (0x1f * N + 0x21) at or above the range start.
+        std::uint64_t grease = 0x52e4a40fa8dbULL;
+        while ((grease - 0x21ULL) % 0x1fULL != 0) {
+            ++grease;
+        }
+        ok &= expect(!http_code_to_webtransport_code(grease).has_value(),
+                     "expected a reserved greasing codepoint to be rejected");
     }
 
     if (!ok) {
