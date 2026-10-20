@@ -11487,6 +11487,18 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     "ends_broadcast is only valid on the catalog track: " + next->track_name);
             }
             closing_catalog = std::move(*next);
+            // The closing catalog must be the source's last object; fail on
+            // one more rather than drop it silently.
+            try {
+                next = source.next_object();
+            } catch (const std::runtime_error& error) {
+                return TransportStatus::failure(
+                    std::string("live object source failed: ") + error.what());
+            }
+            if (next.has_value()) {
+                return TransportStatus::failure(
+                    "live object after ends_broadcast on track: " + next->track_name);
+            }
             source_eof = true;
             break;
         }
