@@ -11286,6 +11286,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     std::set<std::string> loc_waiting_for_group;
     bool live_object_catalog_sent = !alias_by_track.contains("catalog");
     std::optional<openmoq::publisher::LiveObject> retained_source_catalog;
+    // The source's MSF 11.3 closing catalog, held back until the media
+    // tracks are done (see the post-loop flush).
+    std::optional<openmoq::publisher::LiveObject> closing_catalog;
     std::size_t served_catalog_subscription_count = 0;
     const bool has_media_tracks = std::any_of(alias_by_track.begin(), alias_by_track.end(),
                                               [](const auto& entry) { return entry.first != "catalog"; });
@@ -11478,6 +11481,15 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                  next->track_name,
                                  next->group_id,
                                  next->object_id);
+        if (next->ends_broadcast) {
+            if (next->track_name != "catalog") {
+                return TransportStatus::failure(
+                    "ends_broadcast is only valid on the catalog track: " + next->track_name);
+            }
+            closing_catalog = std::move(*next);
+            source_eof = true;
+            break;
+        }
         if (next->track_name == "catalog") {
             retained_source_catalog = std::move(*next);
             if (draft_version == DraftVersion::kDraft22) {
@@ -11684,20 +11696,89 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
     }
 
-    for (const auto& [request_id, subscribe] : active_subscriptions) {
+    // Sends PUBLISH_DONE on the catalog track or on the media tracks. Returns
+    // a status only when the flush must stop there.
+    const auto send_publish_dones = [&](bool catalog_track) -> std::optional<TransportStatus> {
+        for (const auto& [request_id, subscribe] : active_subscriptions) {
+            if ((subscribe.track_name == "catalog") != catalog_track) {
+                continue;
+            }
+            if (flush_budget_exhausted()) {
+                return finish_after_media_event_dispatch(
+                    transport_, sender_by_track, TransportStatus::success());
+            }
+            const auto stream_it = active_subscription_stream_ids.find(request_id);
+            const std::uint64_t response_stream_id =
+                uses_request_streams(draft_version) && stream_it != active_subscription_stream_ids.end()
+                    ? stream_it->second
+                    : control_stream_id_;
+            status = transport_.write_stream(response_stream_id,
+                                             encode_publish_done_message(
+                                                 draft_version, request_id, sender_by_track[subscribe.track_name].stream_count()),
+                                             false);
+            if (!status.ok) {
+                return stopping()
+                           ? finish_after_media_event_dispatch(
+                                 transport_, sender_by_track,
+                                 TransportStatus::success())
+                           : status;
+            }
+        }
+        for (const auto& [track_name, request_id] : published_track_request_ids) {
+            if ((track_name == "catalog") != catalog_track) {
+                continue;
+            }
+            if (terminated_publish_request_ids.contains(request_id)) {
+                continue;
+            }
+            if (flush_budget_exhausted()) {
+                return finish_after_media_event_dispatch(
+                    transport_, sender_by_track, TransportStatus::success());
+            }
+            status = write_publish_done_for_request(transport_,
+                                                    draft_version,
+                                                    control_stream_id_,
+                                                    publish_stream_id_by_request_id_,
+                                                    request_id,
+                                                    sender_by_track[track_name].stream_count());
+            if (!status.ok) {
+                return stopping()
+                           ? finish_after_media_event_dispatch(
+                                 transport_, sender_by_track,
+                                 TransportStatus::success())
+                           : status;
+            }
+            publish_stream_id_by_request_id_.erase(request_id);
+        }
+        return std::nullopt;
+    };
+
+    // MSF 11.3 order: PUBLISH_DONE on the media tracks, then the source's
+    // closing catalog, then PUBLISH_DONE on the catalog track. The order is
+    // only the send order: PUBLISH_DONE and the objects travel on separate
+    // streams, so a receiver must still deliver a track until its PUBLISH_DONE.
+    if (const auto stop_status = send_publish_dones(false)) {
+        return *stop_status;
+    }
+    if (closing_catalog.has_value()) {
         if (flush_budget_exhausted()) {
             return finish_after_media_event_dispatch(
                 transport_, sender_by_track, TransportStatus::success());
         }
-        const auto stream_it = active_subscription_stream_ids.find(request_id);
-        const std::uint64_t response_stream_id =
-            uses_request_streams(draft_version) && stream_it != active_subscription_stream_ids.end()
-                ? stream_it->second
-                : control_stream_id_;
-        status = transport_.write_stream(response_stream_id,
-                                         encode_publish_done_message(
-                                             draft_version, request_id, sender_by_track[subscribe.track_name].stream_count()),
-                                         false);
+        // The closing catalog must reach subscribers already served an
+        // earlier catalog, so clear the served state on every draft.
+        retained_source_catalog = std::move(closing_catalog);
+        closing_catalog.reset();
+        live_object_catalog_sent = false;
+        served_catalog_subscription_count = 0;
+        status = send_retained_catalog();
+        if (status.ok) {
+            status = sender_by_track["catalog"].finish_group(
+                transport_,
+                draft_version,
+                effective_delivery_timeouts("catalog"),
+                now_function_);
+        }
         if (!status.ok) {
             return stopping()
                        ? finish_after_media_event_dispatch(
@@ -11706,28 +11787,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                        : status;
         }
     }
-    for (const auto& [track_name, request_id] : published_track_request_ids) {
-        if (terminated_publish_request_ids.contains(request_id)) {
-            continue;
-        }
-        if (flush_budget_exhausted()) {
-            return finish_after_media_event_dispatch(
-                transport_, sender_by_track, TransportStatus::success());
-        }
-        status = write_publish_done_for_request(transport_,
-                                                draft_version,
-                                                control_stream_id_,
-                                                publish_stream_id_by_request_id_,
-                                                request_id,
-                                                sender_by_track[track_name].stream_count());
-        if (!status.ok) {
-            return stopping()
-                       ? finish_after_media_event_dispatch(
-                             transport_, sender_by_track,
-                             TransportStatus::success())
-                       : status;
-        }
-        publish_stream_id_by_request_id_.erase(request_id);
+    if (const auto stop_status = send_publish_dones(true)) {
+        return *stop_status;
     }
 
     if (flush_budget_exhausted()) {
