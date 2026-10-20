@@ -8904,6 +8904,68 @@ int main() {
     }
 
     {
+        // MSF 11.3 on draft 16, where every SUBSCRIBE and its PUBLISH_DONE share
+        // the control stream: the closing catalog must still reach a catalog
+        // subscriber that was already served, between the media and catalog
+        // PUBLISH_DONE messages.
+        constexpr DraftVersion draft = DraftVersion::kDraft16;
+        MockTransport transport;
+        transport.keep_open_streams.insert(0);
+        queue_draft16_scheduling_prefix(transport);
+        std::vector<std::uint8_t> subscriptions =
+            encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+        append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+        transport.reads[0].push_back(std::move(subscriptions));
+        const std::vector<std::uint8_t> closing_payload = {'E', 'N', 'D', 'C', 'A', 'T'};
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C', 'A', 'T'}},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "catalog", .group_id = 1, .payload = closing_payload, .ends_broadcast = true},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-16 closing-catalog connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected draft-16 closing-catalog publish to succeed: " + status.message);
+
+        const auto media_done_bytes = openmoq::publisher::transport::encode_publish_done_message(draft, 3, 2);
+        const auto catalog_done_bytes = openmoq::publisher::transport::encode_publish_done_message(draft, 1, 2);
+        std::optional<std::size_t> media_done;
+        std::optional<std::size_t> catalog_done;
+        std::optional<std::size_t> closing_write;
+        for (std::size_t index = 0; index < transport.writes.size(); ++index) {
+            const auto& write = transport.writes[index];
+            if (write.bytes == media_done_bytes && !media_done) {
+                media_done = index;
+            }
+            if (write.bytes == catalog_done_bytes && !catalog_done) {
+                catalog_done = index;
+            }
+            if (!closing_write &&
+                std::search(write.bytes.begin(), write.bytes.end(), closing_payload.begin(), closing_payload.end()) !=
+                    write.bytes.end()) {
+                closing_write = index;
+            }
+        }
+        ok &= expect(media_done && closing_write && catalog_done &&
+                         *media_done < *closing_write && *closing_write < *catalog_done,
+                     "expected draft-16 media PUBLISH_DONE, then the closing catalog, then the catalog PUBLISH_DONE");
+        ok &= expect(session.publish_stats().objects_published == 4,
+                     "expected draft-16 to publish both catalogs and both media objects");
+    }
+
+    {
         // ends_broadcast is only meaningful on the catalog track.
         constexpr DraftVersion draft = DraftVersion::kDraft22;
         MockTransport transport;
