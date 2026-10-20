@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cat4moq.h"
 #include "cat4moq_wire_test_utils.h"
@@ -1719,11 +1720,11 @@ int main() {
         const auto namespace_body = [](std::uint8_t id, std::uint8_t params = 0) {
             return std::vector<std::uint8_t>{id, 1, 7, 'i','n','t','e','r','o','p', params};
         };
-        for (const std::string scenario : {"track-status", "track-status-parity", "padding-fragmented",
+        std::fprintf(stderr, "SCENARIOS\n"); for (const std::string scenario : {"track-status", "track-status-parity", "padding-fragmented",
                  "namespace-notification", "namespace-duplicate-goaway", "tracks-overlap",
                  "tracks-invalid-forward", "tracks-invalid-priority", "tracks-prefix-update", "tracks-prefix-pause", "namespace-prefix-update", "namespace-responder-update", "subscribe-fin",
                  "unknown-control", "unknown-request", "unknown-alias", "malformed-subscribe", "malformed-subscribe-namespace", "unknown-stream-high-bits", "control-goaway", "control-duplicate-goaway", "control-fin"}) {
-            MockTransport transport;
+            std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
             transport.reads[3].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft22, .max_request_id = 100}));
             transport.keep_open_streams.insert(3);
             transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft22, 0));
@@ -1858,7 +1859,7 @@ int main() {
     {
         // Draft-21 LOCATION_FILTER {StartGroup=1, StartObject=0, EndGroupDelta=0,
         // EndObject=1} is inclusive of {1,1} and excludes later objects.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
@@ -1887,7 +1888,7 @@ int main() {
     }
 
     for (int property_case = 0; property_case < 4; ++property_case) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -1954,7 +1955,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.on_try_write_object =
             [](MockTransport&,
@@ -2025,7 +2026,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.failing_reset_streams.insert(2);
         transport.on_try_write_object =
@@ -2086,7 +2087,7 @@ int main() {
               DraftVersion::kDraft16, 3, 0, 0x10, 1),
           encode_request_update_filter_message(
               DraftVersion::kDraft16, 3, 1, 0x03, 2, 0)}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.keep_open_streams.insert(0);
         transport.reads[0].push_back(update);
@@ -2131,7 +2132,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.keep_open_streams.insert(0);
         std::vector<std::uint8_t> updates = encode_request_update_message(
@@ -2186,7 +2187,7 @@ int main() {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now =
             Clock::time_point{} + std::chrono::milliseconds(1);
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.on_try_write_object =
             [](MockTransport&,
@@ -2215,7 +2216,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "publisher-low", 1,
@@ -2258,7 +2259,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "low", 1, DraftVersion::kDraft16,
@@ -2296,7 +2297,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -2325,7 +2326,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -2361,7 +2362,7 @@ int main() {
         // 4th and 5th object (media_time 450). With real-deadline tie-break,
         // "audio" must be served exactly where its deadline falls in the
         // interleave, not only after every video object has drained.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "video", 1, DraftVersion::kDraft16,
@@ -2412,7 +2413,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "ascending", 1, DraftVersion::kDraft16,
@@ -2452,7 +2453,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -2481,7 +2482,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -2512,7 +2513,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "high", 1, DraftVersion::kDraft16,
@@ -2578,7 +2579,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -2624,7 +2625,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "blocked-high", 1, DraftVersion::kDraft16,
@@ -2686,7 +2687,7 @@ int main() {
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         if (draft == DraftVersion::kDraft16) {
             queue_draft16_scheduling_prefix(transport);
             transport.reads[0].push_back(encode_subscribe_message(
@@ -2791,7 +2792,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "scale", 1, DraftVersion::kDraft16,
@@ -2826,7 +2827,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "loop", 1, DraftVersion::kDraft16,
@@ -2874,7 +2875,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -2961,7 +2962,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -3078,7 +3079,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -3176,7 +3177,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft14, DraftVersion::kDraft17}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         if (draft == DraftVersion::kDraft14) {
             transport.reads[0].push_back(encode_server_setup_message({
                 .draft = draft,
@@ -3223,7 +3224,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "high", 1, DraftVersion::kDraft16,
@@ -3272,7 +3273,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -3322,7 +3323,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -3373,7 +3374,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -3429,7 +3430,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -3488,7 +3489,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -3540,7 +3541,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -3595,7 +3596,7 @@ int main() {
     {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -3649,7 +3650,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -3677,7 +3678,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -3749,7 +3750,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16,
@@ -3787,7 +3788,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
         const std::uint64_t update_request_id =
@@ -3856,7 +3857,7 @@ int main() {
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         for (const std::uint64_t parameter_type : {0x03ULL, 0x21ULL}) {
-            MockTransport transport;
+            std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
             const std::uint64_t subscription_request_id =
                 draft == DraftVersion::kDraft16 ? 1 : 91;
             const std::uint64_t update_request_id =
@@ -3923,7 +3924,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         const std::uint64_t subscription_request_id =
             draft == DraftVersion::kDraft16 ? 1 : 91;
         const std::uint64_t update_request_id =
@@ -3986,7 +3987,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -4024,7 +4025,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -4070,7 +4071,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -4134,7 +4135,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -4182,7 +4183,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -4240,7 +4241,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         const std::uint64_t request_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
         if (draft == DraftVersion::kDraft16) {
@@ -4307,7 +4308,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
@@ -4350,7 +4351,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -4402,7 +4403,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             2, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16));
@@ -4420,7 +4421,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -4452,7 +4453,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -4505,7 +4506,7 @@ int main() {
     {
         // Draft-21: raising only EndObject within the same End Group extends the
         // subscription end (§9.5.1), so REQUEST_OK must carry LARGEST_OBJECT.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
@@ -4552,7 +4553,7 @@ int main() {
         const openmoq::publisher::transport::NowFunction clock = [ticks, origin] {
             return origin + std::chrono::milliseconds(ticks->fetch_add(1));
         };
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.write_clock = [ticks, origin] { return origin + std::chrono::milliseconds(ticks->load()); };
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
@@ -4586,7 +4587,7 @@ int main() {
         // VOD ack site: an end-extending REQUEST_UPDATE reports LARGEST_OBJECT,
         // so FILL_PARAMETERS on it must open, then reset, a fill fetch stream.
         constexpr DraftVersion draft = DraftVersion::kDraft21;
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
@@ -4639,7 +4640,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             3, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16));
@@ -4657,7 +4658,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             101, kTestTrackNamespace, "events", 0, DraftVersion::kDraft16));
@@ -4675,7 +4676,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -4702,7 +4703,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -4731,7 +4732,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "events", 1, DraftVersion::kDraft16,
@@ -4759,7 +4760,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_setup_message({
             .draft = DraftVersion::kDraft17,
         }));
@@ -4786,7 +4787,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -4883,7 +4884,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -4934,7 +4935,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -4986,7 +4987,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 12,
@@ -5029,7 +5030,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 12,
@@ -5081,7 +5082,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -5113,7 +5114,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -5151,7 +5152,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -5226,7 +5227,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -5264,7 +5265,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -5293,7 +5294,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -5343,7 +5344,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -5390,7 +5391,7 @@ int main() {
     // long the transport may hold close() while the last objects drain
     // (draft -16 9.15 / -18 10.11); the session hands it to the transport.
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
             .max_request_id = 8,
@@ -5418,7 +5419,7 @@ int main() {
         // remembered rather than reopened on a fresh stream.
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
             .max_request_id = 8,
@@ -5481,7 +5482,7 @@ int main() {
         // stalled admission still expires at its earlier 100 ms deadline.
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -5545,7 +5546,7 @@ int main() {
         // object while it waits behind that predecessor.
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -5594,7 +5595,7 @@ int main() {
         // per-stream state before writing: the expired subgroup is retired
         // without failing the subscription, while an independent subgroup
         // still publishes and the later expired-key object stays suppressed.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
             .max_request_id = 8,
@@ -5635,7 +5636,7 @@ int main() {
         // pre-admission query, then expires while try_write_object decides its
         // result. The post-failure query must distinguish timeout from a
         // terminal transport failure and let another subgroup continue.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
             .max_request_id = 8,
@@ -5683,7 +5684,7 @@ int main() {
         // STOP_SENDING retires only the affected subgroup and must remain
         // visible after the backend discards its queued bytes.  Later objects
         // in that subgroup are suppressed, while another subgroup continues.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
             .max_request_id = 8,
@@ -5727,7 +5728,7 @@ int main() {
         // Draft-18 explicitly permits renewed delivery after a Forward 0->1
         // REQUEST_UPDATE.  The stopped QUIC stream remains retired; the next
         // object in that subgroup is admitted on a fresh stream.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -5778,7 +5779,7 @@ int main() {
     {
         // Forward renewal removes only the renewable peer-stop reason. A
         // normally FIN-completed subgroup remains permanently closed.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -5829,7 +5830,7 @@ int main() {
         // sender-local stream-key scans cannot see them after FIN.  The last
         // event is delivered immediately before close to cover the
         // callback-quiesced shutdown drain as well.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1,
@@ -5895,7 +5896,7 @@ int main() {
         // erased its stream-to-subgroup key.  The session-wide snapshot must
         // still drain each ownerless event while publishing, plus the final
         // event during close, rather than retaining stream IDs indefinitely.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1,
@@ -5957,7 +5958,7 @@ int main() {
         // Once a FIN is accepted the subgroup is permanently complete. A
         // duplicate late application publication for that exact key must not
         // open a second stream; an intervening subgroup remains unaffected.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16,
             .max_request_id = 8,
@@ -5987,7 +5988,7 @@ int main() {
         // IDs, although the scheduler can visit them in either negotiated
         // direction and the source plan itself can be out of order. Exact
         // completion ranges must stay compact without changing admissions.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "retention", 1,
@@ -6035,7 +6036,7 @@ int main() {
         // Peer-stopped keys use their own compact range history so a long
         // request remains bounded until a draft-18 renewal clears that
         // reason; they must not accumulate one exact Key allocation per FIN.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "peer-retention", 1,
@@ -6094,7 +6095,7 @@ int main() {
         // fail explicitly rather than reopen a duplicate or grow without
         // bound. Storage instrumentation counts both outer-map and range
         // nodes, not only the logical range counter.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         queue_draft16_scheduling_prefix(transport);
         transport.reads[0].push_back(encode_subscribe_message(
             1, kTestTrackNamespace, "sparse-retention", 1,
@@ -6144,7 +6145,7 @@ int main() {
         // action: there is no subsequent serve or finish_group call available
         // to surface sparse completion-history exhaustion. Dispatch must both
         // acknowledge that event and return the sticky terminal failure.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         transport.on_try_write_object =
             [expire_streams](MockTransport& current,
@@ -6229,7 +6230,7 @@ int main() {
             if (resource.track_name == "vide_1") return Credential{{0xa4}};
             throw std::runtime_error("secret credential must not be logged");
         };
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
         queue_publish_ok_responses(transport, DraftVersion::kDraft16, {2, 4});
         MoqtSession session(transport, "org/stream", true, false, false, false, std::chrono::seconds(30), auth);
@@ -6284,7 +6285,7 @@ int main() {
             bound.setup_credential = Credential{{0xa1}};
             bound.action_credential = Credential{{0xa2}};
             bound.dpop_signer = DpopSigner::from_pem(kDpopTestKeyPem);
-            MockTransport transport;
+            std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
             transport.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
             queue_publish_ok_responses(transport, DraftVersion::kDraft16, {2, 4});
             MoqtSession session(transport, "org/stream", true, false, false, false, std::chrono::seconds(30), bound);
@@ -6908,7 +6909,7 @@ int main() {
     {
         // Draft-21 reserves 0x1E ("PUBLISH_OK in <= 17"); PUBLISH is answered with
         // REQUEST_OK, so a 0x1E response on the PUBLISH stream is a violation.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
         std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
@@ -6935,7 +6936,7 @@ int main() {
         // A draft-21 SUBSCRIBE_TRACKS may carry a LOCATION_FILTER for the tracks
         // it publishes (§9.18.1, §3.5). Rather than over-deliver, this publisher
         // declines it with REQUEST_ERROR NOT_SUPPORTED and keeps the session.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
         std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
@@ -6977,7 +6978,7 @@ int main() {
     {
         // A {0,0} Next Object LOCATION_FILTER matches PUBLISH's own delivery start
         // (§9.8: "Delivery starts at the Next Object"), so it is accepted.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft21, 0));
         std::vector<std::uint8_t> payload = encode_moqint(DraftVersion::kDraft21, 91);
@@ -7106,7 +7107,7 @@ int main() {
     for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         const std::string draft_name = draft == DraftVersion::kDraft18 ? "draft-18" : "draft-21";
         const auto run_missing_request = [&](bool namespace_request) {
-            MockTransport transport;
+            std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
             transport.reads[3].push_back(draft == DraftVersion::kDraft18
                                              ? encode_draft18_setup_response()
                                              : encode_server_setup_message({.draft = draft, .max_request_id = 32}));
@@ -7140,7 +7141,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
         transport.reads[1].push_back(
@@ -7168,7 +7169,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
         transport.reads[1].push_back(
@@ -7770,7 +7771,7 @@ int main() {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
         bool final_catalog_phase = false;
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.missing_read_error = "timed out waiting for stream data";
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
@@ -8330,7 +8331,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -8363,7 +8364,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
         if (draft == DraftVersion::kDraft16) {
@@ -8475,7 +8476,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(0);
         queue_draft16_scheduling_prefix(transport);
         std::vector<std::uint8_t> subscriptions = encode_subscribe_message(
@@ -8533,7 +8534,7 @@ int main() {
 
     for (const DraftVersion draft :
          {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         const std::uint64_t response_stream_id =
             draft == DraftVersion::kDraft16 ? 0 : 1;
         if (draft == DraftVersion::kDraft16) {
@@ -8619,7 +8620,7 @@ int main() {
         // fetchable history the publisher signals failure by resetting it right
         // after the FETCH_HEADER. Forward=0 opens nothing.
         constexpr DraftVersion draft = DraftVersion::kDraft21;
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
@@ -8683,7 +8684,7 @@ int main() {
             // gets a fill fetch stream that is opened and reset. Draft-18 keeps
             // omitting LARGEST_OBJECT.
             const bool draft21 = openmoq::publisher::is_draft21_or_later(draft);
-            MockTransport transport;
+            std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
             transport.keep_open_streams.insert(1);
             transport.keep_open_streams.insert(5);
             transport.reads[3].push_back(encode_draft18_setup_response());
@@ -8781,7 +8782,7 @@ int main() {
         // catalog SUBSCRIBE_OK omits LARGEST_OBJECT even after the catalog was
         // sent; otherwise a Next Object filter would drop that re-send.
         constexpr DraftVersion draft = DraftVersion::kDraft21;
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.keep_open_streams.insert(5);
         transport.reads[3].push_back(encode_draft18_setup_response());
@@ -8833,7 +8834,7 @@ int main() {
         // §3.4.1: fill failure never affects the subscription, so a fill stream
         // that cannot even be opened must not end the session.
         constexpr DraftVersion draft = DraftVersion::kDraft21;
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.keep_open_streams.insert(1);
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
@@ -8864,7 +8865,7 @@ int main() {
     }
 
     for (const bool coalesced : {false, true}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -9229,7 +9230,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -9269,7 +9270,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -9575,7 +9576,7 @@ int main() {
     }
 
     for (int invalid = 0; invalid < 4; ++invalid) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
         transport.reads[4].push_back(encode_publish_ok_message(DraftVersion::kDraft18, 2, 1));
@@ -9602,7 +9603,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         MoqtSession session(transport);
         session.set_media_packaging(MediaPackaging::kLoc);
@@ -9619,7 +9620,7 @@ int main() {
     }
 
     for (const bool audio_only : {false, true}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
         transport.reads[4].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 2));
@@ -9642,7 +9643,7 @@ int main() {
     }
 
     for (const bool audio_only : {false, true}) {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft16, .max_request_id = 8,
         }));
@@ -10125,7 +10126,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(
             encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -10250,7 +10251,7 @@ int main() {
         // in group 0, subgroup 0 and verify the publisher opens a single
         // unidirectional stream and appends the objects onto it with
         // delta-encoded Object IDs.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -10331,7 +10332,7 @@ int main() {
     }
 
     {
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.state_ = ConnectionState::kConnected;
         const TransportStatus rst = transport.reset_stream(42, 0);
         ok &= expect(rst.ok, "mock reset_stream should succeed");
@@ -10350,7 +10351,7 @@ int main() {
         // queued reads, the mock returns a benign "timed out" for stream 0, so
         // the loop reaches next_object() every iteration and spins endlessly;
         // only a stop (close) can end it.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -10402,7 +10403,7 @@ int main() {
         // Flush fallback: if post-stop flush writes block, publish_live_objects
         // must still return promptly. close() tears down the transport, which
         // makes the blocked write fail; the stop-swallow path returns success.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -10449,7 +10450,7 @@ int main() {
     {
         // Graceful flush: with a healthy transport, a stop still returns success
         // and the loop served at least one object.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
@@ -10495,7 +10496,7 @@ int main() {
         // No false positive: a transport error WITHOUT a stop request must still
         // return failure. next_object returns an object for an unknown track,
         // which the loop rejects with failure at runtime; close() is never called.
-        MockTransport transport;
+        std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
         transport.reads[0].push_back(encode_server_setup_message({
             .draft = DraftVersion::kDraft14,
             .max_request_id = 8,
