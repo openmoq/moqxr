@@ -7,6 +7,7 @@
 #include "openmoq/publisher/publisher_api.h"
 #include "../live_media_queue.h"
 #include "../loc_packager.h"
+#include "../loop_timestamps.h"
 #include "stream_reset_codes.h"
 
 #include <algorithm>
@@ -966,6 +967,14 @@ struct TrackLoopInfo {
     std::size_t group_span = 0;
     std::size_t first_loop_object_index = 0;
     bool has_loopable_objects = false;
+    // Media timestamps in looped objects are rebased in this timescale,
+    // according to the track's packaging. Zero for tracks without media.
+    std::uint32_t timescale = 0;
+    std::string packaging;
+    // Set once a looped object of this track could not be rebased, so the
+    // warning is logged once per track. Mutable because LoopState is passed
+    // as const; this is safe only because a publish sends from one thread.
+    mutable bool rebase_failed = false;
 };
 
 struct LoopState {
@@ -1090,6 +1099,22 @@ LoopState build_loop_state(const openmoq::publisher::PublishPlan& plan, bool loo
             state.cycle_duration_us = std::max(state.cycle_duration_us, object.media_time_us + object.media_duration_us);
         }
     }
+    for (const auto& description : plan.tracks) {
+        const auto it = state.tracks.find(description.track_name);
+        if (it != state.tracks.end()) {
+            it->second.timescale = description.timescale;
+            it->second.packaging = description.packaging;
+        }
+        // A timeline track's single object describes one pass of the input
+        // and is resent unchanged, so seeking by it lands on first-pass groups.
+        if ((description.packaging == "mediatimeline" || description.packaging == "eventtimeline") &&
+            it != state.tracks.end() && it->second.has_loopable_objects) {
+            std::cerr << "[moqt-session] warning: timeline track " << description.track_name
+                      << " is not rebased across loop cycles; it repeats the first pass, so seeking by it "
+                         "may request groups from that pass"
+                      << std::endl;
+        }
+    }
 
     return state;
 }
@@ -1119,6 +1144,39 @@ openmoq::publisher::CmsfObject make_looped_object(const openmoq::publisher::Cmsf
     openmoq::publisher::CmsfObject adjusted = object;
     adjusted.group_id += info->group_span * loop_cycle;
     adjusted.media_time_us += loop_state.cycle_duration_us * loop_cycle;
+    return adjusted;
+}
+
+// make_looped_object for an object about to be sent: also advances the media
+// timestamps carried in the payload or properties by the elapsed loop cycles,
+// so a subscriber's media timeline keeps increasing across loops. All tracks
+// advance by the same cycle duration, which keeps them aligned.
+openmoq::publisher::CmsfObject make_looped_send_object(const openmoq::publisher::CmsfObject& object,
+                                                       const LoopState& loop_state,
+                                                       std::size_t loop_cycle) {
+    openmoq::publisher::CmsfObject adjusted = make_looped_object(object, loop_state, loop_cycle);
+    if (!loop_state.enabled || loop_cycle == 0 || object.kind != openmoq::publisher::CmsfObjectKind::kMedia) {
+        return adjusted;
+    }
+    const TrackLoopInfo* info = find_track_loop_info(loop_state, object.track_name);
+    if (info == nullptr || info->timescale == 0) {
+        return adjusted;
+    }
+    const std::uint64_t delta =
+        openmoq::publisher::loop_offset_ticks(loop_state.cycle_duration_us, loop_cycle, info->timescale);
+    bool rebased = true;
+    if (info->packaging == "loc") {
+        openmoq::publisher::rebase_loc_timestamps(adjusted.properties, delta);
+    } else if (info->packaging == "locmaf") {
+        rebased = openmoq::publisher::rebase_locmaf_timestamps(adjusted.owned_payload, delta);
+    } else if (info->packaging == "cmaf") {
+        rebased = openmoq::publisher::rebase_cmaf_timestamps(adjusted.owned_payload, delta);
+    }
+    if (!rebased && !info->rebase_failed) {
+        info->rebase_failed = true;
+        std::cerr << "[moqt-session] warning: could not rebase looped media timestamps for track "
+                  << object.track_name << "; sending them unchanged" << std::endl;
+    }
     return adjusted;
 }
 
@@ -5472,10 +5530,10 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     attempted_eligible_candidate = true;
                     const auto& source_object = plan.objects[selected.plan_index];
                     const openmoq::publisher::CmsfObject object =
-                        make_looped_object(source_object,
-                                           loop_state,
-                                           selected.loop_cycle);
-                    const auto payload = object_payload(source_object);
+                        make_looped_send_object(source_object,
+                                                loop_state,
+                                                selected.loop_cycle);
+                    const auto payload = object_payload(object);
                     if (payload.empty()) {
                         return TransportStatus::failure(
                             "transport publish requires materialized object payloads");
@@ -5625,7 +5683,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         published_sink(object.track_name,
                                        object.group_id,
                                        object.object_id,
-                                       object_payload_size(source_object));
+                                       object_payload_size(object));
                     }
                     if (object_published) {
                         std::cerr << "[moqt-session] served object send_seq=" << send_seq
@@ -5634,7 +5692,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                   << " track=" << object.track_name
                                   << " group=" << object.group_id
                                   << " object=" << object.object_id
-                                  << " bytes=" << object_payload_size(source_object)
+                                  << " bytes=" << object_payload_size(object)
                                   << '\n';
                         if (object.track_name == "catalog") {
                             catalog_last_served_at = std::chrono::steady_clock::now();
@@ -5757,8 +5815,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             if (next_plan_index < plan.objects.size()) {
                 const auto& source_object = plan.objects[next_plan_index];
                 const openmoq::publisher::CmsfObject object =
-                    make_looped_object(source_object, loop_state, next_loop_cycle);
-                const auto payload = object_payload(source_object);
+                    make_looped_send_object(source_object, loop_state, next_loop_cycle);
+                const auto payload = object_payload(object);
                 if (payload.empty()) {
                     return TransportStatus::failure("transport publish requires materialized object payloads");
                 }
@@ -5800,14 +5858,14 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         published_sink(object.track_name,
                                        object.group_id,
                                        object.object_id,
-                                       object_payload_size(source_object));
+                                       object_payload_size(object));
                     }
                     if (object_published) {
                         std::cerr << "[moqt-session] served object send_seq=" << send_seq
                                   << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
                                   << " track=" << object.track_name
                                   << " group=" << object.group_id << " object=" << object.object_id
-                                  << " bytes=" << object_payload_size(source_object) << '\n';
+                                  << " bytes=" << object_payload_size(object) << '\n';
                         if (object.track_name == "catalog") {
                             catalog_last_served_at = std::chrono::steady_clock::now();
                         }
@@ -6184,8 +6242,8 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             }
 
             const openmoq::publisher::CmsfObject object =
-                make_looped_object(source_object, loop_state, loop_cycle);
-            const auto payload = object_payload(source_object);
+                make_looped_send_object(source_object, loop_state, loop_cycle);
+            const auto payload = object_payload(object);
             if (payload.empty()) {
                 return TransportStatus::failure("transport publish requires materialized object payloads");
             }
@@ -6228,7 +6286,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             std::cerr << "[moqt-session] sent object send_seq=" << send_seq
                       << " now_ms=" << trace_elapsed_ms(std::chrono::steady_clock::now())
                       << " track=" << object.track_name << " group=" << object.group_id
-                      << " object=" << object.object_id << " bytes=" << object_payload_size(source_object)
+                      << " object=" << object.object_id << " bytes=" << object_payload_size(object)
                       << " kind="
                       << (object.kind == openmoq::publisher::CmsfObjectKind::kInitialization ? "catalog" : "media")
                       << '\n';
@@ -6544,8 +6602,8 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
             }
 
             const openmoq::publisher::CmsfObject object =
-                make_looped_object(source_object, loop_state, loop_cycle);
-            const auto payload = object_payload(source_object);
+                make_looped_send_object(source_object, loop_state, loop_cycle);
+            const auto payload = object_payload(object);
             if (payload.empty()) {
                 return TransportStatus::failure("transport publish requires materialized object payloads");
             }
@@ -6590,7 +6648,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                       << " track=" << object.track_name
                       << " group=" << object.group_id
                       << " object=" << object.object_id
-                      << " bytes=" << object_payload_size(source_object)
+                      << " bytes=" << object_payload_size(object)
                       << " kind="
                       << (object.kind == openmoq::publisher::CmsfObjectKind::kInitialization ? "catalog" : "media")
                       << '\n';

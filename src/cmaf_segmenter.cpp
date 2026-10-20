@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <sstream>
@@ -205,6 +206,19 @@ std::vector<std::uint8_t> make_full_box(std::string_view type,
     full_payload.push_back(static_cast<std::uint8_t>(flags & 0xFFU));
     full_payload.insert(full_payload.end(), payload.begin(), payload.end());
     return make_box(type, full_payload);
+}
+
+// Version 0 when the decode time fits in 32 bits, version 1 otherwise, so
+// large decode times are not truncated.
+std::vector<std::uint8_t> make_tfdt_box(std::uint64_t base_media_decode_time) {
+    std::vector<std::uint8_t> payload;
+    if (base_media_decode_time > std::numeric_limits<std::uint32_t>::max()) {
+        append_be32(payload, static_cast<std::uint32_t>(base_media_decode_time >> 32U));
+        append_be32(payload, static_cast<std::uint32_t>(base_media_decode_time));
+        return make_full_box("tfdt", 1, 0, payload);
+    }
+    append_be32(payload, static_cast<std::uint32_t>(base_media_decode_time));
+    return make_full_box("tfdt", 0, 0, payload);
 }
 
 std::vector<std::uint8_t> concat_boxes(const std::vector<std::vector<std::uint8_t>>& boxes) {
@@ -967,9 +981,7 @@ std::vector<std::uint8_t> build_sample_object(std::uint32_t track_id,
     append_be32(tfhd_payload, track_id);
     const std::vector<std::uint8_t> tfhd = make_full_box("tfhd", 0, 0x020000, tfhd_payload);
 
-    std::vector<std::uint8_t> tfdt_payload;
-    append_be32(tfdt_payload, static_cast<std::uint32_t>(sample.decode_time));
-    const std::vector<std::uint8_t> tfdt = make_full_box("tfdt", 0, 0, tfdt_payload);
+    const std::vector<std::uint8_t> tfdt = make_tfdt_box(sample.decode_time);
 
     const std::vector<std::uint8_t> placeholder_trun = build_single_sample_trun_box(sample, 0);
     const std::vector<std::uint8_t> placeholder_traf = make_box("traf", concat_boxes({tfhd, tfdt, placeholder_trun}));
@@ -1013,9 +1025,7 @@ std::vector<std::uint8_t> build_remuxed_fragment_range(const TrackRemuxInfo& tra
     append_be32(tfhd_payload, track.description.track_id);
     const std::vector<std::uint8_t> tfhd = make_full_box("tfhd", 0, 0x020000, tfhd_payload);
 
-    std::vector<std::uint8_t> tfdt_payload;
-    append_be32(tfdt_payload, static_cast<std::uint32_t>(base_decode_time));
-    const std::vector<std::uint8_t> tfdt = make_full_box("tfdt", 0, 0, tfdt_payload);
+    const std::vector<std::uint8_t> tfdt = make_tfdt_box(base_decode_time);
 
     const std::vector<std::uint8_t> placeholder_trun = build_trun_range_box(track, first, count, 0);
     const std::vector<std::uint8_t> placeholder_traf = make_box("traf", concat_boxes({tfhd, tfdt, placeholder_trun}));

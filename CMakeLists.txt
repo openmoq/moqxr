@@ -617,6 +617,7 @@ add_library(openmoq_publisher_lib
     src/loc_packager.cpp
     src/locmaf_encoder.cpp
     src/locmaf_packager.cpp
+    src/loop_timestamps.cpp
     src/moq_draft.cpp
     src/msf_catalog.cpp
     src/msf_url.cpp
@@ -814,6 +815,13 @@ if(OPENMOQ_BUILD_TESTS)
     target_compile_definitions(openmoq-publisher-locmaf-tests PRIVATE
         LOCMAF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/locmaf")
     add_test(NAME openmoq-publisher-locmaf-tests COMMAND openmoq-publisher-locmaf-tests)
+
+    add_executable(openmoq-publisher-loop-timestamps-tests tests/loop_timestamps_test.cpp)
+    target_link_libraries(openmoq-publisher-loop-timestamps-tests PRIVATE openmoq_publisher_lib)
+    target_include_directories(openmoq-publisher-loop-timestamps-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_definitions(openmoq-publisher-loop-timestamps-tests PRIVATE
+        LOCMAF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/locmaf")
+    add_test(NAME openmoq-publisher-loop-timestamps-tests COMMAND openmoq-publisher-loop-timestamps-tests)
     add_executable(openmoq-publisher-locmaf-publisher-tests tests/locmaf_publisher_test.cpp)
     target_link_libraries(openmoq-publisher-locmaf-publisher-tests PRIVATE openmoq_publisher_lib)
     target_compile_definitions(openmoq-publisher-locmaf-publisher-tests PRIVATE

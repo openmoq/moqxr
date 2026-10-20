@@ -98,6 +98,9 @@ struct LibmoqObjectTranslation {
     std::uint64_t decode_time_us = 0;
     std::uint64_t presentation_time_us = 0;
     std::vector<std::uint8_t> payload;  // full CMAF fragment bytes
+    // The track's media timescale, used to rebase the payload's tfdt on each
+    // --loop pass. Zero when unknown, which leaves the payload unchanged.
+    std::uint32_t timescale = 0;
 
     moq_media_send_object_t object() const;  // payload left NULL for the caller
 };
@@ -108,8 +111,9 @@ struct LibmoqPlanTranslation {
     // One pass of the plan covers this much media time: max(media_time_us +
     // media_duration_us) over the media objects. A looped publish (--loop)
     // re-emits the objects with their timestamps advanced by one cycle per
-    // pass, the same rebasing the legacy MoqtSession make_looped_object() does.
-    // libmoq derives groups from starts_group/ends_group, so only time moves.
+    // pass, and the payload tfdt advanced to match, the same rebasing the
+    // legacy MoqtSession make_looped_send_object() does. libmoq derives groups
+    // from starts_group/ends_group, so only time moves.
     std::uint64_t cycle_duration_us = 0;
 };
 

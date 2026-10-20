@@ -2872,6 +2872,320 @@ int main() {
     }
 
     {
+        // --loop must advance each sent fragment's tfdt by the cycle length in
+        // the track timescale, leaving the plan's own payload untouched.
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.reads[0].push_back(encode_subscribe_message(
+            1, kTestTrackNamespace, "video", 1, DraftVersion::kDraft16,
+            0, 0, 10, 1));
+        std::vector<std::uint8_t> tfdt_payload;
+        append_be32(tfdt_payload, 3003);
+        std::vector<std::uint8_t> traf = make_box("traf", [&] {
+            std::vector<std::uint8_t> tfhd;
+            append_be32(tfhd, 1);
+            std::vector<std::uint8_t> children = make_full_box("tfhd", tfhd);
+            const auto tfdt = make_full_box("tfdt", tfdt_payload);
+            children.insert(children.end(), tfdt.begin(), tfdt.end());
+            return children;
+        }());
+        std::vector<std::uint8_t> mfhd;
+        append_be32(mfhd, 1);
+        std::vector<std::uint8_t> moof_children = make_full_box("mfhd", mfhd);
+        moof_children.insert(moof_children.end(), traf.begin(), traf.end());
+        std::vector<std::uint8_t> fragment = make_box("moof", moof_children);
+        const auto mdat = make_box("mdat", {0x42});
+        fragment.insert(fragment.end(), mdat.begin(), mdat.end());
+
+        PublishPlan plan = make_scheduling_plan({
+            {.track_name = "video", .group_id = 1, .subgroup_id = 0,
+             .object_id = 0, .marker = 'V'},
+        });
+        plan.tracks[0].packaging = "cmaf";
+        plan.tracks[0].timescale = 90000;
+        plan.objects[0].media_duration_us = 1'000'000;
+        plan.objects[0].owned_payload = fragment;
+
+        constexpr std::size_t kLoopCycles = 4;
+        std::vector<std::uint32_t> sent_tfdt;
+        transport.on_try_write_object =
+            [&](MockTransport& current,
+                const MockTransport::ObjectWriteEvent& event) {
+                const std::string_view type = "tfdt";
+                const auto it = std::search(event.bytes.begin(), event.bytes.end(),
+                                            type.begin(), type.end());
+                if (it != event.bytes.end() && event.bytes.end() - it >= 12) {
+                    const std::size_t value = static_cast<std::size_t>(it - event.bytes.begin()) + 8;
+                    sent_tfdt.push_back((std::uint32_t{event.bytes[value]} << 24U) |
+                                        (std::uint32_t{event.bytes[value + 1]} << 16U) |
+                                        (std::uint32_t{event.bytes[value + 2]} << 8U) |
+                                        std::uint32_t{event.bytes[value + 3]});
+                }
+                if (current.object_write_attempts.size() >= kLoopCycles) {
+                    return ObjectWriteResult{
+                        ObjectWriteDisposition::kFailed,
+                        "loop timestamp test complete"};
+                }
+                return ObjectWriteResult{
+                    ObjectWriteDisposition::kAccepted, {}};
+            };
+        MoqtSession session(transport,
+                            std::string(kTestTrackNamespace),
+                            false,
+                            false,
+                            false,
+                            true,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok,
+                     "expected loop timestamp session connect to succeed");
+        status = session.publish(plan);
+        ok &= expect(!status.ok && status.message == "loop timestamp test complete",
+                     "expected loop timestamp test to stop after the configured cycle count");
+        ok &= expect(sent_tfdt == std::vector<std::uint32_t>{3003, 93003, 183003, 273003},
+                     "expected each loop cycle to advance tfdt by one second at 90 kHz");
+        ok &= expect(plan.objects[0].owned_payload == fragment,
+                     "expected loop rebasing to leave the plan payload unchanged");
+    }
+
+    {
+        // LOCMAF and LOC carry their timestamps outside a tfdt: the LOCMAF
+        // base media decode time (field 10) in the payload, and the LOC
+        // presentation timestamp in object property 16. Both must advance by
+        // one cycle (1 s at 90 kHz) per loop, growing their varints as needed.
+        std::string captured_warnings;
+        const auto capture_loop_objects = [&](MockTransport& transport, const PublishPlan& plan, bool forward) {
+            constexpr std::size_t kLoopCycles = 4;
+            std::vector<std::vector<std::uint8_t>> sent;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+                    sent.push_back(event.bytes);
+                    if (current.object_write_attempts.size() >= kLoopCycles) {
+                        return ObjectWriteResult{ObjectWriteDisposition::kFailed, "loop capture complete"};
+                    }
+                    return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+                };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), forward, false, false, true,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected loop capture session connect to succeed");
+            std::ostringstream captured_stderr;
+            std::streambuf* real_cerr_buf = std::cerr.rdbuf(captured_stderr.rdbuf());
+            const TransportStatus capture_status = session.publish(plan);
+            std::cerr.rdbuf(real_cerr_buf);
+            captured_warnings = captured_stderr.str();
+            ok &= expect(!capture_status.ok && capture_status.message == "loop capture complete",
+                         "expected loop capture to stop after the configured cycle count: " + capture_status.message);
+            return sent;
+        };
+        const auto ends_with = [](const std::vector<std::uint8_t>& bytes, const std::vector<std::uint8_t>& suffix) {
+            return bytes.size() >= suffix.size() && std::equal(suffix.begin(), suffix.end(), bytes.end() - suffix.size());
+        };
+
+        {
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "locmaf", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "locmaf", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'M'},
+            });
+            plan.tracks[0].packaging = "locmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.objects[0].media_duration_us = 1'000'000;
+            // Full anchor: type 2, 2 bytes of properties (field 10 = 5), then the payload.
+            plan.objects[0].owned_payload = {2, 2, 0x0A, 0x05, 'M'};
+            const auto sent = capture_loop_objects(transport, plan, false);
+            ok &= expect(sent.size() == 4 && ends_with(sent[0], {2, 2, 0x0A, 0x05, 'M'}) &&
+                             ends_with(sent[1], {2, 4, 0x0A, 0xC1, 0x5F, 0x95, 'M'}) &&
+                             ends_with(sent[2], {2, 4, 0x0A, 0xC2, 0xBF, 0x25, 'M'}) &&
+                             ends_with(sent[3], {2, 4, 0x0A, 0xC4, 0x1E, 0xB5, 'M'}),
+                         "expected each loop cycle to advance the LOCMAF base media decode time");
+        }
+
+        {
+            MockTransport transport;
+            transport.keep_open_streams.insert(1);
+            transport.reads[3].push_back(encode_draft18_setup_response());
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+            transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "loc", 1, DraftVersion::kDraft18));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "loc", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'L'},
+            });
+            plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+            plan.tracks[0].packaging = "loc";
+            plan.tracks[0].timescale = 90000;
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[0].properties = {{16, std::uint64_t{3003}}};
+            const auto sent = capture_loop_objects(transport, plan, false);
+            // properties length, id delta 16, PTS, payload length, payload.
+            ok &= expect(sent.size() == 4 && ends_with(sent[0], {3, 16, 0x8B, 0xBB, 1, 'L'}) &&
+                             ends_with(sent[1], {4, 16, 0xC1, 0x6B, 0x4B, 1, 'L'}) &&
+                             ends_with(sent[2], {4, 16, 0xC2, 0xCA, 0xDB, 1, 'L'}) &&
+                             ends_with(sent[3], {4, 16, 0xC4, 0x2A, 0x6B, 1, 'L'}),
+                         "expected each loop cycle to advance the LOC presentation timestamp");
+        }
+
+        const auto count_of = [](const std::string& text, std::string_view needle) {
+            std::size_t count = 0;
+            for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) {
+                ++count;
+            }
+            return count;
+        };
+
+        {
+            // Forward mode sends through forward_published_tracks, not
+            // serve_subscriptions; it must rebase the same way.
+            MockTransport transport;
+            transport.reads[0].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft16, .max_request_id = 8}));
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+            transport.reads[0].push_back(encode_publish_ok_message(DraftVersion::kDraft16, 2, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "locmaf", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'F'},
+            });
+            plan.tracks[0].packaging = "locmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[0].owned_payload = {2, 2, 0x0A, 0x05, 'F'};
+            const auto sent = capture_loop_objects(transport, plan, true);
+            ok &= expect(sent.size() == 4 && ends_with(sent[0], {2, 2, 0x0A, 0x05, 'F'}) &&
+                             ends_with(sent[1], {2, 4, 0x0A, 0xC1, 0x5F, 0x95, 'F'}) &&
+                             ends_with(sent[3], {2, 4, 0x0A, 0xC4, 0x1E, 0xB5, 'F'}),
+                         "expected forward-mode loop cycles to advance the LOCMAF base media decode time");
+        }
+
+        {
+            // A payload that cannot be parsed is sent unchanged, with one
+            // warning for the track rather than one per object. A timeline
+            // track in the plan gets its own warning that it is not rebased.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "timeline", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'T'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "mediatimeline";
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].kind = CmsfObjectKind::kMetadata;
+            const auto sent = capture_loop_objects(transport, plan, false);
+            ok &= expect(sent.size() == 4 && std::all_of(sent.begin(), sent.end(), [&](const auto& bytes) {
+                             return ends_with(bytes, {1, 'X'});
+                         }),
+                         "expected an unparseable looped payload to be sent unchanged");
+            ok &= expect(count_of(captured_warnings, "could not rebase looped media timestamps for track broken") == 1,
+                         "expected one rebase warning for the track, got: " + captured_warnings);
+            ok &= expect(count_of(captured_warnings, "timeline track timeline is not rebased across loop cycles") == 1,
+                         "expected one warning for the looped timeline track, got: " + captured_warnings);
+        }
+
+        {
+            // The warning covers both timeline packagings, not just mediatimeline.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "events", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'E'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "eventtimeline";
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].kind = CmsfObjectKind::kMetadata;
+            capture_loop_objects(transport, plan, false);
+            ok &= expect(count_of(captured_warnings, "timeline track events is not rebased across loop cycles") == 1,
+                         "expected one warning for the looped eventtimeline track, got: " + captured_warnings);
+        }
+
+        {
+            // A timeline track with nothing to resend (only an initialization
+            // object) is never looped, so it must not draw the warning.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "timeline", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'T'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "mediatimeline";
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].kind = CmsfObjectKind::kInitialization;
+            capture_loop_objects(transport, plan, false);
+            ok &= expect(count_of(captured_warnings, "timeline track") == 0,
+                         "expected no timeline warning when the track has no loopable objects, got: " +
+                             captured_warnings);
+        }
+
+        {
+            // Without --loop nothing is rebased, so neither warning applies.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            transport.on_try_write_object =
+                [](MockTransport&, const MockTransport::ObjectWriteEvent&) {
+                    return ObjectWriteResult{ObjectWriteDisposition::kFailed, "single send complete"};
+                };
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "timeline", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'T'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "mediatimeline";
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].kind = CmsfObjectKind::kMetadata;
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected non-loop session connect to succeed");
+            std::ostringstream captured_stderr;
+            std::streambuf* real_cerr_buf = std::cerr.rdbuf(captured_stderr.rdbuf());
+            session.publish(plan);
+            std::cerr.rdbuf(real_cerr_buf);
+            const std::string warnings = captured_stderr.str();
+            ok &= expect(count_of(warnings, "could not rebase") == 0 && count_of(warnings, "timeline track") == 0,
+                         "expected no loop warnings when --loop is off, got: " + warnings);
+        }
+
+        {
+            // rebase_failed is per track: one unparseable track must neither
+            // silence the warning for, nor stop rebasing of, a healthy one.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            transport.reads[0].push_back(encode_subscribe_message(
+                3, kTestTrackNamespace, "good", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "good", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'M'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "locmaf";
+            plan.tracks[1].timescale = 90000;
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].media_duration_us = 1'000'000;
+            plan.objects[1].owned_payload = {2, 2, 0x0A, 0x05, 'M'};
+            const auto sent = capture_loop_objects(transport, plan, false);
+            const auto advanced = std::vector<std::uint8_t>{2, 4, 0x0A, 0xC1, 0x5F, 0x95, 'M'};
+            ok &= expect(std::any_of(sent.begin(), sent.end(),
+                                     [&](const auto& bytes) { return ends_with(bytes, advanced); }),
+                         "expected the healthy track to keep rebasing after another track failed");
+            ok &= expect(count_of(captured_warnings, "could not rebase looped media timestamps for track broken") == 1 &&
+                             count_of(captured_warnings, "for track good") == 0,
+                         "expected the rebase warning for only the broken track, got: " + captured_warnings);
+        }
+    }
+
+    {
         using Clock = std::chrono::steady_clock;
         Clock::time_point now{};
         MockTransport transport;

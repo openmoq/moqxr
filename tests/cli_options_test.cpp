@@ -497,6 +497,15 @@ int main() {
     }
 
     {
+        // Timeline tracks are not rebased under --loop; the session warns
+        // rather than refusing, so existing invocations keep working.
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--loop", "--msf-timeline", "--sap"});
+        ok &= expect(options.loop && options.include_msf_timeline && options.include_sap,
+                     "expected --loop to remain combinable with the timeline tracks");
+    }
+
+    {
         bool threw = false;
         try {
             static_cast<void>(parse({"openmoq-publisher", "--input", "sample.mp4", "--timeout", "-1"}));
