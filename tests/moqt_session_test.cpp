@@ -1724,7 +1724,7 @@ int main() {
                  "namespace-notification", "namespace-duplicate-goaway", "tracks-overlap",
                  "tracks-invalid-forward", "tracks-invalid-priority", "tracks-prefix-update", "tracks-prefix-pause", "namespace-prefix-update", "namespace-responder-update", "subscribe-fin",
                  "unknown-control", "unknown-request", "unknown-alias", "malformed-subscribe", "malformed-subscribe-namespace", "unknown-stream-high-bits", "control-goaway", "control-duplicate-goaway", "control-fin"}) {
-            std::fprintf(stderr, "TESTLINE %d\n", __LINE__); std::fflush(stderr); MockTransport transport;
+            std::fprintf(stderr, "SCEN %s\n", scenario.c_str()); std::fflush(stderr); MockTransport transport;
             transport.reads[3].push_back(encode_server_setup_message({.draft = DraftVersion::kDraft22, .max_request_id = 100}));
             transport.keep_open_streams.insert(3);
             transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft22, 0));
