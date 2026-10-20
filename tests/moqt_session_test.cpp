@@ -2236,7 +2236,7 @@ int main() {
         openmoq::publisher::transport::priority_scheduler_internal::
             set_publisher_priority_for_testing(3, 7);
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected publisher-priority session connect to succeed");
         status = session.publish(plan);
@@ -2308,7 +2308,7 @@ int main() {
              .object_id = 0, .media_time_us = 9000, .marker = 'A'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected ascending-order session connect to succeed");
         status = session.publish(plan);
@@ -2337,7 +2337,7 @@ int main() {
              .object_id = 0, .media_time_us = 9000, .marker = 'D'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected descending-order session connect to succeed");
         status = session.publish(plan);
@@ -2386,7 +2386,7 @@ int main() {
                          .marker = 'A'});
         const PublishPlan plan = make_scheduling_plan(specs);
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected cross-track deadline session connect to succeed");
         status = session.publish(plan);
@@ -2431,7 +2431,7 @@ int main() {
              .object_id = 0, .marker = 'D'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected opposite-order fairness session connect to succeed");
         status = session.publish(plan);
@@ -2464,7 +2464,7 @@ int main() {
              .object_id = 0, .media_time_us = 9000, .marker = 'S'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected subgroup-order session connect to succeed");
         status = session.publish(plan);
@@ -2493,7 +2493,7 @@ int main() {
              .object_id = 2, .media_time_us = 9000, .marker = 'O'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected object-order session connect to succeed");
         status = session.publish(plan);
@@ -2604,7 +2604,7 @@ int main() {
                     ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected same-request blocked scheduler session connect to succeed");
         status = session.publish(plan);
@@ -2810,7 +2810,7 @@ int main() {
         const PublishPlan plan = make_scheduling_plan(objects);
         openmoq::publisher::transport::priority_scheduler_internal::
             begin_priority_comparison_count_for_testing();
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected retained-heap scale session connect to succeed");
         status = session.publish(plan);
@@ -3661,7 +3661,7 @@ int main() {
              .object_id = 1, .marker = 'O'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected filtered-predecessor session connect to succeed");
         status = session.publish(plan);
@@ -3713,7 +3713,7 @@ int main() {
                 return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected update-priority session connect to succeed");
         status = session.publish(plan);
@@ -3833,7 +3833,7 @@ int main() {
         });
         plan.draft = openmoq::publisher::draft_profile(draft);
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected repeated-authorization update session connect to succeed");
         status = session.publish(plan);
@@ -4051,7 +4051,7 @@ int main() {
                 return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected filter-update session connect to succeed");
         status = session.publish(plan);
@@ -4171,7 +4171,7 @@ int main() {
                 DraftVersion::kDraft16, 5, 1, 0x10, 1));
         };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected draft-16 Forward park/resume session connect to succeed");
         status = session.publish(plan);
@@ -4411,7 +4411,7 @@ int main() {
              .object_id = 0, .marker = 'P'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected draft-16 parity session connect to succeed");
         status = session.publish(plan);
@@ -4432,7 +4432,7 @@ int main() {
              .object_id = 7, .marker = 'E'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected draft-16 end-extension session connect to succeed");
         status = session.publish(plan);
@@ -4648,7 +4648,7 @@ int main() {
              .object_id = 0, .marker = 'S'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected draft-16 sequence session connect to succeed");
         status = session.publish(plan);
@@ -4666,7 +4666,7 @@ int main() {
              .object_id = 0, .marker = 'L'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected draft-16 request-limit session connect to succeed");
         status = session.publish(plan);
@@ -4741,7 +4741,7 @@ int main() {
              .object_id = 0, .marker = 'Z'},
         });
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected zero-timeout admission session connect to succeed");
         status = session.publish(plan);
@@ -5400,7 +5400,7 @@ int main() {
             encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, DraftVersion::kDraft16, 1500));
         transport.reads[0].push_back(
             encode_subscribe_message(3, kTestTrackNamespace, "vide_1", 1, DraftVersion::kDraft16, 4000));
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected delivery-timeout session connect to succeed");
         status = session.publish(materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft16), source_bytes));
@@ -5616,7 +5616,7 @@ int main() {
                 return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected pre-admission-expiry session connect to succeed");
         status = session.publish(make_transport_expiry_plan(DraftVersion::kDraft16));
@@ -5659,7 +5659,7 @@ int main() {
                 return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected check-write-race session connect to succeed");
         status = session.publish(make_transport_expiry_plan(DraftVersion::kDraft16));
@@ -5706,7 +5706,7 @@ int main() {
                 return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected peer-stop session connect to succeed");
         status = session.publish(make_transport_expiry_plan(DraftVersion::kDraft16));
@@ -5864,7 +5864,7 @@ int main() {
                     ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok,
                      "expected late peer-stop session connect to succeed");
@@ -5930,7 +5930,7 @@ int main() {
                     ObjectWriteDisposition::kAccepted, {}};
             };
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok,
                      "expected late-expiry session connect to succeed");
@@ -5972,7 +5972,7 @@ int main() {
                                      DraftVersion::kDraft16,
                                      1000));
 
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected completed-subgroup session connect to succeed");
         status = session.publish(make_completed_subgroup_reopen_plan(DraftVersion::kDraft16));
@@ -6016,7 +6016,7 @@ int main() {
         });
         openmoq::publisher::transport::priority_scheduler_internal::
             begin_subgroup_completion_storage_tracking_for_testing();
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected subgroup-retention session connect to succeed");
         status = session.publish(make_scheduling_plan(std::move(objects)));
@@ -6070,7 +6070,7 @@ int main() {
             };
         openmoq::publisher::transport::priority_scheduler_internal::
             begin_subgroup_completion_storage_tracking_for_testing();
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected peer-stop retention session connect to succeed");
         status = session.publish(make_scheduling_plan(std::move(objects)));
@@ -6120,7 +6120,7 @@ int main() {
         });
         openmoq::publisher::transport::priority_scheduler_internal::
             begin_subgroup_completion_storage_tracking_for_testing();
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok,
                      "expected sparse-retention session connect to succeed");
         status = session.publish(make_scheduling_plan(std::move(objects)));
@@ -10257,7 +10257,7 @@ int main() {
         }));
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft14, 0));
         transport.reads[0].push_back(encode_subscribe_message(1, kTestTrackNamespace, "vide_1", 0));
-        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         ok &= expect(status.ok, "expected multi-object-subgroup session connect to succeed");
         status = session.publish(make_multi_object_subgroup_plan());
