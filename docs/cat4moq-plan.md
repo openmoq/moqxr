@@ -194,6 +194,10 @@ python3 scripts/test-cat4moq-interop.py \
 # Repeat both with --publisher-transport webtransport.
 ```
 
+The opt-in `loop` case (`--cases valid loop`, not run by default) publishes with
+`--loop` and checks that Playa sees CMAF `tfdt` advance across loop cycles; see
+`examples/auth/README.md`.
+
 Each run records the publisher binary hash, dependency and relay revisions,
 transport, subscriber API and per-case results in its private artifact directory.
 The type-1 C4M-01 fixture covers 18 MAC/type/claim decisions with private labels;

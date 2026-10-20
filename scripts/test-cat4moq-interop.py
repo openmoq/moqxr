@@ -24,6 +24,10 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/cat4moq"
 SECRET = "interop-test-only-signing-secret-0001"
 CASES = ("valid", "valid-publish", "missing", "expired", "tampered", "wrong-key", "wrong-action", "wrong-namespace", "wrong-track", "profile-mismatch")
+# Not run by default; select with --cases valid loop.
+OPT_IN_CASES = ("loop",)
+LOOP_OBSERVE_SECONDS = 20
+LOOP_MIN_GROUPS = 11  # the 8 s sample is 8 groups per pass, so this spans a wrap
 
 
 def run(argv, **kwargs):
@@ -99,6 +103,48 @@ def issue(args, directory, issuer, case, namespace, *, subscriber=False):
     path.write_bytes(token)
     path.chmod(0o600)
     return path
+
+
+def check_loop_timeline(log):
+    """Playa-observed CMAF tfdt must keep advancing when the publisher loops its input."""
+    tracks = {}
+    for line in log.read_text(errors="replace").splitlines():
+        if line.startswith('{"event":"tfdt"'):
+            row = json.loads(line)
+            tracks.setdefault(row["track"], []).append((int(row["group"]), int(row["tfdt"])))
+    if len(tracks) != 2:
+        raise RuntimeError(f"loop: expected tfdt from audio and video, saw {sorted(tracks)}; inspect {log}")
+    for track, rows in tracks.items():
+        groups = {group for group, _ in rows}
+        if len(groups) < LOOP_MIN_GROUPS:
+            raise RuntimeError(f"loop: {track} delivered {len(groups)} groups, need {LOOP_MIN_GROUPS}; inspect {log}")
+        decode_times = [tfdt for _, tfdt in rows]
+        if any(b <= a for a, b in zip(decode_times, decode_times[1:])):
+            raise RuntimeError(f"loop: {track} tfdt did not advance across loop cycles: {decode_times}; inspect {log}")
+
+
+def run_loop_case(args, group, issuer, profile, port, cert, namespace):
+    token = issue(args, group, issuer, "valid", namespace)
+    subscriber = issue(args, group, issuer, "valid", namespace, subscriber=True)
+    publog, sublog = group / "loop-publisher.log", group / "loop-subscriber.log"
+    native_profile = "c4m-01" if profile == "cose" else "moqx-compat"
+    publisher = [args.publisher, "--input", group.parent / "sample.mp4", "--loop", "--paced",
+                 "--transport", args.publisher_transport, "--namespace", namespace, "--draft", "18",
+                 "--endpoint", f"{'https' if args.publisher_transport == 'webtransport' else 'moqt'}://127.0.0.1:{port}/moq",
+                 "--insecure", "--forward", "0", "--coalesce-cmaf-chunks", "--publish-catalog",
+                 "--catalog-republish-interval", "1", "--timeout", "60",
+                 "--auth-profile", native_profile, "--auth-token-file", token]
+    command = [args.node, FIXTURES / "subscribe.mjs", args.playa, args.node_modules,
+               f"https://127.0.0.1:{port}/moq", namespace, cert, subscriber, str(LOOP_OBSERVE_SECONDS), "",
+               args.subscriber_api, "1" if profile == "cose" else "16"]
+    with process(publisher, publog, env=args.child_env) as pub:
+        wait_log(pub, publog, r"namespace published|live: awaiting subscriptions|libmoq: sender ready", timeout=args.timeout)
+        env = dict(args.child_env, CAT4MOQ_OBSERVE_TFDT="1")
+        with process(command, sublog, env=env) as sub:
+            sub.wait(timeout=LOOP_OBSERVE_SECONDS + 10)
+        if pub.poll() is not None:
+            raise RuntimeError(f"loop: publisher exited early; inspect {publog}")
+    check_loop_timeline(sublog)
 
 
 def verify_issuers(args, directory):
@@ -206,6 +252,11 @@ auth.cat.key.interop.secret.file={secret}
         for case in args.cases:
             try:
                 namespace = f"cat4moq/{issuer}/{case}"
+                if case == "loop":
+                    run_loop_case(args, group, issuer, profile, port, cert, namespace)
+                    args.results.append({"target": issuer, "phase": "runtime", "case": case, "result": "pass"})
+                    print(f"PASS: {issuer}/loop: CMAF tfdt advances across --loop cycles", flush=True)
+                    continue
                 token = None if case == "missing" else issue(args, group, issuer, case, namespace)
                 subscriber = issue(args, group, issuer, "valid", namespace, subscriber=True)
                 if case == "expired":
@@ -308,7 +359,8 @@ auth.cat.key.interop.secret.file={secret}
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targets", nargs="+", choices=("moqx", "red5-moqx", "red5-cose"), default=["moqx", "red5-moqx", "red5-cose"])
-    parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
+    parser.add_argument("--cases", nargs="+", choices=CASES + OPT_IN_CASES, default=list(CASES),
+                        help="loop is opt-in: publishes with --loop and checks Playa sees tfdt advance across cycles")
     parser.add_argument("--issuer-only", action="store_true", help="no sockets; actual issuer and Red5 validator checks only")
     parser.add_argument("--moqx", type=Path, default=ROOT.parent / "moqx/build-san/moqx")
     parser.add_argument("--moqx-issuer", type=Path, default=ROOT.parent / "moqx/build-san/moqx-issuer")

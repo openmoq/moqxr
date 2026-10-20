@@ -236,6 +236,17 @@ initialization and progressing audio/video payloads through Playa's connection
 API; it does not prove player routing or rendering. The player alias collision
 is tracked in [moq-playa issue 17](https://github.com/openmoq/moq-playa/issues/17).
 
+The `loop` case is opt-in and is not part of the default case list. It publishes
+the sample with `--loop --paced` and has Playa observe each CMAF `tfdt` for 20
+seconds (about two and a half passes of the 8 second sample). It passes when both
+tracks deliver at least 11 groups and every `tfdt` is strictly greater than the
+last, which proves the media timestamps keep advancing across loop cycles instead
+of restarting at zero. Select it explicitly; `valid` must come first:
+
+```bash
+python3 scripts/test-cat4moq-interop.py --targets red5-moqx red5-cose --cases valid loop
+```
+
 `--publisher-transport webtransport` passes `--transport webtransport` to the
 publisher. Before 0.3.26 the harness only switched the endpoint to `https://`,
 which does not select WebTransport, so those runs published over raw QUIC. The

@@ -21,7 +21,29 @@ let resolveDone;
 let rejectDone;
 const done = new Promise((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
 done.catch(() => {});
-const timer = setTimeout(() => rejectDone(new Error('catalog/media deadline exceeded')), Number(timeout) * 1000);
+// CAT4MOQ_OBSERVE_TFDT: watch for the whole interval and log each CMAF tfdt, so a
+// caller can check the timeline across publisher loop cycles.
+const observeTfdt = Boolean(process.env.CAT4MOQ_OBSERVE_TFDT);
+const timer = setTimeout(() => observeTfdt ? resolveDone() : rejectDone(new Error('catalog/media deadline exceeded')),
+  Number(timeout) * 1000);
+function tfdtOf(data) {
+  const find = (start, end, path) => {
+    for (let offset = start; offset + 8 <= end;) {
+      const size = data.readUInt32BE(offset);
+      if (size < 8) return null;
+      if (data.toString('ascii', offset + 4, offset + 8) === path[0]) {
+        if (path.length === 1) return offset;
+        const inner = find(offset + 8, offset + size, path.slice(1));
+        if (inner !== null) return inner;
+      }
+      offset += size;
+    }
+    return null;
+  };
+  const box = find(0, data.length, ['moof', 'traf', 'tfdt']);
+  if (box === null) return null;
+  return String(data[box + 8] === 1 ? data.readBigUInt64BE(box + 12) : BigInt(data.readUInt32BE(box + 12)));
+}
 const config = {
   url, namespace: namespace.split('/'), authTokens, draftVersion: 18, catalogBootstrap: 'subscribe',
   // This fixture has its own finite init/media deadline and never renders frames.
@@ -114,6 +136,10 @@ function observeMedia(obj) {
     const data = Buffer.from(obj.payload);
     let offset = 0;
     let media = false;
+    if (observeTfdt) {
+      const tfdt = tfdtOf(data);
+      if (tfdt !== null) console.log(JSON.stringify({ event: 'tfdt', track: obj.trackName, group: String(obj.groupId), tfdt }));
+    }
     while (offset < data.length) {
       if (data.length - offset < 8) throw new Error('truncated CMAF box');
       const size = data.readUInt32BE(offset);
@@ -126,7 +152,7 @@ function observeMedia(obj) {
     if (media) state.groups.add(String(obj.groupId));
     state.bytes += data.length;
     state.objects++;
-    if (initialized.size === 2 && states.size === 2 &&
+    if (!observeTfdt && initialized.size === 2 && states.size === 2 &&
         [...states.values()].every((t) => t.groups.size >= 2 && t.boxes.has('moof'))) resolveDone();
   } catch (error) { rejectDone(error); }
 }
