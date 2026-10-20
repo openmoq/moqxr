@@ -3080,6 +3080,109 @@ int main() {
             ok &= expect(count_of(captured_warnings, "timeline track timeline is not rebased across loop cycles") == 1,
                          "expected one warning for the looped timeline track, got: " + captured_warnings);
         }
+
+        {
+            // The warning covers both timeline packagings, not just mediatimeline.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "events", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'E'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "eventtimeline";
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].kind = CmsfObjectKind::kMetadata;
+            capture_loop_objects(transport, plan, false);
+            ok &= expect(count_of(captured_warnings, "timeline track events is not rebased across loop cycles") == 1,
+                         "expected one warning for the looped eventtimeline track, got: " + captured_warnings);
+        }
+
+        {
+            // A timeline track with nothing to resend (only an initialization
+            // object) is never looped, so it must not draw the warning.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "timeline", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'T'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "mediatimeline";
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].kind = CmsfObjectKind::kInitialization;
+            capture_loop_objects(transport, plan, false);
+            ok &= expect(count_of(captured_warnings, "timeline track") == 0,
+                         "expected no timeline warning when the track has no loopable objects, got: " +
+                             captured_warnings);
+        }
+
+        {
+            // Without --loop nothing is rebased, so neither warning applies.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            transport.on_try_write_object =
+                [](MockTransport&, const MockTransport::ObjectWriteEvent&) {
+                    return ObjectWriteResult{ObjectWriteDisposition::kFailed, "single send complete"};
+                };
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "timeline", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'T'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "mediatimeline";
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].kind = CmsfObjectKind::kMetadata;
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected non-loop session connect to succeed");
+            std::ostringstream captured_stderr;
+            std::streambuf* real_cerr_buf = std::cerr.rdbuf(captured_stderr.rdbuf());
+            session.publish(plan);
+            std::cerr.rdbuf(real_cerr_buf);
+            const std::string warnings = captured_stderr.str();
+            ok &= expect(count_of(warnings, "could not rebase") == 0 && count_of(warnings, "timeline track") == 0,
+                         "expected no loop warnings when --loop is off, got: " + warnings);
+        }
+
+        {
+            // rebase_failed is per track: one unparseable track must neither
+            // silence the warning for, nor stop rebasing of, a healthy one.
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.reads[0].push_back(encode_subscribe_message(
+                1, kTestTrackNamespace, "broken", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            transport.reads[0].push_back(encode_subscribe_message(
+                3, kTestTrackNamespace, "good", 1, DraftVersion::kDraft16, 0, 0, 10, 1));
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "broken", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'X'},
+                {.track_name = "good", .group_id = 1, .subgroup_id = 0, .object_id = 0, .marker = 'M'},
+            });
+            plan.tracks[0].packaging = "cmaf";
+            plan.tracks[0].timescale = 90000;
+            plan.tracks[1].packaging = "locmaf";
+            plan.tracks[1].timescale = 90000;
+            plan.objects[0].media_duration_us = 1'000'000;
+            plan.objects[1].media_duration_us = 1'000'000;
+            plan.objects[1].owned_payload = {2, 2, 0x0A, 0x05, 'M'};
+            const auto sent = capture_loop_objects(transport, plan, false);
+            const auto advanced = std::vector<std::uint8_t>{2, 4, 0x0A, 0xC1, 0x5F, 0x95, 'M'};
+            ok &= expect(std::any_of(sent.begin(), sent.end(),
+                                     [&](const auto& bytes) { return ends_with(bytes, advanced); }),
+                         "expected the healthy track to keep rebasing after another track failed");
+            ok &= expect(count_of(captured_warnings, "could not rebase looped media timestamps for track broken") == 1 &&
+                             count_of(captured_warnings, "for track good") == 0,
+                         "expected the rebase warning for only the broken track, got: " + captured_warnings);
+        }
     }
 
     {
