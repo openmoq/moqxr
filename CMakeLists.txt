@@ -913,6 +913,11 @@ if(OPENMOQ_BUILD_TESTS)
         tests/moqt_session_test.cpp
     )
     target_link_libraries(openmoq-publisher-transport-tests PRIVATE openmoq_publisher_lib)
+    if(MSVC)
+        # The Debug frames of this test's main() and the session loops exceed the
+        # default 1 MB stack.
+        target_link_options(openmoq-publisher-transport-tests PRIVATE /STACK:8388608)
+    endif()
     add_test(NAME openmoq-publisher-transport-tests COMMAND openmoq-publisher-transport-tests)
 
     add_executable(openmoq-publisher-webtransport-tests
