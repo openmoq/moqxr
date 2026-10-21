@@ -68,6 +68,16 @@ struct LiveObject {
     bool subgroup_contains_group_largest = true;
     bool final_in_subgroup = true;
     std::vector<ObjectProperty> properties{};
+    // Marks the source's closing catalog of MSF 11.3 (an independent catalog
+    // with "isComplete": true and an empty tracks array). Valid only on the
+    // "catalog" track, and it must be the last object the source returns: an
+    // object after it makes the publish fail. The source owns the payload;
+    // the publisher sends it as given and does not inspect it. The publisher
+    // ends every other track first (finishes its groups and sends
+    // PUBLISH_DONE Track Ended), then sends this object, then ends the
+    // catalog track. This follows MSF 11.3; a receiver must still deliver a
+    // track until its PUBLISH_DONE, because the streams can arrive in any order.
+    bool ends_broadcast = false;
 };
 
 struct LiveObjectSource {
