@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace openmoq::publisher::transport::priority_scheduler_internal {
@@ -1696,6 +1697,120 @@ void queue_draft16_scheduling_prefix(MockTransport& transport,
     }));
     transport.reads[0].push_back(
         encode_publish_namespace_ok_message(DraftVersion::kDraft16, 0));
+}
+
+// Group ID of the first object on every data stream, keyed by track alias.
+std::map<std::uint64_t, std::vector<std::uint64_t>> data_stream_groups(const MockTransport& transport,
+                                                                       DraftVersion draft) {
+    std::map<std::uint64_t, std::vector<std::uint64_t>> groups;
+    std::set<std::uint64_t> seen;
+    for (const auto& write : transport.writes) {
+        if (!is_data_stream_write(write) || !seen.insert(write.stream_id).second) continue;
+        std::size_t offset = 0;
+        std::uint64_t type = 0, alias = 0, group = 0;
+        using openmoq::publisher::transport::decode_vi64;
+        const bool decoded = draft18_family(draft)
+            ? decode_vi64(write.bytes, offset, type) && decode_vi64(write.bytes, offset, alias) &&
+                  decode_vi64(write.bytes, offset, group)
+            : decode_varint(write.bytes, offset, type) && decode_varint(write.bytes, offset, alias) &&
+                  decode_varint(write.bytes, offset, group);
+        if (decoded) groups[alias].push_back(group);
+    }
+    return groups;
+}
+
+// MoqTransport section 2.5: live stdin publishing numbers media and catalog
+// groups from set_initial_group_id() on every draft, not only on draft-22
+// migration.
+bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::uint64_t kInitial = 1700000000000ULL;
+    constexpr std::string_view kNamespace = "interop";
+    bool ok = true;
+    for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft18, DraftVersion::kDraft21,
+                             DraftVersion::kDraft22}) {
+        const std::string label = "draft " + std::to_string(static_cast<int>(draft)) + ": ";
+        MockTransport transport;
+        if (draft18_family(draft)) {
+            transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+            transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        } else {
+            transport.reads[0].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 8}));
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[0].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        }
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        session.set_initial_group_id(kInitial);
+        ok &= expect(session.connect(endpoint, tls).ok, label + "initial Group ID session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB),
+                                   make_live_media_fragment(1000, 0xAC)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "initial Group ID live publish succeeds: " + status.message);
+        const auto groups = data_stream_groups(transport, draft);
+        const auto catalog = groups.find(0);
+        const auto media = groups.find(1);
+        ok &= expect(catalog != groups.end() && !catalog->second.empty() && catalog->second.front() == kInitial,
+                     label + "first catalog group must equal the initial Group ID");
+        ok &= expect(media != groups.end() && media->second.size() == 2 && media->second[0] == kInitial &&
+                         media->second[1] == kInitial + 1,
+                     label + "media groups must count up from the initial Group ID");
+        const auto floor = session.live_resume_group_floor();
+        ok &= expect(floor && *floor == kInitial + 2, label + "migration floor must stay above the initial Group ID");
+        const auto catalog_floor = session.live_resume_catalog_group_floor();
+        ok &= expect(catalog_floor && *catalog_floor == kInitial + 1,
+                     label + "catalog migration floor must follow the last catalog group");
+    }
+
+    {
+        // The migration floors only ever raise the base, and only on draft 22.
+        // A migrated session must not reuse a catalog Location either: its
+        // catalog differs from the previous session's (generatedAt).
+        for (const auto [draft, resume_floor, expected] :
+             {std::tuple{DraftVersion::kDraft22, kInitial + 50, kInitial + 50},
+              std::tuple{DraftVersion::kDraft22, std::uint64_t{7}, kInitial},
+              std::tuple{DraftVersion::kDraft18, kInitial + 50, kInitial}}) {
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+            transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+            MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+            session.set_initial_group_id(kInitial);
+            ok &= expect(session.connect(endpoint, tls).ok, "resume floor session connects");
+            const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+            std::istringstream input(std::string(bytes.begin(), bytes.end()));
+            const auto status = session.publish_live(input, draft, true, false, {}, resume_floor, resume_floor + 1);
+            ok &= expect(status.ok, "resume floor live publish succeeds: " + status.message);
+            const auto groups = data_stream_groups(transport, draft);
+            const auto catalog = groups.find(0);
+            const auto media = groups.find(1);
+            ok &= expect(media != groups.end() && !media->second.empty() && media->second.front() == expected,
+                         "first media group must be max(initial, draft-22 migration floor)");
+            const auto expected_catalog = draft == DraftVersion::kDraft22 ? std::max(kInitial, resume_floor + 1)
+                                                                          : kInitial;
+            ok &= expect(catalog != groups.end() && !catalog->second.empty() &&
+                             catalog->second.front() == expected_catalog,
+                         "first catalog group must be max(initial, draft-22 catalog migration floor)");
+        }
+    }
+
+    {
+        // Above 2^62-1 the publish fails before any setup traffic.
+        MockTransport transport;
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        session.set_initial_group_id(openmoq::publisher::kMaxGroupId + 1);
+        ok &= expect(session.connect(endpoint, tls).ok, "oversized initial Group ID session connects");
+        const auto bytes = make_live_init_mp4();
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, DraftVersion::kDraft18, true);
+        ok &= expect(!status.ok && status.message.find("2^62-1") != std::string::npos,
+                     "initial Group ID above 2^62-1 must fail the live publish: " + status.message);
+        ok &= expect(session.publish_stats().objects_published == 0,
+                     "oversized initial Group ID must publish nothing");
+    }
+    return ok;
 }
 
 }  // namespace
@@ -11221,6 +11336,8 @@ int main() {
         ok &= expect(!result.ok,
                      "expected an unknown-track error without stop to return failure");
     }
+
+    ok &= test_live_stdin_initial_group_id(endpoint, tls);
 
     return ok ? 0 : 1;
 }

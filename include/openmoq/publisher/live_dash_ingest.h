@@ -65,12 +65,18 @@ struct LiveDashIngestConfig {
     // declared lengths are refused with 413 before any body bytes are read.
     std::size_t max_body_size = 256 * 1024 * 1024;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
+    // MoqTransport section 2.5: the first Group ID of every track this ingest
+    // numbers (media and catalog), so a restarted publisher can start above
+    // the groups it used before. See PublisherConfig::initial_group_id.
+    std::uint64_t initial_group_id = 0;
 };
 
 class LiveDashIngestSession {
 public:
+    // Throws std::invalid_argument when initial_group_id exceeds kMaxGroupId.
     explicit LiveDashIngestSession(std::size_t queue_depth = 128,
-                                   MediaPackaging packaging = MediaPackaging::kCmaf);
+                                   MediaPackaging packaging = MediaPackaging::kCmaf,
+                                   std::uint64_t initial_group_id = 0);
 
     void ingest(std::string path, std::span<const std::uint8_t> bytes);
     void close();
@@ -118,6 +124,7 @@ private:
     LiveObject build_catalog_locked();
 
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
+    std::size_t initial_group_id_ = 0;
     std::map<std::string, std::unique_ptr<LocmafEncoder>> locmaf_encoders_;
     std::map<std::string, std::shared_ptr<LocTrackEncoder>> loc_encoders_;
     std::map<std::string, std::size_t> loc_dropped_group_;

@@ -7635,6 +7635,28 @@ std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
 }
 } // namespace live_srt_internal
 
+TransportStatus MoqtSession::apply_live_group_floors(DraftVersion draft_version,
+                                                     std::uint64_t resume_group_floor,
+                                                     std::uint64_t resume_catalog_group_floor) {
+    // MoqTransport section 2.5: initial_group_id_ lets a restarted publisher
+    // start above the Group IDs it used before, on every draft. Draft-22
+    // migration floors only ever raise it. The catalog is a track in the same
+    // namespace, so it starts from the same base.
+    const bool migrating = draft_version == DraftVersion::kDraft22;
+    const std::uint64_t media_floor = std::max(initial_group_id_, migrating ? resume_group_floor : 0);
+    const std::uint64_t catalog_floor =
+        std::max(initial_group_id_, migrating ? resume_catalog_group_floor : 0);
+    if (media_floor > kMaxGroupId || catalog_floor > kMaxGroupId ||
+        media_floor > std::numeric_limits<std::size_t>::max()) {
+        return TransportStatus::failure("live initial Group ID exceeds 2^62-1");
+    }
+    live_resume_group_floor_ = media_floor;
+    // publish_live() resets catalog_publisher_ later, which returns its group
+    // counter to this value.
+    catalog_publisher_.set_initial_group_id(catalog_floor);
+    return TransportStatus::success();
+}
+
 TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                           std::istream* stdin_input,
                                           openmoq::publisher::DraftVersion draft_version,
@@ -7657,11 +7679,16 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return TransportStatus::failure("live ingest requires at least one active source");
     }
     if (ingest.use_stdin) {
-        return publish_live(*stdin_input, draft_version, split_cmaf_chunks, stream_per_object, ingest.resume_bytes, ingest.resume_group_floor);
+        return publish_live(*stdin_input, draft_version, split_cmaf_chunks, stream_per_object, ingest.resume_bytes,
+                            ingest.resume_group_floor, ingest.resume_catalog_group_floor);
     }
 
     // SRT-only path below.
-    live_resume_group_floor_ = draft_version == DraftVersion::kDraft22 ? ingest.resume_group_floor : 0;
+    if (const auto floor_status = apply_live_group_floors(
+            draft_version, ingest.resume_group_floor, ingest.resume_catalog_group_floor);
+        !floor_status.ok) {
+        return floor_status;
+    }
     if (transport_.state() != ConnectionState::kConnected) {
         return TransportStatus::failure("transport is not connected");
     }
@@ -7960,7 +7987,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             if (!queued_fragment.has_value()) break;
             openmoq::publisher::MediaFragment fragment =
                 std::move(*queued_fragment);
-            if (fragment.group_id > std::numeric_limits<std::size_t>::max() - live_resume_group_floor_)
+            if (fragment.group_id > kMaxGroupId - live_resume_group_floor_)
                 return TransportStatus::failure("live SRT input exhausted group IDs");
             fragment.group_id += live_resume_group_floor_;
             const auto object_available_at =
@@ -8767,8 +8794,13 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                            bool split_cmaf_chunks,
                                            bool stream_per_object,
                                            std::span<const std::uint8_t> resume_bytes,
-                                           std::uint64_t resume_group_floor) try {
-    live_resume_group_floor_ = draft_version == DraftVersion::kDraft22 ? resume_group_floor : 0;
+                                           std::uint64_t resume_group_floor,
+                                           std::uint64_t resume_catalog_group_floor) try {
+    if (const auto floor_status = apply_live_group_floors(
+            draft_version, resume_group_floor, resume_catalog_group_floor);
+        !floor_status.ok) {
+        return floor_status;
+    }
     if (media_packaging_ == MediaPackaging::kLoc &&
         (!is_draft18_or_later(draft_version) || !split_cmaf_chunks || stream_per_object)) {
         return TransportStatus::failure("LOC requires draft 18 or 21, split chunks, and GOP subgroup streams");
@@ -9102,7 +9134,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         std::map<std::string, std::size_t> dropped_loc_groups;
         std::size_t shared_group_id = group_floor;
         const auto next_group = [&]() {
-            if (shared_group_id == std::numeric_limits<std::size_t>::max())
+            if (shared_group_id >= kMaxGroupId)
                 throw std::runtime_error("live input exhausted group IDs");
             ++shared_group_id;
         };
@@ -9154,7 +9186,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                     auto fragments = loc_encoders.at(sample.track_name)->encode(std::span(&sample, 1));
                                     std::lock_guard<std::mutex> lock(queue->mutex);
                                     for (auto& fragment : fragments) {
-                                        if (fragment.group_id > std::numeric_limits<std::size_t>::max() - group_floor)
+                                        if (fragment.group_id > kMaxGroupId - group_floor)
                                             throw std::runtime_error("live LOC input exhausted group IDs");
                                         fragment.group_id += group_floor;
                                         const auto dropped = dropped_loc_groups.find(fragment.track_name);

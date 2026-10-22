@@ -301,8 +301,17 @@ void ChunkedBodyDecoder::parse_available() {
     }
 }
 
-LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth, MediaPackaging packaging)
-    : media_packaging_(packaging), queue_depth_(queue_depth == 0 ? 1 : queue_depth) {}
+LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth,
+                                             MediaPackaging packaging,
+                                             std::uint64_t initial_group_id)
+    : media_packaging_(packaging), queue_depth_(queue_depth == 0 ? 1 : queue_depth) {
+    if (initial_group_id > kMaxGroupId || initial_group_id > std::numeric_limits<std::size_t>::max()) {
+        throw std::invalid_argument("DASH ingest initial Group ID exceeds 2^62-1");
+    }
+    initial_group_id_ = static_cast<std::size_t>(initial_group_id);
+    catalog_group_id_ = initial_group_id_;
+    shared_media_group_id_ = initial_group_id_;
+}
 
 void LiveDashIngestSession::ingest(std::string path, std::span<const std::uint8_t> bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -554,9 +563,13 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
                 if (!track_published_locked(sample.track_name)) continue;
                 auto fragments = loc_encoders_.at(sample.track_name)->encode(std::span(&sample, 1));
                 for (auto& fragment : fragments) {
+                    // The encoder numbers its groups from 0.
+                    if (fragment.group_id > kMaxGroupId - initial_group_id_) {
+                        throw std::runtime_error("exhausted group IDs");
+                    }
                     enqueue_locked(LiveObject{
                         .track_name = fragment.track_name,
-                        .group_id = fragment.group_id,
+                        .group_id = fragment.group_id + initial_group_id_,
                         .object_id = fragment.object_id,
                         .media_time_us = fragment.start_time_us,
                         .media_duration_us = fragment.duration_us,
@@ -637,7 +650,8 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         fragment.group_id = shared_media_group_id_;
         fragment.object_id = shared_object_id_by_track_[fragment.track_name]++;
     } else {
-        fragment.group_id = path_state.next_group_by_track[fragment.track_name]++;
+        fragment.group_id =
+            path_state.next_group_by_track.try_emplace(fragment.track_name, initial_group_id_).first->second++;
         fragment.object_id = 0;
     }
     const auto encoder = locmaf_encoders_.find(fragment.track_name);
@@ -770,7 +784,7 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
 struct LiveDashIngestServer::Impl {
     explicit Impl(LiveDashIngestConfig server_config)
         : config(std::move(server_config)),
-          session(config.queue_depth, config.media_packaging) {}
+          session(config.queue_depth, config.media_packaging, config.initial_group_id) {}
 
     LiveDashIngestConfig config;
     LiveDashIngestSession session;

@@ -1,4 +1,5 @@
 #include "openmoq/publisher/msf_catalog.h"
+#include "openmoq/publisher/moq_draft.h"
 
 #include <algorithm>
 #include <cmath>
@@ -976,6 +977,9 @@ CatalogObject CatalogPublisher::emit_independent(const MsfCatalog& catalog) {
     // sent on a throw, and a later delta would land in that phantom group,
     // violating MSF section 5.
     std::string payload = serialize_catalog(catalog);
+    if (next_group_id_ > kMaxGroupId) {
+        throw std::runtime_error("MSF catalog exhausted group IDs");
+    }
 
     CatalogObject object;
     object.group_id = next_group_id_++;
@@ -992,10 +996,21 @@ bool CatalogPublisher::ended() const {
     return ended_;
 }
 
+void CatalogPublisher::set_initial_group_id(std::uint64_t group_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    initial_group_id_ = group_id;
+    next_group_id_ = group_id;
+}
+
+std::uint64_t CatalogPublisher::next_group_id() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return next_group_id_;
+}
+
 void CatalogPublisher::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     last_.reset();
-    next_group_id_ = 0;
+    next_group_id_ = initial_group_id_;
     next_object_id_ = 0;
     ended_ = false;
     deltas_in_group_ = 0;
@@ -1114,10 +1129,10 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     std::string payload = serialize_catalog(delta);
 
     CatalogObject object;
-    // Stay in the current group. next_group_id_ is at least 1 here: this
-    // branch is only reachable when last_ has a value, which means
-    // emit_independent already ran and incremented it. Do not hoist this
-    // expression above that guard.
+    // Stay in the current group. next_group_id_ is at least 1 (and above
+    // initial_group_id_) here: this branch is only reachable when last_ has
+    // a value, which means emit_independent already ran and incremented it.
+    // Do not hoist this expression above that guard.
     object.group_id = next_group_id_ - 1;
     object.object_id = next_object_id_++;
     object.subgroup_id = 0;

@@ -56,6 +56,9 @@ struct LiveIngestOptions {
     bool use_stdin = false;
     std::vector<std::uint8_t> resume_bytes;
     std::uint64_t resume_group_floor = 0;
+    // Draft-22 migration only, like resume_group_floor: the first catalog
+    // Group ID the new session may use (live_resume_catalog_group_floor()).
+    std::uint64_t resume_catalog_group_floor = 0;
     std::vector<LiveSrtCallerOptions> srt_callers;
 };
 
@@ -93,7 +96,8 @@ public:
                                  bool split_cmaf_chunks,
                                  bool stream_per_object = false,
                                  std::span<const std::uint8_t> resume_bytes = {},
-                                 std::uint64_t resume_group_floor = 0);
+                                 std::uint64_t resume_group_floor = 0,
+                                 std::uint64_t resume_catalog_group_floor = 0);
     TransportStatus publish_live(const LiveIngestOptions& ingest,
                                  std::istream* stdin_input,
                                  openmoq::publisher::DraftVersion draft_version,
@@ -139,7 +143,14 @@ public:
         }
         return floor;
     }
-
+    // The catalog's counterpart of live_resume_group_floor(): the next catalog
+    // Group ID, so a migrated session does not reuse a catalog Location the
+    // previous session sent with different content (generatedAt changes).
+    std::optional<std::uint64_t> live_resume_catalog_group_floor() const {
+        const auto floor = catalog_publisher_.next_group_id();
+        if (floor > openmoq::publisher::kMaxGroupId) return std::nullopt;
+        return floor;
+    }
 
     // MSF section 5.3: when non-zero, publish_live() periodically re-emits an
     // independent catalog (via CatalogPublisher::force_independent) even when
@@ -157,9 +168,17 @@ public:
 
     void set_media_packaging(MediaPackaging packaging) { media_packaging_ = packaging; }
 
+    // See PublisherConfig::initial_group_id. publish_live() numbers live media
+    // and catalog groups from at least this value on every draft; on draft 22
+    // a larger migration floor still wins. Above kMaxGroupId it fails.
+    void set_initial_group_id(std::uint64_t group_id) { initial_group_id_ = group_id; }
+
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
+    TransportStatus apply_live_group_floors(openmoq::publisher::DraftVersion draft_version,
+                                            std::uint64_t resume_group_floor,
+                                            std::uint64_t resume_catalog_group_floor);
     void record_published_object(const std::string& track_name,
                                  std::uint64_t group_id,
                                  std::uint64_t object_id,
@@ -209,6 +228,7 @@ private:
     PublishStats publish_stats_{};
     std::vector<std::uint8_t> live_resume_bytes_;
     std::uint64_t live_resume_group_floor_ = 0;
+    std::uint64_t initial_group_id_ = 0;
     std::unordered_map<std::string, std::uint64_t> last_group_by_track_;
     std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> largest_sent_by_track_;
     std::atomic<bool> stop_requested_{false};

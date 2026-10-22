@@ -238,6 +238,21 @@ cat sample.mp4 | ./build/openmoq-publisher \
   --insecure
 ```
 
+### Restarting a live publisher
+
+A live publisher numbers its Group IDs from 0. When it restarts and publishes the same namespace and track names again, the new groups reuse Group IDs from the previous run, so two different objects share one Location. MoqTransport section 2.5 suggests choosing an initial Group ID larger than every group used before, for example from the current time:
+
+```bash
+ffmpeg ... -f mp4 pipe:1 | ./build/openmoq-publisher \
+  --input - \
+  --endpoint localhost:4433 \
+  --namespace media \
+  --forward 1 \
+  --initial-group-id time
+```
+
+`time` is read once at startup as milliseconds since the Unix epoch. This keeps the new Group IDs above the previous run's if that run published fewer groups than the milliseconds that passed between its start and the restart, and the system clock did not step backwards. `--initial-group-id N` sets an explicit start (at most 2^62-1). The option works with `--input -`, `--live-source srt`, and `--live-source dash`, numbers both media and catalog groups, and is rejected for file input. It is not supported by the libmoq publishing backend, which numbers Group IDs itself.
+
 ## SRT Live Ingest
 
 The SRT ingest path receives MPEG-TS from one or more configured SRT sources, discovers the selected MPEG-TS program, converts the elementary streams to CMAF objects, and publishes them to the relay. Each entry can use SRT `caller` mode to connect to an existing listener, or `listener` mode to bind the configured host and port and accept one incoming source.

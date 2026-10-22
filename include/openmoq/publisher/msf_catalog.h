@@ -260,11 +260,22 @@ public:
     // joining subscriber must perform. Default 8.
     void set_max_deltas_per_group(std::size_t max_deltas) { max_deltas_per_group_ = max_deltas; }
 
+    // MoqTransport section 2.5: the Group ID of the first independent catalog
+    // after construction or reset(), so a restarted publisher can start above
+    // the groups it used before. Also moves the next group to it, so call it
+    // before the first publish(). Like max_deltas_per_group_, reset() keeps
+    // it. Default 0.
+    void set_initial_group_id(std::uint64_t group_id);
+
+    // The Group ID the next independent catalog will use.
+    std::uint64_t next_group_id() const;
+
     // Reset all per-broadcast state (the last published catalog, the group
     // and object counters, and the ended flag) back to how a freshly
     // constructed CatalogPublisher starts. max_deltas_per_group_ is left
     // alone, since it is a standing configuration knob rather than
-    // per-broadcast state. A caller that reuses one MoqtSession instance
+    // per-broadcast state, and so is the initial Group ID, which the group
+    // counter returns to. A caller that reuses one MoqtSession instance
     // across more than one publish()/publish_live() call must call this
     // first, or the second broadcast's first publish() would see `last_`
     // already set from the previous broadcast and (via catalogs_equal)
@@ -276,6 +287,7 @@ private:
 
     mutable std::mutex mutex_;
     std::optional<MsfCatalog> last_;
+    std::uint64_t initial_group_id_ = 0;
     std::uint64_t next_group_id_ = 0;
     std::uint64_t next_object_id_ = 0;
     bool ended_ = false;
