@@ -178,14 +178,18 @@ struct LibmoqPublishStats {
     std::uint64_t groups_published = 0;
 };
 
+struct LibmoqLiveHandle;
+
 // Connect an endpoint, attach a media sender, add the plan's tracks, write its
 // media objects, end each finite track, then tear everything down cleanly.
 // draft_version must be draft-16 or draft-18; the endpoint requests it exactly.
+// An optional handle lets disconnect() stop the publish, as for the live paths.
 TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
                                         const PublisherConfig& config,
                                         const EndpointConfig& endpoint,
                                         const TlsConfig& tls,
-                                        LibmoqPublishStats& out_stats);
+                                        LibmoqPublishStats& out_stats,
+                                        LibmoqLiveHandle* live = nullptr);
 
 // Shared handle for an in-flight libmoq live publish. Publisher owns it; the
 // driver registers its endpoint (set_endpoint) once connected and clears it
@@ -195,8 +199,8 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
 // driver observes the cancel flag in its loops and tears down cleanly, returning
 // success -- a cancel is a deliberate stop, matching the legacy MoqtSession
 // close() semantics. A cancel set before the driver connects short-circuits
-// without connecting. NOTE: stdin's blocking read still means cancel is observed
-// once the current read returns; object/SRT/readiness waits stop promptly.
+// without connecting. Real stdin is polled on POSIX, so an idle input does not
+// hold up the cancel; any other istream is observed once its read returns.
 struct LibmoqLiveHandle {
     std::atomic<bool> cancel{false};
     std::mutex        ep_mutex;

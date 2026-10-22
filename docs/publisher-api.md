@@ -407,10 +407,12 @@ drops fragments to stay bounded). If no subscriber appears within
 `PublisherConfig::subscriber_timeout`, the call fails with
 `timed out waiting for media subscriber` instead of hanging.
 
-Calling `disconnect()` from another thread stops a running `publish_live_objects`
-(or live stdin/SRT) publish promptly; the driver loop breaks, the endpoint is
-interrupted, and the call returns success. For stdin specifically, cancellation is
-observed once the current blocking read returns.
+Calling `disconnect()` from another thread stops a running publish promptly
+(batch, `publish_live_objects`, or live stdin/SRT); the driver loop breaks, the
+connection is closed, and the call returns success. A stopped publish is not
+retried and does not follow a GOAWAY migration. Real stdin is polled on POSIX,
+so an idle input does not delay the stop; any other `std::istream` is observed
+once its current blocking read returns.
 
 > **Legacy note:** bare `LiveTrack{.track_name = ...}` entries with no media
 > metadata (a generic "events"-style object track) are rejected on the normal

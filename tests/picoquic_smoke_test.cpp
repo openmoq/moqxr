@@ -1,5 +1,6 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/moq_draft.h"
+#include "openmoq/publisher/publisher_api.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/moqt_session.h"
 #include "openmoq/publisher/transport/picoquic_client.h"
@@ -38,6 +39,11 @@ using openmoq::publisher::PublishPlan;
 using openmoq::publisher::TrackDescription;
 using openmoq::publisher::draft_profile;
 using openmoq::publisher::materialize_publish_plan;
+using openmoq::publisher::PreparedPublish;
+using openmoq::publisher::Publisher;
+using openmoq::publisher::PublisherConfig;
+using openmoq::publisher::transport::PublisherTransport;
+using openmoq::publisher::transport::TransportKind;
 using openmoq::publisher::transport::EndpointConfig;
 using openmoq::publisher::transport::MoqtSession;
 using openmoq::publisher::transport::ObjectWriteDisposition;
@@ -81,6 +87,10 @@ struct SmokeServer {
     std::optional<std::uint64_t> reject_setup_code;
     std::string reject_setup_reason;
     bool setup_rejected = false;
+    // How the client ended the connection, as the server first saw it.
+    std::optional<picoquic_call_back_event_t> close_event;
+    std::uint64_t close_remote_error = 0;
+    std::uint64_t close_remote_application_error = 0;
 };
 
 bool trace_enabled() {
@@ -252,9 +262,19 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
         }
         case picoquic_callback_close:
         case picoquic_callback_application_close:
-        case picoquic_callback_stateless_reset:
+        case picoquic_callback_stateless_reset: {
             trace("server connection close event");
+            std::uint64_t local = 0, remote = 0, local_application = 0, remote_application = 0;
+            picoquic_get_close_reasons(cnx, &local, &remote, &local_application, &remote_application);
+            std::lock_guard<std::mutex> lock(server->mutex);
+            if (!server->close_event.has_value()) {
+                server->close_event = event;
+                server->close_remote_error = remote;
+                server->close_remote_application_error = remote_application;
+            }
+            server->condition.notify_all();
             return 0;
+        }
         case picoquic_callback_stream_reset: {
             std::lock_guard<std::mutex> lock(server->mutex);
             server->media_stream_reset_errors.insert_or_assign(
@@ -963,6 +983,66 @@ int main() {
         ok &= expect(reject_status.message.find("\"expired authorization token\"") != std::string::npos,
                      "expected the relay's reason phrase in the error, got: " + reject_status.message);
         stop_server(reject_server);
+    }
+
+    {
+        // Publisher::disconnect() from another thread, as the CLI does on
+        // SIGTERM/SIGINT, while the publish waits for its first SUBSCRIBE.
+        // The relay must see an application CONNECTION_CLOSE with NO_ERROR
+        // rather than wait out its idle timeout.
+        SmokeServer stop_server_state;
+        ok &= expect(start_server(stop_server_state, false), "expected stop smoke server to start");
+        const EndpointConfig stop_endpoint{
+            .host = "127.0.0.1",
+            .port = stop_server_state.port,
+            .alpn = "moq-00",
+        };
+        PublisherConfig config;
+        config.draft_version = DraftVersion::kDraft14;
+        config.track_namespace = "media";
+        config.forward = false;
+        config.subscriber_timeout = std::chrono::seconds(30);
+        Publisher publisher(config, [](TransportKind) -> std::unique_ptr<PublisherTransport> {
+            return std::make_unique<PicoquicClient>();
+        });
+        const PreparedPublish prepared{.input_bytes = source_bytes, .plan = make_span_backed_plan()};
+        openmoq::publisher::transport::TransportStatus stop_status =
+            openmoq::publisher::transport::TransportStatus::failure("not run");
+        std::thread publishing([&] {
+            stop_status = publisher.publish(prepared, stop_endpoint, tls, true);
+        });
+        {
+            std::unique_lock<std::mutex> lock(stop_server_state.mutex);
+            ok &= expect(stop_server_state.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                             return stop_server_state.namespace_response_sent;
+                         }),
+                         "expected the stopped publish to reach its namespace");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto stop_started = std::chrono::steady_clock::now();
+        static_cast<void>(publisher.disconnect(0));
+        publishing.join();
+        const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
+        ok &= expect(stop_status.ok, "expected a disconnect()-stopped publish to report success: " +
+                                         stop_status.message);
+        ok &= expect(stop_elapsed < std::chrono::seconds(2),
+                     "expected the publish to return within 2 s of disconnect()");
+        {
+            std::unique_lock<std::mutex> lock(stop_server_state.mutex);
+            ok &= expect(stop_server_state.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                             return stop_server_state.close_event.has_value();
+                         }),
+                         "expected the server to see the connection close");
+            ok &= expect(stop_server_state.close_event == picoquic_callback_application_close &&
+                             stop_server_state.close_remote_application_error == 0 &&
+                             stop_server_state.close_remote_error == 0,
+                         "expected an application CONNECTION_CLOSE with NO_ERROR, got event=" +
+                             std::to_string(stop_server_state.close_event.value_or(picoquic_callback_stream_data)) +
+                             " application_error=" +
+                             std::to_string(stop_server_state.close_remote_application_error) +
+                             " transport_error=" + std::to_string(stop_server_state.close_remote_error));
+        }
+        stop_server(stop_server_state);
     }
     return ok ? 0 : 1;
 }
