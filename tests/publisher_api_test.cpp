@@ -590,7 +590,7 @@ bool test_live_stdin_goaway_replays_parser_residual() {
     return ok;
 }
 
-bool test_live_stdin_migration_keeps_object_identity() {
+bool test_live_stdin_migration_keeps_object_identity(std::uint64_t initial_group_id = 0) {
     const auto path=std::filesystem::path(__FILE__).parent_path()/"fixtures"/"locmaf-publisher.mp4";
     std::ifstream file(path,std::ios::binary);
     const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)),{});
@@ -623,7 +623,7 @@ bool test_live_stdin_migration_keeps_object_identity() {
     auto ready=std::make_shared<std::size_t>(0);
     std::vector<std::shared_ptr<MigrationTransport::Record>> records;
     PublisherConfig config;config.draft_version=DraftVersion::kDraft22;config.forward=true;
-    config.subscriber_timeout=std::chrono::seconds(1);
+    config.subscriber_timeout=std::chrono::seconds(1);config.initial_group_id=initial_group_id;
     Publisher publisher(config,[&](TransportKind) -> std::unique_ptr<PublisherTransport> {
         auto record=std::make_shared<MigrationTransport::Record>();records.push_back(record);
         auto transport=std::make_unique<MigrationTransport>(record,records.size()==1
@@ -640,6 +640,12 @@ bool test_live_stdin_migration_keeps_object_identity() {
         for (const auto group:records[1]->media_groups)
             ok &= expect(group>records[0]->media_groups.back(),"new media cannot reuse old session group/object IDs");
     }
+    if (initial_group_id != 0 && records.size()==2 && !records[0]->media_groups.empty()) {
+        // MoqTransport section 2.5: the first session starts at the initial
+        // Group ID, and the migrated one still resumes above its groups.
+        ok &= expect(records[0]->media_groups.front()==initial_group_id,
+                     "first live media group must equal the initial Group ID");
+    }
     return ok;
 }
 
@@ -654,6 +660,7 @@ int main() {
     ok &= test_catalog_replay_limit_only_applies_to_migration();
     ok &= test_live_stdin_goaway_replays_parser_residual();
     ok &= test_live_stdin_migration_keeps_object_identity();
+    ok &= test_live_stdin_migration_keeps_object_identity(1700000000000ULL);
     ok &= expect(PublisherConfig{}.draft_version == DraftVersion::kDraft18,
                  "publisher API defaults to draft-18");
 
@@ -988,6 +995,37 @@ int main() {
     ok &= expect(default_config.catalog_republish_interval == std::chrono::seconds(0),
                  "expected catalog republication disabled by default");
     ok &= expect(!default_config.vod, "expected the publisher to default to live");
+    ok &= expect(default_config.initial_group_id == 0, "expected live Group IDs to start at 0 by default");
+    {
+        const auto before = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto group_id = openmoq::publisher::time_based_initial_group_id();
+        ok &= expect(group_id >= before && group_id <= openmoq::publisher::kMaxGroupId,
+                     "expected a time-based initial Group ID in milliseconds since the epoch");
+        PublisherConfig oversized;
+        oversized.initial_group_id = openmoq::publisher::kMaxGroupId + 1;
+        bool rejected = false;
+        try {
+            Publisher publisher(oversized);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        ok &= expect(rejected, "expected an initial Group ID above 2^62-1 to be rejected");
+        Publisher publisher;
+        rejected = false;
+        try {
+            publisher.set_config(oversized);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        ok &= expect(rejected && publisher.config().initial_group_id == 0,
+                     "expected set_config to reject an initial Group ID above 2^62-1");
+        PublisherConfig largest;
+        largest.initial_group_id = openmoq::publisher::kMaxGroupId;
+        publisher.set_config(largest);
+        ok &= expect(publisher.config().initial_group_id == openmoq::publisher::kMaxGroupId,
+                     "expected an initial Group ID of 2^62-1 to be accepted");
+    }
 
     // end_broadcast on a publisher that never connected reports failure
     // rather than throwing, matching how disconnect() behaves.

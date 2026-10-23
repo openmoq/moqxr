@@ -3,6 +3,7 @@
 #include "openmoq/publisher/version.h"
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -556,6 +557,63 @@ int main() {
         }
         ok &= expect(threw, "expected a non-numeric --catalog-republish-interval to be rejected");
     }
+
+    // --initial-group-id (MoqTransport section 2.5).
+    {
+        const CliOptions options = parse({"openmoq-publisher", "--input", "-"});
+        ok &= expect(options.initial_group_id == 0, "expected Group IDs to start at 0 by default");
+    }
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "-", "--initial-group-id", "1234"});
+        ok &= expect(options.initial_group_id == 1234, "expected a numeric --initial-group-id");
+    }
+    {
+        const CliOptions options = parse(
+            {"openmoq-publisher", "--input", "-", "--initial-group-id", "4611686018427387903"});
+        ok &= expect(options.initial_group_id == 4611686018427387903ULL,
+                     "expected --initial-group-id to accept 2^62-1");
+    }
+    {
+        const auto now_ms = [] {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        };
+        const auto before = now_ms();
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "-", "--initial-group-id", "time"});
+        const auto after = now_ms();
+        ok &= expect(options.initial_group_id >= before && options.initial_group_id <= after,
+                     "expected --initial-group-id time to resolve to milliseconds since the epoch");
+    }
+    {
+        const CliOptions srt = parse({"openmoq-publisher", "--live-source", "srt", "--srt-config", "/tmp/foo.json",
+                                      "--endpoint", "localhost:4443", "--initial-group-id", "7"});
+        ok &= expect(srt.initial_group_id == 7, "expected --initial-group-id with --live-source srt");
+        const CliOptions dash = parse({"openmoq-publisher", "--live-source", "dash",
+                                       "--dash-listen", "127.0.0.1:8080", "--dump-plan",
+                                       "--initial-group-id", "8"});
+        ok &= expect(dash.initial_group_id == 8, "expected --initial-group-id with --live-source dash");
+    }
+    ok &= parse_throws({"openmoq-publisher", "--input", "-", "--initial-group-id", "4611686018427387904"},
+                       "must not exceed 4611686018427387903",
+                       "expected --initial-group-id above 2^62-1 to be rejected");
+    ok &= parse_throws({"openmoq-publisher", "--input", "-", "--initial-group-id", "99999999999999999999999"},
+                       "must not exceed 4611686018427387903",
+                       "expected --initial-group-id above 2^64-1 to be rejected");
+    for (const std::string value : {"", "-1", "+5", " 5", "5x", "0x10", "1.5", "now", "TIME"}) {
+        ok &= parse_throws({"openmoq-publisher", "--input", "-", "--initial-group-id", value},
+                           "--initial-group-id must be an unsigned integer or 'time'",
+                           "expected --initial-group-id \"" + value + "\" to be rejected");
+    }
+    ok &= parse_throws({"openmoq-publisher", "--input", "sample.mp4", "--initial-group-id", "5"},
+                       "--initial-group-id requires live input",
+                       "expected --initial-group-id to be rejected for file input");
+    ok &= parse_throws({"openmoq-publisher", "--input", "sample.mp4", "--vod", "--initial-group-id", "time"},
+                       "--initial-group-id requires live input",
+                       "expected --initial-group-id to be rejected for VOD file input");
+    ok &= expect(build_usage("prog").find("[--initial-group-id <N|time>]") != std::string::npos,
+                 "expected usage to list --initial-group-id");
 
     {
         const CliOptions options = parse({"openmoq-publisher", "--input", "-"});

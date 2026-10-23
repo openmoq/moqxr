@@ -182,7 +182,27 @@ transport::TransportStatus prepare_migration(const transport::TransportStatus& s
     }
 }
 
+#ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+// libmoq's media sender numbers Group IDs itself and offers no setting for the
+// first one, so the libmoq routes refuse a non-zero initial_group_id rather
+// than publish from 0 while the caller expects otherwise.
+constexpr const char* kLibmoqInitialGroupIdUnsupported =
+    "initial_group_id is not supported by the libmoq publishing backend";
+#endif
+
+void validate_initial_group_id(const PublisherConfig& config) {
+    if (config.initial_group_id > kMaxGroupId) {
+        throw std::runtime_error("initial Group ID exceeds 2^62-1");
+    }
+}
+
 }  // namespace
+
+std::uint64_t time_based_initial_group_id() {
+    const auto since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch());
+    return since_epoch.count() > 0 ? static_cast<std::uint64_t>(since_epoch.count()) : 0;
+}
 
 struct Publisher::ActiveSession {
     std::unique_ptr<transport::PublisherTransport> transport;
@@ -206,6 +226,7 @@ Publisher::Publisher(PublisherConfig config, TransportFactory transport_factory)
     : config_(std::move(config)),
       transport_factory_(std::move(transport_factory)) {
     validate_packaging(config_);
+    validate_initial_group_id(config_);
     cat4moq::validate_authorization(config_.authorization, config_.draft_version);
     transport_factory_injected_ = static_cast<bool>(transport_factory_);
     if (!transport_factory_) {
@@ -219,6 +240,7 @@ const PublisherConfig& Publisher::config() const {
 
 void Publisher::set_config(const PublisherConfig& config) {
     validate_packaging(config);
+    validate_initial_group_id(config);
     cat4moq::validate_authorization(config.authorization, config.draft_version);
     config_ = config;
 }
@@ -435,6 +457,9 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     // custom TransportFactory was injected. (publish_live_objects routes to
     // libmoq in its own method.)
     if (!transport_factory_injected_ && ingest.use_stdin && ingest.srt_callers.empty()) {
+        if (config_.initial_group_id != 0) {
+            return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
+        }
         if (stdin_input == nullptr) {
             return transport::TransportStatus::failure("live stdin publish requires an input stream");
         }
@@ -469,6 +494,9 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     // stdin+SRT does not match either branch and falls through to the old path
     // below, which rejects it (consistent with existing validation).
     if (!transport_factory_injected_ && !ingest.use_stdin && !ingest.srt_callers.empty()) {
+        if (config_.initial_group_id != 0) {
+            return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
+        }
         std::vector<LiveSrtCallerRuntimeConfig> runtime_callers;
         runtime_callers.reserve(ingest.srt_callers.size());
         for (const auto& caller : ingest.srt_callers) {
@@ -526,6 +554,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     std::uint64_t prior_bytes = 0, prior_objects = 0, prior_groups = 0;
     std::vector<std::uint8_t> resume_bytes;
     std::uint64_t resume_group_floor = 0;
+    std::uint64_t resume_catalog_group_floor = 0;
     for (std::size_t migrations = 0; ; ++migrations) {
         auto active = std::make_shared<ActiveSession>();
         active->transport = transport_factory_(resolved_endpoint.transport);
@@ -545,6 +574,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
         active->session->set_media_packaging(config_.media_packaging);
+        active->session->set_initial_group_id(config_.initial_group_id);
 
         set_active_session(active, resolved_endpoint, true);
         transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
@@ -559,6 +589,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         session_ingest.use_stdin = ingest.use_stdin;
         session_ingest.resume_bytes = resume_bytes;
         session_ingest.resume_group_floor = resume_group_floor;
+        session_ingest.resume_catalog_group_floor = resume_catalog_group_floor;
         session_ingest.srt_callers.reserve(ingest.srt_callers.size());
         for (const auto& caller : ingest.srt_callers) {
             transport::LiveSrtCallerOptions session_caller;
@@ -597,6 +628,14 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                 return exhausted;
             }
             resume_group_floor = *next_group_floor;
+            const auto next_catalog_group_floor = active->session->live_resume_catalog_group_floor();
+            if (!next_catalog_group_floor) {
+                static_cast<void>(active->close(0));
+                const auto exhausted = transport::TransportStatus::failure("live migration exhausted catalog group IDs");
+                clear_active_session(active, false, exhausted.message);
+                return exhausted;
+            }
+            resume_catalog_group_floor = *next_catalog_group_floor;
 
             static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
@@ -654,6 +693,9 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
     // real media metadata per track; a bare/legacy LiveTrack fails with a clear
     // message rather than being faked as a generic media track.
     if (!transport_factory_injected_ && !source_supplies_catalog) {
+        if (config_.initial_group_id != 0) {
+            return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
+        }
         if (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf ||
             std::any_of(source.tracks.begin(), source.tracks.end(),
                         [](const auto& track) { return track.packaging == LivePackaging::kLoc || track.packaging == LivePackaging::kLocmaf; })) {

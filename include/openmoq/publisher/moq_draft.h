@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace openmoq::publisher {
@@ -12,6 +13,10 @@ enum class DraftVersion {
     kDraft21,
     kDraft22,
 };
+
+// Largest Group ID this publisher writes: the QUIC variable-length integer
+// maximum, which every supported draft can encode.
+inline constexpr std::uint64_t kMaxGroupId = (std::uint64_t{1} << 62) - 1;
 
 struct DraftProfile {
     DraftVersion version = DraftVersion::kDraft18;
