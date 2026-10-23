@@ -297,6 +297,10 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
             return transport::TransportStatus::failure(
                 "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
         }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            stop_requested_ = false;
+        }
         const transport::EndpointConfig resolved_endpoint =
             resolve_endpoint(endpoint, endpoint_alpn_overridden);
         const PublishPlan materialized =
@@ -305,6 +309,11 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             libmoq_live_ = live;
+            // A disconnect() that ran while the endpoint was resolved or the
+            // plan materialized found no handle to cancel; honour it here.
+            if (stop_requested_) {
+                live->cancel.store(true);
+            }
         }
         transport::LibmoqPublishStats libmoq_stats;
         const transport::TransportStatus status = transport::publish_plan_via_libmoq(

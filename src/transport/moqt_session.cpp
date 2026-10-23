@@ -7256,6 +7256,9 @@ AuthorizationValues MoqtSession::action_authorization(
 
 TransportStatus MoqtSession::connect(const EndpointConfig& endpoint, const TlsConfig& tls) {
     endpoint_ = endpoint;
+    // A new connection starts un-stopped: close() on a previous connection of
+    // a reused session must not end this publish immediately.
+    stop_requested_.store(false, std::memory_order_release);
     setup_complete_ = false;
     peer_max_request_id_ = 0;
     pending_control_bytes_.clear();

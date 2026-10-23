@@ -10,6 +10,7 @@
 
 #include <exception>
 #include <chrono>
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
@@ -31,7 +32,10 @@ namespace {
 // working path while keeping a supervisor restart prompt.
 constexpr std::chrono::seconds kStopTimeout{2};
 
-volatile std::sig_atomic_t stop_signal = 0;
+// Written by the signal handler and read by the monitor, retry and main
+// threads, so it must be atomic; lock-free atomics are async-signal-safe.
+std::atomic<int> stop_signal{0};
+static_assert(std::atomic<int>::is_always_lock_free);
 
 void handle_stop_signal(int signo) {
     if (stop_signal != 0) {
