@@ -262,8 +262,8 @@ public:
 
     // MoqTransport section 2.5: the Group ID of the first independent catalog
     // after construction or reset(), so a restarted publisher can start above
-    // the groups it used before. Also moves the next group to it, so call it
-    // before the first publish(). Like max_deltas_per_group_, reset() keeps
+    // the groups it used before. Also moves the next group to it until the
+    // first catalog is published; after that only reset() applies it. Like max_deltas_per_group_, reset() keeps
     // it. Default 0.
     void set_initial_group_id(std::uint64_t group_id);
 

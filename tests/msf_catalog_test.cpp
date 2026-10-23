@@ -688,6 +688,19 @@ int main() {
         ok &= expect(b3.size() == 1 && b3[0].group_id == kInitial,
                      "expected reset() to keep the initial Group ID");
 
+        // After a catalog is out, a late set_initial_group_id() must not move
+        // the live group: deltas keep attaching to it and republication
+        // continues from it. Only reset() applies the new value.
+        CatalogPublisher late_pub;
+        (void)late_pub.publish(live_now);
+        late_pub.set_initial_group_id(kInitial);
+        ok &= expect(late_pub.next_group_id() == 1, "expected a late initial Group ID not to move the live group");
+        const auto late_republish = late_pub.force_independent();
+        ok &= expect(late_republish.size() == 1 && late_republish[0].group_id == 1,
+                     "expected republication to continue from the live group");
+        late_pub.reset();
+        ok &= expect(late_pub.next_group_id() == kInitial, "expected reset() to apply the late initial Group ID");
+
         CatalogPublisher exhausted_pub;
         exhausted_pub.set_initial_group_id(kMaxGroupId);
         ok &= expect(exhausted_pub.publish(live_now)[0].group_id == kMaxGroupId,

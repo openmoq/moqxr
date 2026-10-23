@@ -124,7 +124,7 @@ private:
     LiveObject build_catalog_locked();
 
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
-    std::size_t initial_group_id_ = 0;
+    std::uint64_t initial_group_id_ = 0;
     std::map<std::string, std::unique_ptr<LocmafEncoder>> locmaf_encoders_;
     std::map<std::string, std::shared_ptr<LocTrackEncoder>> loc_encoders_;
     std::map<std::string, std::size_t> loc_dropped_group_;

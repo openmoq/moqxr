@@ -999,7 +999,9 @@ bool CatalogPublisher::ended() const {
 void CatalogPublisher::set_initial_group_id(std::uint64_t group_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     initial_group_id_ = group_id;
-    next_group_id_ = group_id;
+    // Once a catalog is out, next_group_id_ is the group deltas attach to and
+    // the next independent catalog's group; only reset() may move it back.
+    if (!last_.has_value()) next_group_id_ = group_id;
 }
 
 std::uint64_t CatalogPublisher::next_group_id() const {

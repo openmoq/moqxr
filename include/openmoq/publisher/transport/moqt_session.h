@@ -138,7 +138,7 @@ public:
         auto floor = live_resume_group_floor_;
         for (const auto& [track, largest] : largest_sent_by_track_) {
             if (track == "catalog") continue;
-            if (largest.first == std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
+            if (largest.first >= openmoq::publisher::kMaxGroupId) return std::nullopt;
             if (largest.first >= floor) floor = largest.first + 1;
         }
         return floor;

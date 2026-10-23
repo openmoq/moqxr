@@ -308,7 +308,7 @@ LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth,
     if (initial_group_id > kMaxGroupId || initial_group_id > std::numeric_limits<std::size_t>::max()) {
         throw std::invalid_argument("DASH ingest initial Group ID exceeds 2^62-1");
     }
-    initial_group_id_ = static_cast<std::size_t>(initial_group_id);
+    initial_group_id_ = initial_group_id;
     catalog_group_id_ = initial_group_id_;
     shared_media_group_id_ = initial_group_id_;
 }
@@ -634,6 +634,12 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
                 shared_media_group_started_ = true;
                 shared_group_start_time_us_ = fragment.start_time_us;
             } else if (fragment.start_time_us > shared_group_start_time_us_) {
+                if (shared_media_group_id_ >= kMaxGroupId) {
+                    encoding_error_ = "DASH input exhausted group IDs";
+                    closed_ = true;
+                    queue_.clear();
+                    return;
+                }
                 ++shared_media_group_id_;
                 shared_group_start_time_us_ = fragment.start_time_us;
                 shared_object_id_by_track_.clear();
@@ -650,8 +656,15 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
         fragment.group_id = shared_media_group_id_;
         fragment.object_id = shared_object_id_by_track_[fragment.track_name]++;
     } else {
-        fragment.group_id =
-            path_state.next_group_by_track.try_emplace(fragment.track_name, initial_group_id_).first->second++;
+        auto& next_group =
+            path_state.next_group_by_track.try_emplace(fragment.track_name, initial_group_id_).first->second;
+        if (next_group > kMaxGroupId) {
+            encoding_error_ = "DASH input exhausted group IDs";
+            closed_ = true;
+            queue_.clear();
+            return;
+        }
+        fragment.group_id = next_group++;
         fragment.object_id = 0;
     }
     const auto encoder = locmaf_encoders_.find(fragment.track_name);
