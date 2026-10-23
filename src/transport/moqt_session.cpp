@@ -8,6 +8,7 @@
 #include "../live_media_queue.h"
 #include "../loc_packager.h"
 #include "../loop_timestamps.h"
+#include "live_input.h"
 #include "stream_reset_codes.h"
 
 #include <algorithm>
@@ -7255,6 +7256,9 @@ AuthorizationValues MoqtSession::action_authorization(
 
 TransportStatus MoqtSession::connect(const EndpointConfig& endpoint, const TlsConfig& tls) {
     endpoint_ = endpoint;
+    // A new connection starts un-stopped: close() on a previous connection of
+    // a reused session must not end this publish immediately.
+    stop_requested_.store(false, std::memory_order_release);
     setup_complete_ = false;
     peer_max_request_id_ = 0;
     pending_control_bytes_.clear();
@@ -7687,7 +7691,9 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     remember_catalog_delivery_timeouts({});
     last_catalog_published_at_ = std::chrono::steady_clock::time_point{};
 
-    std::atomic<bool> stop_requested = false;
+    // Shared with the SRT ingest, so close() from another thread also ends
+    // codec discovery and the publish loop below.
+    std::atomic<bool>& stop_requested = stop_requested_;
     auto queue = std::make_shared<LiveSrtQueueAdapter>(stop_requested);
 
     std::vector<openmoq::publisher::LiveSrtCallerRuntimeConfig> srt_callers;
@@ -8620,7 +8626,13 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return {TransportStatus::success(), new_subs};
     };
 
+    bool closed = false;
     while (true) {
+        // A set flag without the queue's resource limit means close() ran.
+        if (stop_requested && queue->publishing_status(TransportStatus::success()).ok) {
+            closed = true;
+            break;
+        }
         const bool is_eof = queue->done();
 
         status = drain_queue();
@@ -8657,6 +8669,9 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     stop_requested = true;
     if (srt_join_thread.joinable()) {
         srt_join_thread.join();
+    }
+    if (closed) {
+        return TransportStatus::success();
     }
     status = live_srt_flow.publishing_status(std::move(status));
 
@@ -8716,16 +8731,13 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     return TransportStatus::failure(error.what());
 }
 
-namespace {
-
 // Reads live input for publish_live, appending to the streaming reader and
 // returning the byte count (0 on end of stream or stop request). For real
 // stdin on POSIX, reads the fd directly behind a bounded poll: istream::read
 // would park until a full chunk arrives, which made shutdown joins hang on a
 // feeder that is alive but idle, and mixing istream reads with raw fd reads
 // would lose bytes buffered inside cin/stdio — so every stdin byte in this
-// flow must come through here. A null stop means wait indefinitely for data,
-// matching the blocking semantics of the pre-thread discovery phase.
+// flow must come through here. A null stop means wait indefinitely for data.
 std::size_t read_live_input(std::istream& input,
                             openmoq::publisher::StreamingMp4Reader& reader,
                             const std::atomic<bool>* stop) {
@@ -8759,8 +8771,6 @@ std::size_t read_live_input(std::istream& input,
 #endif
     return reader.read_from(input);
 }
-
-}  // namespace
 
 TransportStatus MoqtSession::publish_live(std::istream& input,
                                            openmoq::publisher::DraftVersion draft_version,
@@ -8821,7 +8831,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             // Skip other pre-moov boxes (e.g. free, styp)
         }        if (!ftyp_bytes.empty() && !moov_bytes.empty()) break;
-        const std::size_t bytes_read = read_live_input(input, reader, nullptr);
+        const std::size_t bytes_read = read_live_input(input, reader, &stop_requested_);
+        if (bytes_read == 0 && stop_requested_.load(std::memory_order_acquire)) {
+            return TransportStatus::success();
+        }
         if (bytes_read == 0 && ftyp_bytes.empty()) {
             return TransportStatus::failure("stdin EOF before ftyp box");
         }
@@ -10313,6 +10326,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
         std::optional<std::chrono::steady_clock::time_point> eof_deadline;
         while (true) {
+            // close() from another thread stops the publish without ending
+            // the tracks.
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                join_stdin_thread();
+                return TransportStatus::success();
+            }
             status = dispatch_peer_stopped_media_streams(transport_,
                                                          sender_by_track);
             if (!status.ok) {
@@ -10381,6 +10400,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
 
         while (true) {
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                join_stdin_thread();
+                return TransportStatus::success();
+            }
             status = dispatch_peer_stopped_media_streams(transport_,
                                                          sender_by_track);
             if (!status.ok) {

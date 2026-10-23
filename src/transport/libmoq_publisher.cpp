@@ -1,4 +1,5 @@
 #include "openmoq/publisher/transport/libmoq_publisher.h"
+#include "live_input.h"
 #include "tls_verification.h"
 #include "../loop_timestamps.h"
 
@@ -1189,7 +1190,8 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
                                         const PublisherConfig& config,
                                         const EndpointConfig& endpoint,
                                         const TlsConfig& tls,
-                                        LibmoqPublishStats& out_stats) {
+                                        LibmoqPublishStats& out_stats,
+                                        LibmoqLiveHandle* live) {
     LibmoqAuthorization authorization;
     const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
     if (!authorization_status.ok) return authorization_status;
@@ -1202,6 +1204,10 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
     if (config.media_packaging == MediaPackaging::kLocmaf || has_locmaf_tracks(materialized_plan)) {
         return TransportStatus::failure(kLocmafUnsupported);
     }
+    std::atomic<bool>* cancel = (live != nullptr) ? &live->cancel : nullptr;
+    if (cancelled(cancel)) {
+        return TransportStatus::success();  // cancelled before connecting: clean stop
+    }
     DemandMonitor demand;
     moq_endpoint_t* ep = nullptr;
     moq_media_sender_t* sender = nullptr;
@@ -1209,6 +1215,9 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
         connect_and_attach(config, endpoint, tls, /*live=*/false, &demand, authorization, &ep, &sender);
     if (!setup.ok) {
         return setup;
+    }
+    if (live != nullptr) {
+        live->set_endpoint(ep);
     }
 
     const std::uint64_t timeout_us =
@@ -1223,25 +1232,31 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
         moq_media_track_t* h = nullptr;
         rc = moq_media_sender_add_track(sender, &c, &h);
         if (rc != MOQ_OK || h == nullptr) {
-            return teardown(sender, ep,
-                            "add_track failed for '" + t.name + "': " + moq_strerror(rc));
+            return live_teardown(live, sender, ep,
+                                 "add_track failed for '" + t.name + "': " + moq_strerror(rc));
         }
         handles[t.name] = h;
     }
 
     // Tracks are configured: now wait for the initial catalog to publish.
-    const LibmoqReadyOutcome ready = wait_ready(ep, sender, /*cancel=*/nullptr, timeout_us, handles,
+    const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
         config.forward || config.preannounce_tracks);
+    if (ready == LibmoqReadyOutcome::kCancelled) {
+        return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
+    }
     if (ready != LibmoqReadyOutcome::kReady) {
-        return ready_failure_teardown(/*live=*/nullptr, sender, ep, ready);
+        return ready_failure_teardown(live, sender, ep, ready);
     }
 
     // Wait for a real subscriber before writing: against a lazy relay the
     // lossless preset would otherwise fill the queue and block here forever.
     const LibmoqDemandOutcome demand_out =
-        wait_for_media_subscriber(ep, sender, &demand, /*cancel=*/nullptr, timeout_us);
+        wait_for_media_subscriber(ep, sender, &demand, cancel, timeout_us);
+    if (demand_out == LibmoqDemandOutcome::kCancelled) {
+        return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
+    }
     if (demand_out != LibmoqDemandOutcome::kSubscriber) {
-        return demand_failure_teardown(/*live=*/nullptr, sender, ep, demand_out);
+        return demand_failure_teardown(live, sender, ep, demand_out);
     }
 
     const moq_alloc_t* alloc = moq_alloc_default();
@@ -1275,8 +1290,16 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
             so.decode_time_us += cycle_offset_us;
             so.presentation_time_us += cycle_offset_us;
             if (config.paced && so.decode_time_us >= first_media_time_us) {
-                std::this_thread::sleep_until(
-                    pacing_start + std::chrono::microseconds(so.decode_time_us - first_media_time_us));
+                const auto due =
+                    pacing_start + std::chrono::microseconds(so.decode_time_us - first_media_time_us);
+                while (!cancelled(cancel) && std::chrono::steady_clock::now() < due) {
+                    std::this_thread::sleep_until(
+                        (std::min)(due, std::chrono::steady_clock::now() + std::chrono::milliseconds(10)));
+                }
+            }
+            if (cancelled(cancel)) {
+                stats.groups_published += static_cast<std::uint64_t>(groups.size());
+                return cancel_teardown(live, sender, ep, stats, out_stats);
             }
             // Advance the payload's tfdt with the send-object times, so the
             // media timeline keeps increasing across loop passes.
@@ -1291,15 +1314,20 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
             moq_rcbuf_t* buf = nullptr;
             rc = moq_rcbuf_create(alloc, payload->data(), payload->size(), &buf);
             if (rc != MOQ_OK || buf == nullptr) {
-                return teardown(sender, ep, "payload buffer allocation failed");
+                return live_teardown(live, sender, ep, "payload buffer allocation failed");
             }
             so.payload = buf;
             // Bounded retry: if the subscriber leaves or the queue never drains, bail
             // with a clear reason instead of spinning forever on WOULD_BLOCK.
             int wrc = MOQ_OK;
             const LibmoqRetryOutcome wout = retry_write(sender, ep, hit->second, &so,
-                                                        /*cancel=*/nullptr, /*check_demand=*/true,
+                                                        cancel, /*check_demand=*/true,
                                                         timeout_us, &wrc);
+            if (wout == LibmoqRetryOutcome::kCancelled) {
+                moq_rcbuf_decref(buf);
+                stats.groups_published += static_cast<std::uint64_t>(groups.size());
+                return cancel_teardown(live, sender, ep, stats, out_stats);
+            }
             if (wout == LibmoqRetryOutcome::kNoDemand && loop && cycle > 0) {
                 // A looped publish only exists to keep serving viewers: the last
                 // one leaving after a full pass ends it cleanly rather than as a
@@ -1310,7 +1338,7 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
             }
             if (wout != LibmoqRetryOutcome::kOk) {
                 moq_rcbuf_decref(buf);  // no ownership transfer on a non-OK write
-                return retry_failure_teardown(/*live=*/nullptr, sender, ep, wout, wrc, "media write");
+                return retry_failure_teardown(live, sender, ep, wout, wrc, "media write");
             }
             // kOk transfers the buf ref to the sender; do not decref.
             stats.bytes_published += static_cast<std::uint64_t>(o.payload.size());
@@ -1332,14 +1360,17 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
         }
         int erc = MOQ_OK;
         const LibmoqRetryOutcome eout =
-            retry_end_track(sender, ep, hit->second, /*cancel=*/nullptr, timeout_us, &erc);
+            retry_end_track(sender, ep, hit->second, cancel, timeout_us, &erc);
+        if (eout == LibmoqRetryOutcome::kCancelled) {
+            return cancel_teardown(live, sender, ep, stats, out_stats);
+        }
         if (eout != LibmoqRetryOutcome::kOk) {
-            return retry_failure_teardown(/*live=*/nullptr, sender, ep, eout, erc, "end_track");
+            return retry_failure_teardown(live, sender, ep, eout, erc, "end_track");
         }
     }
 
     // Let the queued objects drain to the wire before tearing down.
-    drain_sender(ep, sender, timeout_us);
+    drain_sender(ep, sender, timeout_us, cancel);
 
     // drain_sender() only confirms the SENDER queue is empty (objects emitted to
     // the session) -- not that the transport flushed them. moq_endpoint_drain()
@@ -1352,7 +1383,7 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
     moq_endpoint_drain(ep, timeout_us);
 
     out_stats = stats;
-    return teardown(sender, ep, "");
+    return live_teardown(live, sender, ep, "");
 }
 
 TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
@@ -1381,7 +1412,10 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
     std::vector<std::uint8_t> ftyp_bytes;
     std::vector<std::uint8_t> moov_bytes;
     while (ftyp_bytes.empty() || moov_bytes.empty()) {
-        const std::size_t bytes_read = reader.read_from(input);
+        const std::size_t bytes_read = read_live_input(input, reader, cancel);
+        if (bytes_read == 0 && cancelled(cancel)) {
+            return TransportStatus::success();  // cancelled before connecting: clean stop
+        }
         if (bytes_read == 0 && ftyp_bytes.empty()) {
             return TransportStatus::failure("stdin EOF before ftyp box");
         }
@@ -1496,7 +1530,7 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
             stats.groups_published = static_cast<std::uint64_t>(groups.size());
             return cancel_teardown(live, sender, ep, stats, out_stats);
         }
-        const std::size_t bytes_read = reader.read_from(input);
+        const std::size_t bytes_read = read_live_input(input, reader, cancel);
         while (auto box = reader.next_box()) {
             if (box->type == "moof") {
                 pending_moof = std::move(box->bytes);
@@ -1554,6 +1588,9 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
         }
 
         if (bytes_read == 0) {
+            if (cancelled(cancel)) {
+                continue;  // the loop head tears down without ending the tracks
+            }
             break;  // stdin EOF
         }
     }
@@ -1610,7 +1647,10 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
         bool eof = false;
     };
     auto queue = std::make_shared<LiveQueue>();
-    std::atomic<bool> stop_requested{false};
+    // The cancel flag doubles as the ingest stop flag, so a disconnect() also
+    // ends SRT codec discovery.
+    std::atomic<bool> local_stop{false};
+    std::atomic<bool>& stop_requested = (cancel != nullptr) ? *cancel : local_stop;
 
     LiveSrtIngestManager manager(
         std::move(srt_callers),
@@ -1629,6 +1669,10 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
     }
 
     const std::vector<TrackDescription>& tracks = manager.bootstrap().tracks;
+    if (cancelled(cancel)) {
+        manager.join();
+        return TransportStatus::success();  // cancelled during discovery: clean stop
+    }
     if (tracks.empty()) {
         stop_requested = true;
         manager.join();

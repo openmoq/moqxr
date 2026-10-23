@@ -9,6 +9,7 @@
 // h3zero WebTransport server that accepts CONNECT and then does nothing, and
 // asserts close() completes in bounded time.
 
+#include "openmoq/publisher/publisher_api.h"
 #include "openmoq/publisher/transport/webtransport_client.h"
 #include "webtransport_error_codes.h"
 
@@ -43,7 +44,14 @@
 
 namespace {
 
+using openmoq::publisher::DraftVersion;
+using openmoq::publisher::LiveObject;
+using openmoq::publisher::LiveObjectSource;
+using openmoq::publisher::LiveTrack;
+using openmoq::publisher::Publisher;
+using openmoq::publisher::PublisherConfig;
 using openmoq::publisher::transport::ConnectionState;
+using openmoq::publisher::transport::PublisherTransport;
 using openmoq::publisher::transport::EndpointConfig;
 using openmoq::publisher::transport::ObjectWriteDisposition;
 using openmoq::publisher::transport::ObjectWriteOptions;
@@ -193,7 +201,10 @@ int silent_path_callback(picoquic_cnx_t* cnx,
                 return -1;
             }
         }
-        server->stream_bytes_received += length;
+        // Capsules on the CONNECT stream are session control, not stream data.
+        if (stream_ctx != server->control_stream_ctx) {
+            server->stream_bytes_received += length;
+        }
         if (stream_ctx != nullptr && length != 0) {
             server->streams_with_data.insert(stream_ctx->stream_id);
         }
@@ -445,10 +456,71 @@ bool datagram_scenario(std::vector<std::uint8_t> payload, bool valid,
     return ok;
 }
 
+// Publisher::disconnect() from another thread, as the CLI does on
+// SIGTERM/SIGINT, while the publish is blocked waiting for the peer. The
+// peer must see the WebTransport session closed and then an application
+// CONNECTION_CLOSE, both with code 0.
+bool disconnect_scenario() {
+    SilentServer server;
+    if (!expect(start_server(server), "expected disconnect WebTransport server to start")) {
+        stop_server(server);
+        return false;
+    }
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft18;
+    config.track_namespace = "media";
+    Publisher publisher(config, [](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        return std::make_unique<WebTransportClient>();
+    });
+    const LiveObjectSource source{
+        .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}},
+        .next_object = []() -> std::optional<LiveObject> { return std::nullopt; },
+        .is_finished = []() { return false; },
+    };
+    EndpointConfig endpoint;
+    endpoint.transport = TransportKind::kWebTransport;
+    endpoint.host = "127.0.0.1";
+    endpoint.port = server.port;
+    endpoint.path = "/moq";
+    endpoint.path_explicit = true;
+    auto status = openmoq::publisher::transport::TransportStatus::failure("not run");
+    std::thread publishing([&] {
+        status = publisher.publish_live_objects(source, endpoint, TlsConfig{.insecure_skip_verify = true});
+    });
+    bool ok = true;
+    {
+        std::unique_lock<std::mutex> lock(server.mutex);
+        ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(5), [&] { return server.connect_accepted; }),
+                     "expected the server to accept the publisher's CONNECT");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto stop_started = std::chrono::steady_clock::now();
+    static_cast<void>(publisher.disconnect(0));
+    publishing.join();
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
+    ok &= expect(status.ok, "expected a disconnect()-stopped publish to report success: " + status.message);
+    ok &= expect(stop_elapsed < std::chrono::seconds(2),
+                 "expected the publish to return within 2 s of disconnect()");
+    {
+        std::unique_lock<std::mutex> lock(server.mutex);
+        server.condition.wait_for(lock, std::chrono::seconds(5), [&] {
+            return server.received_close_code.has_value() && server.received_connection_close_code.has_value();
+        });
+        ok &= expect(server.received_close_code == 0,
+                     "expected CLOSE_WEBTRANSPORT_SESSION with code 0 after disconnect()");
+        ok &= expect(server.received_connection_close_code == 0,
+                     "expected an application CONNECTION_CLOSE with code 0 after disconnect()");
+    }
+    stop_server(server);
+    return ok;
+}
+
 }  // namespace
 
 int main() {
     bool ok = true;
+
+    ok &= disconnect_scenario();
 
     ok &= datagram_scenario({0xf0, 0x13, 0x2b, 0x3e, 0x2a}, false);
     ok &= datagram_scenario({0xf0, 0x13, 0x2b, 0x3e, 0x2a}, false, "moqt-22", true);
