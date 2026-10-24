@@ -25,7 +25,7 @@ namespace openmoq::publisher {
 
 namespace transport {
 // Defined in transport/libmoq_publisher.h (libmoq builds only). Held here by
-// shared_ptr so disconnect() can interrupt an in-flight libmoq live publish; the
+// shared_ptr so disconnect() can interrupt an in-flight libmoq publish; the
 // member stays null when libmoq is not compiled in.
 struct LibmoqLiveHandle;
 }  // namespace transport
@@ -239,9 +239,13 @@ private:
     static TransportFactory default_transport_factory();
     transport::EndpointConfig resolve_endpoint(const transport::EndpointConfig& endpoint,
                                                bool endpoint_alpn_overridden) const;
-    void set_active_session(std::shared_ptr<ActiveSession> active,
+    bool set_active_session(std::shared_ptr<ActiveSession> active,
                             const transport::EndpointConfig& endpoint,
                             bool publishing_live) const;
+    bool finish_connect(const std::shared_ptr<ActiveSession>& active) const;
+    bool stop_requested() const;
+    transport::TransportStatus finish_stopped_publish(const std::shared_ptr<ActiveSession>& active,
+                                                      bool connected) const;
     void clear_active_session(const std::shared_ptr<ActiveSession>& active,
                               bool connected,
                               const std::string& last_error) const;
@@ -254,11 +258,16 @@ private:
     bool transport_factory_injected_ = false;
     mutable std::mutex state_mutex_;
     mutable std::shared_ptr<ActiveSession> active_session_;
-    // Shared handle for an in-progress libmoq-backed live publish (cancel flag +
+    // Shared handle for an in-progress libmoq-backed publish (cancel flag +
     // the live endpoint). disconnect() calls request_cancel() on it so a running
     // driver stops promptly AND its blocking wait is interrupted (the libmoq
     // paths do not use active_session_). Guarded by state_mutex_.
     mutable std::shared_ptr<transport::LibmoqLiveHandle> libmoq_live_;
+    // Set by disconnect() and cleared when a publish call starts, so the
+    // running publish stops instead of reconnecting for a GOAWAY migration;
+    // stop_error_code_ is the code it closes with. Guarded by state_mutex_.
+    mutable bool stop_requested_ = false;
+    mutable std::uint64_t stop_error_code_ = 0;
     mutable StatsSnapshot stats_;
 };
 

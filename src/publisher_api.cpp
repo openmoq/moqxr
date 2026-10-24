@@ -207,6 +207,9 @@ std::uint64_t time_based_initial_group_id() {
 struct Publisher::ActiveSession {
     std::unique_ptr<transport::PublisherTransport> transport;
     std::unique_ptr<transport::MoqtSession> session;
+    // True while connect() runs on the publish thread. Guarded by the
+    // publisher's state_mutex_.
+    bool connecting = true;
 
     // Closes the session once. disconnect() can run on another thread while a
     // publish closes the same session on its failure path, and the transport
@@ -316,13 +319,33 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
             return transport::TransportStatus::failure(
                 "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
         }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            stop_requested_ = false;
+        }
         const transport::EndpointConfig resolved_endpoint =
             resolve_endpoint(endpoint, endpoint_alpn_overridden);
         const PublishPlan materialized =
             materialize_publish_plan(prepared.plan, prepared.input_bytes);
+        auto live = std::make_shared<transport::LibmoqLiveHandle>();
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            libmoq_live_ = live;
+            // A disconnect() that ran while the endpoint was resolved or the
+            // plan materialized found no handle to cancel; honour it here.
+            if (stop_requested_) {
+                live->cancel.store(true);
+            }
+        }
         transport::LibmoqPublishStats libmoq_stats;
         const transport::TransportStatus status = transport::publish_plan_via_libmoq(
-            materialized, config_, resolved_endpoint, tls, libmoq_stats);
+            materialized, config_, resolved_endpoint, tls, libmoq_stats, live.get());
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (libmoq_live_ == live) {
+                libmoq_live_.reset();
+            }
+        }
         if (!status.ok) {
             std::lock_guard<std::mutex> lock(state_mutex_);
             stats_.active = false;
@@ -350,6 +373,10 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
     auto resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        stop_requested_ = false;
+    }
     for (std::size_t migrations = 0; ; ++migrations) {
         auto active = std::make_shared<ActiveSession>();
         active->transport = transport_factory_(resolved_endpoint.transport);
@@ -370,8 +397,13 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
         active->session->set_media_packaging(config_.media_packaging);
 
-        set_active_session(active, resolved_endpoint, false);
+        if (!set_active_session(active, resolved_endpoint, false)) {
+            return transport::TransportStatus::success();
+        }
         transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
+        if (!finish_connect(active)) {
+            return finish_stopped_publish(active, status.ok);
+        }
         if (!status.ok) {
             const std::string error = "transport connect failed: " + status.message;
             clear_active_session(active, false, error);
@@ -381,6 +413,9 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
 
         const PublishPlan materialized = materialize_publish_plan(prepared.plan, prepared.input_bytes);
         status = active->session->publish(materialized);
+        if (!status.ok && stop_requested()) {
+            return finish_stopped_publish(active, true);
+        }
         if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
             static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
@@ -551,6 +586,10 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
     auto resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        stop_requested_ = false;
+    }
     std::uint64_t prior_bytes = 0, prior_objects = 0, prior_groups = 0;
     std::vector<std::uint8_t> resume_bytes;
     std::uint64_t resume_group_floor = 0;
@@ -576,8 +615,13 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         active->session->set_media_packaging(config_.media_packaging);
         active->session->set_initial_group_id(config_.initial_group_id);
 
-        set_active_session(active, resolved_endpoint, true);
+        if (!set_active_session(active, resolved_endpoint, true)) {
+            return transport::TransportStatus::success();
+        }
         transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
+        if (!finish_connect(active)) {
+            return finish_stopped_publish(active, status.ok);
+        }
         if (!status.ok) {
             const std::string error = "transport connect failed: " + status.message;
             clear_active_session(active, false, error);
@@ -614,6 +658,9 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                                                config_.draft_version,
                                                config_.split_cmaf_chunks,
                                                config_.live_stream_per_object);
+        if (!status.ok && stop_requested()) {
+            return finish_stopped_publish(active, true);
+        }
         if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
             const auto snapshot = active->session->publish_stats();
             prior_bytes += snapshot.bytes_published;
@@ -747,6 +794,10 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         return transport::TransportStatus::failure("publisher transport factory is not configured");
     }
     auto resolved_endpoint = resolve_endpoint(endpoint, endpoint_alpn_overridden);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        stop_requested_ = false;
+    }
     std::uint64_t prior_bytes = 0, prior_objects = 0, prior_groups = 0;
     // Caller catalogs are opaque: replay an independent object plus its deltas,
     // preserving their IDs rather than treating the latest delta as a full catalog.
@@ -807,8 +858,13 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
         active->session->set_media_packaging(config_.media_packaging);
 
-        set_active_session(active, resolved_endpoint, true);
+        if (!set_active_session(active, resolved_endpoint, true)) {
+            return transport::TransportStatus::success();
+        }
         transport::TransportStatus status = active->session->connect(resolved_endpoint, tls);
+        if (!finish_connect(active)) {
+            return finish_stopped_publish(active, status.ok);
+        }
         if (!status.ok) {
             const std::string error = "transport connect failed: " + status.message;
             clear_active_session(active, false, error);
@@ -819,6 +875,9 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         status = active->session->publish_live_objects(
             source_supplies_catalog && config_.draft_version == DraftVersion::kDraft22 ? resumable_source : source,
             config_.draft_version);
+        if (!status.ok && stop_requested()) {
+            return finish_stopped_publish(active, true);
+        }
         if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
             const auto snapshot = active->session->publish_stats();
             prior_bytes += snapshot.bytes_published;
@@ -865,10 +924,14 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
 transport::TransportStatus Publisher::disconnect(std::uint64_t application_error_code) const {
     std::shared_ptr<ActiveSession> active;
     std::shared_ptr<transport::LibmoqLiveHandle> live;
+    bool connecting = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        stop_requested_ = true;
+        stop_error_code_ = application_error_code;
         active = active_session_;
         live = libmoq_live_;
+        connecting = active && active->connecting;
     }
     // A libmoq-backed live publish does not use active_session_; request_cancel()
     // sets its cancel flag AND interrupts the live endpoint so a blocking wait
@@ -878,6 +941,12 @@ transport::TransportStatus Publisher::disconnect(std::uint64_t application_error
         live->request_cancel();
     }
 #endif
+    // connect() is still running on the publish thread, and closing the
+    // transport under it would free the QUIC context it is using. The publish
+    // sees stop_requested_ when connect() returns and closes the session.
+    if (connecting) {
+        return transport::TransportStatus::success();
+    }
     if (!active || !active->session) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         stats_.active = false;
@@ -1032,10 +1101,13 @@ transport::EndpointConfig Publisher::resolve_endpoint(const transport::EndpointC
     return resolved;
 }
 
-void Publisher::set_active_session(std::shared_ptr<ActiveSession> active,
+bool Publisher::set_active_session(std::shared_ptr<ActiveSession> active,
                                    const transport::EndpointConfig& endpoint,
                                    bool publishing_live) const {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    if (stop_requested_) {
+        return false;
+    }
     active_session_ = std::move(active);
     stats_.active = true;
     stats_.connected = false;
@@ -1049,6 +1121,35 @@ void Publisher::set_active_session(std::shared_ptr<ActiveSession> active,
     stats_.path = endpoint.path;
     stats_.connection_id.clear();
     stats_.last_error.clear();
+    return true;
+}
+
+bool Publisher::finish_connect(const std::shared_ptr<ActiveSession>& active) const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    active->connecting = false;
+    return !stop_requested_;
+}
+
+bool Publisher::stop_requested() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return stop_requested_;
+}
+
+// Ends a publish that disconnect() stopped: close the session (a no-op if
+// disconnect() already closed it) and report success, as a stopped publish
+// is not a failure to retry or migrate.
+transport::TransportStatus Publisher::finish_stopped_publish(const std::shared_ptr<ActiveSession>& active,
+                                                             bool connected) const {
+    std::uint64_t application_error_code = 0;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        application_error_code = stop_error_code_;
+    }
+    if (connected) {
+        static_cast<void>(active->close(application_error_code));
+    }
+    clear_active_session(active, false, {});
+    return transport::TransportStatus::success();
 }
 
 void Publisher::clear_active_session(const std::shared_ptr<ActiveSession>& active,

@@ -106,6 +106,9 @@ struct WebTransportClient::Impl {
     bool protocol_error_close = false;
     bool close_requested = false;
     bool close_sent = false;
+    // Packet-loop thread only: the CLOSE_WEBTRANSPORT_SESSION capsule is
+    // queued and the QUIC close waits for it to drain.
+    bool close_capsule_queued = false;
     std::uint64_t close_error_code = 0;
     // Armed by close(): bounds how long the packet loop may hold the QUIC
     // close while queued/in-flight stream data drains (picoquic_close_drain.h).
@@ -566,10 +569,6 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
             if (!drain_summary.empty()) {
                 trace(drain_summary);
             }
-            {
-                std::lock_guard<std::mutex> lock(impl.mutex);
-                impl.close_sent = true;
-            }
             // Tell the peer the WebTransport session is over, then close the
             // QUIC connection ourselves. The packet loop only exits once the
             // connection reaches picoquic_state_disconnected; relying on the
@@ -579,11 +578,21 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
             // the wait: the connection reaches disconnected either when the
             // peer acknowledges the CONNECTION_CLOSE or when the closing
             // timer expires. The capsule send is best-effort; a stream whose
-            // FIN already went out cannot carry it and that is fine.
-            if (impl.control_stream_ctx != nullptr) {
+            // FIN already went out cannot carry it and that is fine. A queued
+            // capsule goes through the same drain before the QUIC close, as
+            // picoquic drops stream data still queued once it is closing.
+            if (!impl.close_capsule_queued && impl.control_stream_ctx != nullptr) {
+                impl.close_capsule_queued = true;
                 const int capsule_ret = picowt_send_close_session_message(
                     impl.cnx, impl.control_stream_ctx, close_error_code, "closed");
                 trace("close session capsule queued ret=" + std::to_string(capsule_ret));
+                if (capsule_ret == 0) {
+                    return 0;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(impl.mutex);
+                impl.close_sent = true;
             }
             trace("closing quic connection state=" + std::to_string(picoquic_get_cnx_state(impl.cnx)));
             if (picoquic_get_cnx_state(impl.cnx) < picoquic_state_disconnecting &&
@@ -1019,6 +1028,7 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     impl_->protocol_error_close = false;
     impl_->close_requested = false;
     impl_->close_sent = false;
+    impl_->close_capsule_queued = false;
     impl_->close_error_code = 0;
     impl_->close_drain.reset();
     impl_->loop_ready = false;

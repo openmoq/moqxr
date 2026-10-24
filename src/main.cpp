@@ -10,11 +10,147 @@
 
 #include <exception>
 #include <chrono>
+#include <atomic>
+#include <csignal>
+#include <cstdlib>
 #include <iostream>
+#include <mutex>
+#include <stop_token>
 #include <thread>
 #include <utility>
 
+#if !defined(_WIN32)
+#include <signal.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+// How long a SIGTERM/SIGINT stop may take before the process exits anyway.
+// Closing waits for in-flight stream data to be acknowledged (about one round
+// trip) and then sends CONNECTION_CLOSE; two seconds covers that on any
+// working path while keeping a supervisor restart prompt.
+constexpr std::chrono::seconds kStopTimeout{2};
+
+// Written by the signal handler and read by the monitor, retry and main
+// threads, so it must be atomic; lock-free atomics are async-signal-safe.
+std::atomic<int> stop_signal{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+void handle_stop_signal(int signo) {
+    if (stop_signal != 0) {
+#if !defined(_WIN32)
+        constexpr char kMessage[] = "publisher interrupted again; exiting now\n";
+        static_cast<void>(::write(STDERR_FILENO, kMessage, sizeof(kMessage) - 1));
+#endif
+        std::_Exit(128 + signo);
+    }
+    stop_signal = signo;
+}
+
+void install_stop_signal_handlers() {
+#if defined(_WIN32)
+    std::signal(SIGINT, handle_stop_signal);
+    std::signal(SIGTERM, handle_stop_signal);
+#else
+    struct sigaction action {};
+    action.sa_handler = handle_stop_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+#endif
+}
+
+const char* stop_signal_name(int signo) {
+    return signo == SIGTERM ? "SIGTERM" : signo == SIGINT ? "SIGINT" : "signal";
+}
+
+int interrupted_exit_code() {
+    std::cerr << "publisher interrupted by " << stop_signal_name(stop_signal) << std::endl;
+    return 128 + stop_signal;
+}
+
+// Lets the stop monitor end a DASH ingest server the main thread is blocked
+// on, without racing the main thread's own stop and destruction of it.
+class DashStopTarget {
+public:
+    void set(openmoq::publisher::LiveDashIngestServer* server) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        server_ = server;
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (server_ != nullptr) {
+            server_->stop();
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    openmoq::publisher::LiveDashIngestServer* server_ = nullptr;
+};
+
+class DashStopRegistration {
+public:
+    DashStopRegistration(DashStopTarget& target, openmoq::publisher::LiveDashIngestServer& server)
+        : target_(target) {
+        target_.set(&server);
+    }
+    ~DashStopRegistration() { target_.set(nullptr); }
+
+private:
+    DashStopTarget& target_;
+};
+
+// Watches for SIGTERM/SIGINT. The first signal closes the publisher's
+// connection with NO_ERROR from another thread, as the main thread is blocked
+// in a publish call, and stops DASH ingest; the publish then returns. If that
+// takes longer than kStopTimeout, the process exits from here instead.
+// disconnect() repeats until the publish returns, so it also stops a publish
+// attempt that started just after the signal.
+class StopMonitor {
+public:
+    StopMonitor(const openmoq::publisher::Publisher& publisher, DashStopTarget& dash)
+        : publisher_(publisher), dash_(dash) {
+        install_stop_signal_handlers();
+        watcher_ = std::jthread([this](std::stop_token token) { watch(token); });
+    }
+
+private:
+    void watch(std::stop_token token) {
+        while (stop_signal == 0) {
+            if (token.stop_requested()) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const auto deadline = std::chrono::steady_clock::now() + kStopTimeout;
+        std::jthread closer([this](std::stop_token closer_token) {
+            while (!closer_token.stop_requested()) {
+                static_cast<void>(publisher_.disconnect(0));
+                dash_.stop();
+                for (int i = 0; i < 10 && !closer_token.stop_requested(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+        });
+        while (!token.stop_requested()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                std::cerr << "publisher interrupted by " << stop_signal_name(stop_signal)
+                          << "; did not stop within " << kStopTimeout.count()
+                          << " s, exiting" << std::endl;
+                std::_Exit(128 + stop_signal);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    const openmoq::publisher::Publisher& publisher_;
+    DashStopTarget& dash_;
+    std::jthread watcher_;
+};
 
 std::string endpoint_label(
     const openmoq::publisher::transport::EndpointConfig& endpoint) {
@@ -26,11 +162,27 @@ openmoq::publisher::transport::TransportStatus publish_with_cli_failover(
     const openmoq::publisher::EndpointPublishAttempt& publish_attempt) {
     using namespace openmoq::publisher;
 
+    // A stop request ends the publish: no retry, failover or new attempt.
     return publish_with_failover(
         options.endpoints,
         options.retry_count,
-        publish_attempt,
-        [](std::chrono::milliseconds delay) { std::this_thread::sleep_for(delay); },
+        [&publish_attempt](const transport::EndpointConfig& endpoint) {
+            if (stop_signal != 0) {
+                return transport::TransportStatus::failure("publisher interrupted",
+                                                           transport::FailureKind::kCancelled);
+            }
+            auto status = publish_attempt(endpoint);
+            if (!status.ok && stop_signal != 0) {
+                status.failure_kind = transport::FailureKind::kCancelled;
+            }
+            return status;
+        },
+        [](std::chrono::milliseconds delay) {
+            const auto until = std::chrono::steady_clock::now() + delay;
+            while (stop_signal == 0 && std::chrono::steady_clock::now() < until) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        },
         [&options](const EndpointFailoverEvent& event) {
             const auto& endpoint = options.endpoints[event.endpoint_index];
             switch (event.kind) {
@@ -123,6 +275,8 @@ int main(int argc, char** argv) {
             .media_packaging = options.media_packaging,
         };
         Publisher publisher(config);
+        DashStopTarget dash_stop;
+        const StopMonitor stop_monitor(publisher, dash_stop);
 
         // --drm-config's laURL/certURL/robustness are deployment fields, not
         // protection detection: detection works on the DASH and stdin live
@@ -166,6 +320,7 @@ int main(int argc, char** argv) {
             dash_config.queue_depth = options.dash_queue_depth;
             dash_config.initial_group_id = options.initial_group_id;
             LiveDashIngestServer dash_server(dash_config);
+            const DashStopRegistration dash_stop_registration(dash_stop, dash_server);
             const auto start_status = dash_server.start();
             if (!start_status.ok) {
                 throw std::runtime_error(start_status.message);
@@ -221,7 +376,7 @@ int main(int argc, char** argv) {
                             options.endpoint_alpn_overridden);
                     });
                 dash_server.stop();
-                if (!status.ok) {
+                if (!status.ok && stop_signal == 0) {
                     throw std::runtime_error(status.message);
                 }
                 const auto disconnect_status = publisher.disconnect(0);
@@ -268,7 +423,7 @@ int main(int argc, char** argv) {
                         options.tls,
                         options.endpoint_alpn_overridden);
                 });
-            if (!status.ok) {
+            if (!status.ok && stop_signal == 0) {
                 throw std::runtime_error(status.message);
             }
             const auto disconnect_status = publisher.disconnect(0);
@@ -299,7 +454,7 @@ int main(int argc, char** argv) {
                             options.tls,
                             options.endpoint_alpn_overridden);
                     });
-                if (!status.ok) {
+                if (!status.ok && stop_signal == 0) {
                     throw std::runtime_error(status.message);
                 }
                 const auto disconnect_status = publisher.disconnect(0);
@@ -309,6 +464,9 @@ int main(int argc, char** argv) {
             }
         }
     } catch (const std::exception& exception) {
+        if (stop_signal != 0) {
+            return interrupted_exit_code();
+        }
         if (std::string_view(exception.what()).empty()) {
             std::cerr << build_usage(argv[0]) << '\n';
             return 0;
@@ -319,5 +477,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (stop_signal != 0) {
+        return interrupted_exit_code();
+    }
     return 0;
 }

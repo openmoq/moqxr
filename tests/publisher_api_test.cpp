@@ -1,4 +1,5 @@
 #include "openmoq/publisher/publisher_api.h"
+#include "openmoq/publisher/endpoint_failover.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 
@@ -12,6 +13,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <sstream>
 #include <iostream>
 #include <memory>
@@ -19,6 +22,10 @@
 #include <span>
 #include <string>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -35,6 +42,7 @@ using openmoq::publisher::PublisherConfig;
 using openmoq::publisher::draft_profile;
 using openmoq::publisher::transport::ConnectionState;
 using openmoq::publisher::transport::EndpointConfig;
+using openmoq::publisher::transport::FailureKind;
 using openmoq::publisher::transport::PublisherTransport;
 using openmoq::publisher::transport::StreamDirection;
 using openmoq::publisher::transport::TlsConfig;
@@ -138,7 +146,10 @@ struct MigrationTransport final : PublisherTransport {
     struct Record {
         EndpointConfig endpoint;
         TlsConfig tls;
-        bool closed = false;
+        std::atomic<bool> closed{false};
+        std::atomic<int> close_calls{0};
+        std::atomic<std::uint64_t> close_code{0};
+        std::atomic<std::size_t> writes_after_close{0};
         std::vector<std::uint8_t> written_bytes;
         std::vector<std::uint64_t> media_groups;
     };
@@ -151,6 +162,8 @@ struct MigrationTransport final : PublisherTransport {
     std::set<std::uint64_t> request_responses;
     std::set<std::uint64_t> media_streams;
     std::shared_ptr<MediaInputGate> media_gate;
+    // Runs just before read_stream reports the GOAWAY.
+    std::function<void()> before_goaway;
     bool setup_read = false;
     std::uint64_t next_stream = 0;
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override {
@@ -159,7 +172,9 @@ struct MigrationTransport final : PublisherTransport {
         return TransportStatus::success();
     }
     TransportStatus connect() override { return TransportStatus::success(); }
-    ConnectionState state() const override { return ConnectionState::kConnected; }
+    ConnectionState state() const override {
+        return record->closed ? ConnectionState::kClosed : ConnectionState::kConnected;
+    }
     TransportStatus open_stream(StreamDirection direction, std::uint64_t& stream) override {
         stream = next_stream;
         next_stream += 4;
@@ -177,6 +192,9 @@ struct MigrationTransport final : PublisherTransport {
         return TransportStatus::failure("timed out waiting for stream data");
     }
     TransportStatus write_stream(std::uint64_t stream, std::span<const std::uint8_t> bytes, bool) override {
+        if (record->closed) {
+            ++record->writes_after_close;
+        }
         if (media_gate && !bytes.empty() && media_streams.erase(stream)) {
             std::size_t offset=0;
             std::uint64_t type=0,alias=0,group=0;
@@ -195,6 +213,9 @@ struct MigrationTransport final : PublisherTransport {
     TransportStatus read_stream(std::uint64_t stream, std::vector<std::uint8_t>& bytes, bool& fin,
                                 std::chrono::milliseconds) override {
         fin = false;
+        if (record->closed) {
+            return TransportStatus::failure("transport closed");
+        }
         if (stream == 3 && !setup_read) {
             setup_read = true;
             bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = DraftVersion::kDraft22});
@@ -215,6 +236,9 @@ struct MigrationTransport final : PublisherTransport {
                 media_gate->released = true;
                 media_gate->condition.notify_all();
             }
+            if (before_goaway) {
+                before_goaway();
+            }
             auto status =
                 TransportStatus::failure("GOAWAY migration", openmoq::publisher::transport::FailureKind::kRetryable);
             status.migration_uri = target;
@@ -225,7 +249,9 @@ struct MigrationTransport final : PublisherTransport {
     }
     TransportStatus reset_stream(std::uint64_t, std::uint64_t) override { return TransportStatus::success(); }
     std::string connection_id() const override { return "migration-test"; }
-    TransportStatus close(std::uint64_t) override {
+    TransportStatus close(std::uint64_t application_error_code) override {
+        record->close_code = application_error_code;
+        ++record->close_calls;
         record->closed = true;
         return TransportStatus::success();
     }
@@ -240,14 +266,31 @@ struct ClosingTransport final : PublisherTransport {
         std::atomic<int> close_calls{0};
         std::atomic<bool> setup_read{false};
         std::atomic<bool> closed{false};
+        std::atomic<std::uint64_t> close_code{0};
+        std::atomic<int> transports{0};
+        // While set, connect() waits for it to clear (bounded).
+        std::atomic<bool> hold_connect{false};
+        std::atomic<bool> connecting{false};
+        std::atomic<bool> closed_during_connect{false};
     };
-    explicit ClosingTransport(std::shared_ptr<Record> record) : record(std::move(record)) {}
+    explicit ClosingTransport(std::shared_ptr<Record> record) : record(std::move(record)) { ++this->record->transports; }
     std::shared_ptr<Record> record;
     std::uint64_t next_stream = 0;
     bool setup_accepted = false;
     TransportStatus configure(const EndpointConfig&, const TlsConfig&) override { return TransportStatus::success(); }
-    TransportStatus connect() override { return TransportStatus::success(); }
-    ConnectionState state() const override { return ConnectionState::kConnected; }
+    TransportStatus connect() override {
+        record->connecting = true;
+        for (int i = 0; i < 2000 && record->hold_connect; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        record->connecting = false;
+        return TransportStatus::success();
+    }
+    // A closed connection reads as kClosed, which makes a publish failure on
+    // it retryable unless the publish was stopped.
+    ConnectionState state() const override {
+        return record->closed ? ConnectionState::kClosed : ConnectionState::kConnected;
+    }
     TransportStatus open_stream(StreamDirection, std::uint64_t& stream) override {
         stream = next_stream;
         next_stream += 4;
@@ -277,7 +320,11 @@ struct ClosingTransport final : PublisherTransport {
     }
     TransportStatus reset_stream(std::uint64_t, std::uint64_t) override { return TransportStatus::success(); }
     std::string connection_id() const override { return "closing-test"; }
-    TransportStatus close(std::uint64_t) override {
+    TransportStatus close(std::uint64_t application_error_code) override {
+        if (record->connecting) {
+            record->closed_during_connect = true;
+        }
+        record->close_code = application_error_code;
         ++record->close_calls;
         record->closed = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -331,6 +378,216 @@ bool test_disconnect_during_live_publish_closes_once() {
                      std::to_string(record->close_calls.load()));
     return ok;
 }
+
+// A publish that disconnect() stopped is not a failure: its reads fail on the
+// closed connection, which would otherwise be retryable, and retrying it
+// through publish_with_failover would reconnect a publisher asked to stop.
+bool test_disconnect_during_publish_is_not_retried() {
+    bool ok = true;
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft22;
+    config.forward = false;
+    config.subscriber_timeout = std::chrono::seconds(30);
+    std::vector<std::shared_ptr<MigrationTransport::Record>> records;
+    Publisher publisher(config, [&](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        auto record = std::make_shared<MigrationTransport::Record>();
+        records.push_back(record);
+        auto transport = std::make_unique<MigrationTransport>(record, std::nullopt);
+        transport->source_reads = std::make_shared<std::size_t>(0);
+        return transport;
+    });
+    const PreparedPublish prepared = publisher.prepare_file(
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / "locmaf-publisher.mp4");
+    EndpointConfig endpoint;
+    endpoint.host = "relay.example";
+    endpoint.port = 443;
+    const std::vector<EndpointConfig> endpoints{endpoint, endpoint};
+
+    std::atomic<std::size_t> attempts{0};
+    TransportStatus status = TransportStatus::failure("not run");
+    std::thread publishing([&] {
+        status = openmoq::publisher::publish_with_failover(
+            endpoints, 3,
+            [&](const EndpointConfig& attempt_endpoint) {
+                ++attempts;
+                return publisher.publish(prepared, attempt_endpoint);
+            },
+            [](std::chrono::milliseconds) {});
+    });
+    // The publish waits for a SUBSCRIBE that never comes.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ok &= expect(attempts == 1, "expected the publish to be waiting for a subscriber");
+    static_cast<void>(publisher.disconnect(0));
+    publishing.join();
+    ok &= expect(status.ok, "expected a disconnect()-stopped publish to report success: " + status.message);
+    ok &= expect(attempts == 1 && records.size() == 1,
+                 "expected no retry or failover after disconnect(), got attempts=" +
+                     std::to_string(attempts.load()) + " transports=" + std::to_string(records.size()));
+    ok &= expect(!records.empty() && records[0]->close_calls == 1 && records[0]->close_code == 0,
+                 "expected one transport close with code 0");
+    return ok;
+}
+
+// disconnect() while connect() is still running must not close the transport
+// under it (the QUIC context would be freed mid-handshake). The publish closes
+// the session itself once connect() returns, and publishes nothing.
+bool test_disconnect_during_connect_waits_for_connect() {
+    bool ok = true;
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft22;
+    config.track_namespace = "app";
+    auto record = std::make_shared<ClosingTransport::Record>();
+    record->hold_connect = true;
+    Publisher publisher(config, [record](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        return std::make_unique<ClosingTransport>(record);
+    });
+    LiveObjectSource source{
+        .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}},
+        .next_object = []() -> std::optional<LiveObject> { return std::nullopt; },
+        .is_finished = []() { return false; },
+    };
+    EndpointConfig endpoint;
+    endpoint.host = "relay.example";
+    endpoint.port = 443;
+
+    TransportStatus status = TransportStatus::failure("not run");
+    std::thread publishing([&] { status = publisher.publish_live_objects(source, endpoint); });
+    for (int i = 0; i < 2000 && !record->connecting; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ok &= expect(record->connecting.load(), "expected the publish to be connecting");
+    ok &= expect(publisher.disconnect(0).ok, "expected disconnect() during connect to succeed");
+    record->hold_connect = false;
+    publishing.join();
+    ok &= expect(status.ok, "expected the stopped publish to report success: " + status.message);
+    ok &= expect(!record->closed_during_connect, "expected no transport close while connect() runs");
+    ok &= expect(record->close_calls == 1 && record->close_code == 0,
+                 "expected the publish to close the transport once with code 0 after connect");
+    ok &= expect(!record->setup_read, "expected no MoQT SETUP after a stop during connect");
+    return ok;
+}
+
+// A GOAWAY that arrives as disconnect() closes the session must not start a
+// migration to a new connection.
+bool test_disconnect_does_not_follow_goaway() {
+    bool ok = true;
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft22;
+    std::vector<std::shared_ptr<MigrationTransport::Record>> records;
+    Publisher* publisher_ptr = nullptr;
+    Publisher publisher(config, [&](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        auto record = std::make_shared<MigrationTransport::Record>();
+        records.push_back(record);
+        auto transport = std::make_unique<MigrationTransport>(record, std::optional<std::string>("moqt://next.example/new"));
+        transport->before_goaway = [&] { std::thread([&] { static_cast<void>(publisher_ptr->disconnect(0)); }).join(); };
+        return transport;
+    });
+    publisher_ptr = &publisher;
+    PreparedPublish prepared;
+    prepared.plan.draft = draft_profile(DraftVersion::kDraft22);
+    EndpointConfig endpoint;
+    endpoint.host = "first.example";
+    endpoint.port = 443;
+    const auto status = publisher.publish(prepared, endpoint);
+    ok &= expect(status.ok, "expected a stopped publish to report success: " + status.message);
+    ok &= expect(records.size() == 1, "expected no migration reconnect after disconnect(), got " +
+                                          std::to_string(records.size()) + " transports");
+    ok &= expect(!records.empty() && records[0]->close_calls == 1 && records[0]->close_code == 0,
+                 "expected the original connection closed once with code 0");
+    return ok;
+}
+
+#if !defined(_WIN32)
+// A live stdin publish fed by a pipe that stays open but delivers no data, as
+// an idle encoder FIFO does. disconnect() from another thread must end the
+// publish promptly, close with code 0 and write nothing after the close (no
+// PUBLISH_DONE or other wind-down). Covers the wait for ftyp+moov and, with
+// an init segment written, the forward and await-subscribe publish loops.
+bool test_disconnect_stops_live_stdin_on_idle_input(bool send_init, bool forward) {
+    const std::string label = std::string("idle stdin (") + (send_init ? "after init" : "before init") +
+                              (forward ? ", forward" : ", await-subscribe") + "): ";
+    std::vector<std::uint8_t> init;
+    if (send_init) {
+        const auto path = std::filesystem::path(__FILE__).parent_path() / "fixtures" / "locmaf-publisher.mp4";
+        std::ifstream file(path, std::ios::binary);
+        const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)), {});
+        for (const auto& box : openmoq::publisher::parse_mp4_boxes(bytes)) {
+            if (box.type == "ftyp" || box.type == "moov") {
+                init.insert(init.end(), bytes.begin() + box.span.offset,
+                            bytes.begin() + box.span.offset + box.span.size);
+            }
+        }
+        if (!expect(!init.empty() && init.size() < 16384, label + "fixture init segment fits a pipe buffer")) {
+            return false;
+        }
+    }
+
+    int fds[2];
+    if (!expect(::pipe(fds) == 0, label + "pipe created")) {
+        return false;
+    }
+    const int saved_stdin = ::dup(STDIN_FILENO);
+    ::dup2(fds[0], STDIN_FILENO);
+    ::close(fds[0]);
+    if (!init.empty()) {
+        static_cast<void>(::write(fds[1], init.data(), init.size()));
+    }
+
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft22;
+    config.forward = forward;
+    config.subscriber_timeout = std::chrono::seconds(30);
+    std::vector<std::shared_ptr<MigrationTransport::Record>> records;
+    Publisher publisher(config, [&](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        auto record = std::make_shared<MigrationTransport::Record>();
+        records.push_back(record);
+        auto transport = std::make_unique<MigrationTransport>(record, std::nullopt);
+        transport->source_reads = std::make_shared<std::size_t>(0);
+        return transport;
+    });
+    EndpointConfig endpoint;
+    endpoint.host = "relay.example";
+    endpoint.port = 443;
+
+    std::atomic<bool> finished{false};
+    TransportStatus status = TransportStatus::failure("not run");
+    std::thread publishing([&] {
+        status = publisher.publish_live(std::cin, endpoint);
+        finished = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    bool ok = expect(!finished, label + "expected the publish to wait for input");
+    const auto stop_started = std::chrono::steady_clock::now();
+    static_cast<void>(publisher.disconnect(0));
+    for (int i = 0; i < 2000 && !finished; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
+    ok &= expect(finished.load(), label + "expected publish_live to return within 2 s of disconnect()");
+    if (!finished) {
+        // Unblock the reader so the test can finish and report.
+        ::close(fds[1]);
+        fds[1] = -1;
+    }
+    publishing.join();
+    if (fds[1] >= 0) {
+        ::close(fds[1]);
+    }
+    ::dup2(saved_stdin, STDIN_FILENO);
+    ::close(saved_stdin);
+
+    ok &= expect(stop_elapsed < std::chrono::seconds(1),
+                 label + "expected the stop to take under 1 s, took " +
+                     std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(stop_elapsed).count()) +
+                     " ms");
+    ok &= expect(status.ok, label + "expected a stopped publish to report success: " + status.message);
+    ok &= expect(records.size() == 1 && records[0]->close_calls == 1 && records[0]->close_code == 0,
+                 label + "expected one connection, closed once with code 0");
+    ok &= expect(!records.empty() && records[0]->writes_after_close == 0,
+                 label + "expected no writes after the close");
+    return ok;
+}
+#endif
 
 bool test_goaway_recreates_publisher_transport() {
     bool ok = true;
@@ -654,6 +911,14 @@ bool test_live_stdin_migration_keeps_object_identity(std::uint64_t initial_group
 int main() {
     bool ok = test_goaway_recreates_publisher_transport();
     ok &= test_disconnect_during_live_publish_closes_once();
+    ok &= test_disconnect_during_publish_is_not_retried();
+    ok &= test_disconnect_during_connect_waits_for_connect();
+    ok &= test_disconnect_does_not_follow_goaway();
+#if !defined(_WIN32)
+    ok &= test_disconnect_stops_live_stdin_on_idle_input(false, true);
+    ok &= test_disconnect_stops_live_stdin_on_idle_input(true, true);
+    ok &= test_disconnect_stops_live_stdin_on_idle_input(true, false);
+#endif
     ok &= test_goaway_migration_bound_and_uri_validation();
     ok &= test_live_source_goaway_continues_and_replays_catalog();
     ok &= test_live_source_goaway_continues_and_replays_catalog(true);

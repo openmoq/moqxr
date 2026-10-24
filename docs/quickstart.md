@@ -399,6 +399,8 @@ When `--forward 0` is used, `connection_id=` confirms that the transport connect
 
 The DASH ingest listener is currently supported on Unix-like platforms. Windows builds compile the CLI but report DASH ingest server startup as unsupported. The listener and live stdin reader use bounded polling so shutdown does not hang on idle input; see [macos-accept-shutdown-quirk.txt](macos-accept-shutdown-quirk.txt) for the macOS listener details.
 
+On SIGTERM or SIGINT the publisher closes its connection with NO_ERROR, so the relay releases the session at once instead of waiting out its idle timeout, and exits with status 143 (SIGTERM) or 130 (SIGINT). It does not end the broadcast, so a supervisor restart can carry on publishing the same tracks. If the close takes longer than 2 seconds, or a second signal arrives, the publisher exits without waiting.
+
 ## CAT4MoQ authorization
 
 The main CLI accepts an externally issued CWT credential for setup and all
