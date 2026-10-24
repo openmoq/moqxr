@@ -1797,6 +1797,24 @@ bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsC
     }
 
     {
+        MockTransport transport;
+        const auto draft = DraftVersion::kDraft18;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+        transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        session.set_initial_group_id(openmoq::publisher::kMaxGroupId);
+        ok &= expect(session.connect(endpoint, tls).ok, "CMAF group exhaustion session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB),
+                                   make_live_media_fragment(1000, 0xAC)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(!status.ok && status.message.find("exhausted group IDs") != std::string::npos,
+                     "CMAF group exhaustion must fail rather than silently discard the next keyframe");
+    }
+
+    {
         // Above 2^62-1 the publish fails before any setup traffic.
         MockTransport transport;
         MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));

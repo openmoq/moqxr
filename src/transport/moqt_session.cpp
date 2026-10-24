@@ -31,6 +31,7 @@
 #include <queue>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -9135,7 +9136,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         std::size_t shared_group_id = group_floor;
         const auto next_group = [&]() {
             if (shared_group_id >= kMaxGroupId)
-                throw std::runtime_error("live input exhausted group IDs");
+                throw std::overflow_error("live input exhausted group IDs");
             ++shared_group_id;
         };
         std::map<std::string, std::size_t> object_id_in_group;  // per track, resets on new group
@@ -9281,6 +9282,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                     }
                                 }
                             }
+                        } catch (const std::overflow_error&) {
+                            // Group exhaustion must stop CMAF input too, rather than skip a keyframe.
+                            throw;
                         } catch (const std::exception& e) {
                             if (retain_locmaf_boxes || !loc_encoders.empty()) {
                                 std::lock_guard<std::mutex> lock(queue->mutex);
