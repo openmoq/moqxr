@@ -14,6 +14,64 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
+## Choose a File Publishing Mode
+
+For file input on the default native backend, the publisher first sends
+`PUBLISH_NAMESPACE`. The following options select how tracks become subscribed:
+
+| Options | Track signaling | Relay behavior needed |
+| --- | --- | --- |
+| `--forward 0` without `--publish-catalog` (default) | Waits for inbound `SUBSCRIBE` for catalog and media tracks; sends no proactive `PUBLISH` | Accept the namespace and request tracks through `SUBSCRIBE` |
+| `--forward 0 --publish-catalog` | Sends `PUBLISH` for the catalog, then waits for media `SUBSCRIBE` requests | Accept catalog `PUBLISH` and request media tracks through `SUBSCRIBE` |
+| `--forward 1` | Sends `PUBLISH` for catalog and media tracks | Accept track `PUBLISH` requests and permit forwarding before objects are sent |
+
+The catalog is generated and available for subscription without
+`--publish-catalog`. That option enables proactive catalog publication. With
+the default subscription-driven mode, a subscriber that needs track discovery
+must request `catalog` and then request the desired media tracks. Start it before
+the publisher's `--timeout` expires. The basic example above uses this mode.
+
+Both namespace publishing followed by `SUBSCRIBE` and track publishing through
+`PUBLISH` are defined in [draft 16 section 8.5](draft-ietf-moq-transport-16.txt)
+and [draft 18 section 9.5](draft-ietf-moq-transport-18.txt). Section 4 of both
+drafts requires relays to implement all MOQT messages, including `PUBLISH`.
+Some implementations nevertheless route tracks only through namespace
+announcements and `SUBSCRIBE`; use the first mode for compatibility with them.
+
+### Troubleshoot `PUBLISH is not supported`
+
+A relay may accept `PUBLISH_NAMESPACE` and then reject a track `PUBLISH` with
+`NOT_SUPPORTED`. For example, the publisher may report:
+
+```text
+transport publish failed: request failed: PUBLISH is not supported
+```
+
+Draft 16 reports the rejection as `peer rejected track publish: ...`. With
+`--forward 0 --publish-catalog`, the rejected track is the proactively published
+catalog; the rejection stops this publish attempt before serving media
+subscriptions. Namespace acceptance alone does not imply that catalog or media
+publication succeeded.
+
+For a relay that requests tracks through `SUBSCRIBE`, keep `--forward 0` and
+remove `--publish-catalog`. For example, with a local self-signed relay:
+
+```bash
+./build/openmoq-publisher \
+  --input clip.mp4 \
+  --transport raw \
+  --draft 18 \
+  --endpoint moqt://127.0.0.1:4592/anon \
+  --namespace a5 \
+  --forward 0 \
+  --loop --paced --insecure --timeout 20
+```
+
+The subscriber must use the same namespace and request catalog/media tracks.
+There is no automatic fallback from a rejected `PUBLISH` to subscription-driven
+publishing. A rejection advances to the next configured endpoint, or returns
+an error after the last endpoint; `--retry` does not change publishing modes.
+
 ## Relay Failover
 
 List relays in preferred order by repeating `--endpoint`. `--retry N` retries
@@ -182,7 +240,7 @@ Rows include `pacing_before`, `pacing_after`, `enqueue`, and `served`/`sent` eve
 - `--forward 0` waits for inbound `SUBSCRIBE` requests before sending matching media objects
 - with `--forward 0`, subscribers are still expected to request tracks explicitly
 - by default, subscribers should subscribe to `catalog` if they need track discovery
-- `--publish-catalog` keeps `--forward 0` for media tracks but proactively publishes the `catalog` track through the normal `PUBLISH` / `PUBLISH_OK` path
+- for file input, `--publish-catalog` proactively sends catalog `PUBLISH`; the catalog is available through `SUBSCRIBE` without it (see [publishing modes](#choose-a-file-publishing-mode))
 - `--sap` adds per-track `*_sap` event timeline tracks and metadata objects
 - media packaging defaults to lower-latency split MOQT objects per group when chunk/sample boundaries are available
 - `--coalesce-cmaf-chunks` disables that split and falls back to one media object per group

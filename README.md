@@ -91,7 +91,16 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --paced
 ```
 
-`--forward 1` sends objects immediately. `--forward 0` waits for the relay to forward subscriber interest. A printed `connection_id=` confirms transport and MOQT setup only; it does not confirm namespace acceptance or a downstream subscription.
+For file input, `--forward 0` announces the namespace and waits for inbound
+`SUBSCRIBE` requests for catalog and media tracks. The catalog is available
+without `--publish-catalog`; that option proactively sends catalog `PUBLISH`
+and requires the relay to accept it. `--forward 1` proactively publishes both
+catalog and media tracks and sends objects when the relay permits forwarding.
+If the relay reports `PUBLISH is not supported`, use `--forward 0` without
+`--publish-catalog`. See [publishing modes and troubleshooting](docs/relay-interop.md#choose-a-file-publishing-mode).
+
+A printed `connection_id=` confirms transport and MOQT setup only; it does not
+confirm namespace acceptance or a downstream subscription.
 
 Add endpoints in preferred order and use `--retry N` to retry each current
 endpoint `N` times before advancing. For example, `--endpoint primary:4433

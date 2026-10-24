@@ -153,6 +153,9 @@ ffmpeg -i input.mp4 \
 
 ## Publish to a Relay
 
+For file input, the default `--forward 0` mode announces the namespace and
+waits for the relay to send `SUBSCRIBE` requests for catalog and media tracks:
+
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --input sample.mp4 \
@@ -162,6 +165,17 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --timeout 10 \
   --paced
 ```
+
+The catalog is generated and available for subscription without
+`--publish-catalog`. Add that option only when you want a proactive catalog
+`PUBLISH` and the relay accepts it. `--forward 1` proactively publishes both
+catalog and media tracks, subject to the relay's forwarding permission.
+
+If a relay accepts the namespace but rejects `PUBLISH` as unsupported, keep
+`--forward 0` and omit `--publish-catalog`; the subscriber must request the
+catalog and media tracks before `--timeout` expires. The publisher does not
+automatically switch modes after a rejection. See the [mode table and rejection
+troubleshooting](relay-interop.md#choose-a-file-publishing-mode).
 
 ## Endpoint Failover and Retries
 
@@ -361,7 +375,6 @@ Useful DASH ingest flags:
 - `--dash-listen <host:port>` chooses the local HTTP listener address
 - `--dash-path <prefix>` limits accepted request paths to that prefix
 - `--dash-queue-depth <count>` controls how many pending live objects are retained when publishers run ahead of subscribers
-- `--publish-catalog` publishes the CMSF catalog track
 - `--forward 1` forwards media objects immediately after publishing to the relay; if the relay answers `PUBLISH_OK` with forward=0, the publisher waits for the relay to switch the track on (see [Relay interop](relay-interop.md))
 - `--forward 0` waits for subscriber interest before media is sent
 
