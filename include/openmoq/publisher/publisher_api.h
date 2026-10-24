@@ -97,10 +97,27 @@ struct PublisherConfig {
     // that it might fall out of a relay cache. Zero disables republication,
     // which is the historical behaviour.
     std::chrono::seconds catalog_republish_interval{0};
+    // MoqTransport section 2.5: a publisher that restarts and resumes the same
+    // track can avoid reusing Group IDs by starting above every group it used
+    // before, for example from the current time (time_based_initial_group_id).
+    // publish_live() numbers its live media groups and its catalog groups from
+    // this value. Zero, the default, numbers from 0. The constructor and
+    // set_config() throw std::runtime_error for a value above kMaxGroupId
+    // (moq_draft.h).
+    // publish_live_objects() sends the Group IDs its source supplies, and the
+    // batch publish() path does not use this field.
+    std::uint64_t initial_group_id = 0;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     cat4moq::AuthorizationConfig authorization;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
 };
+
+// Milliseconds since the Unix epoch, read from the system clock, for use as
+// PublisherConfig::initial_group_id (MoqTransport section 2.5). A restarted
+// publisher stays above its previous run's Group IDs only if that run
+// published fewer groups than milliseconds passed between its start and the
+// restart, and the clock did not step backwards in between.
+std::uint64_t time_based_initial_group_id();
 
 struct PreparedPublish {
     std::vector<std::uint8_t> input_bytes;

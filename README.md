@@ -265,6 +265,19 @@ Each representation path below `/ingest` maintains independent parser state and 
 
 See the [CLI quick start](docs/quickstart.md), [FFmpeg recipes](docs/ffmpeg.md), and [SRT technical note](docs/srt-ingest-technical-note.md) for additional details.
 
+### Restarting a live publisher
+
+Each live publisher process numbers its Group IDs from 0. If the process restarts and publishes the same namespace and track names again, its new groups reuse Group IDs that the previous run already published, so two different objects share one Location. MoqTransport section 2.5 suggests that a resuming publisher set its initial Group ID to a value larger than every group it used before, for example one based on the current time. Use `--initial-group-id` to do that:
+
+```bash
+./build/openmoq-publisher --input - --initial-group-id time ...
+```
+
+- `--initial-group-id time` reads the system clock once at startup and starts at the number of milliseconds since the Unix epoch. This is safe if the previous run published fewer groups than the milliseconds that passed between its start and the restart, and the system clock did not step backwards in between.
+- `--initial-group-id N` starts at the unsigned integer `N`, which must not exceed 2^62-1.
+- The default is 0. The option applies to the media tracks and the catalog of the live sources (stdin, SRT, and CTE LL-DASH) on every draft; it is rejected for file input. On draft 22, a GOAWAY migration still resumes above the groups the previous session sent. The moq5 publishing backend numbers Group IDs itself and rejects a non-zero value.
+- The value is fixed for the process. A `--retry` or endpoint failover reconnect inside the same process starts again from it, so those attempts can reuse Group IDs; the option covers a process restart, not an in-process reconnect.
+
 ## Publishing via moq5
 
 The opt-in [moq5](https://github.com/openmoq/moq5) backend routes batch, live stdin, live SRT, and live-object publishing through moq5's service tier. The service tier handles catalog publication, CMSF/CMAF validation, subscriber-demand gating, bounded backpressure, and graceful transport draining.

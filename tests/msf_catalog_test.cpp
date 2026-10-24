@@ -1,6 +1,8 @@
 #include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/mp4_box.h"
+#include "openmoq/publisher/moq_draft.h"
 
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -662,6 +664,55 @@ int main() {
     ok &= expect(r2[0].subgroup_id == 0, "expected all catalog objects in sub-group 0");
     ok &= expect(r2[0].payload == r1[0].payload,
                  "expected republication to re-send identical content");
+
+    // MoqTransport section 2.5: a restarted publisher starts its catalog
+    // groups at a chosen initial Group ID, and reset() returns there.
+    {
+        constexpr std::uint64_t kInitial = 1700000000000ULL;
+        CatalogPublisher base_pub;
+        base_pub.set_initial_group_id(kInitial);
+        ok &= expect(base_pub.next_group_id() == kInitial, "expected the next catalog group at the initial ID");
+        const auto b1 = base_pub.publish(live_now);
+        ok &= expect(b1.size() == 1 && b1[0].group_id == kInitial && b1[0].object_id == 0,
+                     "expected the first catalog at the initial Group ID, object 0");
+        auto changed = live_now;
+        changed.tracks.pop_back();
+        const auto delta = base_pub.publish(changed);
+        ok &= expect(delta.size() == 1 && delta[0].group_id == kInitial && delta[0].object_id == 1,
+                     "expected a delta to stay in the initial group");
+        const auto b2 = base_pub.force_independent();
+        ok &= expect(b2.size() == 1 && b2[0].group_id == kInitial + 1,
+                     "expected republication in the group after the initial one");
+        base_pub.reset();
+        const auto b3 = base_pub.publish(live_now);
+        ok &= expect(b3.size() == 1 && b3[0].group_id == kInitial,
+                     "expected reset() to keep the initial Group ID");
+
+        // After a catalog is out, a late set_initial_group_id() must not move
+        // the live group: deltas keep attaching to it and republication
+        // continues from it. Only reset() applies the new value.
+        CatalogPublisher late_pub;
+        (void)late_pub.publish(live_now);
+        late_pub.set_initial_group_id(kInitial);
+        ok &= expect(late_pub.next_group_id() == 1, "expected a late initial Group ID not to move the live group");
+        const auto late_republish = late_pub.force_independent();
+        ok &= expect(late_republish.size() == 1 && late_republish[0].group_id == 1,
+                     "expected republication to continue from the live group");
+        late_pub.reset();
+        ok &= expect(late_pub.next_group_id() == kInitial, "expected reset() to apply the late initial Group ID");
+
+        CatalogPublisher exhausted_pub;
+        exhausted_pub.set_initial_group_id(kMaxGroupId);
+        ok &= expect(exhausted_pub.publish(live_now)[0].group_id == kMaxGroupId,
+                     "expected a catalog at Group ID 2^62-1");
+        bool threw_exhausted = false;
+        try {
+            (void)exhausted_pub.force_independent();
+        } catch (const std::runtime_error&) {
+            threw_exhausted = true;
+        }
+        ok &= expect(threw_exhausted, "expected a catalog group past 2^62-1 to throw");
+    }
 
     // A republish before anything has been published emits nothing rather
     // than serializing an empty catalog.

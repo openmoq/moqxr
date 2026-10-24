@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -705,6 +706,78 @@ int main() {
                          !first->final_in_subgroup && !second->final_in_subgroup &&
                          !third->final_in_subgroup && !fourth->final_in_subgroup,
                      "expected DASH group objects to keep their subgroup stream open");
+    }
+
+    {
+        // MoqTransport section 2.5: a restarted publisher numbers the catalog
+        // and media groups from the configured initial Group ID.
+        constexpr std::uint64_t kInitial = 1700000000000ULL;
+        LiveDashIngestSession session(8, openmoq::publisher::MediaPackaging::kCmaf, kInitial);
+        const auto init = make_init_segment(1);
+        const auto keyframe_a = make_media_fragment(1, 0, 0x11);
+        const auto dependent_a = make_media_fragment(1, 1000, 0x12, 0x00010000);
+        const auto keyframe_b = make_media_fragment(1, 2000, 0x13);
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(init.data(), init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected track before initial Group ID test");
+        const auto source = session.source();
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(keyframe_a.data(), keyframe_a.size()));
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(dependent_a.data(), dependent_a.size()));
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(keyframe_b.data(), keyframe_b.size()));
+        const auto catalog = session.try_next_object();
+        const auto first = session.try_next_object();
+        const auto second = session.try_next_object();
+        const auto third = session.try_next_object();
+        ok &= expect(catalog && catalog->track_name == "catalog" && catalog->group_id == kInitial,
+                     "expected the DASH catalog at the initial Group ID");
+        ok &= expect(first && first->group_id == kInitial && first->object_id == 0 &&
+                         second && second->group_id == kInitial && second->object_id == 1,
+                     "expected the first DASH media group at the initial Group ID");
+        ok &= expect(third && third->group_id == kInitial + 1 && third->object_id == 0,
+                     "expected the next DASH keyframe in the following group");
+    }
+
+    {
+        constexpr std::uint64_t kInitial = 42;
+        LiveDashIngestSession session(8, openmoq::publisher::MediaPackaging::kCmaf, kInitial);
+        const auto init = make_init_segment(1, "soun");
+        const auto audio_a = make_media_fragment(1, 0, 0x21);
+        const auto audio_b = make_media_fragment(1, 1024, 0x22);
+        session.ingest("/ingest/audio", std::span<const std::uint8_t>(init.data(), init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected audio track before audio-only initial Group ID test");
+        const auto source = session.source();
+        session.ingest("/ingest/audio", std::span<const std::uint8_t>(audio_a.data(), audio_a.size()));
+        session.ingest("/ingest/audio", std::span<const std::uint8_t>(audio_b.data(), audio_b.size()));
+        const auto catalog = session.try_next_object();
+        const auto first = session.try_next_object();
+        const auto second = session.try_next_object();
+        ok &= expect(catalog && catalog->group_id == kInitial, "expected the audio-only catalog at the initial Group ID");
+        ok &= expect(first && first->group_id == kInitial && second && second->group_id == kInitial + 1,
+                     "expected audio-only DASH groups to count up from the initial Group ID");
+    }
+
+    {
+        LiveDashIngestSession session(2, openmoq::publisher::MediaPackaging::kLoc, 1000);
+        session.ingest("/ingest/loc", make_init_segment(1, "vide", true));
+        const std::vector<std::uint8_t> sample{0, 0, 0, 2, 0x65, 0x88};
+        session.ingest("/ingest/loc", make_dash_media_fragment(1, 0, sample));
+        const auto source = session.source();
+        const auto catalog = session.try_next_object();
+        const auto media = session.try_next_object();
+        ok &= expect(catalog && catalog->group_id == 1000 && media && media->group_id == 1000,
+                     "expected LOC DASH groups to start at the initial Group ID");
+    }
+
+    {
+        bool rejected = false;
+        try {
+            LiveDashIngestSession session(8, openmoq::publisher::MediaPackaging::kCmaf,
+                                          (std::uint64_t{1} << 62));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        ok &= expect(rejected, "expected a DASH initial Group ID above 2^62-1 to be rejected");
     }
 
     {

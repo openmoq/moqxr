@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include "openmoq/publisher/msf_url.h"
+#include "openmoq/publisher/publisher_api.h"
 #include "openmoq/publisher/version.h"
 
 namespace openmoq::publisher {
@@ -241,6 +242,24 @@ std::chrono::seconds parse_catalog_republish_interval(std::string_view value) {
     return std::chrono::seconds(seconds);
 }
 
+std::uint64_t parse_initial_group_id(std::string_view value) {
+    if (value == "time") {
+        return time_based_initial_group_id();
+    }
+    // from_chars takes digits only for an unsigned type: no sign, no
+    // whitespace. Requiring it to consume the whole value rejects "5x".
+    std::uint64_t group_id = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), group_id);
+    if (value.empty() || result.ec == std::errc::invalid_argument ||
+        result.ptr != value.data() + value.size()) {
+        throw std::runtime_error("--initial-group-id must be an unsigned integer or 'time'");
+    }
+    if (result.ec == std::errc::result_out_of_range || group_id > kMaxGroupId) {
+        throw std::runtime_error("--initial-group-id must not exceed 4611686018427387903 (2^62-1)");
+    }
+    return group_id;
+}
+
 std::size_t parse_retry_count(std::string_view value) {
     const int retries = parse_strict_int(value, "--retry");
     if (retries < 0) {
@@ -257,6 +276,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
     bool dash_queue_depth_set = false;
     bool transport_set = false;
     bool retry_set = false;
+    bool initial_group_id_set = false;
     std::optional<cat4moq::Profile> auth_profile;
     std::optional<std::uint64_t> auth_token_type;
     std::optional<std::filesystem::path> auth_token_file;
@@ -517,6 +537,9 @@ CliOptions parse_cli_options(int argc, char** argv) {
         } else if (argument == "--catalog-republish-interval") {
             options.catalog_republish_interval =
                 parse_catalog_republish_interval(require_value("--catalog-republish-interval"));
+        } else if (argument == "--initial-group-id") {
+            options.initial_group_id = parse_initial_group_id(require_value("--initial-group-id"));
+            initial_group_id_set = true;
         } else if (argument == "--drm-config") {
             // Parsed eagerly, not stored as a path: a malformed DRM config
             // must fail before publishing starts rather than publish with
@@ -665,6 +688,13 @@ CliOptions parse_cli_options(int argc, char** argv) {
     if (!options.dash_path_prefix.empty() && options.dash_path_prefix.front() != '/') {
         throw std::runtime_error("--dash-path must start with /");
     }
+    // A file is published from its own plan, not as a live track that a
+    // restarted publisher resumes, so the option has nothing to apply to.
+    if (initial_group_id_set && !live_source_uses_srt && !live_source_uses_dash &&
+        options.input_source.kind != InputSourceKind::kStdin) {
+        throw std::runtime_error(
+            "--initial-group-id requires live input (--input -, --live-source srt, or --live-source dash)");
+    }
 
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
         throw std::runtime_error("--alpn and --sni require --endpoint to be provided first");
@@ -749,7 +779,7 @@ std::string build_usage(const char* argv0) {
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
            " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
-           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--drm-config <path>]"
+           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--webtransport-allow-missing-reset-stream-at]"
            " [--retry <count>]"

@@ -117,6 +117,7 @@ int main(int argc, char** argv) {
             .vod = options.vod,
             .drm_systems = options.drm_systems,
             .catalog_republish_interval = options.catalog_republish_interval,
+            .initial_group_id = options.initial_group_id,
             .subscriber_timeout = options.subscriber_timeout,
             .authorization = options.authorization,
             .media_packaging = options.media_packaging,
@@ -163,6 +164,7 @@ int main(int argc, char** argv) {
             dash_config.port = options.dash_listen_port;
             dash_config.path_prefix = options.dash_path_prefix;
             dash_config.queue_depth = options.dash_queue_depth;
+            dash_config.initial_group_id = options.initial_group_id;
             LiveDashIngestServer dash_server(dash_config);
             const auto start_status = dash_server.start();
             if (!start_status.ok) {

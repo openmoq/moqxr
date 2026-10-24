@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -203,7 +204,7 @@ std::string shell_quote(const std::string& value) {
 }
 
 bool srt_session_discovery(const std::filesystem::path& media, bool namespace_update,
-                           bool unknown_alias = false) {
+                           bool unknown_alias = false, std::uint64_t initial_group_id = 0) {
     srt_startup();
     SRTSOCKET reservation;
     const auto address = reserve_address(reservation);
@@ -246,6 +247,7 @@ bool srt_session_discovery(const std::filesystem::path& media, bool namespace_up
         return std::system(command.c_str());
     });
     MoqtSession session(peer, "media", false, false, false, std::chrono::seconds(1));
+    session.set_initial_group_id(initial_group_id);
     bool ok = expect(session.connect(EndpointConfig{.host = "127.0.0.1", .port = 4433, .alpn = "moqt-22"}, {}).ok,
                      "SRT discovery session must connect");
     LiveSrtCallerOptions source;
@@ -277,7 +279,8 @@ bool srt_session_discovery(const std::filesystem::path& media, bool namespace_up
                 decode_vi64(write.bytes, offset, alias) && alias == 1 &&
                 decode_vi64(write.bytes, offset, group)) {
                 saw_resumed_media = true;
-                ok &= expect(group >= 7, "SRT resumed media must preserve the new group floor");
+                ok &= expect(group >= std::max<std::uint64_t>(7, initial_group_id),
+                             "SRT resumed media must preserve the new group floor and initial Group ID");
             }
         }
         ok &= expect(saw_resumed_media, "SRT discovery must deliver media with the migration group floor");
@@ -310,6 +313,9 @@ bool srt_session_discovery_regressions() {
     if (!expect(std::system(convert.c_str()) == 0, "SRT discovery MPEG-TS fixture conversion must succeed")) return false;
     bool ok = srt_session_discovery(media, true);
     ok &= srt_session_discovery(media, false);
+    // MoqTransport section 2.5: the initial Group ID applies to SRT input too,
+    // and wins over a lower draft-22 migration floor.
+    ok &= srt_session_discovery(media, false, false, 1700000000000ULL);
     ok &= srt_session_discovery(media, true, true);
     std::filesystem::remove(media);
     return ok;

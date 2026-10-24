@@ -301,6 +301,28 @@ if (!status.ok) {
 
 `publish_live(...)` uses incremental parsing and live publish flow instead of buffering to EOF.
 
+A live publisher numbers its Group IDs from 0, so a restarted process that
+publishes the same tracks again reuses Group IDs from its previous run.
+MoqTransport section 2.5 suggests starting a resumed track above every group
+used before, for example from the current time. Set
+`PublisherConfig::initial_group_id` to do that:
+
+```cpp
+config.initial_group_id = openmoq::publisher::time_based_initial_group_id();
+```
+
+`time_based_initial_group_id()` returns milliseconds since the Unix epoch. It
+keeps the new Group IDs above the previous run's if that run published fewer
+groups than the milliseconds that passed between its start and the restart,
+and the system clock did not step backwards. `publish_live(...)` numbers the
+live media groups and the catalog groups from this value on every draft; on
+draft 22 a GOAWAY migration still resumes above the groups the previous
+session sent. The default is 0. A value above `kMaxGroupId` (2^62-1) makes the
+`Publisher` constructor and `set_config` throw. `publish_live_objects(...)`
+sends the Group IDs its source supplies (`LiveDashIngestConfig::initial_group_id`
+sets them for the DASH ingest), and the libmoq backend refuses a non-zero value
+because it numbers Group IDs itself.
+
 ## 10. Arbitrary Live Object Publish
 
 Applications that already produce MoQ objects directly can bypass fragmented MP4
