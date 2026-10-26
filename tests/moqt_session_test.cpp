@@ -1178,9 +1178,38 @@ bool is_data_stream_write(const MockTransport::WriteEvent& write) {
            (*type >= 0x50 && *type <= 0x7d);
 }
 
+bool ends_with(const std::vector<std::uint8_t>& bytes, const std::vector<std::uint8_t>& tail) {
+    return bytes.size() >= tail.size() &&
+           std::equal(tail.begin(), tail.end(), bytes.end() - static_cast<std::ptrdiff_t>(tail.size()));
+}
+
+// True when the transport wrote exactly these bytes on this stream.
+bool wrote(const MockTransport& transport, std::uint64_t stream_id, const std::vector<std::uint8_t>& bytes) {
+    return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const MockTransport::WriteEvent& write) {
+        return write.stream_id == stream_id && write.bytes == bytes;
+    });
+}
+
 bool reset_with_cancelled(const MockTransport& transport, std::uint64_t stream_id) {
     return std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
                      std::pair<std::uint64_t, std::uint64_t>{stream_id, 0x1}) != transport.reset_calls.end();
+}
+
+// A live source that returns these Objects in order, then ends; its catalog
+// comes as "catalog" Objects.
+LiveObjectSource listed_object_source(std::vector<LiveTrack> tracks,
+                                      const std::vector<LiveObject>& objects,
+                                      std::size_t& next) {
+    return LiveObjectSource{
+        .tracks = std::move(tracks),
+        .next_object = [&objects, &next]() -> std::optional<LiveObject> {
+            if (next >= objects.size()) {
+                return std::nullopt;
+            }
+            return objects[next++];
+        },
+        .catalog_mode = LiveCatalogMode::kSourceObject,
+    };
 }
 
 // Write indices of the end of a live-object broadcast: the first write of
@@ -11572,6 +11601,157 @@ int main() {
         ok &= expect(transport.object_write_attempts.size() == 1,
                      "expected no Object after UNSUBSCRIBE; attempted " +
                          std::to_string(transport.object_write_attempts.size()) + " Object writes");
+    }
+
+    // A stalled Object write or subgroup FIN must not stop the publisher from
+    // answering control messages. Field case (moq2ts, moqx relay, draft 16):
+    // the writes stopped being admitted, the publisher slept in its
+    // would-block loop, and the relay's next SUBSCRIBE was never answered.
+    // Here the "video" writes from Group 2 on (or the FIN of Group 1, whose
+    // stream stays open after its Object) would block, as when the peer grants
+    // no more credit, and the relay then subscribes to "audio". The write or
+    // FIN stays blocked until the SUBSCRIBE_OK goes out, for at most 2000
+    // attempts.
+    for (const bool stall_fin : {false, true}) {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        const std::string label = stall_fin ? "stalled-FIN" : "stalled-write";
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        transport.reads[0].push_back(encode_subscribe_message(1, kTestTrackNamespace, "video", 1, draft));
+        // "audio" is the source's second track, alias 1.
+        const auto subscribe_ok = openmoq::publisher::transport::encode_subscribe_ok_message(draft, 3, 1, 0, 0, false);
+        std::size_t blocked_attempts = 0;
+        bool answered = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                const bool stalls = stall_fin ? event.bytes.empty() && event.fin
+                                              : !event.bytes.empty() && event.bytes.back() != static_cast<std::uint8_t>('A');
+                if (!stalls || answered || blocked_attempts > 2000) {
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                }
+                if (blocked_attempts++ == 0) {
+                    current.reads[0].push_back(encode_subscribe_message(3, kTestTrackNamespace, "audio", 1, draft));
+                }
+                answered = wrote(current, 0, subscribe_ok);
+                return {ObjectWriteDisposition::kWouldBlock, "media admission budget is full"};
+            };
+
+        const std::size_t last_group = stall_fin ? 3 : 60;
+        std::size_t next_group = 1;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}, LiveTrack{.track_name = "audio"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (next_group > last_group) {
+                    return std::nullopt;
+                }
+                const std::size_t group = next_group++;
+                return LiveObject{.track_name = "video", .group_id = group, .subgroup_id = 0, .object_id = 0,
+                                  .payload = {static_cast<std::uint8_t>('@' + group)},
+                                  .final_in_subgroup = !stall_fin};
+            },
+        };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                            std::chrono::seconds(5));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected " + label + " connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected " + label + " publish to succeed: " + status.message);
+        ok &= expect(blocked_attempts > 0 && answered,
+                     "expected the publisher to answer a SUBSCRIBE queued while a " + label + " would block");
+    }
+
+    // Once the publish loop has ended, a SUBSCRIBE that arrives while the
+    // closing catalog write would block is not accepted: nothing would send
+    // it a PUBLISH_DONE.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        const std::vector<std::uint8_t> closing_payload = {'E', 'N', 'D'};
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        std::vector<std::uint8_t> subscriptions = encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+        append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+        transport.reads[0].push_back(std::move(subscriptions));
+        std::size_t closing_attempts = 0;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (!ends_with(event.bytes, closing_payload)) {
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                }
+                if (++closing_attempts == 1) {
+                    current.reads[0].push_back(encode_subscribe_message(5, kTestTrackNamespace, "audio", 1, draft));
+                }
+                if (closing_attempts < 50) {
+                    return {ObjectWriteDisposition::kWouldBlock, "media admission budget is full"};
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C', 'A', 'T'}},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "catalog", .group_id = 1, .payload = closing_payload, .ends_broadcast = true},
+        };
+        std::size_t object_index = 0;
+        const LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}, LiveTrack{.track_name = "audio"}},
+            objects, object_index);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected closing-flush SUBSCRIBE connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected closing-flush SUBSCRIBE publish to succeed: " + status.message);
+        ok &= expect(closing_attempts >= 50, "expected the closing catalog to stall, then go out");
+        // "audio" is the source's third track, alias 2.
+        ok &= expect(!wrote(transport, 0, openmoq::publisher::transport::encode_subscribe_ok_message(draft, 5, 2, 0, 0, false)),
+                     "expected no SUBSCRIBE_OK for a SUBSCRIBE read after the publish loop ended");
+    }
+
+    // After the relay closes the control stream, the post-loop flush still
+    // retries a subgroup FIN that would block, and the publish ends with
+    // PUBLISH_DONE. Here the control FIN arrives after the first Object, and
+    // the FIN of its open subgroup would block four times.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        transport.reads[0].push_back(encode_subscribe_message(1, kTestTrackNamespace, "video", 1, draft));
+        std::size_t fin_attempts = 0;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (!event.bytes.empty()) {
+                    if (current.keep_open_streams.erase(0) != 0) {
+                        current.reads[0].push_back({});
+                    }
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                }
+                if (event.fin && ++fin_attempts < 5) {
+                    return {ObjectWriteDisposition::kWouldBlock, "media admission budget is full"};
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::uint64_t next_group = 1;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (next_group > 50) {
+                    return std::nullopt;
+                }
+                const std::uint64_t group = next_group++;
+                return LiveObject{.track_name = "video", .group_id = group, .subgroup_id = 0, .object_id = 0,
+                                  .payload = {static_cast<std::uint8_t>('@' + group)},
+                                  .final_in_subgroup = false};
+            },
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected control-FIN flush connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected a flush FIN that would block after a control FIN to succeed: " +
+                                    status.message);
+        ok &= expect(fin_attempts == 5, "expected the flush to retry the FIN until accepted; attempts " +
+                                            std::to_string(fin_attempts));
+        ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_publish_done_message(draft, 1, 1)),
+                     "expected PUBLISH_DONE after a control FIN");
     }
 
     return ok ? 0 : 1;

@@ -2701,7 +2701,8 @@ public:
                           DeliveryTimeouts delivery_timeouts = {},
                           const NowFunction& now_function = steady_now_function(),
                           bool* published = nullptr,
-                          SchedulingPriority priority = {128, 128}) {
+                          SchedulingPriority priority = {128, 128},
+                          const std::function<TransportStatus()>& while_blocked = {}) {
         if (published != nullptr) {
             *published = false;
         }
@@ -2727,6 +2728,12 @@ public:
                 return result.status;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (while_blocked) {
+                const TransportStatus status = while_blocked();
+                if (!status.ok) {
+                    return status;
+                }
+            }
         }
     }
 
@@ -3115,6 +3122,11 @@ public:
                     const TransportStatus status = resource_status();
                     if (!status.ok) {
                         return status;
+                    }
+                    // The callback can end the subgroup, for example on a
+                    // reset after its subscription ended.
+                    if (is_closed(key)) {
+                        break;
                     }
                 }
                 if (deadline_reached(read_now(now_function), std::nullopt, subgroup_deadline)) {
@@ -11463,6 +11475,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
     bool source_eof = false;
     bool control_fin = false;
+    // Set when the publish loop ends. From then on, a write that would block
+    // no longer serves control messages: a subscription accepted during the
+    // final flush would never get its PUBLISH_DONE.
+    bool loop_ended = false;
     bool awaiting_source_catalog =
         source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject;
     std::optional<std::chrono::steady_clock::time_point> object_pacing_start;
@@ -11486,6 +11502,38 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             active_subscriptions.begin(),
             active_subscriptions.end(),
             [](const auto& entry) { return entry.second.track_name == "catalog"; }));
+    };
+    // Runs between two attempts of a write or FIN that would block: the stop
+    // check, the stream events and, until the loop ends, the control
+    // messages. Fails, ending the retries, on stop or, until the loop ends,
+    // on a control stream FIN: the final flush still finishes every stream.
+    const auto interrupted = [&]() {
+        return stop_requested_.load(std::memory_order_acquire) || (control_fin && !loop_ended);
+    };
+    const auto serve_while_blocked = [&]() -> TransportStatus {
+        TransportStatus control_status = interrupted() ? TransportStatus::success() : dispatch_stream_events();
+        if (control_status.ok && !interrupted() && !loop_ended) {
+            control_status = append_control_stream_bytes_nonblocking(
+                transport_, control_read_stream_id, pending_control_bytes_, &control_fin);
+            if (control_status.ok) {
+                control_status = process_control_messages();
+            }
+        }
+        if (control_status.ok && interrupted()) {
+            return TransportStatus::failure("live publish stopped while a write would block");
+        }
+        return control_status;
+    };
+    const auto finish_live_group = [&](SubgroupSenderState& sender,
+                                       const DeliveryTimeouts& delivery_timeouts) -> TransportStatus {
+        bool first_attempt = true;
+        return sender.finish_group(transport_, draft_version, delivery_timeouts, now_function_, [&]() {
+            if (first_attempt) {
+                first_attempt = false;
+                return TransportStatus::success();
+            }
+            return serve_while_blocked();
+        });
     };
     const auto send_retained_catalog = [&]() -> TransportStatus {
         if (!retained_source_catalog.has_value()) {
@@ -11534,7 +11582,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             &object_published,
             {.subscriber = subscriber_priority_for_track(
                  active_subscriptions, "catalog"),
-             .publisher = 128});
+             .publisher = 128},
+            serve_while_blocked);
         if (!send_status.ok) {
             return send_status;
         }
@@ -11600,7 +11649,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
         status = send_retained_catalog();
         if (!status.ok) {
-            if (stop_requested_.load(std::memory_order_acquire)) {
+            if (interrupted()) {
                 break;
             }
             return status;
@@ -11694,7 +11743,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             status = send_retained_catalog();
             if (!status.ok) {
-                if (stop_requested_.load(std::memory_order_acquire)) {
+                if (interrupted()) {
                     break;
                 }
                 return status;
@@ -11806,9 +11855,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         const auto group_it = last_group_id_by_track.find(next->track_name);
         if (group_it != last_group_id_by_track.end() &&
             group_it->second != static_cast<std::uint64_t>(next->group_id)) {
-            status = sender.finish_group(
-                transport_, draft_version, delivery_timeouts, now_function_);
+            status = finish_live_group(sender, delivery_timeouts);
             if (!status.ok) {
+                if (interrupted()) {
+                    break;
+                }
                 return status;
             }
         }
@@ -11831,12 +11882,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                  published_settings_it != published_track_settings.end()
                      ? published_settings_it->second.subscriber_priority
                      : 128),
-             .publisher = 128});
+             .publisher = 128},
+            serve_while_blocked);
         const TransportStatus event_status = dispatch_stream_events();
         if (!status.ok) {
             // A send failure that races with a concurrent close() is a benign
             // stop, not a transport error: break to the flush.
-            if (stop_requested_.load(std::memory_order_acquire)) {
+            if (interrupted()) {
                 break;
             }
             return status;
@@ -11858,6 +11910,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
     }
 
+    loop_ended = true;
+
     // Bound the post-loop graceful flush. When a stop is in progress, a flush
     // write can fail (transport torn down by a concurrent close()) or the total
     // flush can run long; in either case return success rather than surfacing a
@@ -11877,11 +11931,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return finish_after_media_event_dispatch(
                 transport_, sender_by_track, TransportStatus::success());
         }
-        status = sender.finish_group(
-            transport_,
-            draft_version,
-            effective_delivery_timeouts(track_name),
-            now_function_);
+        status = finish_live_group(sender, effective_delivery_timeouts(track_name));
         if (!status.ok) {
             return stopping()
                        ? finish_after_media_event_dispatch(
@@ -11968,11 +12018,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         served_catalog_subscription_count = 0;
         status = send_retained_catalog();
         if (status.ok) {
-            status = sender_by_track["catalog"].finish_group(
-                transport_,
-                draft_version,
-                effective_delivery_timeouts("catalog"),
-                now_function_);
+            status = finish_live_group(sender_by_track["catalog"], effective_delivery_timeouts("catalog"));
         }
         if (!status.ok) {
             return stopping()
