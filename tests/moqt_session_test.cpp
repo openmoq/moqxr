@@ -789,8 +789,12 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             const std::vector<std::uint8_t> sg = encode_moqint(draft, start_group_id);
             const std::vector<std::uint8_t> so = encode_moqint(draft, start_object_id);
             filter_value.insert(filter_value.end(), ft.begin(), ft.end());
-            filter_value.insert(filter_value.end(), sg.begin(), sg.end());
-            filter_value.insert(filter_value.end(), so.begin(), so.end());
+            // Next Group Start (0x1) and Largest Object (0x2) carry no Start
+            // Location (draft 16 section 5.1.2).
+            if (filter_type_value == 0x03 || filter_type_value == 0x04) {
+                filter_value.insert(filter_value.end(), sg.begin(), sg.end());
+                filter_value.insert(filter_value.end(), so.begin(), so.end());
+            }
             if (filter_type_value == 0x04) {
                 const bool delta = draft == DraftVersion::kDraft17 || draft == DraftVersion::kDraft18;
                 append_bytes(filter_value,
@@ -11752,6 +11756,92 @@ int main() {
                                             std::to_string(fin_attempts));
         ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_publish_done_message(draft, 1, 1)),
                      "expected PUBLISH_DONE after a control FIN");
+    }
+
+    // A SUBSCRIBE with the Next Group Start filter starts at {Largest
+    // Object.Group + 1, 0}, so a track that gains a subscription while its
+    // Groups flow skips the rest of the Group in progress (field case N1). An
+    // "audio" subscription keeps the loop reading the source throughout.
+    // Case 1: the "video" subscription ended before; case 2: the first "video"
+    // subscription; case 3: the Largest Object filter starts at {Largest
+    // Object.Group, Largest Object.Object + 1}, inside the Group by
+    // definition. Each Group holds 3 Objects; the payload is
+    // {'@' + Group, '0' + Object}.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        for (const int variant : {1, 2, 3}) {
+            const bool after_unsubscribe = variant == 1 || variant == 3;
+            const std::uint64_t filter_type = variant == 3 ? 0x02 : 0x01;
+            const std::string label = variant == 1   ? "Next Group Start after an unsubscribe"
+                                      : variant == 2 ? "Next Group Start as the first subscription"
+                                                     : "Largest Object after an unsubscribe";
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.keep_open_streams = {0};
+            std::vector<std::uint8_t> subscriptions = encode_subscribe_message(1, kTestTrackNamespace, "audio", 1, draft);
+            if (after_unsubscribe) {
+                append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+            }
+            transport.reads[0].push_back(std::move(subscriptions));
+            bool unsubscribed = false;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                    if (after_unsubscribe && !unsubscribed && ends_with(event.bytes, {'@' + 1, '2'})) {
+                        unsubscribed = true;
+                        current.reads[0].push_back(encode_unsubscribe_message(draft, 3));
+                    }
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                };
+            // The new "video" SUBSCRIBE arrives once Object 1 of this Group
+            // is read.
+            const std::size_t subscribe_group = after_unsubscribe ? 3 : 2;
+            const std::uint64_t subscribe_request = after_unsubscribe ? 5 : 3;
+            std::size_t next = 0;
+            LiveObjectSource source{
+                .tracks = {LiveTrack{.track_name = "video"}, LiveTrack{.track_name = "audio"}},
+                .next_object = [&]() -> std::optional<LiveObject> {
+                    if (next >= 15) {
+                        return std::nullopt;
+                    }
+                    const std::size_t group = 1 + next / 3;
+                    const std::size_t object = next % 3;
+                    ++next;
+                    if (group == subscribe_group && object == 1) {
+                        transport.reads[0].push_back(encode_subscribe_message(
+                            subscribe_request, kTestTrackNamespace, "video", 1, draft, 0, 0, 128, 0, 0, 0,
+                            filter_type));
+                    }
+                    return LiveObject{.track_name = "video", .group_id = group, .subgroup_id = 0, .object_id = object,
+                                      .payload = {static_cast<std::uint8_t>('@' + group),
+                                                  static_cast<std::uint8_t>('0' + object)},
+                                      .final_in_subgroup = object == 2};
+                },
+            };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected " + label + " connect to succeed");
+            status = session.publish_live_objects(source, draft);
+            ok &= expect(status.ok, "expected " + label + " publish to succeed: " + status.message);
+            std::string delivered;
+            for (const auto& attempt : transport.object_write_attempts) {
+                if (attempt.bytes.size() >= 2) {
+                    delivered += " " + std::to_string(attempt.bytes[attempt.bytes.size() - 2] - '@') + "/" +
+                                 static_cast<char>(attempt.bytes.back());
+                }
+            }
+            const std::string expected = variant == 1   ? " 1/0 1/1 1/2 4/0 4/1 4/2 5/0 5/1 5/2"
+                                         : variant == 3 ? " 1/0 1/1 1/2 3/2 4/0 4/1 4/2 5/0 5/1 5/2"
+                                                        : " 3/0 3/1 3/2 4/0 4/1 4/2 5/0 5/1 5/2";
+            ok &= expect(delivered == expected,
+                         "expected " + label + " to deliver Group/Object" + expected + "; got" + delivered);
+            // SUBSCRIBE_OK reports the Largest Object the filter resolves
+            // against, {subscribe_group, 1}, in LARGEST_OBJECT.
+            ok &= expect(wrote(transport, 0,
+                               openmoq::publisher::transport::encode_subscribe_ok_message(
+                                   draft, subscribe_request, 0, subscribe_group, 1, true)),
+                         "expected " + label + " SUBSCRIBE_OK to carry LARGEST_OBJECT {" +
+                             std::to_string(subscribe_group) + ", 1}");
+        }
     }
 
     return ok ? 0 : 1;

@@ -1886,9 +1886,10 @@ private:
 
 bool object_matches_filter(const openmoq::publisher::CmsfObject& object, const SubscribeMessage& subscribe) {
     switch (subscribe.filter_type) {
+        // Next Group Start and Largest Object: publish_live_objects resolves
+        // the Start Location at SUBSCRIBE, elsewhere it stays {0, 0}.
         case 0x01:
         case 0x02:
-            return true;
         case 0x03:
             return object.group_id > subscribe.start_group_id ||
                    (object.group_id == subscribe.start_group_id && object.object_id >= subscribe.start_object_id);
@@ -10925,8 +10926,15 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                            false);
         }
 
-        const auto largest = subscribe_ok_largest(
-            draft_version, subscribe.track_name, largest_sent_object(subscribe.track_name));
+        // The largest Location read from the source, which SUBSCRIBE_OK
+        // reports and the filter resolves against. The catalog keeps
+        // reporting none.
+        const auto seen_it = subscribe.track_name == "catalog" ? largest_object_by_track.end()
+                                                               : largest_object_by_track.find(subscribe.track_name);
+        std::optional<std::pair<std::size_t, std::size_t>> largest;
+        if (draft_version != DraftVersion::kDraft14 && seen_it != largest_object_by_track.end()) {
+            largest = seen_it->second;
+        }
         TransportStatus write_status =
             transport_.write_stream(response_stream_id,
                                     encode_subscribe_ok_with_largest(draft_version,
@@ -10940,7 +10948,17 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         established_subscription_tracks.insert(subscription_key);
         open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested, subscribe.request_id,
                                 subscribe.forward, largest.has_value());
-        active_subscriptions.emplace(subscribe.request_id, subscribe);
+        SubscribeMessage stored = subscribe;
+        if (seen_it != largest_object_by_track.end()) {
+            if (subscribe.filter_type == 0x01) {
+                stored.start_group_id = seen_it->second.first + 1;
+                stored.start_object_id = 0;
+            } else if (subscribe.filter_type == 0x02) {
+                stored.start_group_id = seen_it->second.first;
+                stored.start_object_id = seen_it->second.second + 1;
+            }
+        }
+        active_subscriptions.emplace(subscribe.request_id, std::move(stored));
         active_subscription_stream_ids.insert_or_assign(subscribe.request_id, response_stream_id);
         if (subscription_forwards_objects(
                 draft_version, subscribe.forward)) {
