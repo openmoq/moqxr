@@ -12215,5 +12215,122 @@ int main() {
                          std::to_string(payload_writes(transport, {'C', '0'})) + " Objects 0");
     }
 
+    // The subscriber deadline bounds only the wait for the first
+    // subscription. A live publisher whose last subscriber leaves keeps
+    // serving past the deadline, so a SUBSCRIBE 1.5 s later, after the 1 s
+    // subscriber timeout, is answered.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        transport.reads[0].push_back(encode_subscribe_message(1, kTestTrackNamespace, "video", 1, draft));
+        const auto start = std::chrono::steady_clock::now();
+        std::atomic<bool> first_object_sent{false};
+        std::atomic<bool> subscribed_late{false};
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) -> ObjectWriteResult {
+                if (!first_object_sent.exchange(true)) {
+                    current.reads[0].push_back(encode_unsubscribe_message(draft, 1));
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (stream_id != 0 || subscribed_late.load() || !first_object_sent.load() ||
+                std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500)) {
+                return;
+            }
+            subscribed_late.store(true);
+            // The server (relay) Request IDs run 1, 3, ...
+            current.reads[0].push_back(encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+        };
+
+        // A live source: Group 1 at once, nothing more until the late
+        // SUBSCRIBE, then Groups 2 to 4.
+        std::size_t next_group = 1;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (next_group > 4 || (next_group > 1 && !subscribed_late.load())) {
+                    return std::nullopt;
+                }
+                const std::size_t group = next_group++;
+                return LiveObject{.track_name = "video", .group_id = group, .subgroup_id = 0, .object_id = 0,
+                                  .payload = {static_cast<std::uint8_t>('@' + group)}};
+            },
+            .is_finished = [&]() { return next_group > 4; },
+        };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected resubscribe after the timeout connect to succeed");
+        std::promise<TransportStatus> result_promise;
+        std::future<TransportStatus> result_future = result_promise.get_future();
+        std::thread worker([&]() { result_promise.set_value(session.publish_live_objects(source, draft)); });
+        const bool returned = result_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        if (!returned) {
+            static_cast<void>(session.close(0));
+        }
+        worker.join();
+        ok &= expect(returned, "expected a resubscribe after the timeout to end with its source");
+        ok &= expect(subscribed_late.load(), "expected the publisher to still serve after 1.5 s");
+        // LARGEST_OBJECT is Group 1, read before the SUBSCRIBE.
+        ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_subscribe_ok_message(draft, 3, 0, 1, 0, true)),
+                     "expected the SUBSCRIBE after the timeout to get SUBSCRIBE_OK");
+        ok &= expect(transport.object_write_attempts.size() == 4,
+                     "expected the Groups after the late SUBSCRIBE to be delivered; attempted " +
+                         std::to_string(transport.object_write_attempts.size()) + " Object writes");
+    }
+
+    // After the first subscription, a live source that ends while no
+    // subscriber is left still ends the publish: the source keeps being read,
+    // and its Objects are dropped, instead of waiting for a subscriber that may
+    // never come.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        transport.reads[0].push_back(encode_subscribe_message(1, kTestTrackNamespace, "video", 1, draft));
+        bool unsubscribed = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) -> ObjectWriteResult {
+                if (!unsubscribed) {
+                    unsubscribed = true;
+                    current.reads[0].push_back(encode_unsubscribe_message(draft, 1));
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::size_t next_group = 1;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (next_group > 5) {
+                    return std::nullopt;
+                }
+                const std::size_t group = next_group++;
+                return LiveObject{.track_name = "video", .group_id = group, .subgroup_id = 0, .object_id = 0,
+                                  .payload = {static_cast<std::uint8_t>('@' + group)}};
+            },
+            .is_finished = [&]() { return next_group > 5; },
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                            std::chrono::seconds(5));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected drain-after-unsubscribe connect to succeed");
+        std::promise<TransportStatus> result_promise;
+        std::future<TransportStatus> result_future = result_promise.get_future();
+        std::thread worker([&]() { result_promise.set_value(session.publish_live_objects(source, draft)); });
+        const bool returned = result_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        if (!returned) {
+            static_cast<void>(session.close(0));
+        }
+        worker.join();
+        ok &= expect(returned, "expected a live publish to end with its source after the last subscriber left");
+        ok &= expect(next_group > 5, "expected the source to be read to its end after the last subscriber left");
+        ok &= expect(transport.object_write_attempts.size() == 1,
+                     "expected no Object after the last subscriber left; attempted " +
+                         std::to_string(transport.object_write_attempts.size()) + " Object writes");
+    }
+
     return ok ? 0 : 1;
 }
