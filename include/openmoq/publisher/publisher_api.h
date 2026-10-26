@@ -107,7 +107,18 @@ struct PublisherConfig {
     // publish_live_objects() sends the Group IDs its source supplies, and the
     // batch publish() path does not use this field.
     std::uint64_t initial_group_id = 0;
+    // Bounds the wait for the first subscriber, and each read of a request
+    // message on a request stream.
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
+    // publish_live_objects() on the MoqtSession backend: wait for the first
+    // subscriber without a deadline instead of returning once
+    // subscriber_timeout has passed. subscriber_timeout still bounds request
+    // stream reads. Whatever this is set to, the deadline never applies after
+    // the first subscriber: the last subscriber leaving does not end a live
+    // publish, which keeps reading its source and ends with it. The libmoq
+    // backend refuses this setting, and the publish_live() overloads (stdin,
+    // SRT) ignore it.
+    bool await_subscriber_indefinitely = false;
     cat4moq::AuthorizationConfig authorization;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
 };

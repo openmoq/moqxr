@@ -11773,24 +11773,30 @@ int main() {
     // Case 1: the "video" subscription ended before; case 2: the first "video"
     // subscription; case 3: the Largest Object filter starts at {Largest
     // Object.Group, Largest Object.Object + 1}, inside the Group by
-    // definition. Each Group holds 3 Objects; the payload is
+    // definition; case 4: the first subscription of all, during an unlimited
+    // wait that drains the source. Each Group holds 3 Objects; the payload is
     // {'@' + Group, '0' + Object}.
     {
         const DraftVersion draft = DraftVersion::kDraft16;
-        for (const int variant : {1, 2, 3}) {
+        for (const int variant : {1, 2, 3, 4}) {
             const bool after_unsubscribe = variant == 1 || variant == 3;
+            const bool unlimited_wait = variant == 4;
             const std::uint64_t filter_type = variant == 3 ? 0x02 : 0x01;
             const std::string label = variant == 1   ? "Next Group Start after an unsubscribe"
                                       : variant == 2 ? "Next Group Start as the first subscription"
-                                                     : "Largest Object after an unsubscribe";
+                                      : variant == 3 ? "Largest Object after an unsubscribe"
+                                                     : "Next Group Start during an unlimited wait";
             MockTransport transport;
             queue_draft16_scheduling_prefix(transport);
             transport.keep_open_streams = {0};
-            std::vector<std::uint8_t> subscriptions = encode_subscribe_message(1, kTestTrackNamespace, "audio", 1, draft);
-            if (after_unsubscribe) {
-                append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+            if (!unlimited_wait) {
+                std::vector<std::uint8_t> subscriptions =
+                    encode_subscribe_message(1, kTestTrackNamespace, "audio", 1, draft);
+                if (after_unsubscribe) {
+                    append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+                }
+                transport.reads[0].push_back(std::move(subscriptions));
             }
-            transport.reads[0].push_back(std::move(subscriptions));
             bool unsubscribed = false;
             transport.on_try_write_object =
                 [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
@@ -11803,7 +11809,7 @@ int main() {
             // The new "video" SUBSCRIBE arrives once Object 1 of this Group
             // is read.
             const std::size_t subscribe_group = after_unsubscribe ? 3 : 2;
-            const std::uint64_t subscribe_request = after_unsubscribe ? 5 : 3;
+            const std::uint64_t subscribe_request = after_unsubscribe ? 5 : unlimited_wait ? 1 : 3;
             std::size_t next = 0;
             LiveObjectSource source{
                 .tracks = {LiveTrack{.track_name = "video"}, LiveTrack{.track_name = "audio"}},
@@ -11827,6 +11833,7 @@ int main() {
             };
             MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
                                 std::chrono::seconds(1));
+            session.set_await_subscriber_indefinitely(unlimited_wait);
             ok &= expect(session.connect(endpoint, tls).ok, "expected " + label + " connect to succeed");
             status = session.publish_live_objects(source, draft);
             ok &= expect(status.ok, "expected " + label + " publish to succeed: " + status.message);
@@ -12330,6 +12337,70 @@ int main() {
         ok &= expect(transport.object_write_attempts.size() == 1,
                      "expected no Object after the last subscriber left; attempted " +
                          std::to_string(transport.object_write_attempts.size()) + " Object writes");
+    }
+
+    // With await_subscriber_indefinitely, the first subscription has no
+    // deadline: here it arrives 1.5 s in, after the 1 s subscriber timeout.
+    // Meanwhile the publisher reads and drops the source, so the source is
+    // never held back, and keeps the latest catalog for that subscriber.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'O', 'L', 'D'}},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "catalog", .group_id = 1, .payload = {'N', 'E', 'W'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+        };
+        const auto start = std::chrono::steady_clock::now();
+        std::atomic<std::size_t> object_index{0};
+        std::atomic<bool> subscribed{false};
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (stream_id != 0 || subscribed.load() || object_index.load() < 4 ||
+                std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500)) {
+                return;
+            }
+            subscribed.store(true);
+            std::vector<std::uint8_t> subscriptions =
+                encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+            append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+            current.reads[0].push_back(std::move(subscriptions));
+        };
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}},
+            // The last Group waits for the subscription.
+            .next_object = [&]() -> std::optional<LiveObject> {
+                const std::size_t index = object_index.load();
+                if (index >= objects.size() || (index >= 4 && !subscribed.load())) {
+                    return std::nullopt;
+                }
+                object_index.store(index + 1);
+                return objects[index];
+            },
+            .is_finished = [&]() { return object_index.load() >= objects.size(); },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        session.set_await_subscriber_indefinitely(true);
+        ok &= expect(session.connect(endpoint, tls).ok, "expected unlimited-wait drain connect to succeed");
+        std::promise<TransportStatus> result_promise;
+        std::future<TransportStatus> result_future = result_promise.get_future();
+        std::thread worker([&]() { result_promise.set_value(session.publish_live_objects(source, draft)); });
+        const bool returned = result_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        if (!returned) {
+            static_cast<void>(session.close(0));
+        }
+        worker.join();
+        ok &= expect(returned && subscribed.load(),
+                     "expected an unlimited wait to serve a first subscriber after the subscriber timeout");
+        ok &= expect(payload_writes(transport, {'N', 'E', 'W'}) == 1 && payload_writes(transport, {'O', 'L', 'D'}) == 0,
+                     "expected the first catalog subscriber to get only the latest catalog");
+        ok &= expect(payload_writes(transport, {'V', '1'}) == 0 && payload_writes(transport, {'V', '2'}) == 0 &&
+                         payload_writes(transport, {'V', '3'}) == 1,
+                     "expected media read before the first subscriber to be dropped");
     }
 
     return ok ? 0 : 1;
