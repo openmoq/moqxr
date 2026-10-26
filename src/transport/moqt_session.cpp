@@ -257,6 +257,7 @@ void note_delivery_timeouts(openmoq::publisher::transport::PublisherTransport& t
 }
 
 
+constexpr std::uint64_t kCancelledErrorCode = 0x1;
 constexpr std::uint64_t kProtocolViolationErrorCode = 0x3;
 constexpr std::uint64_t kDoesNotExistLegacyRequestErrorCode = 0x02;
 constexpr std::uint64_t kDoesNotExistRequestErrorCode = 0x10;
@@ -10957,6 +10958,64 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
         };
 
+    // The subscriber ended this subscription. Subgroup streams belong to the
+    // track, so they are reset only once no subscription forwards it. An
+    // unknown request ID is ignored.
+    const auto end_subscription = [&](std::uint64_t request_id) -> TransportStatus {
+        const auto active_it = active_subscriptions.find(request_id);
+        if (active_it == active_subscriptions.end()) {
+            return TransportStatus::success();
+        }
+        const SubscribeMessage ended = std::move(active_it->second);
+        active_subscriptions.erase(active_it);
+        active_subscription_stream_ids.erase(request_id);
+        pending_subscription_request_bytes.erase(request_id);
+        const bool track_still_subscribed = std::any_of(
+            active_subscriptions.begin(), active_subscriptions.end(), [&](const auto& entry) {
+                return entry.second.track_namespace == ended.track_namespace &&
+                       entry.second.track_name == ended.track_name;
+            });
+        if (!track_still_subscribed) {
+            established_subscription_tracks.erase(std::pair{ended.track_namespace, ended.track_name});
+        }
+        refresh_subscriber_forward_permission(ended.track_name);
+        if (subscribed_tracks.contains(ended.track_name)) {
+            return TransportStatus::success();
+        }
+        const auto sender_it = sender_by_track.find(ended.track_name);
+        return sender_it == sender_by_track.end()
+                   ? TransportStatus::success()
+                   : sender_it->second.cancel_all_open_subgroups(transport_, kCancelledErrorCode);
+    };
+
+    // Ends each subscription whose request stream the subscriber cancelled,
+    // and resets that stream. Runs before the media stream events, which
+    // would take its STOP_SENDING for an ownerless media stream stop.
+    const auto dispatch_stream_events = [&]() -> TransportStatus {
+        if (uses_request_streams(draft_version)) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> cancelled;
+            for (const auto& [request_id, stream_id] : active_subscription_stream_ids) {
+                if (transport_.media_stream_peer_stopped(stream_id) ||
+                    transport_.stream_peer_reset_error(stream_id).has_value()) {
+                    cancelled.emplace_back(request_id, stream_id);
+                }
+            }
+            for (const auto& [request_id, stream_id] : cancelled) {
+                TransportStatus cancel_status = end_subscription(request_id);
+                if (cancel_status.ok) {
+                    cancel_status = transport_.reset_stream(stream_id, kCancelledErrorCode);
+                }
+                if (transport_.media_stream_peer_stopped(stream_id)) {
+                    transport_.acknowledge_media_stream_peer_stopped(stream_id);
+                }
+                if (!cancel_status.ok) {
+                    return cancel_status;
+                }
+            }
+        }
+        return dispatch_peer_stopped_media_streams(transport_, sender_by_track);
+    };
+
     const auto apply_subscriber_request_update =
         [&](std::uint64_t existing_request_id,
             std::uint64_t response_stream_id,
@@ -11363,6 +11422,15 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 if (!subscribe_status.ok) {
                     return subscribe_status;
                 }
+            } else if (message_type == 0x0a) {
+                std::uint64_t unsubscribe_request_id = 0;
+                if (!decode_unsubscribe_message(message_bytes, draft_version, unsubscribe_request_id)) {
+                    return protocol_violation(transport_, "received invalid UNSUBSCRIBE");
+                }
+                const TransportStatus unsubscribe_status = end_subscription(unsubscribe_request_id);
+                if (!unsubscribe_status.ok) {
+                    return unsubscribe_status;
+                }
             } else if (message_type == 0x11) {
                 SubscribeNamespaceMessage subscribe_namespace;
                 if (decode_subscribe_namespace_message(message_bytes, draft_version, subscribe_namespace)) {
@@ -11482,8 +11550,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     };
     const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
     while (!source_eof) {
-        status = dispatch_peer_stopped_media_streams(transport_,
-                                                     sender_by_track);
+        status = dispatch_stream_events();
         if (!status.ok) {
             return status;
         }
@@ -11765,8 +11832,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                      ? published_settings_it->second.subscriber_priority
                      : 128),
              .publisher = 128});
-        const TransportStatus event_status =
-            dispatch_peer_stopped_media_streams(transport_, sender_by_track);
+        const TransportStatus event_status = dispatch_stream_events();
         if (!status.ok) {
             // A send failure that races with a concurrent close() is a benign
             // stop, not a transport error: break to the flush.
