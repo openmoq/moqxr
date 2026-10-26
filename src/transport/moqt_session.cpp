@@ -257,6 +257,7 @@ void note_delivery_timeouts(openmoq::publisher::transport::PublisherTransport& t
 }
 
 
+constexpr std::uint64_t kCancelledErrorCode = 0x1;
 constexpr std::uint64_t kProtocolViolationErrorCode = 0x3;
 constexpr std::uint64_t kDoesNotExistLegacyRequestErrorCode = 0x02;
 constexpr std::uint64_t kDoesNotExistRequestErrorCode = 0x10;
@@ -1885,9 +1886,10 @@ private:
 
 bool object_matches_filter(const openmoq::publisher::CmsfObject& object, const SubscribeMessage& subscribe) {
     switch (subscribe.filter_type) {
+        // Next Group Start and Largest Object: publish_live_objects resolves
+        // the Start Location at SUBSCRIBE, elsewhere it stays {0, 0}.
         case 0x01:
         case 0x02:
-            return true;
         case 0x03:
             return object.group_id > subscribe.start_group_id ||
                    (object.group_id == subscribe.start_group_id && object.object_id >= subscribe.start_object_id);
@@ -2700,7 +2702,8 @@ public:
                           DeliveryTimeouts delivery_timeouts = {},
                           const NowFunction& now_function = steady_now_function(),
                           bool* published = nullptr,
-                          SchedulingPriority priority = {128, 128}) {
+                          SchedulingPriority priority = {128, 128},
+                          const std::function<TransportStatus()>& while_blocked = {}) {
         if (published != nullptr) {
             *published = false;
         }
@@ -2726,6 +2729,12 @@ public:
                 return result.status;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (while_blocked) {
+                const TransportStatus status = while_blocked();
+                if (!status.ok) {
+                    return status;
+                }
+            }
         }
     }
 
@@ -3114,6 +3123,11 @@ public:
                     const TransportStatus status = resource_status();
                     if (!status.ok) {
                         return status;
+                    }
+                    // The callback can end the subgroup, for example on a
+                    // reset after its subscription ended.
+                    if (is_closed(key)) {
+                        break;
                     }
                 }
                 if (deadline_reached(read_now(now_function), std::nullopt, subgroup_deadline)) {
@@ -10912,8 +10926,15 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                            false);
         }
 
-        const auto largest = subscribe_ok_largest(
-            draft_version, subscribe.track_name, largest_sent_object(subscribe.track_name));
+        // The largest Location read from the source, which SUBSCRIBE_OK
+        // reports and the filter resolves against. The catalog keeps
+        // reporting none.
+        const auto seen_it = subscribe.track_name == "catalog" ? largest_object_by_track.end()
+                                                               : largest_object_by_track.find(subscribe.track_name);
+        std::optional<std::pair<std::size_t, std::size_t>> largest;
+        if (draft_version != DraftVersion::kDraft14 && seen_it != largest_object_by_track.end()) {
+            largest = seen_it->second;
+        }
         TransportStatus write_status =
             transport_.write_stream(response_stream_id,
                                     encode_subscribe_ok_with_largest(draft_version,
@@ -10927,7 +10948,17 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         established_subscription_tracks.insert(subscription_key);
         open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested, subscribe.request_id,
                                 subscribe.forward, largest.has_value());
-        active_subscriptions.emplace(subscribe.request_id, subscribe);
+        SubscribeMessage stored = subscribe;
+        if (seen_it != largest_object_by_track.end()) {
+            if (subscribe.filter_type == 0x01) {
+                stored.start_group_id = seen_it->second.first + 1;
+                stored.start_object_id = 0;
+            } else if (subscribe.filter_type == 0x02) {
+                stored.start_group_id = seen_it->second.first;
+                stored.start_object_id = seen_it->second.second + 1;
+            }
+        }
+        active_subscriptions.emplace(subscribe.request_id, std::move(stored));
         active_subscription_stream_ids.insert_or_assign(subscribe.request_id, response_stream_id);
         if (subscription_forwards_objects(
                 draft_version, subscribe.forward)) {
@@ -10956,6 +10987,64 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 subscribed_tracks.erase(std::string(track_name));
             }
         };
+
+    // The subscriber ended this subscription. Subgroup streams belong to the
+    // track, so they are reset only once no subscription forwards it. An
+    // unknown request ID is ignored.
+    const auto end_subscription = [&](std::uint64_t request_id) -> TransportStatus {
+        const auto active_it = active_subscriptions.find(request_id);
+        if (active_it == active_subscriptions.end()) {
+            return TransportStatus::success();
+        }
+        const SubscribeMessage ended = std::move(active_it->second);
+        active_subscriptions.erase(active_it);
+        active_subscription_stream_ids.erase(request_id);
+        pending_subscription_request_bytes.erase(request_id);
+        const bool track_still_subscribed = std::any_of(
+            active_subscriptions.begin(), active_subscriptions.end(), [&](const auto& entry) {
+                return entry.second.track_namespace == ended.track_namespace &&
+                       entry.second.track_name == ended.track_name;
+            });
+        if (!track_still_subscribed) {
+            established_subscription_tracks.erase(std::pair{ended.track_namespace, ended.track_name});
+        }
+        refresh_subscriber_forward_permission(ended.track_name);
+        if (subscribed_tracks.contains(ended.track_name)) {
+            return TransportStatus::success();
+        }
+        const auto sender_it = sender_by_track.find(ended.track_name);
+        return sender_it == sender_by_track.end()
+                   ? TransportStatus::success()
+                   : sender_it->second.cancel_all_open_subgroups(transport_, kCancelledErrorCode);
+    };
+
+    // Ends each subscription whose request stream the subscriber cancelled,
+    // and resets that stream. Runs before the media stream events, which
+    // would take its STOP_SENDING for an ownerless media stream stop.
+    const auto dispatch_stream_events = [&]() -> TransportStatus {
+        if (uses_request_streams(draft_version)) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> cancelled;
+            for (const auto& [request_id, stream_id] : active_subscription_stream_ids) {
+                if (transport_.media_stream_peer_stopped(stream_id) ||
+                    transport_.stream_peer_reset_error(stream_id).has_value()) {
+                    cancelled.emplace_back(request_id, stream_id);
+                }
+            }
+            for (const auto& [request_id, stream_id] : cancelled) {
+                TransportStatus cancel_status = end_subscription(request_id);
+                if (cancel_status.ok) {
+                    cancel_status = transport_.reset_stream(stream_id, kCancelledErrorCode);
+                }
+                if (transport_.media_stream_peer_stopped(stream_id)) {
+                    transport_.acknowledge_media_stream_peer_stopped(stream_id);
+                }
+                if (!cancel_status.ok) {
+                    return cancel_status;
+                }
+            }
+        }
+        return dispatch_peer_stopped_media_streams(transport_, sender_by_track);
+    };
 
     const auto apply_subscriber_request_update =
         [&](std::uint64_t existing_request_id,
@@ -11363,6 +11452,15 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 if (!subscribe_status.ok) {
                     return subscribe_status;
                 }
+            } else if (message_type == 0x0a) {
+                std::uint64_t unsubscribe_request_id = 0;
+                if (!decode_unsubscribe_message(message_bytes, draft_version, unsubscribe_request_id)) {
+                    return protocol_violation(transport_, "received invalid UNSUBSCRIBE");
+                }
+                const TransportStatus unsubscribe_status = end_subscription(unsubscribe_request_id);
+                if (!unsubscribe_status.ok) {
+                    return unsubscribe_status;
+                }
             } else if (message_type == 0x11) {
                 SubscribeNamespaceMessage subscribe_namespace;
                 if (decode_subscribe_namespace_message(message_bytes, draft_version, subscribe_namespace)) {
@@ -11395,6 +11493,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
     bool source_eof = false;
     bool control_fin = false;
+    // Set when the publish loop ends. From then on, a write that would block
+    // no longer serves control messages: a subscription accepted during the
+    // final flush would never get its PUBLISH_DONE.
+    bool loop_ended = false;
     bool awaiting_source_catalog =
         source.catalog_mode == openmoq::publisher::LiveCatalogMode::kSourceObject;
     std::optional<std::chrono::steady_clock::time_point> object_pacing_start;
@@ -11418,6 +11520,38 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             active_subscriptions.begin(),
             active_subscriptions.end(),
             [](const auto& entry) { return entry.second.track_name == "catalog"; }));
+    };
+    // Runs between two attempts of a write or FIN that would block: the stop
+    // check, the stream events and, until the loop ends, the control
+    // messages. Fails, ending the retries, on stop or, until the loop ends,
+    // on a control stream FIN: the final flush still finishes every stream.
+    const auto interrupted = [&]() {
+        return stop_requested_.load(std::memory_order_acquire) || (control_fin && !loop_ended);
+    };
+    const auto serve_while_blocked = [&]() -> TransportStatus {
+        TransportStatus control_status = interrupted() ? TransportStatus::success() : dispatch_stream_events();
+        if (control_status.ok && !interrupted() && !loop_ended) {
+            control_status = append_control_stream_bytes_nonblocking(
+                transport_, control_read_stream_id, pending_control_bytes_, &control_fin);
+            if (control_status.ok) {
+                control_status = process_control_messages();
+            }
+        }
+        if (control_status.ok && interrupted()) {
+            return TransportStatus::failure("live publish stopped while a write would block");
+        }
+        return control_status;
+    };
+    const auto finish_live_group = [&](SubgroupSenderState& sender,
+                                       const DeliveryTimeouts& delivery_timeouts) -> TransportStatus {
+        bool first_attempt = true;
+        return sender.finish_group(transport_, draft_version, delivery_timeouts, now_function_, [&]() {
+            if (first_attempt) {
+                first_attempt = false;
+                return TransportStatus::success();
+            }
+            return serve_while_blocked();
+        });
     };
     const auto send_retained_catalog = [&]() -> TransportStatus {
         if (!retained_source_catalog.has_value()) {
@@ -11466,7 +11600,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             &object_published,
             {.subscriber = subscriber_priority_for_track(
                  active_subscriptions, "catalog"),
-             .publisher = 128});
+             .publisher = 128},
+            serve_while_blocked);
         if (!send_status.ok) {
             return send_status;
         }
@@ -11482,8 +11617,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     };
     const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
     while (!source_eof) {
-        status = dispatch_peer_stopped_media_streams(transport_,
-                                                     sender_by_track);
+        status = dispatch_stream_events();
         if (!status.ok) {
             return status;
         }
@@ -11533,7 +11667,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
         status = send_retained_catalog();
         if (!status.ok) {
-            if (stop_requested_.load(std::memory_order_acquire)) {
+            if (interrupted()) {
                 break;
             }
             return status;
@@ -11627,7 +11761,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             status = send_retained_catalog();
             if (!status.ok) {
-                if (stop_requested_.load(std::memory_order_acquire)) {
+                if (interrupted()) {
                     break;
                 }
                 return status;
@@ -11739,9 +11873,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         const auto group_it = last_group_id_by_track.find(next->track_name);
         if (group_it != last_group_id_by_track.end() &&
             group_it->second != static_cast<std::uint64_t>(next->group_id)) {
-            status = sender.finish_group(
-                transport_, draft_version, delivery_timeouts, now_function_);
+            status = finish_live_group(sender, delivery_timeouts);
             if (!status.ok) {
+                if (interrupted()) {
+                    break;
+                }
                 return status;
             }
         }
@@ -11764,13 +11900,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                  published_settings_it != published_track_settings.end()
                      ? published_settings_it->second.subscriber_priority
                      : 128),
-             .publisher = 128});
-        const TransportStatus event_status =
-            dispatch_peer_stopped_media_streams(transport_, sender_by_track);
+             .publisher = 128},
+            serve_while_blocked);
+        const TransportStatus event_status = dispatch_stream_events();
         if (!status.ok) {
             // A send failure that races with a concurrent close() is a benign
             // stop, not a transport error: break to the flush.
-            if (stop_requested_.load(std::memory_order_acquire)) {
+            if (interrupted()) {
                 break;
             }
             return status;
@@ -11792,6 +11928,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
     }
 
+    loop_ended = true;
+
     // Bound the post-loop graceful flush. When a stop is in progress, a flush
     // write can fail (transport torn down by a concurrent close()) or the total
     // flush can run long; in either case return success rather than surfacing a
@@ -11811,11 +11949,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return finish_after_media_event_dispatch(
                 transport_, sender_by_track, TransportStatus::success());
         }
-        status = sender.finish_group(
-            transport_,
-            draft_version,
-            effective_delivery_timeouts(track_name),
-            now_function_);
+        status = finish_live_group(sender, effective_delivery_timeouts(track_name));
         if (!status.ok) {
             return stopping()
                        ? finish_after_media_event_dispatch(
@@ -11902,11 +12036,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         served_catalog_subscription_count = 0;
         status = send_retained_catalog();
         if (status.ok) {
-            status = sender_by_track["catalog"].finish_group(
-                transport_,
-                draft_version,
-                effective_delivery_timeouts("catalog"),
-                now_function_);
+            status = finish_live_group(sender_by_track["catalog"], effective_delivery_timeouts("catalog"));
         }
         if (!status.ok) {
             return stopping()

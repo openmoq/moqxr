@@ -17,6 +17,12 @@ This project keeps `draft-ietf-moq-transport-14` as the primary publisher profil
 - `PUBLISH_OK` applies the draft-16 defaults when parameters are omitted: `FORWARD=1`, `SUBSCRIBER_PRIORITY=128`, no explicit `GROUP_ORDER`, and no subscription filter.
 - Namespace overlap handling is expressed through the generic request error path rather than the older dedicated response message family.
 
+## Live object subscriptions (`publish_live_objects`, drafts 16 and 18)
+
+- The subscriber ends a subscription with `UNSUBSCRIBE` (draft 16) or with `STOP_SENDING` or `RESET_STREAM` on the `SUBSCRIBE` request stream (draft 18). The publisher drops the subscription state and resets the track's open subgroup streams with `CANCELLED` once no subscription forwards the track (section 5.1.1 of both drafts).
+- `Next Group Start` and `Largest Object` are resolved once, at `SUBSCRIBE`, against the largest Location read from the source: `{Largest.Group + 1, 0}` and `{Largest.Group, Largest.Object + 1}` (section 5.1.2). `SUBSCRIBE_OK` reports that Location in `LARGEST_OBJECT`.
+- A `REQUEST_UPDATE` that sets `Next Group Start` or `Largest Object` is not resolved again: the subscription falls back to `{0, 0}`, the earlier behaviour. A `REQUEST_UPDATE` that turns `FORWARD` from 0 to 1 resumes at the next Object read, possibly inside a Group. The filter is fixed at `SUBSCRIBE`, so both behaviours stay within the drafts.
+
 ## CMAF packaging assumptions
 
 - Initialization data is represented either as a binary payload or as a dedicated MOQT track with one group and one object.
