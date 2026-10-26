@@ -273,6 +273,62 @@ if(NOT OPENMOQ_LIBMOQ_SOURCE_DIR AND OPENMOQ_USE_LIBMOQ_PUBLISHER)
     set(_openmoq_libmoq_pins "${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}/scripts/setup_picoquic_deps.sh")
 endif()
 
+# Identifies a pinned revision together with the exact content of its patch
+# series.
+function(openmoq_patch_series_fingerprint out tag patch_dir)
+    file(READ "${patch_dir}/series" content)
+    string(PREPEND content "${tag}\n")
+    file(STRINGS "${patch_dir}/series" lines)
+    foreach(line IN LISTS lines)
+        string(REGEX REPLACE "#.*$" "" line "${line}")
+        string(STRIP "${line}" name)
+        if(NOT name STREQUAL "" AND EXISTS "${patch_dir}/${name}")
+            file(SHA256 "${patch_dir}/${name}" patch_hash)
+            string(APPEND content "\n${patch_hash}")
+        endif()
+    endforeach()
+    string(SHA256 fingerprint "${content}")
+    set(${out} "${fingerprint}" PARENT_SCOPE)
+endfunction()
+
+# FetchContent's git update stashes local changes, checks out the new revision
+# and reapplies the stash. In a managed checkout those changes are the patches
+# applied for the previous pin, so reapplying them conflicts once the pin or
+# the series moves, and configure fails. Return such a checkout to its clean
+# revision first; the patch step then applies the current series. The stamp is
+# written only after a complete series applies, so a patched checkout without
+# one (including one patched by an older moqxr) is treated as stale.
+function(openmoq_discard_stale_patches source_dir fingerprint)
+    set(stamp "${source_dir}-openmoq-patches")
+    # A stamp only describes the checkout it was written for; a fresh clone
+    # starts unpatched.
+    if(NOT EXISTS "${source_dir}/.git")
+        file(REMOVE "${stamp}")
+        return()
+    endif()
+    set(applied "")
+    if(EXISTS "${stamp}")
+        file(READ "${stamp}" applied)
+        string(STRIP "${applied}" applied)
+    endif()
+    # Nothing to discard: the checkout already carries this series, or no
+    # series applies and none was applied.
+    if(applied STREQUAL fingerprint)
+        return()
+    endif()
+    find_package(Git REQUIRED)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${source_dir}" status --porcelain
+        OUTPUT_VARIABLE changes RESULT_VARIABLE status_result ERROR_QUIET)
+    if(status_result EQUAL 0 AND NOT changes STREQUAL "")
+        message(STATUS "OpenMOQ: discarding stale patches in ${source_dir}")
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${source_dir}" reset --hard --quiet
+            COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${source_dir}" clean -fd --quiet
+            COMMAND_ERROR_IS_FATAL ANY)
+    endif()
+    file(REMOVE "${stamp}")
+endfunction()
+
 # Revision and patch series for a managed dependency of libmoq. Sets
 # <prefix>_TAG to the pinned commit (or branch when libmoq is not managed),
 # <prefix>_SHALLOW, and <prefix>_PATCH, the PATCH_COMMAND arguments (empty
@@ -281,6 +337,7 @@ function(openmoq_libmoq_dependency_pin prefix var provider source_dir default_ta
     set(tag "${default_tag}")
     set(shallow TRUE)
     set(patch "")
+    set(fingerprint "")
     if(_openmoq_libmoq_pins AND EXISTS "${_openmoq_libmoq_pins}")
         file(READ "${_openmoq_libmoq_pins}" pin_text)
         if(pin_text MATCHES "${var}:-([0-9a-f]+)\\}")
@@ -293,13 +350,19 @@ function(openmoq_libmoq_dependency_pin prefix var provider source_dir default_ta
         set(patch_dir "${OPENMOQ_RESOLVED_LIBMOQ_SOURCE_DIR}/patches/${provider}")
         if(EXISTS "${patch_dir}/series")
             find_package(Git REQUIRED)
+            # The fingerprint is part of the command so that a changed series
+            # reruns the patch step even when the pin did not move.
+            openmoq_patch_series_fingerprint(fingerprint "${tag}" "${patch_dir}")
             set(patch ${CMAKE_COMMAND}
                 -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
                 -DPATCH_DIR=${patch_dir}
                 -DSOURCE_DIR=${source_dir}
+                -DSTAMP_FILE=${source_dir}-openmoq-patches
+                -DFINGERPRINT=${fingerprint}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenMoqApplyPatches.cmake)
         endif()
     endif()
+    openmoq_discard_stale_patches("${source_dir}" "${fingerprint}")
     set(${prefix}_TAG "${tag}" PARENT_SCOPE)
     set(${prefix}_SHALLOW "${shallow}" PARENT_SCOPE)
     set(${prefix}_PATCH "${patch}" PARENT_SCOPE)
