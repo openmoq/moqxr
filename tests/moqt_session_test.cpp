@@ -1194,6 +1194,14 @@ bool wrote(const MockTransport& transport, std::uint64_t stream_id, const std::v
     });
 }
 
+// The number of unidirectional stream writes that end with this payload.
+std::size_t payload_writes(const MockTransport& transport, const std::vector<std::uint8_t>& payload) {
+    return static_cast<std::size_t>(
+        std::count_if(transport.writes.begin(), transport.writes.end(), [&](const MockTransport::WriteEvent& write) {
+            return (write.stream_id & 0x3U) == 0x2U && ends_with(write.bytes, payload);
+        }));
+}
+
 bool reset_with_cancelled(const MockTransport& transport, std::uint64_t stream_id) {
     return std::find(transport.reset_calls.begin(), transport.reset_calls.end(),
                      std::pair<std::uint64_t, std::uint64_t>{stream_id, 0x1}) != transport.reset_calls.end();
@@ -11842,6 +11850,369 @@ int main() {
                          "expected " + label + " SUBSCRIBE_OK to carry LARGEST_OBJECT {" +
                              std::to_string(subscribe_group) + ", 1}");
         }
+    }
+
+    // A late catalog subscriber gets the current catalog (field case D7: a
+    // relay drops its catalog track when the last subscriber leaves, then
+    // subscribes upstream again). The catalog SUBSCRIBE_OK carries no Largest
+    // Object, so the new subscription starts at {0, 0}, and the latest catalog
+    // Group goes out again at its own Location on a fresh stream. The closing
+    // catalog still follows, in its own Group. In the second case the catalog
+    // SUBSCRIBE comes after the media one: the catalog was never sent, so it
+    // goes out once.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        const std::vector<std::uint8_t> catalog_payload = {'C', 'A', 'T'};
+        const std::vector<std::uint8_t> closing_payload = {'E', 'N', 'D'};
+        // Catalog alias 0, Groups below 64: the header is {type, alias, Group}.
+        const auto catalog_groups = [&](const MockTransport& transport, const std::vector<std::uint8_t>& payload) {
+            std::string groups;
+            for (const auto& write : transport.writes) {
+                if ((write.stream_id & 0x3U) == 0x2U && write.bytes.size() > 3 && write.bytes[1] == 0 &&
+                    ends_with(write.bytes, payload)) {
+                    groups += " " + std::to_string(write.bytes[2]);
+                }
+            }
+            return groups;
+        };
+
+        {
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.keep_open_streams = {0};
+            std::vector<std::uint8_t> subscriptions =
+                encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+            append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+            transport.reads[0].push_back(std::move(subscriptions));
+            bool catalog_unsubscribed = false;
+            bool catalog_resubscribed = false;
+            std::size_t idle_reads = 0;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                    if (!catalog_unsubscribed && ends_with(event.bytes, catalog_payload)) {
+                        catalog_unsubscribed = true;
+                        current.reads[0].push_back(encode_unsubscribe_message(draft, 1));
+                    }
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                };
+            transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+                if (stream_id != 0 || !catalog_unsubscribed || catalog_resubscribed || ++idle_reads < 4) {
+                    return;
+                }
+                catalog_resubscribed = true;
+                current.reads[0].push_back(encode_subscribe_message(5, kTestTrackNamespace, "catalog", 1, draft));
+            };
+            const std::vector<LiveObject> objects = {
+                LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+                LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+                LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+                LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+                LiveObject{.track_name = "video", .group_id = 4, .payload = {'V', '4'}},
+                LiveObject{.track_name = "catalog", .group_id = 1, .payload = closing_payload, .ends_broadcast = true},
+            };
+            std::size_t object_index = 0;
+            LiveObjectSource source = listed_object_source(
+                {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+            // The last video Group and the closing catalog wait for the
+            // catalog resubscription.
+            source.next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size() || (object_index >= 4 && !catalog_resubscribed)) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            };
+            source.is_finished = [&]() { return object_index >= objects.size(); };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected catalog resubscribe connect to succeed");
+            status = session.publish_live_objects(source, draft);
+            ok &= expect(status.ok, "expected catalog resubscribe publish to succeed: " + status.message);
+            ok &= expect(catalog_resubscribed, "expected the catalog resubscribe case to resubscribe");
+            const std::string catalogs = catalog_groups(transport, catalog_payload);
+            ok &= expect(catalogs == " 0 0",
+                         "expected the Group 0 catalog again, on a second stream, for the new subscription; got Groups" +
+                             catalogs);
+            const std::string closings = catalog_groups(transport, closing_payload);
+            ok &= expect(closings == " 1", "expected the closing catalog once, in Group 1; got Groups" + closings);
+            // The catalog track opened three streams: Group 0, its resend, and
+            // the closing Group 1.
+            ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_publish_done_message(draft, 5, 3)),
+                         "expected PUBLISH_DONE for the new catalog subscription to count the three catalog streams");
+        }
+
+        {
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.keep_open_streams = {0};
+            transport.reads[0].push_back(encode_subscribe_message(1, kTestTrackNamespace, "video", 1, draft));
+            bool catalog_subscribed = false;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                    if (!catalog_subscribed && ends_with(event.bytes, {'V', '2'})) {
+                        catalog_subscribed = true;
+                        current.reads[0].push_back(
+                            encode_subscribe_message(3, kTestTrackNamespace, "catalog", 1, draft));
+                    }
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                };
+            const std::vector<LiveObject> objects = {
+                LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+                LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+                LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+                LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+                LiveObject{.track_name = "video", .group_id = 4, .payload = {'V', '4'}},
+            };
+            std::size_t object_index = 0;
+            const LiveObjectSource source = listed_object_source(
+                {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected late first catalog SUBSCRIBE connect to succeed");
+            status = session.publish_live_objects(source, draft);
+            ok &= expect(status.ok, "expected late first catalog SUBSCRIBE publish to succeed: " + status.message);
+            const std::string catalogs = catalog_groups(transport, catalog_payload);
+            ok &= expect(catalogs == " 0",
+                         "expected a late first catalog SUBSCRIBE to get the catalog once, in Group 0; got Groups" +
+                             catalogs);
+        }
+    }
+
+    // The resend of a catalog Group starts at Object 0. A second catalog
+    // subscription, while the first stays, arrives after Object 1 (a delta)
+    // was read but not sent: it gets Objects 0 and 1, on one fresh stream,
+    // and not the delta alone.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        std::vector<std::uint8_t> subscriptions = encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+        append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+        transport.reads[0].push_back(std::move(subscriptions));
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (ends_with(event.bytes, {'V', '2'})) {
+                    current.reads[0].push_back(encode_subscribe_message(5, kTestTrackNamespace, "catalog", 1, draft));
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C', '0'}, .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "catalog", .group_id = 0, .object_id = 1, .payload = {'D', '1'},
+                       .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+        };
+        std::size_t object_index = 0;
+        const LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected catalog delta resend connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected catalog delta resend publish to succeed: " + status.message);
+        std::vector<std::uint64_t> c0_streams;
+        std::vector<std::uint64_t> d1_streams;
+        for (const auto& write : transport.writes) {
+            if ((write.stream_id & 0x3U) == 0x2U) {
+                if (ends_with(write.bytes, {'C', '0'})) {
+                    c0_streams.push_back(write.stream_id);
+                } else if (ends_with(write.bytes, {'D', '1'})) {
+                    d1_streams.push_back(write.stream_id);
+                }
+            }
+        }
+        ok &= expect(c0_streams.size() == 2 && d1_streams.size() == 1 && d1_streams[0] == c0_streams[1],
+                     "expected the second catalog subscription to get Objects 0 and 1 on one fresh stream");
+    }
+
+    // A catalog subscription that ends while its catalog write would block
+    // must not count as served: a later catalog subscription still gets the
+    // catalog, on a fresh stream, because the ended subscription reset the
+    // first one.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        const std::vector<std::uint8_t> catalog_payload = {'C', 'A', 'T'};
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        std::vector<std::uint8_t> subscriptions = encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+        append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+        transport.reads[0].push_back(std::move(subscriptions));
+        bool catalog_unsubscribed = false;
+        bool catalog_resubscribed = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (ends_with(event.bytes, catalog_payload) && !catalog_unsubscribed) {
+                    catalog_unsubscribed = true;
+                    current.reads[0].push_back(encode_unsubscribe_message(draft, 1));
+                    return {ObjectWriteDisposition::kWouldBlock, "media admission budget is full"};
+                }
+                if (ends_with(event.bytes, {'V', '3'}) && !catalog_resubscribed) {
+                    catalog_resubscribed = true;
+                    current.reads[0].push_back(encode_subscribe_message(5, kTestTrackNamespace, "catalog", 1, draft));
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+            LiveObject{.track_name = "video", .group_id = 4, .payload = {'V', '4'}},
+        };
+        std::size_t object_index = 0;
+        const LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected stalled catalog unsubscribe connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected stalled catalog unsubscribe publish to succeed: " + status.message);
+        ok &= expect(catalog_unsubscribed && catalog_resubscribed,
+                     "expected the stalled catalog case to unsubscribe and resubscribe");
+        const std::size_t delivered = payload_writes(transport, catalog_payload);
+        ok &= expect(delivered == 1, "expected the later catalog subscription to get the catalog once; got " +
+                                         std::to_string(delivered));
+    }
+
+    // A catalog subscription that ends before it is served leaves nothing to
+    // serve: with no catalog subscription left, the catalog is never sent.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        const std::vector<std::uint8_t> catalog_payload = {'C', 'A', 'T'};
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        transport.reads[0].push_back(encode_subscribe_message(1, kTestTrackNamespace, "video", 1, draft));
+        bool catalog_ended = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (ends_with(event.bytes, {'V', '1'}) && !catalog_ended) {
+                    catalog_ended = true;
+                    std::vector<std::uint8_t> messages =
+                        encode_subscribe_message(3, kTestTrackNamespace, "catalog", 1, draft);
+                    append_bytes(messages, encode_unsubscribe_message(draft, 3));
+                    current.reads[0].push_back(std::move(messages));
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+        };
+        std::size_t object_index = 0;
+        const LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected ended unserved catalog connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected ended unserved catalog publish to succeed: " + status.message);
+        ok &= expect(catalog_ended, "expected the catalog subscription to start and end");
+        ok &= expect(payload_writes(transport, catalog_payload) == 0,
+                     "expected no catalog for a catalog subscription that ended before it was served");
+    }
+
+    // A catalog resend that would block stops when its subscription ends:
+    // the publisher resets its stream with CANCELLED and does not deliver it.
+    {
+        const DraftVersion draft = DraftVersion::kDraft16;
+        const std::vector<std::uint8_t> catalog_payload = {'C', 'A', 'T'};
+        MockTransport transport;
+        queue_draft16_scheduling_prefix(transport);
+        transport.keep_open_streams = {0};
+        std::vector<std::uint8_t> subscriptions = encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+        append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+        transport.reads[0].push_back(std::move(subscriptions));
+        std::size_t catalog_attempts = 0;
+        std::optional<std::uint64_t> resend_stream;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (ends_with(event.bytes, {'V', '2'}) && catalog_attempts == 1) {
+                    current.reads[0].push_back(encode_unsubscribe_message(draft, 1));
+                    current.reads[0].push_back(encode_subscribe_message(5, kTestTrackNamespace, "catalog", 1, draft));
+                }
+                if (!ends_with(event.bytes, catalog_payload)) {
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                }
+                ++catalog_attempts;
+                if (catalog_attempts == 1) {
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                }
+                // The resend: end its subscription on the first attempt, and
+                // admit it only after 20 attempts.
+                if (!resend_stream.has_value()) {
+                    resend_stream = event.stream_id;
+                    current.reads[0].push_back(encode_unsubscribe_message(draft, 5));
+                }
+                return catalog_attempts < 20
+                           ? ObjectWriteResult{ObjectWriteDisposition::kWouldBlock, "media admission budget is full"}
+                           : ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+            LiveObject{.track_name = "video", .group_id = 4, .payload = {'V', '4'}},
+        };
+        std::size_t object_index = 0;
+        const LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected cancelled catalog resend connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected cancelled catalog resend publish to succeed: " + status.message);
+        const std::size_t delivered = payload_writes(transport, catalog_payload);
+        ok &= expect(delivered == 1, "expected no catalog resend after its subscription ended; delivered " +
+                                         std::to_string(delivered));
+        ok &= expect(resend_stream.has_value() && reset_with_cancelled(transport, *resend_stream),
+                     "expected the cancelled catalog resend stream to be reset with CANCELLED (0x1)");
+    }
+
+    // Draft 22 sends each catalog Object as it is read. When the catalog
+    // Group's subgroup was reset (its only subscription ended) and a new
+    // catalog subscription got the Group resent, a later delta in that Group
+    // goes out with the Group again, on a fresh stream: the track's own
+    // stream for the subgroup is gone.
+    {
+        constexpr DraftVersion draft = DraftVersion::kDraft22;
+        MockTransport transport;
+        transport.keep_open_streams = {1, 5, 9};
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "catalog", 1, draft));
+        transport.reads[5].push_back(encode_subscribe_message(95, kTestTrackNamespace, "video", 1, draft));
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (ends_with(event.bytes, {'V', '1'})) {
+                    current.peer_reset_errors.emplace(1, 0x1);
+                } else if (ends_with(event.bytes, {'V', '2'})) {
+                    current.reads[9].push_back(encode_subscribe_message(99, kTestTrackNamespace, "catalog", 1, draft));
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C', '0'}, .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+            LiveObject{.track_name = "catalog", .group_id = 0, .object_id = 1, .payload = {'D', '1'},
+                       .final_in_subgroup = false},
+            LiveObject{.track_name = "video", .group_id = 4, .payload = {'V', '4'}},
+        };
+        std::size_t object_index = 0;
+        const LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-22 catalog delta connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected draft-22 catalog delta publish to succeed: " + status.message);
+        ok &= expect(payload_writes(transport, {'D', '1'}) == 1 && payload_writes(transport, {'C', '0'}) == 3,
+                     "expected the draft-22 delta to go out once, with Object 0, after the catalog Group resend; got " +
+                         std::to_string(payload_writes(transport, {'D', '1'})) + " deltas and " +
+                         std::to_string(payload_writes(transport, {'C', '0'})) + " Objects 0");
     }
 
     return ok ? 0 : 1;
