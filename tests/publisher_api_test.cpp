@@ -261,6 +261,8 @@ struct MigrationTransport final : PublisherTransport {
 // closed, as picoquic does while a live publish waits for its first
 // subscriber. After close() a read reports the closed connection. close()
 // counts its calls and holds for a moment, as picoquic's close drain does.
+// With answer_namespace, the relay accepts PUBLISH_NAMESPACE, on the first
+// bidirectional stream, with REQUEST_OK.
 struct ClosingTransport final : PublisherTransport {
     struct Record {
         std::atomic<int> close_calls{0};
@@ -272,6 +274,9 @@ struct ClosingTransport final : PublisherTransport {
         std::atomic<bool> hold_connect{false};
         std::atomic<bool> connecting{false};
         std::atomic<bool> closed_during_connect{false};
+        bool answer_namespace = false;
+        std::optional<std::uint64_t> namespace_stream;
+        bool namespace_answered = false;
     };
     explicit ClosingTransport(std::shared_ptr<Record> record) : record(std::move(record)) { ++this->record->transports; }
     std::shared_ptr<Record> record;
@@ -291,9 +296,12 @@ struct ClosingTransport final : PublisherTransport {
     ConnectionState state() const override {
         return record->closed ? ConnectionState::kClosed : ConnectionState::kConnected;
     }
-    TransportStatus open_stream(StreamDirection, std::uint64_t& stream) override {
+    TransportStatus open_stream(StreamDirection direction, std::uint64_t& stream) override {
         stream = next_stream;
         next_stream += 4;
+        if (direction == StreamDirection::kBidirectional && !record->namespace_stream) {
+            record->namespace_stream = stream;
+        }
         return TransportStatus::success();
     }
     TransportStatus accept_stream(StreamDirection direction, std::uint64_t& stream,
@@ -314,6 +322,11 @@ struct ClosingTransport final : PublisherTransport {
         if (stream == 3 && !record->setup_read) {
             bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = DraftVersion::kDraft22});
             record->setup_read = true;
+            return TransportStatus::success();
+        }
+        if (record->answer_namespace && stream == record->namespace_stream && !record->namespace_answered) {
+            bytes = openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft22, 0);
+            record->namespace_answered = true;
             return TransportStatus::success();
         }
         return idle();
@@ -588,6 +601,54 @@ bool test_disconnect_stops_live_stdin_on_idle_input(bool send_init, bool forward
     return ok;
 }
 #endif
+
+// PublisherConfig::await_subscriber_indefinitely reaches the session: with a
+// 1 s subscriber_timeout and no subscriber, the live publish is still waiting
+// after 2 s, until disconnect(). Without it, the publish ends at the timeout.
+bool test_await_subscriber_indefinitely_outlasts_subscriber_timeout() {
+    bool ok = true;
+    for (const bool indefinitely : {false, true}) {
+        PublisherConfig config;
+        config.draft_version = DraftVersion::kDraft22;
+        config.track_namespace = "app";
+        config.subscriber_timeout = std::chrono::seconds(1);
+        config.await_subscriber_indefinitely = indefinitely;
+        auto record = std::make_shared<ClosingTransport::Record>();
+        record->answer_namespace = true;
+        Publisher publisher(config, [record](TransportKind) -> std::unique_ptr<PublisherTransport> {
+            return std::make_unique<ClosingTransport>(record);
+        });
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = []() -> std::optional<LiveObject> {
+                return LiveObject{.track_name = "video", .payload = {0x00}};
+            },
+        };
+        EndpointConfig endpoint;
+        endpoint.transport = TransportKind::kRawQuic;
+        endpoint.host = "relay.example";
+        endpoint.port = 443;
+
+        std::atomic<bool> returned{false};
+        std::thread publishing([&] {
+            static_cast<void>(publisher.publish_live_objects(source, endpoint));
+            returned = true;
+        });
+        // Without the setting the publish ends at the 1 s timeout; allow a
+        // slow machine 5 s. With it, it still waits 1 s past the timeout.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(indefinitely ? 2 : 5);
+        while (!returned.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const bool waiting = !returned.load();
+        static_cast<void>(publisher.disconnect(0));
+        publishing.join();
+        ok &= expect(waiting == indefinitely,
+                     std::string("expected a live publish with await_subscriber_indefinitely=") +
+                         (indefinitely ? "true to still wait" : "false to end") + " after the 1 s subscriber timeout");
+    }
+    return ok;
+}
 
 bool test_goaway_recreates_publisher_transport() {
     bool ok = true;
@@ -919,6 +980,7 @@ int main() {
     ok &= test_disconnect_stops_live_stdin_on_idle_input(true, true);
     ok &= test_disconnect_stops_live_stdin_on_idle_input(true, false);
 #endif
+    ok &= test_await_subscriber_indefinitely_outlasts_subscriber_timeout();
     ok &= test_goaway_migration_bound_and_uri_validation();
     ok &= test_live_source_goaway_continues_and_replays_catalog();
     ok &= test_live_source_goaway_continues_and_replays_catalog(true);

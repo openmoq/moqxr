@@ -49,6 +49,7 @@ config.split_cmaf_chunks = true;
 config.paced = false;
 config.loop = false;
 config.subscriber_timeout = std::chrono::seconds(30);
+config.await_subscriber_indefinitely = false;
 
 openmoq::publisher::Publisher publisher(config);
 ```
@@ -428,6 +429,23 @@ nothing is written (batch/objects/stdin do not consume their source; live SRT
 drops fragments to stay bounded). If no subscriber appears within
 `PublisherConfig::subscriber_timeout`, the call fails with
 `timed out waiting for media subscriber` instead of hanging.
+
+**Subscriber wait (`MoqtSession` backend).** By default, `publish_live_objects`
+waits for its first media subscriber without reading its source. The wait ends after
+`PublisherConfig::subscriber_timeout`, and the call returns success, unless
+`PublisherConfig::await_subscriber_indefinitely` is set. With that setting, only
+`disconnect()` or the end of the session ends the wait, and the publisher reads
+the source meanwhile: it drops media Objects and keeps the latest catalog for
+the first subscriber, so the source is never held back. The libmoq backend
+refuses the setting, and the `publish_live` overloads (stdin, SRT) ignore it. The
+publisher does not pace the Objects it drops, so a paced file source can reach
+its end before the first subscriber arrives. `subscriber_timeout` also
+bounds each request-stream read, so an unlimited wait no longer needs a huge
+timeout. The deadline applies only before the first subscriber: when the last
+subscriber leaves (UNSUBSCRIBE on draft 16, a cancelled request stream on
+draft 18), the publisher ends that subscription, resets its open subgroup
+streams with CANCELLED, keeps reading and dropping source Objects, answers a
+later SUBSCRIBE, and returns when the source ends.
 
 Calling `disconnect()` from another thread stops a running publish promptly
 (batch, `publish_live_objects`, or live stdin/SRT); the driver loop breaks, the

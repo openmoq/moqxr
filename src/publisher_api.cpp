@@ -395,6 +395,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
             config_.authorization);
         active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
 
         if (!set_active_session(active, resolved_endpoint, false)) {
@@ -612,6 +613,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
             config_.authorization);
         active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
         active->session->set_initial_group_id(config_.initial_group_id);
 
@@ -752,6 +754,10 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
             return transport::TransportStatus::failure(
                 "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
         }
+        if (config_.await_subscriber_indefinitely) {
+            return transport::TransportStatus::failure(
+                "await_subscriber_indefinitely is not supported by the libmoq publishing backend");
+        }
         for (const auto& track : source.tracks) {
             if (!transport::live_track_has_media_metadata(track)) {
                 return transport::TransportStatus::failure(
@@ -856,6 +862,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
             config_.authorization);
         active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
 
         if (!set_active_session(active, resolved_endpoint, true)) {

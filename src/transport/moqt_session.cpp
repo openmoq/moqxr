@@ -11673,6 +11673,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         return TransportStatus::success();
     };
     const auto await_subscribe_deadline = std::chrono::steady_clock::now() + subscriber_timeout_;
+    // Set once a subscription first forwards a media track (any track for a
+    // catalog-only source). Until then the loop waits for it, bounded by
+    // subscriber_timeout_, without reading the source; with
+    // await_subscriber_indefinitely_ it has no bound and drains the source.
+    // From then on the source is always read: Objects without a subscriber
+    // are dropped, and the end of the source ends the publish.
+    bool media_subscribed_once = false;
     while (!source_eof) {
         status = dispatch_stream_events();
         if (!status.ok) {
@@ -11695,8 +11702,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         const bool waiting_for_media_subscription =
             requires_forward_permission && live_object_catalog_sent && has_media_tracks && !has_media_subscription();
         const bool waiting_for_required_subscription =
-            waiting_for_first_subscription || waiting_for_media_subscription;
-        const auto read_timeout = waiting_for_required_subscription && !uses_request_streams(draft_version)
+            !media_subscribed_once && (waiting_for_first_subscription || waiting_for_media_subscription);
+        // An unlimited wait drains the source, so it polls without blocking.
+        const auto read_timeout = waiting_for_required_subscription && !await_subscriber_indefinitely_ &&
+                                          !uses_request_streams(draft_version)
                                       ? subscriber_timeout_
                                       : std::chrono::milliseconds(0);
         const TransportStatus read_status =
@@ -11706,7 +11715,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             control_fin = read_fin;
         } else if (read_status.message == "timed out waiting for stream data" ||
                    read_status.message == "no queued read for stream") {
-            if (waiting_for_required_subscription &&
+            if (waiting_for_required_subscription && !await_subscriber_indefinitely_ &&
                 std::chrono::steady_clock::now() >= await_subscribe_deadline) {
                 break;
             }
@@ -11733,10 +11742,14 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             break;
         }
 
-        if (requires_forward_permission && subscribed_tracks.empty()) {
-            continue;
-        }
-        if (requires_forward_permission && live_object_catalog_sent && has_media_tracks && !has_media_subscription()) {
+        media_subscribed_once =
+            media_subscribed_once || has_media_subscription() || (!has_media_tracks && !subscribed_tracks.empty());
+        if (!media_subscribed_once && !await_subscriber_indefinitely_ && requires_forward_permission &&
+            (subscribed_tracks.empty() || (live_object_catalog_sent && has_media_tracks))) {
+            // Request-stream drafts poll without blocking; do not spin.
+            if (read_timeout == std::chrono::milliseconds(0)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             continue;
         }
 
