@@ -1971,7 +1971,8 @@ std::vector<std::uint8_t> build_fill_parameters_message(DraftVersion draft, std:
     }
     append_moqint(payload, draft, 1);     // one parameter
     append_moqint(payload, draft, 0x23);  // FILL_PARAMETERS, length-prefixed
-    append_moqint(payload, draft, 0);     // no overriding fill parameters
+    append_moqint(payload, draft, 1);     // Length
+    append_moqint(payload, draft, 0);     // Number of Parameters: no overrides
     std::vector<std::uint8_t> bytes;
     append_moqint(bytes, draft, message_type);
     bytes.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xff));
@@ -2011,6 +2012,83 @@ bool test_draft21_fill_parameters() {
     ok &= expect(openmoq::publisher::transport::encode_fetch_header(DraftVersion::kDraft21, 93) ==
                      std::vector<std::uint8_t>{0x05, 93},
                  "draft-21 FETCH_HEADER is type 0x05 followed by the Request ID");
+    return ok;
+}
+
+// Draft-22 SUBSCRIBE for synthetic/d22 "catalog" (request 14) carrying
+// FORWARD=1, a NextObject LOCATION_FILTER and FILL_PARAMETERS with the given
+// value. With fill {01 21 01 01} this is byte-for-byte the catalog join that
+// moq-dev/moq and Shaka Player send.
+std::vector<std::uint8_t> build_draft22_catalog_subscribe(const std::vector<std::uint8_t>& fill) {
+    std::vector<std::uint8_t> payload{
+        0x0e, 0x02, 0x09, 's', 'y', 'n', 't', 'h', 'e', 't', 'i', 'c', 0x03, 'd', '2', '2',
+        0x07, 'c', 'a', 't', 'a', 'l', 'o', 'g',
+        0x03, 0x10, 0x01, 0x11, 0x05, 0x02, static_cast<std::uint8_t>(fill.size())};
+    payload.insert(payload.end(), fill.begin(), fill.end());
+    std::vector<std::uint8_t> bytes{0x03, 0x00, static_cast<std::uint8_t>(payload.size())};
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> build_draft22_fill_request_update(const std::vector<std::uint8_t>& fill) {
+    std::vector<std::uint8_t> payload{0x0e, 0x01, 0x23, static_cast<std::uint8_t>(fill.size())};
+    payload.insert(payload.end(), fill.begin(), fill.end());
+    std::vector<std::uint8_t> bytes{0x02, 0x00, static_cast<std::uint8_t>(payload.size())};
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+bool test_draft22_fill_parameters_parameter_count() {
+    constexpr DraftVersion draft = DraftVersion::kDraft22;
+    bool ok = true;
+    const std::vector<std::uint8_t> current_group_join{0x01, 0x21, 0x01, 0x01};
+    const std::vector<std::uint8_t> received = build_draft22_catalog_subscribe(current_group_join);
+    const std::vector<std::uint8_t> expected_wire{
+        0x03, 0x00, 0x23, 0x0e, 0x02, 0x09, 0x73, 0x79, 0x6e, 0x74, 0x68, 0x65, 0x74, 0x69, 0x63,
+        0x03, 0x64, 0x32, 0x32, 0x07, 0x63, 0x61, 0x74, 0x61, 0x6c, 0x6f, 0x67,
+        0x03, 0x10, 0x01, 0x11, 0x05, 0x02, 0x04, 0x01, 0x21, 0x01, 0x01};
+    ok &= expect(received == expected_wire, "draft-22 catalog SUBSCRIBE fixture matches the captured bytes");
+
+    SubscribeMessage subscribe;
+    ok &= expect(decode_subscribe_message(received, draft, subscribe) && subscribe.request_id == 14 &&
+                     subscribe.track_name == "catalog" && subscribe.forward == 1 &&
+                     subscribe.filter_type == 0x02 && subscribe.fill_requested,
+                 "draft-22 SUBSCRIBE accepts a counted FILL_PARAMETERS current-group join");
+
+    SubscribeMessage with_group_order;
+    ok &= expect(decode_subscribe_message(build_draft22_catalog_subscribe(
+                                              {0x02, 0x21, 0x01, 0x01, 0x01, 0x01}),
+                                          draft, with_group_order) &&
+                     with_group_order.fill_requested,
+                 "draft-22 SUBSCRIBE accepts FILL_PARAMETERS with LOCATION_FILTER and GROUP_ORDER");
+
+    const auto decodes = [&](const std::vector<std::uint8_t>& fill) {
+        SubscribeMessage message;
+        return decode_subscribe_message(build_draft22_catalog_subscribe(fill), draft, message) &&
+               message.fill_requested;
+    };
+    ok &= expect(decodes({0x00}), "draft-22 FILL_PARAMETERS accepts zero parameters");
+    ok &= expect(decodes({0x01, 0x21, 0x00}), "draft-22 FILL_PARAMETERS accepts a type-0 nested LOCATION_FILTER");
+    ok &= expect(decodes({0x01, 0x21, 0x05}), "draft-22 FILL_PARAMETERS accepts a type-5 nested LOCATION_FILTER");
+    ok &= expect(decodes({0x01, 0x20, 0xc8}),
+                 "draft-22 FILL_PARAMETERS reads SUBSCRIBER_PRIORITY as uint8 like the enclosing message");
+    ok &= expect(!decodes({}), "draft-22 FILL_PARAMETERS rejects an empty value with no parameter count");
+    ok &= expect(!decodes({0x21, 0x01, 0x01}), "draft-22 FILL_PARAMETERS rejects parameters without a count");
+    ok &= expect(!decodes({0x02, 0x21, 0x01, 0x01}),
+                 "draft-22 FILL_PARAMETERS rejects a count larger than the parameters present");
+    ok &= expect(!decodes({0x01, 0x21, 0x01, 0x01, 0x01, 0x01}),
+                 "draft-22 FILL_PARAMETERS rejects bytes beyond the counted parameters");
+    ok &= expect(!decodes({0x01, 0x10, 0x01}), "draft-22 FILL_PARAMETERS still rejects FORWARD inside the fill");
+
+    RequestUpdateMessage update;
+    ok &= expect(decode_request_update_message(build_draft22_fill_request_update(current_group_join), draft,
+                                               update) &&
+                     update.request_id == 14 && update.fill_requested,
+                 "draft-22 REQUEST_UPDATE accepts a counted FILL_PARAMETERS");
+    RequestUpdateMessage countless_update;
+    ok &= expect(!decode_request_update_message(build_draft22_fill_request_update({0x21, 0x01, 0x01}), draft,
+                                                countless_update),
+                 "draft-22 REQUEST_UPDATE rejects FILL_PARAMETERS without a count");
     return ok;
 }
 
@@ -2425,6 +2503,7 @@ int main() {
     ok &= test_draft21_subscribe_tracks_parameters();
     ok &= test_draft21_include_properties();
     ok &= test_draft21_fill_parameters();
+    ok &= test_draft22_fill_parameters_parameter_count();
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
     ok &= test_draft21_identity();
