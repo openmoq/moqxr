@@ -805,9 +805,10 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             payload.insert(payload.end(), group_order_delta.begin(), group_order_delta.end());
             payload.insert(payload.end(), group_order_value.begin(), group_order_value.end());
         }
-        if (fill_parameters) {  // FILL_PARAMETERS (0x23), empty override block
+        if (fill_parameters) {  // FILL_PARAMETERS (0x23), no overriding parameters
             append_bytes(payload, encode_moqint(draft, 0x23 - (group_order != 0 ? 0x22 : 0x21)));
-            append_bytes(payload, encode_moqint(draft, 0));
+            append_bytes(payload, encode_moqint(draft, 1));  // Length
+            append_bytes(payload, encode_moqint(draft, 0));  // Number of Parameters
         }
     }
 
@@ -893,6 +894,9 @@ std::vector<std::uint8_t> encode_request_update_message(DraftVersion draft,
     if (draft18_family(draft) &&
         (parameter_type == 0x10 || parameter_type == 0x20 || parameter_type == 0x22)) {
         payload.push_back(value);
+    } else if (parameter_type == 0x23) {  // FILL_PARAMETERS: Length 1, zero parameters
+        append_bytes(payload, encode_moqint(draft, 1));
+        append_bytes(payload, encode_moqint(draft, 0));
     } else {
         append_bytes(payload, encode_moqint(draft, value));
     }
@@ -5088,7 +5092,8 @@ int main() {
         }
         append_bytes(update_payload, filter);
         append_bytes(update_payload, encode_moqint(draft, 0x23 - 0x21));  // FILL_PARAMETERS
-        append_bytes(update_payload, encode_moqint(draft, 0));
+        append_bytes(update_payload, encode_moqint(draft, 1));  // Length
+        append_bytes(update_payload, encode_moqint(draft, 0));  // Number of Parameters
         std::vector<std::uint8_t> update_message = encode_moqint(draft, 0x02);
         append_be16(update_message, static_cast<std::uint16_t>(update_payload.size()));
         append_bytes(update_message, update_payload);
@@ -9313,6 +9318,62 @@ int main() {
         }
         ok &= expect(second_queued && second_ok.has_value() && without_largest,
                      "expected a draft-21 catalog SUBSCRIBE_OK to omit LARGEST_OBJECT after the catalog was sent");
+    }
+
+    {
+        // A draft-22 catalog SUBSCRIBE carrying the MSF current-group join as
+        // moq-dev/moq and Shaka Player encode it: FORWARD=1, NextObject, and
+        // FILL_PARAMETERS {count 1, LOCATION_FILTER Relative Start, StartGroup 1}.
+        // It must be answered, not treated as a protocol violation.
+        constexpr DraftVersion draft = DraftVersion::kDraft22;
+        const std::vector<std::uint8_t> payload{
+            95, 0x01, 0x07, 'i', 'n', 't', 'e', 'r', 'o', 'p', 0x07, 'c', 'a', 't', 'a', 'l', 'o', 'g',
+            0x03, 0x10, 0x01, 0x11, 0x05, 0x02, 0x04, 0x01, 0x21, 0x01, 0x01};
+        std::vector<std::uint8_t> fill_subscribe{0x03};
+        append_be16(fill_subscribe, static_cast<std::uint16_t>(payload.size()));
+        append_bytes(fill_subscribe, payload);
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.keep_open_streams.insert(5);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "catalog", 1, draft));
+        bool second_queued = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
+                if (!second_queued) {
+                    current.reads[5].push_back(fill_subscribe);
+                    second_queued = true;
+                }
+                return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+            };
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .subgroup_id = 0, .object_id = 0, .payload = {'{', '}'}},
+            LiveObject{.track_name = "video0_vide_1", .group_id = 1, .subgroup_id = 0, .object_id = 0, .payload = {'M'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video0_vide_1"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, true, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected draft-22 catalog fill SUBSCRIBE connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok && transport.last_close_code != 3,
+                     "expected a draft-22 catalog SUBSCRIBE with a counted FILL_PARAMETERS not to end the session: " +
+                         status.message);
+        bool second_ok = false;
+        for (const auto& write : transport.writes) {
+            second_ok = second_ok || (write.stream_id == 5 && message_type(write.bytes) == 0x04);
+        }
+        ok &= expect(second_queued && second_ok,
+                     "expected the draft-22 catalog SUBSCRIBE with FILL_PARAMETERS to receive SUBSCRIBE_OK");
     }
 
     {
