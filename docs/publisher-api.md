@@ -317,7 +317,12 @@ groups than the milliseconds that passed between its start and the restart,
 and the system clock did not step backwards. `publish_live(...)` numbers the
 live media groups and the catalog groups from this value on every draft; on
 draft 22 a GOAWAY migration still resumes above the groups the previous
-session sent. The default is 0. A value above `kMaxGroupId` (2^62-1) makes the
+session sent. To retry a failed live publish the same way, pass one
+`LiveResumeState` to every `publish_live(ingest, stdin_input, endpoint, tls,
+endpoint_alpn_overridden, &resume)` attempt on the same input: a retryable
+failure records the unsent stdin bytes and the next media and catalog Group
+IDs in it, the next attempt resumes from them, and a successful publish clears
+it. The CLI does this for `--retry` and endpoint failover. The default is 0. A value above `kMaxGroupId` (2^62-1) makes the
 `Publisher` constructor and `set_config` throw. `publish_live_objects(...)`
 sends the Group IDs its source supplies (`LiveDashIngestConfig::initial_group_id`
 sets them for the DASH ingest), and the libmoq backend refuses a non-zero value

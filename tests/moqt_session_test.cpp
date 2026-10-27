@@ -1764,13 +1764,14 @@ bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsC
     }
 
     {
-        // The migration floors only ever raise the base, and only on draft 22.
-        // A migrated session must not reuse a catalog Location either: its
-        // catalog differs from the previous session's (generatedAt).
+        // The resume floors only ever raise the base, on every draft: a retry
+        // after a failed session resumes like a draft-22 migration. A resumed
+        // session must not reuse a catalog Location either: its catalog
+        // differs from the previous session's (generatedAt).
         for (const auto [draft, resume_floor, expected] :
              {std::tuple{DraftVersion::kDraft22, kInitial + 50, kInitial + 50},
               std::tuple{DraftVersion::kDraft22, std::uint64_t{7}, kInitial},
-              std::tuple{DraftVersion::kDraft18, kInitial + 50, kInitial}}) {
+              std::tuple{DraftVersion::kDraft18, kInitial + 50, kInitial + 50}}) {
             MockTransport transport;
             transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
             transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
@@ -1787,12 +1788,11 @@ bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsC
             const auto catalog = groups.find(0);
             const auto media = groups.find(1);
             ok &= expect(media != groups.end() && !media->second.empty() && media->second.front() == expected,
-                         "first media group must be max(initial, draft-22 migration floor)");
-            const auto expected_catalog = draft == DraftVersion::kDraft22 ? std::max(kInitial, resume_floor + 1)
-                                                                          : kInitial;
+                         "first media group must be max(initial, resume floor)");
+            const auto expected_catalog = std::max(kInitial, resume_floor + 1);
             ok &= expect(catalog != groups.end() && !catalog->second.empty() &&
                              catalog->second.front() == expected_catalog,
-                         "first catalog group must be max(initial, draft-22 catalog migration floor)");
+                         "first catalog group must be max(initial, catalog resume floor)");
         }
     }
 
