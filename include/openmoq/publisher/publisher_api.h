@@ -162,6 +162,19 @@ struct LiveIngestConfig {
     std::vector<LiveSrtCaller> srt_callers;
 };
 
+// Carries a live publish across retries of the same input. publish_live()
+// fills it when a session fails and reads it on the next call, so a retry
+// resumes the way a draft-22 GOAWAY migration does: stdin replays the init
+// segment and unsent media, and media and catalog Group IDs continue above
+// the last ones sent instead of restarting at initial_group_id
+// (MoqTransport section 2.5). publish_live() clears it after a successful
+// publish. Pass the same object to every attempt on one input.
+struct LiveResumeState {
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t group_floor = 0;
+    std::uint64_t catalog_group_floor = 0;
+};
+
 class Publisher {
 public:
     using TransportFactory = std::function<std::unique_ptr<transport::PublisherTransport>(transport::TransportKind)>;
@@ -198,7 +211,8 @@ public:
                                             std::istream* stdin_input,
                                             const transport::EndpointConfig& endpoint,
                                             const transport::TlsConfig& tls = {},
-                                            bool endpoint_alpn_overridden = false) const;
+                                            bool endpoint_alpn_overridden = false,
+                                            LiveResumeState* resume = nullptr) const;
     transport::TransportStatus publish_live_objects(const LiveObjectSource& source,
                                                     const transport::EndpointConfig& endpoint,
                                                     const transport::TlsConfig& tls = {},

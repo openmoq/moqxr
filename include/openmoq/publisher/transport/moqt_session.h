@@ -56,8 +56,9 @@ struct LiveIngestOptions {
     bool use_stdin = false;
     std::vector<std::uint8_t> resume_bytes;
     std::uint64_t resume_group_floor = 0;
-    // Draft-22 migration only, like resume_group_floor: the first catalog
-    // Group ID the new session may use (live_resume_catalog_group_floor()).
+    // Like resume_group_floor, set by a draft-22 migration or a retry: the
+    // first catalog Group ID the new session may use
+    // (live_resume_catalog_group_floor()).
     std::uint64_t resume_catalog_group_floor = 0;
     std::vector<LiveSrtCallerOptions> srt_callers;
 };
@@ -176,8 +177,7 @@ public:
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
-    TransportStatus apply_live_group_floors(openmoq::publisher::DraftVersion draft_version,
-                                            std::uint64_t resume_group_floor,
+    TransportStatus apply_live_group_floors(std::uint64_t resume_group_floor,
                                             std::uint64_t resume_catalog_group_floor);
     void record_published_object(const std::string& track_name,
                                  std::uint64_t group_id,

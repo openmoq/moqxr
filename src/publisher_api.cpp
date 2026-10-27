@@ -478,7 +478,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                                                    std::istream* stdin_input,
                                                    const transport::EndpointConfig& endpoint,
                                                    const transport::TlsConfig& tls,
-                                                   bool endpoint_alpn_overridden) const {
+                                                   bool endpoint_alpn_overridden,
+                                                   LiveResumeState* resume) const {
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
     if (!transport_factory_injected_ && (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf)) {
         return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
@@ -591,9 +592,9 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         stop_requested_ = false;
     }
     std::uint64_t prior_bytes = 0, prior_objects = 0, prior_groups = 0;
-    std::vector<std::uint8_t> resume_bytes;
-    std::uint64_t resume_group_floor = 0;
-    std::uint64_t resume_catalog_group_floor = 0;
+    std::vector<std::uint8_t> resume_bytes = resume ? resume->bytes : std::vector<std::uint8_t>{};
+    std::uint64_t resume_group_floor = resume ? resume->group_floor : 0;
+    std::uint64_t resume_catalog_group_floor = resume ? resume->catalog_group_floor : 0;
     for (std::size_t migrations = 0; ; ++migrations) {
         auto active = std::make_shared<ActiveSession>();
         active->transport = transport_factory_(resolved_endpoint.transport);
@@ -695,8 +696,25 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         }
         if (!status.ok) {
             const std::string error = "transport live publish failed: " + status.message;
-            const transport::FailureKind failure_kind =
+            transport::FailureKind failure_kind =
                 publish_failure_kind(status, *active->transport);
+            if (resume != nullptr && failure_kind == transport::FailureKind::kRetryable) {
+                // A session that failed before reading its input leaves no
+                // bytes of its own, so keep the ones it was given.
+                if (!active->session->live_resume_bytes().empty()) {
+                    resume->bytes = active->session->live_resume_bytes();
+                }
+                const auto group_floor = active->session->live_resume_group_floor();
+                const auto catalog_group_floor = active->session->live_resume_catalog_group_floor();
+                if (group_floor && catalog_group_floor) {
+                    resume->group_floor = std::max(resume->group_floor, *group_floor);
+                    resume->catalog_group_floor = std::max(resume->catalog_group_floor, *catalog_group_floor);
+                } else {
+                    // No Group ID is left to resume above, so a retry could
+                    // only reuse one.
+                    failure_kind = transport::FailureKind::kFatal;
+                }
+            }
             static_cast<void>(active->close(0));
             clear_active_session(active, true, error);
             status.message = error;
@@ -709,6 +727,9 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
             stats_.bytes_published = prior_bytes + live_stats.bytes_published;
             stats_.objects_published = prior_objects + live_stats.objects_published;
             stats_.groups_published = prior_groups + live_stats.groups_published;
+        }
+        if (resume != nullptr) {
+            *resume = {};
         }
 
         return transport::TransportStatus::success();

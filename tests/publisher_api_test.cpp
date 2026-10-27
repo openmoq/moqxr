@@ -149,6 +149,7 @@ struct MigrationTransport final : PublisherTransport {
         std::atomic<bool> closed{false};
         std::atomic<int> close_calls{0};
         std::atomic<std::uint64_t> close_code{0};
+        std::atomic<std::uint64_t> first_close_code{0};
         std::atomic<std::size_t> writes_after_close{0};
         std::vector<std::uint8_t> written_bytes;
         std::vector<std::uint64_t> media_groups;
@@ -164,6 +165,11 @@ struct MigrationTransport final : PublisherTransport {
     std::shared_ptr<MediaInputGate> media_gate;
     // Runs just before read_stream reports the GOAWAY.
     std::function<void()> before_goaway;
+    // Instead of a GOAWAY, open a request stream carrying a SUBSCRIBE whose
+    // parameters do not decode (§9.20: PROTOCOL_VIOLATION).
+    bool invalid_subscribe = false;
+    bool invalid_subscribe_sent = false;
+    static constexpr std::uint64_t kInvalidSubscribeStream = 101;
     bool setup_read = false;
     std::uint64_t next_stream = 0;
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override {
@@ -189,6 +195,17 @@ struct MigrationTransport final : PublisherTransport {
             stream = 3;
             return TransportStatus::success();
         }
+        if (direction == StreamDirection::kBidirectional && invalid_subscribe && !invalid_subscribe_sent &&
+            source_reads && *source_reads >= migration_threshold) {
+            invalid_subscribe_sent = true;
+            if (media_gate) {
+                std::lock_guard lock(media_gate->mutex);
+                media_gate->released = true;
+                media_gate->condition.notify_all();
+            }
+            stream = kInvalidSubscribeStream;
+            return TransportStatus::success();
+        }
         return TransportStatus::failure("timed out waiting for stream data");
     }
     TransportStatus write_stream(std::uint64_t stream, std::span<const std::uint8_t> bytes, bool) override {
@@ -202,7 +219,7 @@ struct MigrationTransport final : PublisherTransport {
             if (!decode_vi64(bytes,offset,type) || !decode_vi64(bytes,offset,alias) || !decode_vi64(bytes,offset,group))
                 return TransportStatus::failure("malformed test media header");
             record->media_groups.push_back(group);
-            if (target) {
+            if (target || invalid_subscribe) {
                 *source_reads=1;
 
             }
@@ -219,6 +236,16 @@ struct MigrationTransport final : PublisherTransport {
         if (stream == 3 && !setup_read) {
             setup_read = true;
             bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = DraftVersion::kDraft22});
+            return TransportStatus::success();
+        }
+        if (stream == kInvalidSubscribeStream) {
+            // SUBSCRIBE "interop"/"catalog" with one parameter of unknown
+            // type 0x3E.
+            const std::vector<std::uint8_t> payload{
+                0x01, 0x01, 0x07, 'i', 'n', 't', 'e', 'r', 'o', 'p', 0x07, 'c', 'a', 't', 'a', 'l', 'o', 'g',
+                0x01, 0x3e, 0x00};
+            bytes = {0x03, 0x00, static_cast<std::uint8_t>(payload.size())};
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
             return TransportStatus::success();
         }
         if (source_reads) {
@@ -251,7 +278,7 @@ struct MigrationTransport final : PublisherTransport {
     std::string connection_id() const override { return "migration-test"; }
     TransportStatus close(std::uint64_t application_error_code) override {
         record->close_code = application_error_code;
-        ++record->close_calls;
+        if (record->close_calls++ == 0) record->first_close_code = application_error_code;
         record->closed = true;
         return TransportStatus::success();
     }
@@ -906,6 +933,85 @@ bool test_live_stdin_migration_keeps_object_identity(std::uint64_t initial_group
     return ok;
 }
 
+
+// A peer SUBSCRIBE that does not decode closes the session with
+// PROTOCOL_VIOLATION, as §9.20 requires. The publisher then retries the live
+// publish; the retry replays the stdin input and keeps its Group IDs
+// above those of the failed session (MoqTransport section 2.5) instead of
+// restarting at the initial Group ID.
+bool test_live_stdin_retry_after_protocol_violation_resumes(std::uint64_t initial_group_id) {
+    const auto path=std::filesystem::path(__FILE__).parent_path()/"fixtures"/"locmaf-publisher.mp4";
+    std::ifstream file(path,std::ios::binary);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)),{});
+    const auto boxes=openmoq::publisher::parse_mp4_boxes(bytes);
+    std::vector<std::uint8_t> init,first,remaining;
+    bool saw_first=false;
+    for (const auto& box:boxes) {
+        if (box.type=="ftyp" || box.type=="moov") init.insert(init.end(),bytes.begin()+box.span.offset,bytes.begin()+box.span.offset+box.span.size);
+        if (box.type=="moof" || box.type=="mdat") {
+            auto& destination=saw_first ? remaining : first;
+            destination.insert(destination.end(),bytes.begin()+box.span.offset,bytes.begin()+box.span.offset+box.span.size);
+            if (box.type=="mdat") saw_first=true;
+        }
+    }
+    remaining.insert(remaining.end(),first.begin(),first.end());
+    const auto pad=[](std::vector<std::uint8_t>& chunk) {
+        const std::size_t size=16384-chunk.size();
+        chunk.insert(chunk.end(),{static_cast<std::uint8_t>(size>>24),static_cast<std::uint8_t>(size>>16),
+                                 static_cast<std::uint8_t>(size>>8),static_cast<std::uint8_t>(size),'f','r','e','e'});
+        chunk.resize(16384);
+    };
+    if (!expect(!init.empty() && !first.empty() && !remaining.empty() && init.size()<16376 && first.size()<16376 &&
+                remaining.size()<16384,"staged stdin retry fixture has bounded complete chunks")) return false;
+    pad(init);pad(first);
+    auto gate=std::make_shared<MediaInputGate>();
+    StagedMediaInputBuffer buffer(std::move(init),std::move(first),std::move(remaining),gate);
+    std::istream input(&buffer);
+    auto ready=std::make_shared<std::size_t>(0);
+    std::vector<std::shared_ptr<MigrationTransport::Record>> records;
+    PublisherConfig config;config.draft_version=DraftVersion::kDraft22;config.forward=true;
+    config.subscriber_timeout=std::chrono::seconds(1);config.initial_group_id=initial_group_id;
+    Publisher publisher(config,[&](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        auto record=std::make_shared<MigrationTransport::Record>();records.push_back(record);
+        auto transport=std::make_unique<MigrationTransport>(record,std::nullopt);
+        transport->source_reads=ready;transport->migration_threshold=1;transport->media_gate=gate;
+        transport->invalid_subscribe=records.size()==1;
+        return transport;
+    });
+    EndpointConfig endpoint;endpoint.host="first.example";endpoint.port=443;
+    const std::vector<EndpointConfig> endpoints{endpoint};
+    openmoq::publisher::LiveResumeState resume;
+    openmoq::publisher::LiveIngestConfig ingest;ingest.use_stdin=true;
+    std::vector<TransportStatus> attempts;
+    const auto status=openmoq::publisher::publish_with_failover(
+        endpoints, 1,
+        [&](const EndpointConfig& attempt_endpoint) {
+            attempts.push_back(publisher.publish_live(ingest,&input,attempt_endpoint,{},false,&resume));
+            return attempts.back();
+        },
+        {}, {});
+    const std::string label="initial Group ID "+std::to_string(initial_group_id)+": ";
+    bool ok=expect(status.ok,label+"live publish retried after PROTOCOL_VIOLATION completes: "+status.message);
+    ok &= expect(attempts.size()==2 &&
+                     attempts[0].failure_kind==openmoq::publisher::transport::FailureKind::kRetryable,
+                 label+"a peer PROTOCOL_VIOLATION is a retryable live publish failure");
+    ok &= expect(records.size()==2 && records[0]->first_close_code==3,
+                 label+"an undecodable SUBSCRIBE closes the first session with PROTOCOL_VIOLATION");
+    // The init segment was read by the first session, so the retry can only
+    // publish media if it was replayed from the resume state.
+    ok &= expect(records.size()==2 && !records[0]->media_groups.empty() && !records[1]->media_groups.empty(),
+                 label+"media is published before and after the retry");
+    if (records.size()==2 && !records[0]->media_groups.empty()) {
+        ok &= expect(records[0]->media_groups.front()==initial_group_id,
+                     label+"the first session starts at the initial Group ID");
+        for (const auto group:records[1]->media_groups)
+            ok &= expect(group>records[0]->media_groups.back(),
+                         label+"the retry must not reuse or go below the failed session's Group IDs");
+    }
+    ok &= expect(resume.bytes.empty() && resume.group_floor==0,
+                 label+"a successful publish clears the resume state");
+    return ok;
+}
 }  // namespace
 
 int main() {
@@ -914,6 +1020,8 @@ int main() {
     ok &= test_disconnect_during_publish_is_not_retried();
     ok &= test_disconnect_during_connect_waits_for_connect();
     ok &= test_disconnect_does_not_follow_goaway();
+    ok &= test_live_stdin_retry_after_protocol_violation_resumes(0);
+    ok &= test_live_stdin_retry_after_protocol_violation_resumes(1000);
 #if !defined(_WIN32)
     ok &= test_disconnect_stops_live_stdin_on_idle_input(false, true);
     ok &= test_disconnect_stops_live_stdin_on_idle_input(true, true);

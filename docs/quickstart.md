@@ -182,7 +182,10 @@ troubleshooting](relay-interop.md#choose-a-file-publishing-mode).
 Repeat `--endpoint` to provide relay targets in preference order. `--retry N`
 allows `N` retries of the current endpoint after its initial attempt, with a
 one-second pause before each retry. The default is `--retry 0`, so each endpoint
-is attempted once before the publisher advances or exits.
+is attempted once before the publisher advances or exits. A live session that
+ends on a closed connection is retried too, including one the publisher closed
+with PROTOCOL_VIOLATION after a request it could not decode; for stdin and SRT
+input the retry continues above the Group IDs already sent.
 
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \

@@ -7640,17 +7640,15 @@ std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
 }
 } // namespace live_srt_internal
 
-TransportStatus MoqtSession::apply_live_group_floors(DraftVersion draft_version,
-                                                     std::uint64_t resume_group_floor,
+TransportStatus MoqtSession::apply_live_group_floors(std::uint64_t resume_group_floor,
                                                      std::uint64_t resume_catalog_group_floor) {
     // MoqTransport section 2.5: initial_group_id_ lets a restarted publisher
-    // start above the Group IDs it used before, on every draft. Draft-22
-    // migration floors only ever raise it. The catalog is a track in the same
-    // namespace, so it starts from the same base.
-    const bool migrating = draft_version == DraftVersion::kDraft22;
-    const std::uint64_t media_floor = std::max(initial_group_id_, migrating ? resume_group_floor : 0);
-    const std::uint64_t catalog_floor =
-        std::max(initial_group_id_, migrating ? resume_catalog_group_floor : 0);
+    // start above the Group IDs it used before, on every draft. Resume floors,
+    // from a draft-22 migration or a retry after a failed session, only ever
+    // raise it. The catalog is a track in the same namespace, so it starts
+    // from the same base.
+    const std::uint64_t media_floor = std::max(initial_group_id_, resume_group_floor);
+    const std::uint64_t catalog_floor = std::max(initial_group_id_, resume_catalog_group_floor);
     if (media_floor > kMaxGroupId || catalog_floor > kMaxGroupId ||
         media_floor > std::numeric_limits<std::size_t>::max()) {
         return TransportStatus::failure("live initial Group ID exceeds 2^62-1");
@@ -7690,7 +7688,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
 
     // SRT-only path below.
     if (const auto floor_status = apply_live_group_floors(
-            draft_version, ingest.resume_group_floor, ingest.resume_catalog_group_floor);
+            ingest.resume_group_floor, ingest.resume_catalog_group_floor);
         !floor_status.ok) {
         return floor_status;
     }
@@ -8808,7 +8806,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                            std::uint64_t resume_group_floor,
                                            std::uint64_t resume_catalog_group_floor) try {
     if (const auto floor_status = apply_live_group_floors(
-            draft_version, resume_group_floor, resume_catalog_group_floor);
+            resume_group_floor, resume_catalog_group_floor);
         !floor_status.ok) {
         return floor_status;
     }
