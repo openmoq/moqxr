@@ -1726,6 +1726,111 @@ std::map<std::uint64_t, std::vector<std::uint64_t>> data_stream_groups(const Moc
 // MoqTransport section 2.5: live stdin publishing numbers media and catalog
 // groups from set_initial_group_id() on every draft, not only on draft-22
 // migration.
+// Draft-22 catalog SUBSCRIBE "interop"/"catalog" with FORWARD=1 and a Next
+// Object LOCATION_FILTER, optionally carrying FILL_PARAMETERS with the given
+// value.
+std::vector<std::uint8_t> encode_draft22_catalog_subscribe(std::uint8_t request_id,
+                                                           std::optional<std::vector<std::uint8_t>> fill) {
+    std::vector<std::uint8_t> payload{request_id, 0x01, 0x07, 'i', 'n', 't', 'e', 'r', 'o', 'p',
+                                      0x07, 'c', 'a', 't', 'a', 'l', 'o', 'g',
+                                      static_cast<std::uint8_t>(fill ? 3 : 2), 0x10, 0x01, 0x11, 0x05};
+    if (fill) {
+        payload.push_back(0x02);  // FILL_PARAMETERS
+        payload.push_back(static_cast<std::uint8_t>(fill->size()));
+        append_bytes(payload, *fill);
+    }
+    std::vector<std::uint8_t> message{0x03};
+    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_bytes(message, payload);
+    return message;
+}
+
+// MSF section 5: every catalog subscriber needs the current catalog, not only
+// the first one in a session. A relay re-subscribes to the catalog for each
+// new viewer once the previous ones have left.
+bool test_live_stdin_catalog_reaches_every_subscriber(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    for (const auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+        const std::string label = openmoq::publisher::to_string(draft) + ": ";
+        const bool draft22 = draft == DraftVersion::kDraft22;
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+        transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        if (draft22) {
+            // A later subscriber with no fill, then one joining the current
+            // group: FILL_PARAMETERS {count 1, LOCATION_FILTER Relative Start 1}.
+            transport.reads[5].push_back(encode_draft22_catalog_subscribe(3, std::nullopt));
+            transport.reads[9].push_back(encode_draft22_catalog_subscribe(5, std::vector<std::uint8_t>{0x01, 0x21, 0x01, 0x01}));
+            // A fill whose range, Absolute Start {5,0}, lies past Largest
+            // Object: the fill range is empty (§3.4), so no fill fetch stream.
+            transport.reads[13].push_back(
+                encode_draft22_catalog_subscribe(7, std::vector<std::uint8_t>{0x01, 0x21, 0x02, 0x05, 0x00}));
+        } else {
+            transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, "catalog", 1, draft));
+        }
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        bool ok = expect(session.connect(endpoint, tls).ok, label + "catalog subscribers session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "catalog subscribers live publish succeeds: " + status.message);
+
+        const auto subscribe_ok_on = [&](std::uint64_t stream_id) -> std::optional<std::vector<std::uint8_t>> {
+            for (const auto& write : transport.writes) {
+                if (write.stream_id == stream_id && message_type(write.bytes) == 0x04) return write.bytes;
+            }
+            return std::nullopt;
+        };
+        using openmoq::publisher::transport::encode_subscribe_ok_message;
+        ok &= expect(subscribe_ok_on(1) == encode_subscribe_ok_message(draft, 1, 0, 0, 0, false),
+                     label + "the first catalog SUBSCRIBE_OK omits LARGEST_OBJECT before any catalog is sent");
+        ok &= expect(subscribe_ok_on(5) == encode_subscribe_ok_message(draft, 3, 0, 0, 0, true),
+                     label + "a later catalog SUBSCRIBE_OK reports LARGEST_OBJECT {0,0} (§9.20.17)");
+
+        // Without a usable fill, a later subscriber gets the unchanged catalog
+        // as a new independent group; the joining fill subscriber gets none.
+        const auto groups = data_stream_groups(transport, draft);
+        const auto catalog = groups.find(0);
+        const std::vector<std::uint64_t> expected_groups =
+            draft22 ? std::vector<std::uint64_t>{0, 1, 2} : std::vector<std::uint64_t>{0, 1};
+        ok &= expect(catalog != groups.end() && catalog->second == expected_groups,
+                     label + "a later catalog subscriber without a fill receives the catalog as a new group");
+
+        if (draft22) {
+            ok &= expect(subscribe_ok_on(9) == encode_subscribe_ok_message(draft, 5, 0, 1, 0, true),
+                         label + "the joining catalog SUBSCRIBE_OK reports LARGEST_OBJECT {1,0}");
+            const MockTransport::WriteEvent* fill = nullptr;
+            for (const auto& write : transport.writes) {
+                if (write.bytes.size() > 2 && write.bytes[0] == 0x05 && write.bytes[1] == 5) fill = &write;
+            }
+            const std::vector<std::uint8_t> fill_prefix{0x05, 0x05, 0x1c, 0x01, 0x00, 0x80};
+            ok &= expect(fill != nullptr && fill->fin && (fill->stream_id & 0x3ULL) == 0x2ULL &&
+                             std::equal(fill_prefix.begin(), fill_prefix.end(), fill->bytes.begin()),
+                         label + "a catalog SUBSCRIBE joining the current group gets {1,0} on a fill fetch stream ending in FIN");
+            if (fill != nullptr) {
+                const std::string_view expected_key = "\"version\"";
+                ok &= expect(std::search(fill->bytes.begin(), fill->bytes.end(), expected_key.begin(),
+                                         expected_key.end()) != fill->bytes.end(),
+                             label + "the catalog fill object carries the catalog JSON");
+                ok &= expect(std::none_of(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                          [&](const auto& reset) { return reset.first == fill->stream_id; }),
+                             label + "a served catalog fill is not reset");
+            }
+            ok &= expect(subscribe_ok_on(13) == encode_subscribe_ok_message(draft, 7, 0, 1, 0, true) &&
+                             std::none_of(transport.writes.begin(), transport.writes.end(),
+                                          [](const auto& write) {
+                                              return write.bytes.size() > 1 && write.bytes[0] == 0x05 &&
+                                                     write.bytes[1] == 7;
+                                          }),
+                         label + "a catalog fill range past Largest Object opens no fill fetch stream");
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
 bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsConfig& tls) {
     constexpr std::uint64_t kInitial = 1700000000000ULL;
     constexpr std::string_view kNamespace = "interop";
@@ -11417,6 +11522,7 @@ int main() {
     }
 
     ok &= test_live_stdin_initial_group_id(endpoint, tls);
+    ok &= test_live_stdin_catalog_reaches_every_subscriber(endpoint, tls);
 
     return ok ? 0 : 1;
 }
