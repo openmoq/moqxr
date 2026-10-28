@@ -203,6 +203,13 @@ private:
                                          std::size_t* streams_opened = nullptr);
     void remember_catalog_delivery_timeouts(DeliveryTimeouts delivery_timeouts);
     DeliveryTimeouts catalog_delivery_timeouts_snapshot() const;
+    // Draft-22 §3.4: serves a catalog SUBSCRIBE's fill from the last catalog
+    // object sent, on a fill fetch stream that ends with FIN. served is false
+    // when no fill is owed: not draft 22, no FILL_PARAMETERS, Forward 0, no
+    // catalog sent yet, or a fill range without the current catalog group.
+    TransportStatus serve_catalog_fill(openmoq::publisher::DraftVersion draft_version,
+                                       const SubscribeMessage& subscribe,
+                                       bool& served);
 
     PublisherTransport& transport_;
     std::string track_namespace_;
@@ -259,6 +266,11 @@ private:
     bool catalog_track_alias_known_ = false;
     mutable std::mutex catalog_delivery_timeouts_mutex_;
     DeliveryTimeouts catalog_delivery_timeouts_;
+    // The catalog object most recently sent. Catalogs are only ever sent
+    // independent (object 0 of a new group), so it is the whole current
+    // catalog group, which a joining subscriber's fill asks for.
+    mutable std::mutex last_catalog_object_mutex_;
+    std::optional<openmoq::publisher::CatalogObject> last_catalog_object_;
 };
 
 }  // namespace openmoq::publisher::transport
