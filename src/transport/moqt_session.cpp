@@ -8891,16 +8891,18 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     }
 
     // MSF 5.2.20 framerate: an empty_moov init segment has no sample
-    // durations (its stts is empty), so read ahead to each video track's first
-    // fragment before building the catalog. The boxes read are replayed for
-    // Phase 4. The look-ahead is bounded so a stream without video fragments
-    // still publishes, just without framerate.
+    // durations (its stts is empty), so read ahead to collect video sample
+    // durations from the first fragments before building the catalog, until
+    // each estimate settles: the first sample alone can be irregular. The boxes
+    // read are replayed for Phase 4. The look-ahead is bounded so a stream
+    // without video fragments still publishes, just without framerate.
     if (std::any_of(tracks.begin(), tracks.end(), openmoq::publisher::needs_fragment_frame_rate)) {
-        constexpr std::size_t kMaxLookaheadFragments = 16;
+        constexpr std::size_t kMaxLookaheadFragments = 2 * openmoq::publisher::kFrameRateSampleCount;
+        openmoq::publisher::FragmentSampleDurations durations;
         std::vector<std::uint8_t> lookahead;
         std::size_t fragments_seen = 0;
         while (fragments_seen < kMaxLookaheadFragments &&
-               std::any_of(tracks.begin(), tracks.end(), openmoq::publisher::needs_fragment_frame_rate)) {
+               !openmoq::publisher::frame_rates_settled(tracks, durations)) {
             auto box = reader.next_box();
             if (!box) {
                 const std::size_t bytes_read = read_live_input(input, reader, &stop_requested_);
@@ -8912,11 +8914,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             }
             if (box->type == "moof") {
                 ++fragments_seen;
-                openmoq::publisher::apply_fragment_frame_rates(
-                    tracks, openmoq::publisher::parse_mp4_boxes(box->bytes), box->bytes);
+                openmoq::publisher::collect_fragment_sample_durations(
+                    tracks, openmoq::publisher::parse_mp4_boxes(box->bytes), box->bytes, durations);
             }
             lookahead.insert(lookahead.end(), box->bytes.begin(), box->bytes.end());
         }
+        openmoq::publisher::apply_fragment_frame_rates(tracks, durations);
         const auto pending = reader.pending_bytes();
         lookahead.insert(lookahead.end(), pending.begin(), pending.end());
         reader = openmoq::publisher::StreamingMp4Reader{};

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -97,15 +98,32 @@ std::vector<Mp4Box> parse_mp4_boxes(std::span<const std::uint8_t> bytes);
 std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_level_boxes,
                                              std::span<const std::uint8_t> bytes);
 
-// Sets frame_rate on each video track that has none, from its first track
-// fragment among the top-level moof boxes in `boxes`. A fragmented track's
+// Frame rates for fragmented video tracks (MSF 5.2.20). A fragmented track's
 // sample durations live in its movie fragments (ISO/IEC 14496-12 8.8): the trun
 // per-sample durations, else the tfhd default, else the trex default. Its moov
-// stts is empty. extract_tracks() already applies this to the boxes it is
-// given; a live reader that sees fragments later calls it directly.
+// stts is empty. Durations are collected per track ID across fragments, and
+// the rate uses the most common one, because a stream's first sample can be
+// irregular (FFmpeg's first video sample is often longer than the rest).
+using FragmentSampleDurations = std::map<std::uint32_t, std::vector<std::uint32_t>>;
+// Samples per track an estimate collects before it is settled.
+inline constexpr std::size_t kFrameRateSampleCount = 8;
+// Adds the sample durations of each video track that needs a frame rate, from
+// the top-level moof boxes in `boxes`, up to kFrameRateSampleCount per track.
+void collect_fragment_sample_durations(const std::vector<TrackDescription>& tracks,
+                                       const std::vector<Mp4Box>& boxes,
+                                       std::span<const std::uint8_t> bytes,
+                                       FragmentSampleDurations& durations);
+// True once every video track that needs a frame rate has a settled estimate:
+// a duration seen twice, or kFrameRateSampleCount durations. A lone first
+// sample is not settled, however long.
+bool frame_rates_settled(const std::vector<TrackDescription>& tracks,
+                            const FragmentSampleDurations& durations);
+// Sets frame_rate on each video track that has none from its most common
+// collected duration, else from its trex default. extract_tracks() already
+// does this for the boxes it is given; a live reader that sees fragments later
+// collects them and calls this itself.
 void apply_fragment_frame_rates(std::vector<TrackDescription>& tracks,
-                                const std::vector<Mp4Box>& boxes,
-                                std::span<const std::uint8_t> bytes);
+                                const FragmentSampleDurations& durations);
 // True for a video track whose frame rate is still unknown.
 bool needs_fragment_frame_rate(const TrackDescription& track);
 

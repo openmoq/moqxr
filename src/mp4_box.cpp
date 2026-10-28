@@ -912,29 +912,31 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         ++track_index;
     }
 
-    apply_fragment_frame_rates(tracks, top_level_boxes, bytes);
+    FragmentSampleDurations durations;
+    collect_fragment_sample_durations(tracks, top_level_boxes, bytes, durations);
+    apply_fragment_frame_rates(tracks, durations);
     return tracks;
 }
 
 namespace {
 
-// Frame rate of one track fragment: its sample count over the sum of its
-// sample durations, in timescale units. 0 when the fragment carries no
-// usable duration.
-double traf_frame_rate(const Mp4Box& traf,
-                       std::uint32_t timescale,
-                       std::uint32_t trex_default_duration,
-                       std::span<const std::uint8_t> bytes) {
+// Appends the sample durations of one track fragment, up to `limit` in total.
+// Leaves `durations` unchanged for a fragment with no usable durations.
+void append_traf_sample_durations(const Mp4Box& traf,
+                                  std::uint32_t trex_default_duration,
+                                  std::span<const std::uint8_t> bytes,
+                                  std::size_t limit,
+                                  std::vector<std::uint32_t>& durations) {
     const Mp4Box* tfhd = find_child(traf, "tfhd");
     const Mp4Box* trun = find_child(traf, "trun");
-    if (tfhd == nullptr || trun == nullptr || tfhd->payload.size < 8 || trun->payload.size < 8) return 0.0;
+    if (tfhd == nullptr || trun == nullptr || tfhd->payload.size < 8 || trun->payload.size < 8) return;
     std::uint32_t default_duration = trex_default_duration;
     const std::uint32_t tfhd_flags = read_be32(bytes, tfhd->payload.offset) & 0x00ffffffU;
     std::size_t cursor = tfhd->payload.offset + 8;  // version/flags, track_ID
     if ((tfhd_flags & 0x000001U) != 0) cursor += 8;  // base_data_offset
     if ((tfhd_flags & 0x000002U) != 0) cursor += 4;  // sample_description_index
     if ((tfhd_flags & 0x000008U) != 0) {
-        if (cursor + 4 > tfhd->payload.offset + tfhd->payload.size) return 0.0;
+        if (cursor + 4 > tfhd->payload.offset + tfhd->payload.size) return;
         default_duration = read_be32(bytes, cursor);
     }
 
@@ -944,21 +946,34 @@ double traf_frame_rate(const Mp4Box& traf,
     cursor = trun->payload.offset + 8;
     if ((trun_flags & 0x000001U) != 0) cursor += 4;  // data_offset
     if ((trun_flags & 0x000004U) != 0) cursor += 4;  // first_sample_flags
-    std::uint64_t duration_sum = 0;
-    for (std::uint32_t index = 0; index < sample_count; ++index) {
+    for (std::uint32_t index = 0; index < sample_count && durations.size() < limit; ++index) {
         std::uint32_t duration = default_duration;
         if ((trun_flags & 0x000100U) != 0) {
-            if (cursor + 4 > trun_end) return 0.0;
+            if (cursor + 4 > trun_end) return;
             duration = read_be32(bytes, cursor);
             cursor += 4;
         }
         if ((trun_flags & 0x000200U) != 0) cursor += 4;  // sample_size
         if ((trun_flags & 0x000400U) != 0) cursor += 4;  // sample_flags
         if ((trun_flags & 0x000800U) != 0) cursor += 4;  // sample_composition_time_offset
-        duration_sum += duration;
+        if (duration != 0) durations.push_back(duration);
     }
-    if (sample_count == 0 || duration_sum == 0 || timescale == 0) return 0.0;
-    return static_cast<double>(sample_count) * static_cast<double>(timescale) / static_cast<double>(duration_sum);
+}
+
+// The most common duration; a tie goes to the one that reached that count
+// last, which favours a stream's steady state over its first sample.
+std::uint32_t most_common_duration(const std::vector<std::uint32_t>& durations) {
+    std::map<std::uint32_t, std::size_t> counts;
+    std::uint32_t best = 0;
+    std::size_t best_count = 0;
+    for (const std::uint32_t duration : durations) {
+        const std::size_t count = ++counts[duration];
+        if (count >= best_count) {
+            best = duration;
+            best_count = count;
+        }
+    }
+    return best;
 }
 
 }  // namespace
@@ -967,27 +982,53 @@ bool needs_fragment_frame_rate(const TrackDescription& track) {
     return track.handler_type == "vide" && track.frame_rate <= 0.0;
 }
 
-void apply_fragment_frame_rates(std::vector<TrackDescription>& tracks,
-                                const std::vector<Mp4Box>& boxes,
-                                std::span<const std::uint8_t> bytes) {
-    for (auto& track : tracks) {
+void collect_fragment_sample_durations(const std::vector<TrackDescription>& tracks,
+                                       const std::vector<Mp4Box>& boxes,
+                                       std::span<const std::uint8_t> bytes,
+                                       FragmentSampleDurations& durations) {
+    for (const auto& track : tracks) {
         if (!needs_fragment_frame_rate(track)) continue;
+        auto& track_durations = durations[track.track_id];
         const std::uint32_t trex_default_duration =
             track.fragment_defaults ? track.fragment_defaults->sample_duration : 0;
         for (const auto& moof : boxes) {
+            if (track_durations.size() >= kFrameRateSampleCount) break;
             if (moof.type != "moof") continue;
-            const auto traf = std::find_if(moof.children.begin(), moof.children.end(), [&](const Mp4Box& child) {
-                const Mp4Box* tfhd = child.type == "traf" ? find_child(child, "tfhd") : nullptr;
-                return tfhd != nullptr && tfhd->payload.size >= 8 &&
-                       read_be32(bytes, tfhd->payload.offset + 4) == track.track_id;
-            });
-            if (traf == moof.children.end()) continue;
-            track.frame_rate = traf_frame_rate(*traf, track.timescale, trex_default_duration, bytes);
-            break;
+            for (const auto& traf : moof.children) {
+                const Mp4Box* tfhd = traf.type == "traf" ? find_child(traf, "tfhd") : nullptr;
+                if (tfhd != nullptr && tfhd->payload.size >= 8 &&
+                    read_be32(bytes, tfhd->payload.offset + 4) == track.track_id) {
+                    append_traf_sample_durations(traf, trex_default_duration, bytes, kFrameRateSampleCount,
+                                                 track_durations);
+                }
+            }
         }
+    }
+}
+
+bool frame_rates_settled(const std::vector<TrackDescription>& tracks,
+                            const FragmentSampleDurations& durations) {
+    return std::all_of(tracks.begin(), tracks.end(), [&](const TrackDescription& track) {
+        if (!needs_fragment_frame_rate(track)) return true;
+        const auto it = durations.find(track.track_id);
+        if (it == durations.end()) return false;
+        const auto& samples = it->second;
+        const std::uint32_t mode = most_common_duration(samples);
+        return samples.size() >= kFrameRateSampleCount ||
+               std::count(samples.begin(), samples.end(), mode) >= 2;
+    });
+}
+
+void apply_fragment_frame_rates(std::vector<TrackDescription>& tracks,
+                                const FragmentSampleDurations& durations) {
+    for (auto& track : tracks) {
+        if (!needs_fragment_frame_rate(track) || track.timescale == 0) continue;
+        const auto it = durations.find(track.track_id);
+        std::uint32_t duration = it != durations.end() ? most_common_duration(it->second) : 0;
         // An init segment alone: the trex default is the only duration there.
-        if (needs_fragment_frame_rate(track) && trex_default_duration != 0 && track.timescale != 0) {
-            track.frame_rate = static_cast<double>(track.timescale) / static_cast<double>(trex_default_duration);
+        if (duration == 0 && track.fragment_defaults) duration = track.fragment_defaults->sample_duration;
+        if (duration != 0) {
+            track.frame_rate = static_cast<double>(track.timescale) / static_cast<double>(duration);
         }
     }
 }
