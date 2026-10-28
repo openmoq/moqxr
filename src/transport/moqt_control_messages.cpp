@@ -652,6 +652,24 @@ std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t 
     return bytes;
 }
 
+std::vector<std::uint8_t> encode_fetch_object(DraftVersion draft,
+                                              std::uint64_t group_id,
+                                              std::uint64_t object_id,
+                                              std::uint8_t publisher_priority,
+                                              std::span<const std::uint8_t> payload) {
+    // Serialization Flags: Subgroup ID zero (0x00), Object ID Delta (0x04),
+    // Group ID Delta (0x08) and Priority (0x10) present, no Properties.
+    constexpr std::uint64_t kFlags = 0x04 | 0x08 | 0x10;
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, kFlags);
+    append_moqint(bytes, draft, group_id);
+    append_moqint(bytes, draft, object_id);
+    bytes.push_back(publisher_priority);
+    append_moqint(bytes, draft, payload.size());
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
 std::vector<std::uint8_t> encode_varint(std::uint64_t value) {
     std::vector<std::uint8_t> bytes;
     if (!append_varint(bytes, value)) {
@@ -1494,6 +1512,15 @@ bool decode_location_filter(std::span<const std::uint8_t> bytes,
         message.start_group_id = static_cast<std::size_t>(fields[0]);
         message.start_object_id = static_cast<std::size_t>(fields[1]);
     }
+    if (explicit_type) {
+        message.location_filter = LocationFilterForm{
+            .type = *explicit_type,
+            .start_group = fields[0],
+            .start_object = fields[1],
+            .end_group_delta = fields[2],
+            .end_object = fields[3],
+        };
+    }
     return offset == end;
 }
 
@@ -1543,33 +1570,47 @@ bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
     return offset == end;
 }
 
+// Validates a FILL_PARAMETERS value. On draft 22, also reports the nested
+// LOCATION_FILTER, if any, through location_filter.
 bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
                               std::size_t begin,
                               std::size_t end,
-                              DraftVersion draft) {
+                              DraftVersion draft,
+                              std::optional<LocationFilterForm>* location_filter = nullptr) {
     if (!openmoq::publisher::is_draft21_or_later(draft)) return false;
+    // The value is encoded "as if they were Parameters for a separate message"
+    // (§9.20.15), and a message's parameter block is bounded by a count rather
+    // than a length (§9.20): Number of Parameters, then that many Parameters.
+    // Drafts 21/22 keep the Length prefix around that block (moq-transport
+    // #1991). moq-transport #2015 drops the Length after draft 22, so a later
+    // draft must read the count directly after the parameter type instead.
+    const auto scope = bytes.subspan(0, end);
     std::size_t offset = begin;
+    std::uint64_t count = 0;
+    if (!decode_moqint_impl(scope, offset, draft, count)) return false;
     std::uint64_t previous_type = 0;
-    while (offset < end) {
+    for (std::uint64_t index = 0; index < count; ++index) {
+        if (offset >= end) return false;
         std::uint64_t type = 0;
-        if (!decode_parameter_type(bytes, offset, draft, previous_type, true, type)) return false;
+        if (!decode_parameter_type(scope, offset, draft, previous_type, true, type)) return false;
         switch (type) {
             case 0x0A:  // FILL_TIMEOUT
             case 0x20:  // SUBSCRIBER_PRIORITY
             case 0x22: {  // GROUP_ORDER
                 std::uint64_t value = 0;
-                if (!decode_moqint_impl(bytes.subspan(0, end), offset, draft, value)) return false;
+                if (!decode_numeric_message_parameter(scope, offset, draft, type, value)) return false;
                 if (type == 0x20 && value > 255) return false;
                 if (type == 0x22 && value != 1 && value != 2) return false;
                 break;
             }
             case 0x21: {  // LOCATION_FILTER
                 std::uint64_t length = 0;
-                if (!read_parameter_length(bytes.subspan(0, end), offset, end, draft, type, length)) return false;
+                if (!read_parameter_length(scope, offset, end, draft, type, length)) return false;
                 const std::size_t filter_end = offset + static_cast<std::size_t>(length);
                 SubscribeMessage filter;
                 std::size_t filter_offset = offset;
                 if (!decode_location_filter(bytes, filter_offset, filter_end, filter, draft)) return false;
+                if (location_filter != nullptr) *location_filter = filter.location_filter;
                 offset = filter_end;
                 break;
             }
@@ -1578,7 +1619,7 @@ bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
             case 0x27:  // PRIORITY_FILTER
             case 0x28: {  // OBJECT_PROPERTY_FILTER
                 std::uint64_t length = 0;
-                if (!decode_moqint_impl(bytes.subspan(0, end), offset, draft, length) ||
+                if (!decode_moqint_impl(scope, offset, draft, length) ||
                     length > end - offset) return false;
                 offset += static_cast<std::size_t>(length);
                 break;
@@ -1684,6 +1725,8 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
     message.end_group_id = 0;
     message.end_object_id.reset();
     message.fill_requested = false;
+    message.location_filter.reset();
+    message.fill_location_filter.reset();
 
     std::uint64_t parameter_count = 0;
     if (!decode_moqint_impl(bytes, offset, draft, parameter_count)) {
@@ -1778,7 +1821,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
                 if (!openmoq::publisher::is_draft21_or_later(draft) || message.fill_requested ||
                     !validate_fill_parameters(bytes, offset,
                                               offset + static_cast<std::size_t>(parameter_length),
-                                              draft)) {
+                                              draft, &message.fill_location_filter)) {
                     return false;
                 }
                 message.fill_requested = true;
