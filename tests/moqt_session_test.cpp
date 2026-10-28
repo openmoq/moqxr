@@ -1831,6 +1831,62 @@ bool test_live_stdin_catalog_reaches_every_subscriber(const EndpointConfig& endp
     return true;
 }
 
+// §9.20.17: LARGEST_OBJECT is the Largest Object in the Track, and a
+// publisher that has published Objects on it MUST include it. While a catalog
+// subscription is paused the publisher keeps producing catalog groups; the
+// REQUEST_UPDATE_OK that resumes it reports the newest one, not the last
+// Largest the subscriber saw.
+bool test_live_stdin_catalog_resume_reports_current_largest(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    for (const auto draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+        const std::string label = openmoq::publisher::to_string(draft) + ": ";
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+        transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        // Pause the catalog subscription after its first group, and resume it
+        // once the publisher has produced another.
+        std::set<std::uint64_t> seen_streams;
+        std::size_t catalog_groups = 0;
+        transport.on_try_write_object = [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+            std::size_t offset = 0;
+            std::uint64_t type = 0, alias = 1;
+            using openmoq::publisher::transport::decode_vi64;
+            if (seen_streams.insert(event.stream_id).second && decode_vi64(event.bytes, offset, type) &&
+                decode_vi64(event.bytes, offset, alias) && alias == 0) {
+                ++catalog_groups;
+                if (catalog_groups == 1) {
+                    current.reads[1].push_back(encode_request_update_message(draft, 3, 0, 0x10));
+                } else if (catalog_groups == 2) {
+                    current.reads[1].push_back(encode_request_update_message(draft, 5, 1, 0x10));
+                }
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(3));
+        session.set_catalog_republish_interval(std::chrono::seconds(1));
+        bool ok = expect(session.connect(endpoint, tls).ok, label + "catalog resume session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "catalog resume live publish succeeds: " + status.message);
+        std::vector<std::vector<std::uint8_t>> request_oks;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 1 && message_type(write.bytes) == 0x07) request_oks.push_back(write.bytes);
+        }
+        using openmoq::publisher::transport::encode_request_ok_message;
+        ok &= expect(catalog_groups >= 2, label + "the publisher produces a catalog group while the subscription is paused");
+        ok &= expect(request_oks.size() == 2 && request_oks[0] == encode_request_ok_message(draft, 3, 0, 0),
+                     label + "the pausing REQUEST_UPDATE_OK reports the catalog's Largest Object {0,0}");
+        ok &= expect(request_oks.size() == 2 && request_oks[1] == encode_request_ok_message(draft, 5, 1, 0),
+                     label + "the resuming REQUEST_UPDATE_OK reports the newest catalog group {1,0}");
+        if (!ok) return false;
+    }
+    return true;
+}
+
 bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsConfig& tls) {
     constexpr std::uint64_t kInitial = 1700000000000ULL;
     constexpr std::string_view kNamespace = "interop";
@@ -11523,6 +11579,7 @@ int main() {
 
     ok &= test_live_stdin_initial_group_id(endpoint, tls);
     ok &= test_live_stdin_catalog_reaches_every_subscriber(endpoint, tls);
+    ok &= test_live_stdin_catalog_resume_reports_current_largest(endpoint, tls);
 
     return ok ? 0 : 1;
 }
