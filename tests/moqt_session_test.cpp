@@ -1722,6 +1722,41 @@ std::map<std::uint64_t, std::vector<std::uint64_t>> data_stream_groups(const Moc
 // MoqTransport section 2.5: live stdin publishing numbers media and catalog
 // groups from set_initial_group_id() on every draft, not only on draft-22
 // migration.
+// MSF 5.2.20 framerate on a live stdin LOC catalog. The fixture is an
+// empty_moov fragmented MP4 at 4 fps (sample duration 4096 at timescale 16384),
+// so the rate is only in its fragments: publish_live() reads ahead to the
+// first video fragment before building the catalog, then still publishes it.
+bool test_live_stdin_catalog_framerate_from_fragments(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    MockTransport transport;
+    transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+    transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+    transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+    transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+    MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+    session.set_media_packaging(MediaPackaging::kLoc);
+    bool ok = expect(session.connect(endpoint, tls).ok, "LOC framerate session connects");
+    std::ifstream input(std::filesystem::path(__FILE__).parent_path() / "fixtures/locmaf-publisher.mp4", std::ios::binary);
+    const auto status = session.publish_live(input, draft, true);
+    ok &= expect(status.ok, "LOC framerate live publish succeeds: " + status.message);
+    std::string catalog;
+    for (const auto& write : transport.writes) {
+        const std::string text(write.bytes.begin(), write.bytes.end());
+        if (text.find("\"tracks\"") != std::string::npos) catalog = text;
+    }
+    const auto video = catalog.find("\"role\":\"video\"");
+    const auto framerate = catalog.find("\"framerate\":4,");
+    ok &= expect(video != std::string::npos && framerate != std::string::npos &&
+                     catalog.rfind('{', framerate) == catalog.rfind('{', video),
+                 "the live LOC catalog advertises framerate 4 on the video track");
+    const auto groups = data_stream_groups(transport, draft);
+    const auto media = std::find_if(groups.begin(), groups.end(), [](const auto& entry) { return entry.first != 0; });
+    ok &= expect(media != groups.end() && !media->second.empty() && media->second.front() == 0,
+                 "the fragments read ahead for the frame rate are still published, from group 0");
+    return ok;
+}
+
 bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsConfig& tls) {
     constexpr std::uint64_t kInitial = 1700000000000ULL;
     constexpr std::string_view kNamespace = "interop";
@@ -11356,6 +11391,7 @@ int main() {
     }
 
     ok &= test_live_stdin_initial_group_id(endpoint, tls);
+    ok &= test_live_stdin_catalog_framerate_from_fragments(endpoint, tls);
 
     return ok ? 0 : 1;
 }

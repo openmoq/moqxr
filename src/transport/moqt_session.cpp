@@ -8890,6 +8890,39 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         return TransportStatus::failure("no tracks found in moov box");
     }
 
+    // MSF 5.2.20 framerate: an empty_moov init segment has no sample
+    // durations (its stts is empty), so read ahead to each video track's first
+    // fragment before building the catalog. The boxes read are replayed for
+    // Phase 4. The look-ahead is bounded so a stream without video fragments
+    // still publishes, just without framerate.
+    if (std::any_of(tracks.begin(), tracks.end(), openmoq::publisher::needs_fragment_frame_rate)) {
+        constexpr std::size_t kMaxLookaheadFragments = 16;
+        std::vector<std::uint8_t> lookahead;
+        std::size_t fragments_seen = 0;
+        while (fragments_seen < kMaxLookaheadFragments &&
+               std::any_of(tracks.begin(), tracks.end(), openmoq::publisher::needs_fragment_frame_rate)) {
+            auto box = reader.next_box();
+            if (!box) {
+                const std::size_t bytes_read = read_live_input(input, reader, &stop_requested_);
+                if (bytes_read == 0 && stop_requested_.load(std::memory_order_acquire)) {
+                    return TransportStatus::success();
+                }
+                if (bytes_read == 0) break;
+                continue;
+            }
+            if (box->type == "moof") {
+                ++fragments_seen;
+                openmoq::publisher::apply_fragment_frame_rates(
+                    tracks, openmoq::publisher::parse_mp4_boxes(box->bytes), box->bytes);
+            }
+            lookahead.insert(lookahead.end(), box->bytes.begin(), box->bytes.end());
+        }
+        const auto pending = reader.pending_bytes();
+        lookahead.insert(lookahead.end(), pending.begin(), pending.end());
+        reader = openmoq::publisher::StreamingMp4Reader{};
+        reader.append(lookahead.data(), lookahead.size());
+    }
+
     std::cerr << "[moqt-session] live: discovered " << tracks.size() << " track(s): "
               << openmoq::publisher::summarize_tracks(tracks) << '\n';
 
@@ -9160,13 +9193,20 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         bool first_keyframe_seen = locmaf_audio_only;
 
         try {
+            bool first_pass = true;
             while (true) {
                 if (stdin_stop.load(std::memory_order_acquire)) {
                     std::lock_guard<std::mutex> lock(queue->mutex);
                     queue->eof = true;
                     break;
                 }
-                const std::size_t bytes_read = read_live_input(input, reader, &stdin_stop);
+                // Parse boxes already buffered (the framerate look-ahead or
+                // resume bytes) before the first read, which blocks until the
+                // input produces more.
+                const bool parse_buffered = first_pass && !reader.pending_bytes().empty();
+                first_pass = false;
+                const std::size_t bytes_read =
+                    parse_buffered ? reader.pending_bytes().size() : read_live_input(input, reader, &stdin_stop);
 
                 while (auto box = reader.next_box()) {
                     if (!loc_encoders.empty() && (box->type == "moov" || box->type == "ftyp")) {

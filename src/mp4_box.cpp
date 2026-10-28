@@ -912,7 +912,84 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         ++track_index;
     }
 
+    apply_fragment_frame_rates(tracks, top_level_boxes, bytes);
     return tracks;
+}
+
+namespace {
+
+// Frame rate of one track fragment: its sample count over the sum of its
+// sample durations, in timescale units. 0 when the fragment carries no
+// usable duration.
+double traf_frame_rate(const Mp4Box& traf,
+                       std::uint32_t timescale,
+                       std::uint32_t trex_default_duration,
+                       std::span<const std::uint8_t> bytes) {
+    const Mp4Box* tfhd = find_child(traf, "tfhd");
+    const Mp4Box* trun = find_child(traf, "trun");
+    if (tfhd == nullptr || trun == nullptr || tfhd->payload.size < 8 || trun->payload.size < 8) return 0.0;
+    std::uint32_t default_duration = trex_default_duration;
+    const std::uint32_t tfhd_flags = read_be32(bytes, tfhd->payload.offset) & 0x00ffffffU;
+    std::size_t cursor = tfhd->payload.offset + 8;  // version/flags, track_ID
+    if ((tfhd_flags & 0x000001U) != 0) cursor += 8;  // base_data_offset
+    if ((tfhd_flags & 0x000002U) != 0) cursor += 4;  // sample_description_index
+    if ((tfhd_flags & 0x000008U) != 0) {
+        if (cursor + 4 > tfhd->payload.offset + tfhd->payload.size) return 0.0;
+        default_duration = read_be32(bytes, cursor);
+    }
+
+    const std::size_t trun_end = trun->payload.offset + trun->payload.size;
+    const std::uint32_t trun_flags = read_be32(bytes, trun->payload.offset) & 0x00ffffffU;
+    const std::uint32_t sample_count = read_be32(bytes, trun->payload.offset + 4);
+    cursor = trun->payload.offset + 8;
+    if ((trun_flags & 0x000001U) != 0) cursor += 4;  // data_offset
+    if ((trun_flags & 0x000004U) != 0) cursor += 4;  // first_sample_flags
+    std::uint64_t duration_sum = 0;
+    for (std::uint32_t index = 0; index < sample_count; ++index) {
+        std::uint32_t duration = default_duration;
+        if ((trun_flags & 0x000100U) != 0) {
+            if (cursor + 4 > trun_end) return 0.0;
+            duration = read_be32(bytes, cursor);
+            cursor += 4;
+        }
+        if ((trun_flags & 0x000200U) != 0) cursor += 4;  // sample_size
+        if ((trun_flags & 0x000400U) != 0) cursor += 4;  // sample_flags
+        if ((trun_flags & 0x000800U) != 0) cursor += 4;  // sample_composition_time_offset
+        duration_sum += duration;
+    }
+    if (sample_count == 0 || duration_sum == 0 || timescale == 0) return 0.0;
+    return static_cast<double>(sample_count) * static_cast<double>(timescale) / static_cast<double>(duration_sum);
+}
+
+}  // namespace
+
+bool needs_fragment_frame_rate(const TrackDescription& track) {
+    return track.handler_type == "vide" && track.frame_rate <= 0.0;
+}
+
+void apply_fragment_frame_rates(std::vector<TrackDescription>& tracks,
+                                const std::vector<Mp4Box>& boxes,
+                                std::span<const std::uint8_t> bytes) {
+    for (auto& track : tracks) {
+        if (!needs_fragment_frame_rate(track)) continue;
+        const std::uint32_t trex_default_duration =
+            track.fragment_defaults ? track.fragment_defaults->sample_duration : 0;
+        for (const auto& moof : boxes) {
+            if (moof.type != "moof") continue;
+            const auto traf = std::find_if(moof.children.begin(), moof.children.end(), [&](const Mp4Box& child) {
+                const Mp4Box* tfhd = child.type == "traf" ? find_child(child, "tfhd") : nullptr;
+                return tfhd != nullptr && tfhd->payload.size >= 8 &&
+                       read_be32(bytes, tfhd->payload.offset + 4) == track.track_id;
+            });
+            if (traf == moof.children.end()) continue;
+            track.frame_rate = traf_frame_rate(*traf, track.timescale, trex_default_duration, bytes);
+            break;
+        }
+        // An init segment alone: the trex default is the only duration there.
+        if (needs_fragment_frame_rate(track) && trex_default_duration != 0 && track.timescale != 0) {
+            track.frame_rate = static_cast<double>(track.timescale) / static_cast<double>(trex_default_duration);
+        }
+    }
 }
 
 const Mp4Box* find_first_box(const std::vector<Mp4Box>& boxes, std::string_view type) {

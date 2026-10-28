@@ -97,6 +97,18 @@ std::vector<Mp4Box> parse_mp4_boxes(std::span<const std::uint8_t> bytes);
 std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_level_boxes,
                                              std::span<const std::uint8_t> bytes);
 
+// Sets frame_rate on each video track that has none, from its first track
+// fragment among the top-level moof boxes in `boxes`. A fragmented track's
+// sample durations live in its movie fragments (ISO/IEC 14496-12 8.8): the trun
+// per-sample durations, else the tfhd default, else the trex default. Its moov
+// stts is empty. extract_tracks() already applies this to the boxes it is
+// given; a live reader that sees fragments later calls it directly.
+void apply_fragment_frame_rates(std::vector<TrackDescription>& tracks,
+                                const std::vector<Mp4Box>& boxes,
+                                std::span<const std::uint8_t> bytes);
+// True for a video track whose frame rate is still unknown.
+bool needs_fragment_frame_rate(const TrackDescription& track);
+
 const Mp4Box* find_first_box(const std::vector<Mp4Box>& boxes, std::string_view type);
 std::vector<const Mp4Box*> find_boxes(const std::vector<Mp4Box>& boxes, std::string_view type);
 const Mp4Box* find_child_box(const Mp4Box& box, std::string_view type);
