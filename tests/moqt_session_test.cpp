@@ -351,6 +351,9 @@ struct MockTransport final : PublisherTransport {
     }
 
     std::vector<std::uint64_t> media_stream_expiry_events() const override {
+        if (on_media_stream_expiry_events) {
+            on_media_stream_expiry_events();
+        }
         return {expired_media_streams.begin(), expired_media_streams.end()};
     }
 
@@ -406,6 +409,11 @@ struct MockTransport final : PublisherTransport {
     std::set<std::uint64_t> expired_media_streams;
     std::vector<std::uint64_t> acknowledged_expired_media_streams;
     std::set<std::uint64_t> peer_stopped_media_streams;
+    // Runs when the session queries media stream expiry, which
+    // dispatch_peer_stopped_media_streams() does just before it snapshots
+    // peer stops: a STOP_SENDING landing there arrives between that snapshot
+    // and any earlier one.
+    std::function<void()> on_media_stream_expiry_events;
     std::vector<std::uint64_t> acknowledged_peer_stopped_media_streams;
     std::set<std::uint64_t> failing_reset_streams;
     std::map<std::uint64_t, std::vector<std::vector<std::uint8_t>>> reads;
@@ -1725,54 +1733,71 @@ std::map<std::uint64_t, std::vector<std::uint64_t>> data_stream_groups(const Moc
 // Draft 18 §5.1.1: a subscriber ends a subscription with STOP_SENDING on its
 // request stream, after which the publisher can destroy its state. A later
 // SUBSCRIBE to the same track is then a new subscription; only one arriving
-// while a subscription is active is a DUPLICATE_SUBSCRIPTION (§5.1).
+// while a subscription is active is a DUPLICATE_SUBSCRIPTION (§5.1). The
+// STOP_SENDING arrives either before the next control poll, or while media
+// dispatch is reading peer stops, after the subscription teardown last looked.
 bool test_live_stdin_resubscribe_after_stop_sending(const EndpointConfig& endpoint, const TlsConfig& tls) {
     constexpr std::string_view kNamespace = "interop";
     constexpr DraftVersion draft = DraftVersion::kDraft18;
-    MockTransport transport;
-    transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
-    transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
-    transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
-    transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
-    bool stopped = false;
-    transport.on_try_write_object = [&](MockTransport& current, const MockTransport::ObjectWriteEvent&) {
-        if (!stopped) {
+    bool ok = true;
+    for (const bool during_media_dispatch : {false, true}) {
+        const std::string label = during_media_dispatch ? "stop during media dispatch: " : "stop before poll: ";
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+        transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        bool armed = false;
+        bool stopped = false;
+        const auto stop_and_resubscribe = [&]() {
             // The subscriber cancels the catalog subscription, then subscribes
             // again, and once more while that second subscription is active.
             stopped = true;
-            current.peer_stopped_media_streams.insert(1);
-            current.reads[5].push_back(encode_subscribe_message(3, kNamespace, "catalog", 1, draft));
-            current.reads[9].push_back(encode_subscribe_message(5, kNamespace, "catalog", 1, draft));
-        }
-        return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
-    };
-    MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
-    bool ok = expect(session.connect(endpoint, tls).ok, "STOP_SENDING resubscribe session connects");
-    const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
-    std::istringstream input(std::string(bytes.begin(), bytes.end()));
-    const auto status = session.publish_live(input, draft, true);
-    ok &= expect(status.ok, "STOP_SENDING resubscribe live publish succeeds: " + status.message);
-    const auto response_on = [&](std::uint64_t stream_id) -> std::optional<std::uint64_t> {
+            transport.peer_stopped_media_streams.insert(1);
+            transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, "catalog", 1, draft));
+            transport.reads[9].push_back(encode_subscribe_message(5, kNamespace, "catalog", 1, draft));
+        };
+        transport.on_try_write_object = [&](MockTransport&, const MockTransport::ObjectWriteEvent&) {
+            if (!armed) {
+                armed = true;
+                if (!during_media_dispatch) stop_and_resubscribe();
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
+        transport.on_media_stream_expiry_events = [&]() {
+            if (armed && !stopped && during_media_dispatch) stop_and_resubscribe();
+        };
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, label + "STOP_SENDING resubscribe session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "STOP_SENDING resubscribe live publish succeeds: " + status.message);
+        const auto response_on = [&](std::uint64_t stream_id) -> std::optional<std::uint64_t> {
+            for (const auto& write : transport.writes) {
+                if (write.stream_id == stream_id) {
+                    const auto type = message_type(write.bytes);
+                    if (type == 0x04 || type == 0x05) return type;
+                }
+            }
+            return std::nullopt;
+        };
+        ok &= expect(stopped && response_on(5) == 0x04,
+                     label + "a catalog SUBSCRIBE after the subscriber stopped the previous one gets SUBSCRIBE_OK");
+        std::optional<std::uint64_t> duplicate_code;
         for (const auto& write : transport.writes) {
-            if (write.stream_id == stream_id) {
-                const auto type = message_type(write.bytes);
-                if (type == 0x04 || type == 0x05) return type;
+            openmoq::publisher::transport::RequestError error;
+            if (write.stream_id == 9 && message_type(write.bytes) == 0x05 &&
+                openmoq::publisher::transport::decode_request_error(write.bytes, draft, error)) {
+                duplicate_code = error.error_code;
             }
         }
-        return std::nullopt;
-    };
-    ok &= expect(stopped && response_on(5) == 0x04,
-                 "a catalog SUBSCRIBE after the subscriber stopped the previous one gets SUBSCRIBE_OK");
-    std::optional<std::uint64_t> duplicate_code;
-    for (const auto& write : transport.writes) {
-        openmoq::publisher::transport::RequestError error;
-        if (write.stream_id == 9 && message_type(write.bytes) == 0x05 &&
-            openmoq::publisher::transport::decode_request_error(write.bytes, draft, error)) {
-            duplicate_code = error.error_code;
-        }
+        ok &= expect(duplicate_code == 0x19,
+                     label + "a catalog SUBSCRIBE while another catalog subscription is active is still a DUPLICATE_SUBSCRIPTION");
+        ok &= expect(std::count(transport.acknowledged_peer_stopped_media_streams.begin(),
+                                transport.acknowledged_peer_stopped_media_streams.end(), 1) == 1,
+                     label + "the request-stream STOP_SENDING is acknowledged once, after ending the subscription");
     }
-    ok &= expect(duplicate_code == 0x19,
-                 "a catalog SUBSCRIBE while another catalog subscription is active is still a DUPLICATE_SUBSCRIPTION");
     return ok;
 }
 

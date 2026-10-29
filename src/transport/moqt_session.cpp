@@ -3283,10 +3283,21 @@ private:
     std::uint64_t stream_count_ = 0;
 };
 
+// A QUIC stream ID with bit 0x2 clear is bidirectional: a request stream.
+// Media subgroup streams are unidirectional.
+bool is_request_stream(std::uint64_t stream_id) {
+    return (stream_id & 0x2ULL) == 0;
+}
+
+// Retires and acknowledges peer STOP_SENDING on media streams. A STOP_SENDING
+// on a request stream ends that request (draft 18 §5.1.1), so it is left
+// queued for end_peer_stopped_subscriptions() unless include_request_streams
+// drains everything, as close() does.
 template <typename VisitSenders>
 [[nodiscard]] TransportStatus dispatch_peer_stopped_media_streams(
     PublisherTransport& transport,
-    VisitSenders&& visit_senders) {
+    VisitSenders&& visit_senders,
+    bool include_request_streams = false) {
     for (const std::uint64_t stream_id :
          transport.media_stream_expiry_events()) {
         bool owned = false;
@@ -3301,6 +3312,9 @@ template <typename VisitSenders>
     }
     for (const std::uint64_t stream_id :
          transport.media_stream_peer_stop_events()) {
+        if (is_request_stream(stream_id) && !include_request_streams) {
+            continue;
+        }
         if (const auto code = transport.media_stream_peer_stop_error(stream_id)) {
             std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
                       << describe_stream_reset_code(*code) << '\n';
@@ -3358,7 +3372,7 @@ template <typename VisitSenders>
 [[nodiscard]] TransportStatus acknowledge_ownerless_peer_stopped_media_streams(
     PublisherTransport& transport) {
     return dispatch_peer_stopped_media_streams(
-        transport, [](const auto&) {});
+        transport, [](const auto&) {}, true);
 }
 
 template <typename SenderMap>
@@ -3861,8 +3875,10 @@ TransportStatus read_request_stream_message(PublisherTransport& transport,
 // subscription state as soon as it has received STOP_SENDING". Ends each
 // active subscription whose request stream the peer stopped, so a later
 // SUBSCRIBE to the same track starts a new subscription instead of failing as
-// a DUPLICATE_SUBSCRIPTION (§5.1). Returns the subscriptions it ended. The
-// stop events stay queued for dispatch_peer_stopped_media_streams().
+// a DUPLICATE_SUBSCRIPTION (§5.1). Returns the subscriptions it ended. This is
+// the only consumer of request-stream stops outside close():
+// dispatch_peer_stopped_media_streams() leaves them queued, so a stop is seen
+// here however its arrival interleaves with media dispatch.
 std::vector<SubscribeMessage> end_peer_stopped_subscriptions(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
@@ -3875,6 +3891,13 @@ std::vector<SubscribeMessage> end_peer_stopped_subscriptions(
         return ended;
     }
     for (const std::uint64_t stream_id : transport.media_stream_peer_stop_events()) {
+        if (!is_request_stream(stream_id)) {
+            continue;
+        }
+        if (const auto code = transport.media_stream_peer_stop_error(stream_id)) {
+            std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
+                      << describe_stream_reset_code(*code) << '\n';
+        }
         for (auto it = active_subscription_stream_ids.begin(); it != active_subscription_stream_ids.end();) {
             const auto subscription_it = it->second == stream_id ? active_subscriptions.find(it->first)
                                                                  : active_subscriptions.end();
@@ -3894,6 +3917,7 @@ std::vector<SubscribeMessage> end_peer_stopped_subscriptions(
             active_subscriptions.erase(subscription_it);
             it = active_subscription_stream_ids.erase(it);
         }
+        transport.acknowledge_media_stream_peer_stopped(stream_id);
     }
     return ended;
 }
