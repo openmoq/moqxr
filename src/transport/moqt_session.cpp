@@ -1936,10 +1936,10 @@ std::vector<std::uint8_t> encode_live_request_ok_message(
 // the REQUEST_OK reported a Largest Object opens a fill fetch stream. Holding no
 // fetchable history, the publisher reports fill failure the only way the draft
 // allows: FETCH_HEADER, then an immediate reset.
-// publish_live() serves draft-22 catalog fills itself (serve_catalog_fill);
+// publish_live() serves draft-21+ catalog fills itself (serve_catalog_fill);
 // every other fill reports failure through open_failed_fill_stream().
 bool serves_catalog_fills(openmoq::publisher::DraftVersion draft, const SubscribeMessage& subscribe) {
-    return draft == openmoq::publisher::DraftVersion::kDraft22 && subscribe.track_name == "catalog";
+    return openmoq::publisher::is_draft21_or_later(draft) && subscribe.track_name == "catalog";
 }
 
 void open_failed_fill_stream(PublisherTransport& transport,
@@ -7271,7 +7271,8 @@ TransportStatus MoqtSession::serve_catalog_fill(openmoq::publisher::DraftVersion
                                                 const SubscribeMessage& subscribe,
                                                 bool& served) {
     served = false;
-    if (draft_version != DraftVersion::kDraft22 || !subscribe.fill_requested || subscribe.forward != 1) {
+    if (!openmoq::publisher::is_draft21_or_later(draft_version) || !subscribe.fill_requested ||
+        subscribe.forward != 1) {
         return TransportStatus::success();
     }
     std::optional<openmoq::publisher::CatalogObject> object;
@@ -7951,7 +7952,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     //
     // `joining` is the catalog SUBSCRIBE being answered, if any. A subscriber
     // that joins after the catalog was sent still needs it (MSF section 5):
-    // a draft-22 fill that covers the current catalog group is served on its
+    // a draft-21+ fill that covers the current catalog group is served on its
     // fill fetch stream, and otherwise the unchanged catalog goes out as a
     // new independent group, which a Next Object subscription receives.
     auto send_catalog = [&](std::uint64_t track_alias,
@@ -9168,7 +9169,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
     // `joining` is the catalog SUBSCRIBE being answered, if any. A subscriber
     // that joins after the catalog was sent still needs it (MSF section 5):
-    // a draft-22 fill that covers the current catalog group is served on its
+    // a draft-21+ fill that covers the current catalog group is served on its
     // fill fetch stream, and otherwise the unchanged catalog goes out as a
     // new independent group, which a Next Object subscription receives.
     auto send_catalog = [&](std::uint64_t track_alias,

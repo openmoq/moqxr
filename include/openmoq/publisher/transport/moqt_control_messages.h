@@ -144,8 +144,10 @@ struct SubscribeMessage {
     DeliveryTimeouts delivery_timeouts;
     // Draft-21 FILL_PARAMETERS presence.
     bool fill_requested = false;
-    // Draft 22 only: the subscription's LOCATION_FILTER, and the one inside
+    // Drafts 21 and 22: the subscription's LOCATION_FILTER, and the one inside
     // FILL_PARAMETERS, when present. Together they give the fill range (§3.4).
+    // Draft 21's filter has no type field; the decoder derives the
+    // equivalent draft-22 type from the fields present.
     std::optional<LocationFilterForm> location_filter;
     std::optional<LocationFilterForm> fill_location_filter;
     bool has_unnegotiated_range_filter = false;

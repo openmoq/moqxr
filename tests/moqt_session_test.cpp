@@ -1726,14 +1726,17 @@ std::map<std::uint64_t, std::vector<std::uint64_t>> data_stream_groups(const Moc
 // MoqTransport section 2.5: live stdin publishing numbers media and catalog
 // groups from set_initial_group_id() on every draft, not only on draft-22
 // migration.
-// Draft-22 catalog SUBSCRIBE "interop"/"catalog" with FORWARD=1 and a Next
-// Object LOCATION_FILTER, optionally carrying FILL_PARAMETERS with the given
-// value.
-std::vector<std::uint8_t> encode_draft22_catalog_subscribe(std::uint8_t request_id,
-                                                           std::optional<std::vector<std::uint8_t>> fill) {
+// Draft-21 or draft-22 catalog SUBSCRIBE "interop"/"catalog" with FORWARD=1
+// and a Next Object LOCATION_FILTER, optionally carrying FILL_PARAMETERS with
+// the given value. Draft 22's filter is the Filter Type 5 with no Length;
+// draft 21's is a Length and the two-field Next Object {0, 0}.
+std::vector<std::uint8_t> encode_catalog_subscribe_with_fill(DraftVersion draft, std::uint8_t request_id,
+                                                             std::optional<std::vector<std::uint8_t>> fill) {
     std::vector<std::uint8_t> payload{request_id, 0x01, 0x07, 'i', 'n', 't', 'e', 'r', 'o', 'p',
                                       0x07, 'c', 'a', 't', 'a', 'l', 'o', 'g',
-                                      static_cast<std::uint8_t>(fill ? 3 : 2), 0x10, 0x01, 0x11, 0x05};
+                                      static_cast<std::uint8_t>(fill ? 3 : 2), 0x10, 0x01, 0x11};
+    append_bytes(payload, draft == DraftVersion::kDraft22 ? std::vector<std::uint8_t>{0x05}
+                                                          : std::vector<std::uint8_t>{0x02, 0x00, 0x00});
     if (fill) {
         payload.push_back(0x02);  // FILL_PARAMETERS
         payload.push_back(static_cast<std::uint8_t>(fill->size()));
@@ -1752,24 +1755,27 @@ bool test_live_stdin_catalog_reaches_every_subscriber(const EndpointConfig& endp
     constexpr std::string_view kNamespace = "interop";
     for (const auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22}) {
         const std::string label = openmoq::publisher::to_string(draft) + ": ";
-        const bool draft22 = draft == DraftVersion::kDraft22;
         MockTransport transport;
         transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
         transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
         transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
-        if (draft22) {
-            // A later subscriber with no fill, then one joining the current
-            // group: FILL_PARAMETERS {count 1, LOCATION_FILTER Relative Start 1}.
-            transport.reads[5].push_back(encode_draft22_catalog_subscribe(3, std::nullopt));
-            transport.reads[9].push_back(encode_draft22_catalog_subscribe(5, std::vector<std::uint8_t>{0x01, 0x21, 0x01, 0x01}));
-            // A fill whose range, Absolute Start {5,0}, lies past Largest
-            // Object: the fill range is empty (§3.4), so no fill fetch stream.
-            transport.reads[13].push_back(
-                encode_draft22_catalog_subscribe(7, std::vector<std::uint8_t>{0x01, 0x21, 0x02, 0x05, 0x00}));
-        } else {
-            transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, "catalog", 1, draft));
-        }
+        // A later subscriber with no fill, then one joining the current group:
+        // FILL_PARAMETERS {count 1, LOCATION_FILTER StartGroup 1}. The fill
+        // bytes read the same on both drafts: draft 22's are Filter Type 1 and
+        // StartGroup 1, draft 21's are Length 1 and StartGroup 1.
+        transport.reads[5].push_back(encode_catalog_subscribe_with_fill(draft, 3, std::nullopt));
+        transport.reads[9].push_back(
+            encode_catalog_subscribe_with_fill(draft, 5, std::vector<std::uint8_t>{0x01, 0x21, 0x01, 0x01}));
+        // A fill whose range, Absolute Start {5,0}, lies past Largest Object:
+        // the fill range is empty (§3.4), so no fill fetch stream. Draft 22:
+        // Filter Type 2 {5, 0}; draft 21: Length 2 {5, 0}.
+        transport.reads[13].push_back(
+            encode_catalog_subscribe_with_fill(draft, 7, std::vector<std::uint8_t>{0x01, 0x21, 0x02, 0x05, 0x00}));
+        // A fill starting at the Next Group, StartGroup 0, also lies past
+        // Largest Object.
+        transport.reads[17].push_back(
+            encode_catalog_subscribe_with_fill(draft, 9, std::vector<std::uint8_t>{0x01, 0x21, 0x01, 0x00}));
         MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
         bool ok = expect(session.connect(endpoint, tls).ok, label + "catalog subscribers session connects");
         const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
@@ -1793,12 +1799,11 @@ bool test_live_stdin_catalog_reaches_every_subscriber(const EndpointConfig& endp
         // as a new independent group; the joining fill subscriber gets none.
         const auto groups = data_stream_groups(transport, draft);
         const auto catalog = groups.find(0);
-        const std::vector<std::uint64_t> expected_groups =
-            draft22 ? std::vector<std::uint64_t>{0, 1, 2} : std::vector<std::uint64_t>{0, 1};
+        const std::vector<std::uint64_t> expected_groups{0, 1, 2, 3};
         ok &= expect(catalog != groups.end() && catalog->second == expected_groups,
                      label + "a later catalog subscriber without a fill receives the catalog as a new group");
 
-        if (draft22) {
+        {
             ok &= expect(subscribe_ok_on(9) == encode_subscribe_ok_message(draft, 5, 0, 1, 0, true),
                          label + "the joining catalog SUBSCRIBE_OK reports LARGEST_OBJECT {1,0}");
             const MockTransport::WriteEvent* fill = nullptr;
@@ -1825,6 +1830,13 @@ bool test_live_stdin_catalog_reaches_every_subscriber(const EndpointConfig& endp
                                                      write.bytes[1] == 7;
                                           }),
                          label + "a catalog fill range past Largest Object opens no fill fetch stream");
+            ok &= expect(subscribe_ok_on(17) == encode_subscribe_ok_message(draft, 9, 0, 2, 0, true) &&
+                             std::none_of(transport.writes.begin(), transport.writes.end(),
+                                          [](const auto& write) {
+                                              return write.bytes.size() > 1 && write.bytes[0] == 0x05 &&
+                                                     write.bytes[1] == 9;
+                                          }),
+                         label + "a catalog fill starting at the Next Group opens no fill fetch stream");
         }
         if (!ok) return false;
     }
