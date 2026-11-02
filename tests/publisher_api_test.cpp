@@ -1228,6 +1228,25 @@ int main() {
     }
 
     {
+        // libmoq builds its own catalog, so a video altGroup would be dropped
+        // from it silently; it is refused instead.
+        PublisherConfig config;
+        config.video_alt_group = 1;
+        Publisher publisher(config);  // no injected factory
+
+        EndpointConfig endpoint;
+        endpoint.transport = TransportKind::kRawQuic;
+        endpoint.host = "relay.example.com";
+        endpoint.port = 443;
+
+        std::istringstream input;
+        const TransportStatus status = publisher.publish_live(input, endpoint);
+        ok &= expect(!status.ok, "expected video_alt_group to fail on the libmoq route");
+        ok &= expect(status.message.find("video_alt_group") != std::string::npos,
+                     "expected the libmoq route to name the unsupported video_alt_group");
+    }
+
+    {
         Publisher publisher(PublisherConfig{});  // no injected factory
 
         LiveObjectSource source{

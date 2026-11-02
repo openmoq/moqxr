@@ -260,6 +260,15 @@ std::uint64_t parse_initial_group_id(std::string_view value) {
     return group_id;
 }
 
+std::uint32_t parse_video_alt_group(std::string_view value) {
+    std::uint32_t alt_group = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), alt_group);
+    if (value.empty() || result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        throw std::runtime_error("--video-alt-group must be an unsigned 32-bit integer");
+    }
+    return alt_group;
+}
+
 std::size_t parse_retry_count(std::string_view value) {
     const int retries = parse_strict_int(value, "--retry");
     if (retries < 0) {
@@ -540,6 +549,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
         } else if (argument == "--initial-group-id") {
             options.initial_group_id = parse_initial_group_id(require_value("--initial-group-id"));
             initial_group_id_set = true;
+        } else if (argument == "--video-alt-group") {
+            options.video_alt_group = parse_video_alt_group(require_value("--video-alt-group"));
         } else if (argument == "--drm-config") {
             // Parsed eagerly, not stored as a path: a malformed DRM config
             // must fail before publishing starts rather than publish with
@@ -695,6 +706,15 @@ CliOptions parse_cli_options(int argc, char** argv) {
         throw std::runtime_error(
             "--initial-group-id requires live input (--input -, --live-source srt, or --live-source dash)");
     }
+    // SRT callers are independent sources rather than alternates, and the
+    // LL-DASH ingest already groups its video representations. Without an
+    // endpoint, stdin is read whole and rendered as a batch plan, which does
+    // not take the option either.
+    if (options.video_alt_group &&
+        (!live_source_uses_stdin || options.input_source.kind != InputSourceKind::kStdin ||
+         !options.endpoint.has_value())) {
+        throw std::runtime_error("--video-alt-group requires live stdin publishing (--input - with --endpoint)");
+    }
 
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
         throw std::runtime_error("--alpn and --sni require --endpoint to be provided first");
@@ -779,7 +799,7 @@ std::string build_usage(const char* argv0) {
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
            " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
-           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--drm-config <path>]"
+           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--video-alt-group <N>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--webtransport-allow-missing-reset-stream-at]"
            " [--retry <count>]"

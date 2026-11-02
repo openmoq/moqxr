@@ -270,6 +270,7 @@ int main(int argc, char** argv) {
             .drm_systems = options.drm_systems,
             .catalog_republish_interval = options.catalog_republish_interval,
             .initial_group_id = options.initial_group_id,
+            .video_alt_group = options.video_alt_group,
             .subscriber_timeout = options.subscriber_timeout,
             .authorization = options.authorization,
             .media_packaging = options.media_packaging,

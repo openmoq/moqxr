@@ -188,6 +188,10 @@ transport::TransportStatus prepare_migration(const transport::TransportStatus& s
 // than publish from 0 while the caller expects otherwise.
 constexpr const char* kLibmoqInitialGroupIdUnsupported =
     "initial_group_id is not supported by the libmoq publishing backend";
+// libmoq builds that backend's catalog itself, so a video_alt_group would not
+// reach the published catalog.
+constexpr const char* kLibmoqVideoAltGroupUnsupported =
+    "video_alt_group is not supported by the libmoq publishing backend";
 #endif
 
 void validate_initial_group_id(const PublisherConfig& config) {
@@ -495,6 +499,9 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         if (config_.initial_group_id != 0) {
             return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
         }
+        if (config_.video_alt_group) {
+            return transport::TransportStatus::failure(kLibmoqVideoAltGroupUnsupported);
+        }
         if (stdin_input == nullptr) {
             return transport::TransportStatus::failure("live stdin publish requires an input stream");
         }
@@ -614,6 +621,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
         active->session->set_media_packaging(config_.media_packaging);
         active->session->set_initial_group_id(config_.initial_group_id);
+        active->session->set_video_alt_group(config_.video_alt_group);
 
         if (!set_active_session(active, resolved_endpoint, true)) {
             return transport::TransportStatus::success();

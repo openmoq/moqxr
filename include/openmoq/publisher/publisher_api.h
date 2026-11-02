@@ -107,6 +107,14 @@ struct PublisherConfig {
     // publish_live_objects() sends the Group IDs its source supplies, and the
     // batch publish() path does not use this field.
     std::uint64_t initial_group_id = 0;
+    // MSF section 5.2.12: when set and live stdin input carries two or more
+    // video tracks, publish_live() gives each video track this altGroup,
+    // declaring them alternate versions of the same content. That needs
+    // time-aligned tracks (MSF section 4), which only the caller can know, so
+    // it is never inferred. Unset, the default, writes no altGroup. Audio
+    // tracks, SRT input, publish_live_objects(), and the batch publish() path
+    // do not use this field; the libmoq backend refuses it.
+    std::optional<std::uint32_t> video_alt_group;
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
     cat4moq::AuthorizationConfig authorization;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
