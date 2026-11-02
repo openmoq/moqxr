@@ -3300,7 +3300,8 @@ private:
 template <typename VisitSenders>
 [[nodiscard]] TransportStatus dispatch_peer_stopped_media_streams(
     PublisherTransport& transport,
-    VisitSenders&& visit_senders) {
+    VisitSenders&& visit_senders,
+    bool include_request_streams = false) {
     for (const std::uint64_t stream_id :
          transport.media_stream_expiry_events()) {
         bool owned = false;
@@ -3315,6 +3316,10 @@ template <typename VisitSenders>
     }
     for (const std::uint64_t stream_id :
          transport.media_stream_peer_stop_events()) {
+        // A stop on a request (bidirectional) stream ends its subscription.
+        if ((stream_id & 0x2ULL) == 0 && !include_request_streams) {
+            continue;
+        }
         if (const auto code = transport.media_stream_peer_stop_error(stream_id)) {
             std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
                       << describe_stream_reset_code(*code) << '\n';
@@ -3372,7 +3377,7 @@ template <typename VisitSenders>
 [[nodiscard]] TransportStatus acknowledge_ownerless_peer_stopped_media_streams(
     PublisherTransport& transport) {
     return dispatch_peer_stopped_media_streams(
-        transport, [](const auto&) {});
+        transport, [](const auto&) {}, true);
 }
 
 template <typename SenderMap>
@@ -10903,6 +10908,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             std::pair{subscribe.track_namespace, subscribe.track_name};
         if (draft_version == DraftVersion::kDraft18 &&
             established_subscription_tracks.contains(subscription_key)) {
+            std::cerr << "[moqt-session] live: rejected subscribe track=" << subscribe.track_name
+                      << " request_id=" << subscribe.request_id << ": REQUEST_ERROR 0x19 duplicate subscription\n";
             return transport_.write_stream(
                 response_stream_id,
                 encode_request_error_message(draft_version, subscribe.request_id,
@@ -10997,6 +11004,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return TransportStatus::success();
         }
         const SubscribeMessage ended = std::move(active_it->second);
+        std::cerr << "[moqt-session] live: subscriber ended subscription track=" << ended.track_name
+                  << " request_id=" << request_id << '\n';
         active_subscriptions.erase(active_it);
         active_subscription_stream_ids.erase(request_id);
         pending_subscription_request_bytes.erase(request_id);
@@ -11019,9 +11028,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     };
 
     // Ends each subscription whose request stream the subscriber cancelled,
-    // and resets that stream. Runs before the media stream events, which
-    // would take its STOP_SENDING for an ownerless media stream stop.
-    const auto dispatch_stream_events = [&]() -> TransportStatus {
+    // and resets that stream. Media stream dispatch leaves request-stream
+    // stops to this teardown.
+    const auto end_cancelled_subscriptions = [&]() -> TransportStatus {
         if (uses_request_streams(draft_version)) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> cancelled;
             for (const auto& [request_id, stream_id] : active_subscription_stream_ids) {
@@ -11036,6 +11045,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     cancel_status = transport_.reset_stream(stream_id, kCancelledErrorCode);
                 }
                 if (transport_.media_stream_peer_stopped(stream_id)) {
+                    if (const auto code = transport_.media_stream_peer_stop_error(stream_id)) {
+                        std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
+                                  << describe_stream_reset_code(*code) << '\n';
+                    }
                     transport_.acknowledge_media_stream_peer_stopped(stream_id);
                 }
                 if (!cancel_status.ok) {
@@ -11043,7 +11056,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 }
             }
         }
-        return dispatch_peer_stopped_media_streams(transport_, sender_by_track);
+        return TransportStatus::success();
+    };
+
+    const auto dispatch_stream_events = [&]() -> TransportStatus {
+        const TransportStatus teardown_status = end_cancelled_subscriptions();
+        return teardown_status.ok ? dispatch_peer_stopped_media_streams(transport_, sender_by_track)
+                                  : teardown_status;
     };
 
     const auto apply_subscriber_request_update =
@@ -11244,7 +11263,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                         return write_status.ok ? TransportStatus::failure("peer requested unsupported track namespace")
                                                : write_status;
                     }
-                    TransportStatus subscribe_status = accept_subscribe(subscribe, request_stream_id);
+                    TransportStatus subscribe_status = end_cancelled_subscriptions();
+                    if (subscribe_status.ok) {
+                        subscribe_status = accept_subscribe(subscribe, request_stream_id);
+                    }
                     if (!subscribe_status.ok) {
                         return subscribe_status;
                     }
