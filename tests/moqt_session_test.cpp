@@ -351,6 +351,9 @@ struct MockTransport final : PublisherTransport {
     }
 
     std::vector<std::uint64_t> media_stream_expiry_events() const override {
+        if (on_media_stream_expiry_events) {
+            on_media_stream_expiry_events();
+        }
         return {expired_media_streams.begin(), expired_media_streams.end()};
     }
 
@@ -411,6 +414,8 @@ struct MockTransport final : PublisherTransport {
     std::set<std::uint64_t> expired_media_streams;
     std::vector<std::uint64_t> acknowledged_expired_media_streams;
     std::set<std::uint64_t> peer_stopped_media_streams;
+    // Runs where media dispatch reads peer stops, to inject one there.
+    std::function<void()> on_media_stream_expiry_events;
     std::vector<std::uint64_t> acknowledged_peer_stopped_media_streams;
     std::set<std::uint64_t> failing_reset_streams;
     // RESET_STREAM codes received from the peer, by stream.
@@ -11566,6 +11571,98 @@ int main() {
                              "expected " + label + " to acknowledge the request stream STOP_SENDING");
             }
         }
+    }
+
+    // Draft 18: a STOP_SENDING on the request stream ends the subscription
+    // however it interleaves with the loop: when media dispatch reads it, or
+    // when it arrives with a new SUBSCRIBE for the track in one control read.
+    // Either way, the new SUBSCRIBE gets SUBSCRIBE_OK, and the open subgroup
+    // stream and the request stream are reset with CANCELLED.
+    for (const bool with_subscribe : {false, true}) {
+        constexpr DraftVersion draft = DraftVersion::kDraft18;
+        constexpr std::uint64_t kLastGroup = 30;
+        constexpr std::size_t kIdleControlReads = 6;
+        const std::string label = with_subscribe ? "STOP_SENDING with a new SUBSCRIBE in one control read"
+                                                 : "STOP_SENDING during media dispatch";
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.keep_open_streams = {1, 3, 5};
+        transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "video", 1, draft));
+
+        bool armed = false;
+        bool stopped = false;
+        bool resubscribed = false;
+        std::size_t idle_reads = 0;
+        std::size_t writes_at_resubscribe = 0;
+        std::optional<std::uint64_t> open_subgroup;
+        const auto resubscribe = [&](MockTransport& current) {
+            resubscribed = true;
+            writes_at_resubscribe = current.writes.size();
+            current.reads[5].push_back(encode_subscribe_message(95, kTestTrackNamespace, "video", 1, draft));
+        };
+        transport.on_try_write_object = [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+            if (!armed && !event.bytes.empty() && event.bytes.back() == static_cast<std::uint8_t>('@' + 2)) {
+                armed = true;
+                open_subgroup = event.stream_id;
+                if (with_subscribe) {
+                    resubscribe(current);
+                }
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
+        transport.on_media_stream_expiry_events = [&]() {
+            if (!with_subscribe && armed && !stopped) {
+                stopped = true;
+                transport.peer_stopped_media_streams.insert(1);
+            }
+        };
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (with_subscribe && stream_id == 5 && !stopped) {
+                stopped = true;
+                current.peer_stopped_media_streams.insert(1);
+            }
+            if (!with_subscribe && stopped && !resubscribed && stream_id == 3 &&
+                ++idle_reads >= kIdleControlReads) {
+                resubscribe(current);
+            }
+        };
+
+        std::uint64_t next_group = 1;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (next_group > kLastGroup) {
+                    return std::nullopt;
+                }
+                const std::uint64_t group = next_group++;
+                return LiveObject{.track_name = "video", .group_id = group, .subgroup_id = 0, .object_id = 0,
+                                  .payload = {static_cast<std::uint8_t>('@' + group)},
+                                  .final_in_subgroup = false};
+            },
+            .is_finished = [&]() { return next_group > kLastGroup; },
+        };
+
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                            std::chrono::seconds(5));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected " + label + " connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected " + label + " publish to succeed: " + status.message);
+        ok &= expect(stopped && resubscribed, "expected " + label + " to reach the stop and the new SUBSCRIBE");
+
+        std::optional<std::uint64_t> response;
+        for (std::size_t index = writes_at_resubscribe; index < transport.writes.size() && !response; ++index) {
+            const auto& write = transport.writes[index];
+            const auto type = message_type(write.bytes);
+            if (write.stream_id == 5 && (type == 0x04 || type == 0x05)) {
+                response = type;
+            }
+        }
+        ok &= expect(response == 0x04, "expected " + label + " to answer the new SUBSCRIBE with SUBSCRIBE_OK");
+        ok &= expect(open_subgroup.has_value() && reset_with_cancelled(transport, *open_subgroup),
+                     "expected " + label + " to reset the open subgroup stream with CANCELLED (0x1)");
+        ok &= expect(reset_with_cancelled(transport, 1),
+                     "expected " + label + " to reset the request stream with CANCELLED (0x1)");
     }
 
     // On UNSUBSCRIBE, the publisher resets the open subgroup stream with
