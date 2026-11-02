@@ -1778,7 +1778,9 @@ bool test_live_stdin_groups_per_video_track(const EndpointConfig& endpoint, cons
     constexpr std::string_view kNamespace = "interop";
     constexpr auto draft = DraftVersion::kDraft16;
     constexpr std::uint64_t kInitial = 100;
-    constexpr std::uint8_t kGops = 3;
+    // Two GOPs: the reader can run ahead of the paced sender, and the queue
+    // keeps each track's latest two groups, so a third would race the trim.
+    constexpr std::uint8_t kGops = 2;
     constexpr std::uint8_t kFramesPerGop = 3;
     bool ok = true;
     MockTransport transport;
