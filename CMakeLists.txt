@@ -498,6 +498,11 @@ if(_openmoq_configure_libmoq)
     # Keep libmoq's own test/sim suite out of moqxr's CTest run.
     set(MOQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(MOQ_BUILD_SIM   OFF CACHE BOOL "" FORCE)
+    # moqxr links libmoq's targets in-tree and installs no CMake package of
+    # its own (see below), so it needs no libmoq package either. Generating
+    # one fails here: libmoq exports its adapters, and they link the
+    # picoquic targets this project adds, which are in no export set.
+    set(MOQ_BUILD_PACKAGE_EXPORTS OFF CACHE BOOL "" FORCE)
 
     if(OPENMOQ_HAS_PICOQUIC AND OPENMOQ_USE_SYSTEM_PICOQUIC)
         # libmoq's threaded picoquic helper and managed WebTransport adapter
