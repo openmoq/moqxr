@@ -13,3 +13,6 @@ ffprobe -v error -show_packets -show_entries packet=pts,dts,duration,size,pos,fl
 Expected PTS: 8192,20480,12288,16384; DTS: 0,4096,8192,12288; duration: 4096.
 Packet sizes: 2105,812,537,436; fragmented positions: 921,3026,3838,4375.
 Progressive positions: 48,2153,2965,3502. First packet is IDR; remaining packets depend on it.
+
+Irregular first video sample fixture (FFmpeg libx264 zerolatency video with AAC audio, 64x64 at 30 fps, 0.4 s). With the audio track, FFmpeg writes the first video sample duration as 840 and the rest as 512 at timescale 15360, so a frame rate taken from the first sample alone is 18.286 instead of 30:
+ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=64x64:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 0.4 -c:v libx264 -tune zerolatency -g 30 -pix_fmt yuv420p -c:a aac -b:a 32k -movflags empty_moov+default_base_moof+separate_moof+frag_keyframe -frag_duration 33333 -f mp4 tests/fixtures/irregular-first-sample.mp4
