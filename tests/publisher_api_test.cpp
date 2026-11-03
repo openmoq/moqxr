@@ -1359,8 +1359,32 @@ int main() {
     // connection, so it is not exercised here -- the injected-factory cases above
     // already cover the old path, and they force it regardless of the gate).
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+    // libmoq publishes drafts 16 and 18 only; the draft-22 default publishes
+    // through MoqtSession even in libmoq builds, so these cases pin draft 18.
+    const auto libmoq_config = [] {
+        PublisherConfig config;
+        config.draft_version = DraftVersion::kDraft18;
+        return config;
+    };
     {
+        // The default draft skips the libmoq route: a bare track that the
+        // libmoq media-metadata gate would refuse reaches transport creation.
         Publisher publisher(PublisherConfig{});  // no injected factory
+
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = []() { return std::nullopt; },
+        };
+
+        EndpointConfig endpoint;
+        endpoint.transport = static_cast<TransportKind>(0xff);
+
+        const TransportStatus status = publisher.publish_live_objects(source, endpoint);
+        ok &= expect(!status.ok && status.message == "failed to create requested transport",
+                     "expected the default draft to publish through MoqtSession in libmoq builds");
+    }
+    {
+        Publisher publisher(libmoq_config());  // no injected factory
 
         LiveObjectSource source{
             .tracks = {LiveTrack{.track_name = "events"}},
@@ -1381,7 +1405,7 @@ int main() {
     {
         // libmoq runs its own WebTransport client, so the reset_stream_at
         // opt-out would be silently ignored; it is refused instead.
-        Publisher publisher(PublisherConfig{});  // no injected factory
+        Publisher publisher(libmoq_config());  // no injected factory
 
         LiveObjectSource source{
             .tracks = {LiveTrack{.track_name = "events"}},
@@ -1405,7 +1429,7 @@ int main() {
     {
         // libmoq builds its own catalog, so a video altGroup would be dropped
         // from it silently; it is refused instead.
-        PublisherConfig config;
+        PublisherConfig config = libmoq_config();
         config.video_alt_group = 1;
         Publisher publisher(config);  // no injected factory
 
@@ -1422,7 +1446,7 @@ int main() {
     }
 
     {
-        Publisher publisher(PublisherConfig{});  // no injected factory
+        Publisher publisher(libmoq_config());  // no injected factory
 
         LiveObjectSource source{
             .tracks = {
