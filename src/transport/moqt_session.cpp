@@ -8605,7 +8605,10 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         discovery_requests.retain(namespace_stream_id_, 0x06, {}, 0);
     process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
         // PUBLISH-initiated subscriptions are in active_subscriptions too, so
-        // a track the PUBLISH still forwards stays forwarded.
+        // a track the PUBLISH still forwards stays forwarded. Their request
+        // streams are in published_stream_ids rather than
+        // active_subscription_stream_ids, so a STOP_SENDING on one is not
+        // matched here yet.
         TransportStatus teardown_status = TransportStatus::success();
         for (const auto& ended : end_peer_stopped_subscriptions(
                  transport_, draft_version, active_subscriptions, active_subscription_stream_ids,
