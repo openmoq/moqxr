@@ -1008,8 +1008,8 @@ TransportStatus WebTransportClient::configure(const EndpointConfig& endpoint, co
     endpoint_ = endpoint;
     impl_->datagram_draft = DraftVersion::kDraft14;
     const auto& protocol = endpoint.application_protocol;
-    for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft17,
-                             DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+    for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18,
+                             DraftVersion::kDraft21, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
         const auto alpn = default_alpn(draft);
         if (protocol == alpn || protocol == "\"" + alpn + "\"") {
             impl_->datagram_draft = draft;

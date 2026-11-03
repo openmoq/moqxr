@@ -56,8 +56,9 @@ struct LiveIngestOptions {
     bool use_stdin = false;
     std::vector<std::uint8_t> resume_bytes;
     std::uint64_t resume_group_floor = 0;
-    // Draft-22 migration only, like resume_group_floor: the first catalog
-    // Group ID the new session may use (live_resume_catalog_group_floor()).
+    // Like resume_group_floor, set by a draft-22 migration or a retry: the
+    // first catalog Group ID the new session may use
+    // (live_resume_catalog_group_floor()).
     std::uint64_t resume_catalog_group_floor = 0;
     std::vector<LiveSrtCallerOptions> srt_callers;
 };
@@ -166,6 +167,11 @@ public:
         preannounce_tracks_ = enabled;
     }
 
+    // See PublisherConfig::await_subscriber_indefinitely.
+    void set_await_subscriber_indefinitely(bool enabled) {
+        await_subscriber_indefinitely_ = enabled;
+    }
+
     void set_media_packaging(MediaPackaging packaging) { media_packaging_ = packaging; }
 
     // See PublisherConfig::initial_group_id. publish_live() numbers live media
@@ -173,11 +179,14 @@ public:
     // a larger migration floor still wins. Above kMaxGroupId it fails.
     void set_initial_group_id(std::uint64_t group_id) { initial_group_id_ = group_id; }
 
+    // See PublisherConfig::video_alt_group. Live stdin only: SRT callers are
+    // independent sources, not alternates of one another.
+    void set_video_alt_group(std::optional<std::uint32_t> alt_group) { video_alt_group_ = alt_group; }
+
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
-    TransportStatus apply_live_group_floors(openmoq::publisher::DraftVersion draft_version,
-                                            std::uint64_t resume_group_floor,
+    TransportStatus apply_live_group_floors(std::uint64_t resume_group_floor,
                                             std::uint64_t resume_catalog_group_floor);
     void record_published_object(const std::string& track_name,
                                  std::uint64_t group_id,
@@ -203,12 +212,20 @@ private:
                                          std::size_t* streams_opened = nullptr);
     void remember_catalog_delivery_timeouts(DeliveryTimeouts delivery_timeouts);
     DeliveryTimeouts catalog_delivery_timeouts_snapshot() const;
+    // Draft-22 §3.4: serves a catalog SUBSCRIBE's fill from the last catalog
+    // object sent, on a fill fetch stream that ends with FIN. served is false
+    // when no fill is owed: not draft 22, no FILL_PARAMETERS, Forward 0, no
+    // catalog sent yet, or a fill range without the current catalog group.
+    TransportStatus serve_catalog_fill(openmoq::publisher::DraftVersion draft_version,
+                                       const SubscribeMessage& subscribe,
+                                       bool& served);
 
     PublisherTransport& transport_;
     std::string track_namespace_;
     bool auto_forward_ = false;
     bool publish_catalog_ = false;
     bool preannounce_tracks_ = false;
+    bool await_subscriber_indefinitely_ = false;
     bool paced_ = false;
     bool loop_ = false;
     std::chrono::seconds subscriber_timeout_ = std::chrono::seconds(30);
@@ -229,6 +246,7 @@ private:
     std::vector<std::uint8_t> live_resume_bytes_;
     std::uint64_t live_resume_group_floor_ = 0;
     std::uint64_t initial_group_id_ = 0;
+    std::optional<std::uint32_t> video_alt_group_;
     std::unordered_map<std::string, std::uint64_t> last_group_by_track_;
     std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> largest_sent_by_track_;
     std::atomic<bool> stop_requested_{false};
@@ -259,6 +277,11 @@ private:
     bool catalog_track_alias_known_ = false;
     mutable std::mutex catalog_delivery_timeouts_mutex_;
     DeliveryTimeouts catalog_delivery_timeouts_;
+    // The catalog object most recently sent. Catalogs are only ever sent
+    // independent (object 0 of a new group), so it is the whole current
+    // catalog group, which a joining subscriber's fill asks for.
+    mutable std::mutex last_catalog_object_mutex_;
+    std::optional<openmoq::publisher::CatalogObject> last_catalog_object_;
 };
 
 }  // namespace openmoq::publisher::transport

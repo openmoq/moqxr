@@ -43,7 +43,7 @@ struct DrmSystemConfig {
 };
 
 struct PublisherConfig {
-    DraftVersion draft_version = DraftVersion::kDraft18;
+    DraftVersion draft_version = DraftVersion::kDraft22;
     std::string track_namespace = "media";
     bool forward = false;
     bool publish_catalog = false;
@@ -107,7 +107,26 @@ struct PublisherConfig {
     // publish_live_objects() sends the Group IDs its source supplies, and the
     // batch publish() path does not use this field.
     std::uint64_t initial_group_id = 0;
+    // MSF section 5.2.12: when set and live stdin input carries two or more
+    // video tracks, publish_live() gives each video track this altGroup,
+    // declaring them alternate versions of the same content. That needs
+    // time-aligned tracks (MSF section 4), which only the caller can know, so
+    // it is never inferred. Unset, the default, writes no altGroup. Audio
+    // tracks, SRT input, publish_live_objects(), and the batch publish() path
+    // do not use this field; the libmoq backend refuses it.
+    std::optional<std::uint32_t> video_alt_group;
+    // Bounds the wait for the first subscriber, and each read of a request
+    // message on a request stream.
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
+    // publish_live_objects() on the MoqtSession backend: wait for the first
+    // subscriber without a deadline instead of returning once
+    // subscriber_timeout has passed. subscriber_timeout still bounds request
+    // stream reads. Whatever this is set to, the deadline never applies after
+    // the first subscriber: the last subscriber leaving does not end a live
+    // publish, which keeps reading its source and ends with it. The libmoq
+    // backend refuses this setting, and the publish_live() overloads (stdin,
+    // SRT) ignore it.
+    bool await_subscriber_indefinitely = false;
     cat4moq::AuthorizationConfig authorization;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
 };
@@ -162,6 +181,19 @@ struct LiveIngestConfig {
     std::vector<LiveSrtCaller> srt_callers;
 };
 
+// Carries a live publish across retries of the same input. publish_live()
+// fills it when a session fails and reads it on the next call, so a retry
+// resumes the way a draft-22 GOAWAY migration does: stdin replays the init
+// segment and unsent media, and media and catalog Group IDs continue above
+// the last ones sent instead of restarting at initial_group_id
+// (MoqTransport section 2.5). publish_live() clears it after a successful
+// publish. Pass the same object to every attempt on one input.
+struct LiveResumeState {
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t group_floor = 0;
+    std::uint64_t catalog_group_floor = 0;
+};
+
 class Publisher {
 public:
     using TransportFactory = std::function<std::unique_ptr<transport::PublisherTransport>(transport::TransportKind)>;
@@ -198,7 +230,8 @@ public:
                                             std::istream* stdin_input,
                                             const transport::EndpointConfig& endpoint,
                                             const transport::TlsConfig& tls = {},
-                                            bool endpoint_alpn_overridden = false) const;
+                                            bool endpoint_alpn_overridden = false,
+                                            LiveResumeState* resume = nullptr) const;
     transport::TransportStatus publish_live_objects(const LiveObjectSource& source,
                                                     const transport::EndpointConfig& endpoint,
                                                     const transport::TlsConfig& tls = {},
@@ -249,12 +282,15 @@ private:
     void clear_active_session(const std::shared_ptr<ActiveSession>& active,
                               bool connected,
                               const std::string& last_error) const;
+    // Whether a publish goes to the libmoq backend: in libmoq builds, with no
+    // injected TransportFactory, for a draft libmoq speaks (16 or 18).
+    bool routes_to_libmoq() const;
 
     PublisherConfig config_;
     TransportFactory transport_factory_;
     // True when the caller injected a custom TransportFactory (e.g. a test
-    // mock). When false and libmoq is available, batch publishing prefers the
-    // libmoq service-tier path over the local MoqtSession transport.
+    // mock). When false and libmoq is available, publishing on drafts 16 and
+    // 18 prefers the libmoq service-tier path over the local MoqtSession.
     bool transport_factory_injected_ = false;
     mutable std::mutex state_mutex_;
     mutable std::shared_ptr<ActiveSession> active_session_;

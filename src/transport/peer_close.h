@@ -32,6 +32,8 @@ struct PeerClose {
 // (TOO_MANY_REQUESTS in 14/16, INVALID_REQUIRED_REQUEST_ID in 17, unassigned
 // in 18+), which is left unnamed. Draft-21 retires 0x15 and adds 0x1B; neither
 // collides with another draft's meaning, so one table serves every draft.
+// Draft-23 renames 0x6 MALFORMED_KEY_VALUE (same meaning) and adds the
+// 0x200-0x401 codes, which no earlier draft assigns.
 // Empty for unknown or greasing codes.
 inline std::string_view moqt_termination_code_name(std::uint64_t code) {
     switch (code) {
@@ -56,6 +58,19 @@ inline std::string_view moqt_termination_code_name(std::uint64_t code) {
         case 0x19: return "INVALID_AUTHORITY";
         case 0x1A: return "MALFORMED_AUTHORITY";
         case 0x1B: return "TOO_MANY_REQUEST_UPDATES";
+        case 0x200: return "INVALID_STREAM_HEADER";
+        case 0x201: return "MALFORMED_OBJECT";
+        case 0x202: return "INVALID_OBJECT_STATUS";
+        case 0x203: return "TRUNCATED_OBJECT";
+        case 0x300: return "MALFORMED_MESSAGE";
+        case 0x301: return "INVALID_FIELD";
+        case 0x302: return "INVALID_TRACK_NAMESPACE";
+        case 0x303: return "UNEXPECTED_MESSAGE";
+        case 0x304: return "ROLE_VIOLATION";
+        case 0x305: return "INVALID_PARAMETER";
+        case 0x306: return "CLOSED_CONTROL_STREAM";
+        case 0x400: return "DELTA_ENCODING_OVERFLOW";
+        case 0x401: return "FIELD_LENGTH_EXCEEDED";
         default: return {};
     }
 }

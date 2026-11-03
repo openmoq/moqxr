@@ -779,7 +779,8 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
                                bool is_live,
-                               const std::vector<DrmSystemConfig>& drm_systems) {
+                               const std::vector<DrmSystemConfig>& drm_systems,
+                               std::optional<std::uint32_t> video_alt_group) {
     LiveCatalog result;
 
     // Build per-track init segments (single-track moov), matching the static file publish path.
@@ -818,8 +819,16 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
         any_track_protected ? collect_pssh_systems(init_segment) : std::vector<CencSystem>{};
     std::vector<std::string> protected_schemes;
 
+    // One video track has no alternates, so it gets no altGroup, as in the
+    // LL-DASH ingest's catalog.
+    const auto video_track_count = std::count_if(
+        tracks.begin(), tracks.end(), [](const TrackDescription& track) { return track.handler_type == "vide"; });
+
     for (const auto& track : tracks) {
         MsfTrack msf_track = make_msf_track(track, is_live);
+        if (video_alt_group && video_track_count > 1 && track.handler_type == "vide") {
+            msf_track.alt_group = *video_alt_group;
+        }
 
         const auto init_it = init_data_by_track.find(track.track_name);
         if (init_it != init_data_by_track.end()) {

@@ -2,7 +2,9 @@
 
 #include "openmoq/publisher/object_properties.h"
 
+#include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -93,10 +95,16 @@ struct LiveCatalog {
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
                                bool is_live = true);
+// video_alt_group: MSF section 5.2.12 altGroup for every video track when
+// there are two or more of them. Alternate tracks represent the same content
+// and must be time-aligned, which the init segment cannot show, so the caller
+// asserts it; unset, the default, writes no altGroup. Audio tracks never get
+// one.
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
                                bool is_live,
-                               const std::vector<DrmSystemConfig>& drm_systems);
+                               const std::vector<DrmSystemConfig>& drm_systems,
+                               std::optional<std::uint32_t> video_alt_group = std::nullopt);
 
 // Base64-encoded, track-specific CMAF init segment (ftyp + single-track moov)
 // for the track at track_index within init_segment. This is exactly the value

@@ -38,7 +38,16 @@ publisher::DraftVersion parse_draft(const std::string& value) {
     if (value == "18") {
         return publisher::DraftVersion::kDraft18;
     }
-    throw std::runtime_error("--draft must be one of: 14, 16, 17, 18");
+    if (value == "21") {
+        return publisher::DraftVersion::kDraft21;
+    }
+    if (value == "22") {
+        return publisher::DraftVersion::kDraft22;
+    }
+    if (value == "23") {
+        return publisher::DraftVersion::kDraft23;
+    }
+    throw std::runtime_error("--draft must be one of: 14, 16, 17, 18, 21, 22, 23");
 }
 
 }  // namespace
@@ -108,7 +117,7 @@ std::string msfts_usage(const char* executable) {
     return std::string("Usage: ") + executable +
            " --input FILE [--endpoint URL] [--namespace NAME] [--track NAME]\n"
            "       [--program NUMBER] [--packets-per-object COUNT]\n"
-           "       [--draft 14|16|17|18] [--insecure]\n";
+           "       [--draft 14|16|17|18|21|22|23] [--insecure]\n";
 }
 
 }  // namespace openmoq::examples::msfts

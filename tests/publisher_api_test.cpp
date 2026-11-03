@@ -149,6 +149,7 @@ struct MigrationTransport final : PublisherTransport {
         std::atomic<bool> closed{false};
         std::atomic<int> close_calls{0};
         std::atomic<std::uint64_t> close_code{0};
+        std::atomic<std::uint64_t> first_close_code{0};
         std::atomic<std::size_t> writes_after_close{0};
         std::vector<std::uint8_t> written_bytes;
         std::vector<std::uint64_t> media_groups;
@@ -164,8 +165,15 @@ struct MigrationTransport final : PublisherTransport {
     std::shared_ptr<MediaInputGate> media_gate;
     // Runs just before read_stream reports the GOAWAY.
     std::function<void()> before_goaway;
+    // Instead of a GOAWAY, open a request stream carrying a SUBSCRIBE whose
+    // parameters do not decode (§9.20: PROTOCOL_VIOLATION).
+    bool invalid_subscribe = false;
+    bool invalid_subscribe_sent = false;
+    static constexpr std::uint64_t kInvalidSubscribeStream = 101;
     bool setup_read = false;
     std::uint64_t next_stream = 0;
+    // The draft the relay answers SETUP and requests with.
+    DraftVersion draft = DraftVersion::kDraft22;
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override {
         record->endpoint = endpoint;
         record->tls = tls;
@@ -189,6 +197,17 @@ struct MigrationTransport final : PublisherTransport {
             stream = 3;
             return TransportStatus::success();
         }
+        if (direction == StreamDirection::kBidirectional && invalid_subscribe && !invalid_subscribe_sent &&
+            source_reads && *source_reads >= migration_threshold) {
+            invalid_subscribe_sent = true;
+            if (media_gate) {
+                std::lock_guard lock(media_gate->mutex);
+                media_gate->released = true;
+                media_gate->condition.notify_all();
+            }
+            stream = kInvalidSubscribeStream;
+            return TransportStatus::success();
+        }
         return TransportStatus::failure("timed out waiting for stream data");
     }
     TransportStatus write_stream(std::uint64_t stream, std::span<const std::uint8_t> bytes, bool) override {
@@ -202,7 +221,7 @@ struct MigrationTransport final : PublisherTransport {
             if (!decode_vi64(bytes,offset,type) || !decode_vi64(bytes,offset,alias) || !decode_vi64(bytes,offset,group))
                 return TransportStatus::failure("malformed test media header");
             record->media_groups.push_back(group);
-            if (target) {
+            if (target || invalid_subscribe) {
                 *source_reads=1;
 
             }
@@ -218,12 +237,22 @@ struct MigrationTransport final : PublisherTransport {
         }
         if (stream == 3 && !setup_read) {
             setup_read = true;
-            bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = DraftVersion::kDraft22});
+            bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = draft});
+            return TransportStatus::success();
+        }
+        if (stream == kInvalidSubscribeStream) {
+            // SUBSCRIBE "interop"/"catalog" with one parameter of unknown
+            // type 0x3E.
+            const std::vector<std::uint8_t> payload{
+                0x01, 0x01, 0x07, 'i', 'n', 't', 'e', 'r', 'o', 'p', 0x07, 'c', 'a', 't', 'a', 'l', 'o', 'g',
+                0x01, 0x3e, 0x00};
+            bytes = {0x03, 0x00, static_cast<std::uint8_t>(payload.size())};
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
             return TransportStatus::success();
         }
         if (source_reads) {
             if (request_responses.erase(stream)) {
-                bytes = openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft22, 0);
+                bytes = openmoq::publisher::transport::encode_request_ok_message(draft, 0);
                 return TransportStatus::success();
             }
             if (stream != 3 || !target || *source_reads < migration_threshold) {
@@ -251,7 +280,7 @@ struct MigrationTransport final : PublisherTransport {
     std::string connection_id() const override { return "migration-test"; }
     TransportStatus close(std::uint64_t application_error_code) override {
         record->close_code = application_error_code;
-        ++record->close_calls;
+        if (record->close_calls++ == 0) record->first_close_code = application_error_code;
         record->closed = true;
         return TransportStatus::success();
     }
@@ -261,6 +290,8 @@ struct MigrationTransport final : PublisherTransport {
 // closed, as picoquic does while a live publish waits for its first
 // subscriber. After close() a read reports the closed connection. close()
 // counts its calls and holds for a moment, as picoquic's close drain does.
+// With answer_namespace, the relay accepts PUBLISH_NAMESPACE, on the first
+// bidirectional stream, with REQUEST_OK.
 struct ClosingTransport final : PublisherTransport {
     struct Record {
         std::atomic<int> close_calls{0};
@@ -272,6 +303,9 @@ struct ClosingTransport final : PublisherTransport {
         std::atomic<bool> hold_connect{false};
         std::atomic<bool> connecting{false};
         std::atomic<bool> closed_during_connect{false};
+        bool answer_namespace = false;
+        std::optional<std::uint64_t> namespace_stream;
+        bool namespace_answered = false;
     };
     explicit ClosingTransport(std::shared_ptr<Record> record) : record(std::move(record)) { ++this->record->transports; }
     std::shared_ptr<Record> record;
@@ -291,9 +325,12 @@ struct ClosingTransport final : PublisherTransport {
     ConnectionState state() const override {
         return record->closed ? ConnectionState::kClosed : ConnectionState::kConnected;
     }
-    TransportStatus open_stream(StreamDirection, std::uint64_t& stream) override {
+    TransportStatus open_stream(StreamDirection direction, std::uint64_t& stream) override {
         stream = next_stream;
         next_stream += 4;
+        if (direction == StreamDirection::kBidirectional && !record->namespace_stream) {
+            record->namespace_stream = stream;
+        }
         return TransportStatus::success();
     }
     TransportStatus accept_stream(StreamDirection direction, std::uint64_t& stream,
@@ -314,6 +351,11 @@ struct ClosingTransport final : PublisherTransport {
         if (stream == 3 && !record->setup_read) {
             bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = DraftVersion::kDraft22});
             record->setup_read = true;
+            return TransportStatus::success();
+        }
+        if (record->answer_namespace && stream == record->namespace_stream && !record->namespace_answered) {
+            bytes = openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft22, 0);
+            record->namespace_answered = true;
             return TransportStatus::success();
         }
         return idle();
@@ -589,8 +631,57 @@ bool test_disconnect_stops_live_stdin_on_idle_input(bool send_init, bool forward
 }
 #endif
 
+// PublisherConfig::await_subscriber_indefinitely reaches the session: with a
+// 1 s subscriber_timeout and no subscriber, the live publish is still waiting
+// after 2 s, until disconnect(). Without it, the publish ends at the timeout.
+bool test_await_subscriber_indefinitely_outlasts_subscriber_timeout() {
+    bool ok = true;
+    for (const bool indefinitely : {false, true}) {
+        PublisherConfig config;
+        config.draft_version = DraftVersion::kDraft22;
+        config.track_namespace = "app";
+        config.subscriber_timeout = std::chrono::seconds(1);
+        config.await_subscriber_indefinitely = indefinitely;
+        auto record = std::make_shared<ClosingTransport::Record>();
+        record->answer_namespace = true;
+        Publisher publisher(config, [record](TransportKind) -> std::unique_ptr<PublisherTransport> {
+            return std::make_unique<ClosingTransport>(record);
+        });
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "video"}},
+            .next_object = []() -> std::optional<LiveObject> {
+                return LiveObject{.track_name = "video", .payload = {0x00}};
+            },
+        };
+        EndpointConfig endpoint;
+        endpoint.transport = TransportKind::kRawQuic;
+        endpoint.host = "relay.example";
+        endpoint.port = 443;
+
+        std::atomic<bool> returned{false};
+        std::thread publishing([&] {
+            static_cast<void>(publisher.publish_live_objects(source, endpoint));
+            returned = true;
+        });
+        // Without the setting the publish ends at the 1 s timeout; allow a
+        // slow machine 5 s. With it, it still waits 1 s past the timeout.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(indefinitely ? 2 : 5);
+        while (!returned.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const bool waiting = !returned.load();
+        static_cast<void>(publisher.disconnect(0));
+        publishing.join();
+        ok &= expect(waiting == indefinitely,
+                     std::string("expected a live publish with await_subscriber_indefinitely=") +
+                         (indefinitely ? "true to still wait" : "false to end") + " after the 1 s subscriber timeout");
+    }
+    return ok;
+}
+
 bool test_goaway_recreates_publisher_transport() {
     bool ok = true;
+    for (const auto draft : {DraftVersion::kDraft22, DraftVersion::kDraft23})
     for (const auto kind : {TransportKind::kRawQuic, TransportKind::kWebTransport}) {
         for (const auto& target :
              {std::string(),
@@ -599,17 +690,19 @@ bool test_goaway_recreates_publisher_transport() {
               kind == TransportKind::kRawQuic ? std::string("https://relay-next.example:4443/moq-next?q=1")
                                               : std::string("moqt://relay-next.example:4443/moq-next?q=1")}) {
             PublisherConfig config;
-            config.draft_version = DraftVersion::kDraft22;
+            config.draft_version = draft;
             config.authorization.setup_credential = openmoq::publisher::cat4moq::Credential{{0xde, 0xad, 0xbe, 0xef}};
             std::vector<std::shared_ptr<MigrationTransport::Record>> records;
             Publisher publisher(config, [&](TransportKind) -> std::unique_ptr<PublisherTransport> {
                 auto record = std::make_shared<MigrationTransport::Record>();
                 records.push_back(record);
-                return std::make_unique<MigrationTransport>(record,
-                                                            records.size() == 1 ? std::optional(target) : std::nullopt);
+                auto transport = std::make_unique<MigrationTransport>(
+                    record, records.size() == 1 ? std::optional(target) : std::nullopt);
+                transport->draft = draft;
+                return transport;
             });
             PreparedPublish prepared;
-            prepared.plan.draft = draft_profile(DraftVersion::kDraft22);
+            prepared.plan.draft = draft_profile(draft);
             EndpointConfig endpoint;
             endpoint.transport = kind;
             endpoint.host = "relay.example";
@@ -636,7 +729,7 @@ bool test_goaway_recreates_publisher_transport() {
                              records[1]->tls.private_key_path == tls.private_key_path &&
                              records[1]->endpoint.alpn == (target.empty()                   ? records[0]->endpoint.alpn
                                                            : target.starts_with("https://") ? "h3"
-                                                                                            : "moqt-22"),
+                                                                                            : default_alpn(draft)),
                          "migration retains TLS client credentials and protocol offer");
             ok &= expect(records[1]->endpoint.transport == (target.empty() ? kind
                                                             : target.starts_with("https://")
@@ -906,6 +999,85 @@ bool test_live_stdin_migration_keeps_object_identity(std::uint64_t initial_group
     return ok;
 }
 
+
+// A peer SUBSCRIBE that does not decode closes the session with
+// PROTOCOL_VIOLATION, as §9.20 requires. The publisher then retries the live
+// publish; the retry replays the stdin input and keeps its Group IDs
+// above those of the failed session (MoqTransport section 2.5) instead of
+// restarting at the initial Group ID.
+bool test_live_stdin_retry_after_protocol_violation_resumes(std::uint64_t initial_group_id) {
+    const auto path=std::filesystem::path(__FILE__).parent_path()/"fixtures"/"locmaf-publisher.mp4";
+    std::ifstream file(path,std::ios::binary);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)),{});
+    const auto boxes=openmoq::publisher::parse_mp4_boxes(bytes);
+    std::vector<std::uint8_t> init,first,remaining;
+    bool saw_first=false;
+    for (const auto& box:boxes) {
+        if (box.type=="ftyp" || box.type=="moov") init.insert(init.end(),bytes.begin()+box.span.offset,bytes.begin()+box.span.offset+box.span.size);
+        if (box.type=="moof" || box.type=="mdat") {
+            auto& destination=saw_first ? remaining : first;
+            destination.insert(destination.end(),bytes.begin()+box.span.offset,bytes.begin()+box.span.offset+box.span.size);
+            if (box.type=="mdat") saw_first=true;
+        }
+    }
+    remaining.insert(remaining.end(),first.begin(),first.end());
+    const auto pad=[](std::vector<std::uint8_t>& chunk) {
+        const std::size_t size=16384-chunk.size();
+        chunk.insert(chunk.end(),{static_cast<std::uint8_t>(size>>24),static_cast<std::uint8_t>(size>>16),
+                                 static_cast<std::uint8_t>(size>>8),static_cast<std::uint8_t>(size),'f','r','e','e'});
+        chunk.resize(16384);
+    };
+    if (!expect(!init.empty() && !first.empty() && !remaining.empty() && init.size()<16376 && first.size()<16376 &&
+                remaining.size()<16384,"staged stdin retry fixture has bounded complete chunks")) return false;
+    pad(init);pad(first);
+    auto gate=std::make_shared<MediaInputGate>();
+    StagedMediaInputBuffer buffer(std::move(init),std::move(first),std::move(remaining),gate);
+    std::istream input(&buffer);
+    auto ready=std::make_shared<std::size_t>(0);
+    std::vector<std::shared_ptr<MigrationTransport::Record>> records;
+    PublisherConfig config;config.draft_version=DraftVersion::kDraft22;config.forward=true;
+    config.subscriber_timeout=std::chrono::seconds(1);config.initial_group_id=initial_group_id;
+    Publisher publisher(config,[&](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        auto record=std::make_shared<MigrationTransport::Record>();records.push_back(record);
+        auto transport=std::make_unique<MigrationTransport>(record,std::nullopt);
+        transport->source_reads=ready;transport->migration_threshold=1;transport->media_gate=gate;
+        transport->invalid_subscribe=records.size()==1;
+        return transport;
+    });
+    EndpointConfig endpoint;endpoint.host="first.example";endpoint.port=443;
+    const std::vector<EndpointConfig> endpoints{endpoint};
+    openmoq::publisher::LiveResumeState resume;
+    openmoq::publisher::LiveIngestConfig ingest;ingest.use_stdin=true;
+    std::vector<TransportStatus> attempts;
+    const auto status=openmoq::publisher::publish_with_failover(
+        endpoints, 1,
+        [&](const EndpointConfig& attempt_endpoint) {
+            attempts.push_back(publisher.publish_live(ingest,&input,attempt_endpoint,{},false,&resume));
+            return attempts.back();
+        },
+        {}, {});
+    const std::string label="initial Group ID "+std::to_string(initial_group_id)+": ";
+    bool ok=expect(status.ok,label+"live publish retried after PROTOCOL_VIOLATION completes: "+status.message);
+    ok &= expect(attempts.size()==2 &&
+                     attempts[0].failure_kind==openmoq::publisher::transport::FailureKind::kRetryable,
+                 label+"a peer PROTOCOL_VIOLATION is a retryable live publish failure");
+    ok &= expect(records.size()==2 && records[0]->first_close_code==3,
+                 label+"an undecodable SUBSCRIBE closes the first session with PROTOCOL_VIOLATION");
+    // The init segment was read by the first session, so the retry can only
+    // publish media if it was replayed from the resume state.
+    ok &= expect(records.size()==2 && !records[0]->media_groups.empty() && !records[1]->media_groups.empty(),
+                 label+"media is published before and after the retry");
+    if (records.size()==2 && !records[0]->media_groups.empty()) {
+        ok &= expect(records[0]->media_groups.front()==initial_group_id,
+                     label+"the first session starts at the initial Group ID");
+        for (const auto group:records[1]->media_groups)
+            ok &= expect(group>records[0]->media_groups.back(),
+                         label+"the retry must not reuse or go below the failed session's Group IDs");
+    }
+    ok &= expect(resume.bytes.empty() && resume.group_floor==0,
+                 label+"a successful publish clears the resume state");
+    return ok;
+}
 }  // namespace
 
 int main() {
@@ -914,11 +1086,14 @@ int main() {
     ok &= test_disconnect_during_publish_is_not_retried();
     ok &= test_disconnect_during_connect_waits_for_connect();
     ok &= test_disconnect_does_not_follow_goaway();
+    ok &= test_live_stdin_retry_after_protocol_violation_resumes(0);
+    ok &= test_live_stdin_retry_after_protocol_violation_resumes(1000);
 #if !defined(_WIN32)
     ok &= test_disconnect_stops_live_stdin_on_idle_input(false, true);
     ok &= test_disconnect_stops_live_stdin_on_idle_input(true, true);
     ok &= test_disconnect_stops_live_stdin_on_idle_input(true, false);
 #endif
+    ok &= test_await_subscriber_indefinitely_outlasts_subscriber_timeout();
     ok &= test_goaway_migration_bound_and_uri_validation();
     ok &= test_live_source_goaway_continues_and_replays_catalog();
     ok &= test_live_source_goaway_continues_and_replays_catalog(true);
@@ -926,8 +1101,8 @@ int main() {
     ok &= test_live_stdin_goaway_replays_parser_residual();
     ok &= test_live_stdin_migration_keeps_object_identity();
     ok &= test_live_stdin_migration_keeps_object_identity(1700000000000ULL);
-    ok &= expect(PublisherConfig{}.draft_version == DraftVersion::kDraft18,
-                 "publisher API defaults to draft-18");
+    ok &= expect(PublisherConfig{}.draft_version == DraftVersion::kDraft22,
+                 "publisher API defaults to draft-22");
 
     {
         PublisherConfig invalid;
@@ -1084,7 +1259,7 @@ int main() {
                      "expected draft-18 webtransport to offer a structured WT protocol token");
     }
 
-    for (const auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+    for (const auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
         for (const TransportKind kind : {TransportKind::kWebTransport, TransportKind::kRawQuic}) {
             PublisherConfig config;
             config.draft_version = draft;
@@ -1225,6 +1400,25 @@ int main() {
         ok &= expect(!status.ok, "expected the reset_stream_at opt-out to fail on the libmoq route");
         ok &= expect(status.message.find("--webtransport-allow-missing-reset-stream-at") != std::string::npos,
                      "expected the libmoq route to name the unsupported reset_stream_at opt-out");
+    }
+
+    {
+        // libmoq builds its own catalog, so a video altGroup would be dropped
+        // from it silently; it is refused instead.
+        PublisherConfig config;
+        config.video_alt_group = 1;
+        Publisher publisher(config);  // no injected factory
+
+        EndpointConfig endpoint;
+        endpoint.transport = TransportKind::kRawQuic;
+        endpoint.host = "relay.example.com";
+        endpoint.port = 443;
+
+        std::istringstream input;
+        const TransportStatus status = publisher.publish_live(input, endpoint);
+        ok &= expect(!status.ok, "expected video_alt_group to fail on the libmoq route");
+        ok &= expect(status.message.find("video_alt_group") != std::string::npos,
+                     "expected the libmoq route to name the unsupported video_alt_group");
     }
 
     {

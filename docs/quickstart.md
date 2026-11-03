@@ -22,7 +22,7 @@ Inspect the same input with an MSF media timeline track enabled:
 ./build/openmoq-publisher --input sample.mp4 --msf-timeline --dump-plan
 ```
 
-Explicitly select the default draft-18 profile:
+Explicitly select the draft-18 profile (the default is draft 22):
 
 ```bash
 ./build/openmoq-publisher --input sample.mp4 --draft 18 --dump-plan
@@ -182,7 +182,10 @@ troubleshooting](relay-interop.md#choose-a-file-publishing-mode).
 Repeat `--endpoint` to provide relay targets in preference order. `--retry N`
 allows `N` retries of the current endpoint after its initial attempt, with a
 one-second pause before each retry. The default is `--retry 0`, so each endpoint
-is attempted once before the publisher advances or exits.
+is attempted once before the publisher advances or exits. A live session that
+ends on a closed connection is retried too, including one the publisher closed
+with PROTOCOL_VIOLATION after a request it could not decode; for stdin and SRT
+input the retry continues above the Group IDs already sent.
 
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
@@ -487,5 +490,6 @@ config, token generation, relay connection, and focused-test workflow.
 - `--coalesce-cmaf-chunks` restores one media object per group for CMAF; it is rejected with LOCMAF
 - draft-16 defaults to ALPN `moqt-16`
 - draft-18 defaults to ALPN `moqt-18`
+- drafts 21, 22, and 23 default to ALPN `moqt-21`, `moqt-22`, and `moqt-23`
 - drafts 14, 17, and 19 are retained as local text or implementation-history references but are not selectable in the main CLI
 - `--alpn` overrides the draft default when targeting a specific relay

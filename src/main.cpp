@@ -270,6 +270,7 @@ int main(int argc, char** argv) {
             .drm_systems = options.drm_systems,
             .catalog_republish_interval = options.catalog_republish_interval,
             .initial_group_id = options.initial_group_id,
+            .video_alt_group = options.video_alt_group,
             .subscriber_timeout = options.subscriber_timeout,
             .authorization = options.authorization,
             .media_packaging = options.media_packaging,
@@ -413,6 +414,9 @@ int main(int argc, char** argv) {
             }
 
             std::istream* stdin_input = live_stdin ? &std::cin : nullptr;
+            // Shared by every --retry attempt, so a retry replays the stdin init
+            // segment and keeps Group IDs above the ones already sent.
+            LiveResumeState live_resume;
             const auto status = publish_with_cli_failover(
                 options,
                 [&](const transport::EndpointConfig& endpoint) {
@@ -421,7 +425,8 @@ int main(int argc, char** argv) {
                         stdin_input,
                         endpoint,
                         options.tls,
-                        options.endpoint_alpn_overridden);
+                        options.endpoint_alpn_overridden,
+                        &live_resume);
                 });
             if (!status.ok && stop_signal == 0) {
                 throw std::runtime_error(status.message);

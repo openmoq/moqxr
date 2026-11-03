@@ -97,8 +97,14 @@ Args parse_args(int argc, char** argv) {
                 args.draft = openmoq::publisher::DraftVersion::kDraft17;
             } else if (value == "18") {
                 args.draft = openmoq::publisher::DraftVersion::kDraft18;
+            } else if (value == "21") {
+                args.draft = openmoq::publisher::DraftVersion::kDraft21;
+            } else if (value == "22") {
+                args.draft = openmoq::publisher::DraftVersion::kDraft22;
+            } else if (value == "23") {
+                args.draft = openmoq::publisher::DraftVersion::kDraft23;
             } else {
-                throw std::runtime_error("--draft must be one of: 14, 16, 17, 18");
+                throw std::runtime_error("--draft must be one of: 14, 16, 17, 18, 21, 22, 23");
             }
         } else if (flag == "--insecure") {
             args.insecure = true;
@@ -140,7 +146,7 @@ std::string build_ffmpeg_video_command(int seconds) {
 
 void print_usage(const char* argv0) {
     std::cout << "Usage: " << argv0
-              << " [--endpoint https://host:port/moq] [--namespace name] [--draft 14|16|17|18] [--seconds N] [--insecure] [--help]\n";
+              << " [--endpoint https://host:port/moq] [--namespace name] [--draft 14|16|17|18|21|22|23] [--seconds N] [--insecure] [--help]\n";
 }
 
 }  // namespace

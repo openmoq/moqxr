@@ -48,7 +48,7 @@ struct CliOptions {
     std::size_t retry_count = 0;
     transport::TransportKind transport = transport::TransportKind::kRawQuic;
     transport::TlsConfig tls;
-    DraftVersion draft_version = DraftVersion::kDraft18;
+    DraftVersion draft_version = DraftVersion::kDraft22;
     std::string track_namespace = "media";
     // Retained for source compatibility; decoded into authorization before
     // parse_cli_options returns. Never include this value in diagnostics.
@@ -93,6 +93,9 @@ struct CliOptions {
     // "time" is resolved once, during parsing, to milliseconds since the Unix
     // epoch. Live input only.
     std::uint64_t initial_group_id = 0;
+    // --video-alt-group <N>; see PublisherConfig::video_alt_group. Live stdin
+    // only.
+    std::optional<std::uint32_t> video_alt_group;
     // Parsed eagerly by parse_cli_options so a malformed --drm-config file is
     // reported before publishing begins, rather than publishing with partial
     // DRM configuration.

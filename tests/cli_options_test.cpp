@@ -445,6 +445,14 @@ int main() {
         ok &= expect(false, std::string("--draft 22 must parse: ") + error.what());
     }
 
+    try {
+        const auto options = parse({"openmoq-publisher", "--input", "sample.mp4", "--draft", "23"});
+        ok &= expect(options.draft_version == openmoq::publisher::DraftVersion::kDraft23,
+                     "expected --draft 23 to select draft-23 mode");
+    } catch (const std::exception& error) {
+        ok &= expect(false, std::string("--draft 23 must parse: ") + error.what());
+    }
+
     {
         bool threw = false;
         try {
@@ -614,6 +622,47 @@ int main() {
                        "expected --initial-group-id to be rejected for VOD file input");
     ok &= expect(build_usage("prog").find("[--initial-group-id <N|time>]") != std::string::npos,
                  "expected usage to list --initial-group-id");
+
+    // --video-alt-group (MSF section 5.2.12).
+    {
+        const CliOptions options = parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443"});
+        ok &= expect(!options.video_alt_group.has_value(), "expected no video altGroup by default");
+    }
+    {
+        const CliOptions options = parse(
+            {"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443", "--video-alt-group", "1"});
+        ok &= expect(options.video_alt_group == 1u, "expected a numeric --video-alt-group");
+    }
+    {
+        const CliOptions options = parse({"openmoq-publisher", "--input", "-", "--live-source", "stdin",
+                                          "--endpoint", "localhost:4443", "--video-alt-group", "4294967295"});
+        ok &= expect(options.video_alt_group == 4294967295u, "expected --video-alt-group to accept 2^32-1");
+    }
+    for (const std::string value : {"", "-1", "+1", " 1", "1x", "0x1", "1.5", "4294967296"}) {
+        ok &= parse_throws({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443",
+                            "--video-alt-group", value},
+                           "--video-alt-group must be an unsigned 32-bit integer",
+                           "expected --video-alt-group \"" + value + "\" to be rejected");
+    }
+    ok &= parse_throws({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443", "--video-alt-group"},
+                       "--video-alt-group", "expected --video-alt-group without a value to be rejected");
+    ok &= parse_throws({"openmoq-publisher", "--input", "-", "--video-alt-group", "1"},
+                       "--video-alt-group requires live stdin publishing",
+                       "expected --video-alt-group to be rejected without an endpoint");
+    ok &= parse_throws({"openmoq-publisher", "--input", "sample.mp4", "--endpoint", "localhost:4443",
+                        "--video-alt-group", "1"},
+                       "--video-alt-group requires live stdin publishing",
+                       "expected --video-alt-group to be rejected for file input");
+    ok &= parse_throws({"openmoq-publisher", "--live-source", "srt", "--srt-config", "/tmp/foo.json",
+                        "--endpoint", "localhost:4443", "--video-alt-group", "1"},
+                       "--video-alt-group requires live stdin publishing",
+                       "expected --video-alt-group to be rejected for SRT input");
+    ok &= parse_throws({"openmoq-publisher", "--live-source", "dash", "--dash-listen", "127.0.0.1:8080",
+                        "--endpoint", "localhost:4443", "--video-alt-group", "1"},
+                       "--video-alt-group requires live stdin publishing",
+                       "expected --video-alt-group to be rejected for LL-DASH input");
+    ok &= expect(build_usage("prog").find("[--video-alt-group <N>]") != std::string::npos,
+                 "expected usage to list --video-alt-group");
 
     {
         const CliOptions options = parse({"openmoq-publisher", "--input", "-"});
@@ -1183,8 +1232,8 @@ int main() {
     }
 
     ok &= expect(parse({"publisher", "--input", "sample.mp4"}).draft_version ==
-                     openmoq::publisher::DraftVersion::kDraft18,
-                 "CLI defaults to draft-18");
+                     openmoq::publisher::DraftVersion::kDraft22,
+                 "CLI defaults to draft-22");
     try {
         parse({"publisher", "--input", "sample.mp4", "--packaging", "loc"});
     } catch (const std::exception& error) {

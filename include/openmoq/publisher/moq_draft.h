@@ -12,6 +12,7 @@ enum class DraftVersion {
     kDraft18,
     kDraft21,
     kDraft22,
+    kDraft23,
 };
 
 // Largest Group ID this publisher writes: the QUIC variable-length integer
@@ -19,16 +20,26 @@ enum class DraftVersion {
 inline constexpr std::uint64_t kMaxGroupId = (std::uint64_t{1} << 62) - 1;
 
 struct DraftProfile {
-    DraftVersion version = DraftVersion::kDraft18;
+    DraftVersion version = DraftVersion::kDraft22;
     std::string subscribe_namespace_label;
     std::string track_alias_label;
     std::string object_status_label;
     std::string notes;
 };
 
+// Draft-23 changes control framing (varint Length) and several parameters.
+constexpr bool is_draft23_or_later(DraftVersion version) {
+    return version == DraftVersion::kDraft23;
+}
+
+// Draft-22 behaviour (GOAWAY migration, retained discovery streams) carries forward.
+constexpr bool is_draft22_or_later(DraftVersion version) {
+    return version == DraftVersion::kDraft22 || is_draft23_or_later(version);
+}
+
 // Modern drafts share the draft-18 control/request-stream model.
 constexpr bool is_draft21_or_later(DraftVersion version) {
-    return version == DraftVersion::kDraft21 || version == DraftVersion::kDraft22;
+    return version == DraftVersion::kDraft21 || is_draft22_or_later(version);
 }
 
 constexpr bool is_draft18_or_later(DraftVersion version) {

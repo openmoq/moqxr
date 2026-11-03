@@ -30,6 +30,9 @@ struct SetupMessage {
 struct ServerSetupMessage {
     DraftVersion draft = DraftVersion::kDraft14;
     std::uint64_t max_request_id = 0;
+    // Draft-23 MAX_CONTROL_MESSAGE_SIZE (Setup Option 0x09): the largest
+    // control message the peer accepts. 65535 when the option is absent.
+    std::uint64_t max_control_message_size = 65535;
     std::optional<std::uint64_t> unsupported_server_option_error_code;
     bool malformed_authorization_token = false;
 };
@@ -66,6 +69,9 @@ struct TrackMessage {
     // DPoP proof for authorization_token, sent as a second AUTHORIZATION TOKEN
     // parameter; ignored when there is no credential to accompany.
     std::optional<std::vector<std::uint8_t>> dpop_proof;
+    // Draft-23 SUBSCRIBE_TRACKS_ID (0x36): the SUBSCRIBE_TRACKS request this
+    // PUBLISH answers. Ignored on earlier drafts.
+    std::optional<std::uint64_t> subscribe_tracks_request_id;
 };
 
 struct PublishNamespaceOk {
@@ -117,6 +123,17 @@ struct DeliveryTimeouts {
     std::uint64_t subgroup_ms = 0;
 };
 
+// A draft-22 LOCATION_FILTER as received: its Location Filter Type and the
+// fields that type carries (§9.20.9). filter_type above maps it onto the
+// draft-18 model, which cannot express a relative start before the next group.
+struct LocationFilterForm {
+    std::uint64_t type = 0;
+    std::uint64_t start_group = 0;
+    std::uint64_t start_object = 0;
+    std::uint64_t end_group_delta = 0;
+    std::uint64_t end_object = 0;
+};
+
 struct SubscribeMessage {
     std::uint64_t request_id = 0;
     std::vector<std::string> track_namespace;
@@ -133,6 +150,12 @@ struct SubscribeMessage {
     DeliveryTimeouts delivery_timeouts;
     // Draft-21 FILL_PARAMETERS presence.
     bool fill_requested = false;
+    // Drafts 21 and 22: the subscription's LOCATION_FILTER, and the one inside
+    // FILL_PARAMETERS, when present. Together they give the fill range (§3.4).
+    // Draft 21's filter has no type field; the decoder derives the
+    // equivalent draft-22 type from the fields present.
+    std::optional<LocationFilterForm> location_filter;
+    std::optional<LocationFilterForm> fill_location_filter;
     bool has_unnegotiated_range_filter = false;
     bool malformed_authorization_token = false;
     bool authorization_token_cache_overflow = false;
@@ -185,8 +208,18 @@ struct PublishOk {
     std::uint8_t subscriber_priority = 0;
     std::uint8_t group_order = 0;
     std::uint64_t filter_type = 0;
+    // Range of an AbsoluteStart/AbsoluteRange (draft-21: LOCATION) filter;
+    // left at zero for filter types without one.
+    std::size_t start_group_id = 0;
+    std::size_t start_object_id = 0;
+    std::size_t end_group_id = 0;
+    std::optional<std::size_t> end_object_id;
     DeliveryTimeouts delivery_timeouts;
 };
+
+// Copies the subscription state a PUBLISH_OK establishes (priority, order,
+// forward state, filter and delivery timeouts) into publisher-side settings.
+void apply_publish_ok_settings(const PublishOk& publish_ok, SubscribeMessage& settings);
 
 struct PublishError {
     std::uint64_t request_id = 0;
@@ -196,6 +229,14 @@ struct PublishError {
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
 std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id);
+// Draft-22 fetch stream Object (§11.4.1) in Subgroup 0, carrying its absolute
+// Group ID, Object ID and Publisher Priority and no Properties, as the first
+// Object on a fetch stream must.
+std::vector<std::uint8_t> encode_fetch_object(DraftVersion draft,
+                                              std::uint64_t group_id,
+                                              std::uint64_t object_id,
+                                              std::uint8_t publisher_priority,
+                                              std::span<const std::uint8_t> payload);
 bool decode_vi64(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 // Validates datagram framing before a publisher discards unknown-alias objects.
@@ -207,6 +248,9 @@ bool validate_publisher_datagram(std::span<const std::uint8_t> bytes, DraftVersi
 // 9.3.6, 9.3.8; draft-18 sections 10.2.16-10.2.18); drafts up to 16 encode
 // them as variable-length integers.
 inline constexpr std::uint64_t kParamForward = 0x10;
+// Draft-23 replaces FORWARD with PAUSED, an odd-typed uint8 whose value is the
+// inverse of FORWARD (draft-23 section 9.19.18).
+inline constexpr std::uint64_t kParamPaused = 0x11;
 inline constexpr std::uint64_t kParamSubscriberPriority = 0x20;
 inline constexpr std::uint64_t kParamGroupOrder = 0x22;
 
@@ -229,6 +273,19 @@ bool decode_max_request_id_message(std::span<const std::uint8_t> bytes, MaxReque
 bool decode_goaway_message(std::span<const std::uint8_t> bytes, DraftVersion draft, GoawayMessage& message);
 std::vector<std::uint8_t> encode_namespace_notification(DraftVersion draft, std::span<const std::string> suffix);
 bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draft, std::size_t& message_size);
+// Largest control message moqxr accepts. It never advertises a larger
+// draft-23 MAX_CONTROL_MESSAGE_SIZE, so this is also the draft-23 default.
+inline constexpr std::size_t kDefaultMaxControlMessageSize = 65535;
+// True when bytes begin a draft-23 control message whose Length exceeds
+// kDefaultMaxControlMessageSize. Such a message never completes within the
+// limit, so the receiver closes instead of buffering it (draft-23 §9).
+bool control_message_exceeds_limit(std::span<const std::uint8_t> bytes, DraftVersion draft);
+// Reads a draft-18+ control message Type and Length; the payload must end exactly at the end of `bytes`.
+bool decode_control_message_header(std::span<const std::uint8_t> bytes,
+                                   DraftVersion draft,
+                                   std::uint64_t& type,
+                                   std::size_t& payload_offset,
+                                   std::size_t& payload_length);
 std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& message);
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uint64_t request_id);
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,

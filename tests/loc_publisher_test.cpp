@@ -23,7 +23,7 @@ int main() {
     try {
         PublisherConfig config;
         config.media_packaging = MediaPackaging::kLoc;
-        check(config.draft_version == DraftVersion::kDraft18, "publisher defaults to draft18");
+        check(config.draft_version == DraftVersion::kDraft22, "publisher defaults to draft22");
         config.draft_version = DraftVersion::kDraft16;
         bool rejected = false;
         try { Publisher invalid(config); } catch (const std::runtime_error&) { rejected = true; }

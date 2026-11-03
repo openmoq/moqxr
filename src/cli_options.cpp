@@ -75,14 +75,15 @@ DraftVersion parse_draft(std::string_view value) {
         return DraftVersion::kDraft21;
     }
     if (value == "22") return DraftVersion::kDraft22;
+    if (value == "23") return DraftVersion::kDraft23;
     // Draft-14 and draft-17 are no longer user-selectable.
     if (value == "14" || value == "17") {
         throw std::runtime_error(
             "draft " + std::string(value) +
-            " is no longer supported; only draft 16, 18, 21, and 22 are available");
+            " is no longer supported; only draft 16, 18, 21, 22, and 23 are available");
     }
 
-    throw std::runtime_error("unsupported draft value: expected 16, 18, 21, or 22");
+    throw std::runtime_error("unsupported draft value: expected 16, 18, 21, 22, or 23");
 }
 
 transport::TransportKind parse_transport_kind(std::string_view value) {
@@ -258,6 +259,15 @@ std::uint64_t parse_initial_group_id(std::string_view value) {
         throw std::runtime_error("--initial-group-id must not exceed 4611686018427387903 (2^62-1)");
     }
     return group_id;
+}
+
+std::uint32_t parse_video_alt_group(std::string_view value) {
+    std::uint32_t alt_group = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), alt_group);
+    if (value.empty() || result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        throw std::runtime_error("--video-alt-group must be an unsigned 32-bit integer");
+    }
+    return alt_group;
 }
 
 std::size_t parse_retry_count(std::string_view value) {
@@ -540,6 +550,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
         } else if (argument == "--initial-group-id") {
             options.initial_group_id = parse_initial_group_id(require_value("--initial-group-id"));
             initial_group_id_set = true;
+        } else if (argument == "--video-alt-group") {
+            options.video_alt_group = parse_video_alt_group(require_value("--video-alt-group"));
         } else if (argument == "--drm-config") {
             // Parsed eagerly, not stored as a path: a malformed DRM config
             // must fail before publishing starts rather than publish with
@@ -641,7 +653,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
     if (options.media_packaging == MediaPackaging::kLoc) {
         if (!is_draft18_or_later(options.draft_version)) {
-            throw std::runtime_error("LOC-04 requires --draft 18 or 21");
+            throw std::runtime_error("LOC-04 requires --draft 18 or later");
         }
         if (options.stream_per_object || !options.split_cmaf_chunks) {
             throw std::runtime_error("LOC requires one sample per object and a stream per GOP");
@@ -694,6 +706,15 @@ CliOptions parse_cli_options(int argc, char** argv) {
         options.input_source.kind != InputSourceKind::kStdin) {
         throw std::runtime_error(
             "--initial-group-id requires live input (--input -, --live-source srt, or --live-source dash)");
+    }
+    // SRT callers are independent sources rather than alternates, and the
+    // LL-DASH ingest already groups its video representations. Without an
+    // endpoint, stdin is read whole and rendered as a batch plan, which does
+    // not take the option either.
+    if (options.video_alt_group &&
+        (!live_source_uses_stdin || options.input_source.kind != InputSourceKind::kStdin ||
+         !options.endpoint.has_value())) {
+        throw std::runtime_error("--video-alt-group requires live stdin publishing (--input - with --endpoint)");
     }
 
     if (options.endpoint.has_value() && options.endpoint->host.empty()) {
@@ -777,9 +798,9 @@ std::string build_usage(const char* argv0) {
     return build_version_banner() + "\nUsage: " + argv0 +
            " --input <mp4|-> [--live-source auto|stdin|srt|dash] [--srt-config <path>]"
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
-           " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
+           " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22|23] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
-           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--drm-config <path>]"
+           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--video-alt-group <N>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--webtransport-allow-missing-reset-stream-at]"
            " [--retry <count>]"

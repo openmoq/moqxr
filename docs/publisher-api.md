@@ -49,6 +49,7 @@ config.split_cmaf_chunks = true;
 config.paced = false;
 config.loop = false;
 config.subscriber_timeout = std::chrono::seconds(30);
+config.await_subscriber_indefinitely = false;
 
 openmoq::publisher::Publisher publisher(config);
 ```
@@ -316,8 +317,13 @@ keeps the new Group IDs above the previous run's if that run published fewer
 groups than the milliseconds that passed between its start and the restart,
 and the system clock did not step backwards. `publish_live(...)` numbers the
 live media groups and the catalog groups from this value on every draft; on
-draft 22 a GOAWAY migration still resumes above the groups the previous
-session sent. The default is 0. A value above `kMaxGroupId` (2^62-1) makes the
+drafts 22 and 23 a GOAWAY migration still resumes above the groups the previous
+session sent. To retry a failed live publish the same way, pass one
+`LiveResumeState` to every `publish_live(ingest, stdin_input, endpoint, tls,
+endpoint_alpn_overridden, &resume)` attempt on the same input: a retryable
+failure records the unsent stdin bytes and the next media and catalog Group
+IDs in it, the next attempt resumes from them, and a successful publish clears
+it. The CLI does this for `--retry` and endpoint failover. The default is 0. A value above `kMaxGroupId` (2^62-1) makes the
 `Publisher` constructor and `set_config` throw. `publish_live_objects(...)`
 sends the Group IDs its source supplies (`LiveDashIngestConfig::initial_group_id`
 sets them for the DASH ingest), and the libmoq backend refuses a non-zero value
@@ -429,6 +435,23 @@ drops fragments to stay bounded). If no subscriber appears within
 `PublisherConfig::subscriber_timeout`, the call fails with
 `timed out waiting for media subscriber` instead of hanging.
 
+**Subscriber wait (`MoqtSession` backend).** By default, `publish_live_objects`
+waits for its first media subscriber without reading its source. The wait ends after
+`PublisherConfig::subscriber_timeout`, and the call returns success, unless
+`PublisherConfig::await_subscriber_indefinitely` is set. With that setting, only
+`disconnect()` or the end of the session ends the wait, and the publisher reads
+the source meanwhile: it drops media Objects and keeps the latest catalog for
+the first subscriber, so the source is never held back. The libmoq backend
+refuses the setting, and the `publish_live` overloads (stdin, SRT) ignore it. The
+publisher does not pace the Objects it drops, so a paced file source can reach
+its end before the first subscriber arrives. `subscriber_timeout` also
+bounds each request-stream read, so an unlimited wait no longer needs a huge
+timeout. The deadline applies only before the first subscriber: when the last
+subscriber leaves (UNSUBSCRIBE on draft 16, a cancelled request stream on
+draft 18), the publisher ends that subscription, resets its open subgroup
+streams with CANCELLED, keeps reading and dropping source Objects, answers a
+later SUBSCRIBE, and returns when the source ends.
+
 Calling `disconnect()` from another thread stops a running publish promptly
 (batch, `publish_live_objects`, or live stdin/SRT); the driver loop breaks, the
 connection is closed, and the call returns success. A stopped publish is not
@@ -453,11 +476,15 @@ By default, the API applies transport-appropriate ALPN:
 - Raw QUIC + draft-16: `moqt-16`
 - Raw QUIC + draft-17: `moqt-17`
 - Raw QUIC + draft-18: `moqt-18`
+- Raw QUIC + draft-21: `moqt-21`
+- Raw QUIC + draft-22: `moqt-22`
+- Raw QUIC + draft-23: `moqt-23`
 - WebTransport: `h3`
 
 For WebTransport, the API sends the MoQ application protocol offer separately
 from QUIC ALPN through `WT-Available-Protocols`: draft-16 offers `"moqt-16"`,
-draft-17 offers `"moqt-17"`, draft-18 offers `"moqt-18"`, and draft-14 keeps
+draft-17 offers `"moqt-17"`, draft-18 offers `"moqt-18"`, drafts 21, 22, and
+23 offer `"moqt-21"`, `"moqt-22"`, and `"moqt-23"`, and draft-14 keeps
 the legacy no-subprotocol behavior.  The quotes are part of the HTTP
 Structured Fields syntax; Raw QUIC ALPN remains the unquoted token.
 
