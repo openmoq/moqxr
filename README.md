@@ -301,7 +301,7 @@ Each live publisher process numbers its Group IDs from 0. If the process restart
 - `--initial-group-id time` reads the system clock once at startup and starts at the number of milliseconds since the Unix epoch. This is safe if the previous run published fewer groups than the milliseconds that passed between its start and the restart, and the system clock did not step backwards in between.
 - `--initial-group-id N` starts at the unsigned integer `N`, which must not exceed 2^62-1.
 - The default is 0. The option applies to the media tracks and the catalog of the live sources (stdin, SRT, and CTE LL-DASH) on every draft; it is rejected for file input. On drafts 22 and 23, a GOAWAY migration still resumes above the groups the previous session sent. The moq5 publishing backend numbers Group IDs itself and rejects a non-zero value.
-- The value is fixed for the process. For stdin and SRT input, a `--retry` or endpoint failover reconnect inside the same process continues above the Group IDs the failed session sent instead of starting again from it, and stdin input resumes from its init segment.
+- The value is fixed for the process. For stdin and SRT input, a `--retry` or endpoint failover reconnect inside the same process continues above the Group IDs the failed session sent instead of starting again from it, and stdin input resumes from its init segment. The moq5 publishing backend does not take part in this: it ignores the resume state, so a retry there restarts from Group 0 and a stdin input cannot be replayed.
 
 ## Publishing via moq5
 

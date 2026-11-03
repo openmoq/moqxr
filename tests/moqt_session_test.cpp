@@ -2804,6 +2804,23 @@ int main() {
             append_bytes(body, parameters);
             return body;
         };
+        // The SETUP response is read before the publish loops, so an oversized
+        // declared Length there must close with FIELD_LENGTH_EXCEEDED instead of
+        // buffering until the body arrives.
+        {
+            MockTransport transport;
+            auto oversized_setup = encode_server_setup_message({.draft = d23});
+            oversized_setup.resize(2);  // the two-byte SETUP message type (0x2f00)
+            append_bytes(oversized_setup, {0xc1, 0x11, 0x70, 1});  // vi64 Length 70000, one body byte
+            transport.reads[3].push_back(oversized_setup);
+            transport.keep_open_streams.insert(3);
+            MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "D23 oversized SETUP response connects");
+            const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(d23), source_bytes));
+            ok &= expect(!result.ok && transport.last_close_code == 0x401,
+                         "D23 closes with FIELD_LENGTH_EXCEEDED for an oversized SETUP response, saw " +
+                             std::to_string(transport.last_close_code) + ": " + result.message);
+        }
         const auto is_publish = [](const auto& write) { return message_type(write.bytes) == 0x1d; };
         for (const std::string scenario : {"namespace-overlap", "namespace-goaway", "namespace-prefix-update",
                  "tracks-overlap", "tracks-publish-id", "tracks-prefix-update", "subscribe-goaway", "fetch",
@@ -12949,6 +12966,68 @@ int main() {
             // the closing Group 1.
             ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_publish_done_message(draft, 5, 3)),
                          "expected PUBLISH_DONE for the new catalog subscription to count the three catalog streams");
+        }
+
+        // A catalog subscription whose filter excludes the retained Group (an
+        // Absolute Start after it) is not sent it: the resend stream is shared
+        // by every catalog subscription, so it must not carry a Group that
+        // this subscriber asked to skip.
+        {
+            MockTransport transport;
+            queue_draft16_scheduling_prefix(transport);
+            transport.keep_open_streams = {0};
+            std::vector<std::uint8_t> subscriptions =
+                encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+            append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+            transport.reads[0].push_back(std::move(subscriptions));
+            bool catalog_unsubscribed = false;
+            bool catalog_resubscribed = false;
+            std::size_t idle_reads = 0;
+            transport.on_try_write_object =
+                [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                    if (!catalog_unsubscribed && ends_with(event.bytes, catalog_payload)) {
+                        catalog_unsubscribed = true;
+                        current.reads[0].push_back(encode_unsubscribe_message(draft, 1));
+                    }
+                    return {ObjectWriteDisposition::kAccepted, {}};
+                };
+            transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+                if (stream_id != 0 || !catalog_unsubscribed || catalog_resubscribed || ++idle_reads < 4) {
+                    return;
+                }
+                catalog_resubscribed = true;
+                // Absolute Start at Group 5, after the catalog's Group 0.
+                current.reads[0].push_back(encode_subscribe_message(
+                    5, kTestTrackNamespace, "catalog", 1, draft, 0, 0, 128, 0, 5, 0, 0x03));
+            };
+            const std::vector<LiveObject> objects = {
+                LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+                LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+                LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+                LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+                LiveObject{.track_name = "video", .group_id = 4, .payload = {'V', '4'}},
+                LiveObject{.track_name = "catalog", .group_id = 1, .payload = closing_payload, .ends_broadcast = true},
+            };
+            std::size_t object_index = 0;
+            LiveObjectSource source = listed_object_source(
+                {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+            source.next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size() || (object_index >= 4 && !catalog_resubscribed)) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            };
+            source.is_finished = [&]() { return object_index >= objects.size(); };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected filtered catalog resubscribe connect to succeed");
+            status = session.publish_live_objects(source, draft);
+            ok &= expect(status.ok, "expected filtered catalog resubscribe publish to succeed: " + status.message);
+            ok &= expect(catalog_resubscribed, "expected the filtered catalog case to resubscribe");
+            const std::string catalogs = catalog_groups(transport, catalog_payload);
+            ok &= expect(catalogs == " 0",
+                         "expected no catalog resend for a subscription that starts after the catalog Group; got Groups" +
+                             catalogs);
         }
 
         {

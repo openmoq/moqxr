@@ -149,6 +149,11 @@ bool test_fragment_frame_rates(std::span<const std::uint8_t> init_segment) {
     ok &= expect(rate_after(one_sample_moofs({840, 512}), 15360) == 30.0,
                  "with no repeated duration yet, the later sample wins over the first");
 
+    // A trun that has neither per-sample durations nor a default duration to
+    // read cannot yield one, so a huge sample_count must not be walked.
+    ok &= expect(rate_after(make_moof(track_id, std::nullopt, {}, 0xFFFFFFFFU), 15360) == 0.0,
+                 "a trun with no duration source and a huge sample_count leaves the frame rate unknown");
+
     const auto settled_after = [&](const std::vector<std::uint32_t>& durations) {
         const auto moofs = one_sample_moofs(durations);
         FragmentSampleDurations collected;
