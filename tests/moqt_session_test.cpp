@@ -11882,9 +11882,6 @@ int main() {
         const std::vector<std::uint8_t> delivery_timeout_zero_subscribe = {
             0x03, 0x00, 0x13, 0x01, 0x01, 0x05, 0x6d, 0x6f, 0x71, 0x78, 0x72,
             0x07, 0x63, 0x61, 0x74, 0x61, 0x6c, 0x6f, 0x67, 0x01, 0x02, 0x00,
-    ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
-    ok &= test_live_stdin_video_alt_group(endpoint, tls);
-    ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
         };
         SubscribeMessage delivery_timeout_zero_msg;
         ok &= expect(!openmoq::publisher::transport::decode_subscribe_message(
@@ -12169,6 +12166,9 @@ int main() {
 
     ok &= test_live_stdin_initial_group_id(endpoint, tls);
     ok &= test_live_stdin_catalog_framerate_from_fragments(endpoint, tls);
+    ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
+    ok &= test_live_stdin_video_alt_group(endpoint, tls);
+    ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
     ok &= test_live_stdin_resubscribe_after_stop_sending(endpoint, tls);
     ok &= test_live_stdin_stop_sending_cancels_subgroups(endpoint, tls);
 
