@@ -1773,6 +1773,143 @@ std::map<std::uint64_t, std::vector<std::uint64_t>> data_stream_groups(const Moc
     return groups;
 }
 
+// Draft 18 §5.1.1: a subscriber ends a subscription with STOP_SENDING on its
+// request stream, after which the publisher can destroy its state. A later
+// SUBSCRIBE to the same track is then a new subscription; only one arriving
+// while a subscription is active is a DUPLICATE_SUBSCRIPTION (§5.1). The
+// STOP_SENDING arrives either before the next control poll, or while media
+// dispatch is reading peer stops, after the subscription teardown last looked.
+bool test_live_stdin_resubscribe_after_stop_sending(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    bool ok = true;
+    for (const bool during_media_dispatch : {false, true}) {
+        const std::string label = during_media_dispatch ? "stop during media dispatch: " : "stop before poll: ";
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+        transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        bool armed = false;
+        bool stopped = false;
+        const auto stop_and_resubscribe = [&]() {
+            // The subscriber cancels the catalog subscription, then subscribes
+            // again, and once more while that second subscription is active.
+            stopped = true;
+            transport.peer_stopped_media_streams.insert(1);
+            transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, "catalog", 1, draft));
+            transport.reads[9].push_back(encode_subscribe_message(5, kNamespace, "catalog", 1, draft));
+        };
+        transport.on_try_write_object = [&](MockTransport&, const MockTransport::ObjectWriteEvent&) {
+            if (!armed) {
+                armed = true;
+                if (!during_media_dispatch) stop_and_resubscribe();
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
+        transport.on_media_stream_expiry_events = [&]() {
+            if (armed && !stopped && during_media_dispatch) stop_and_resubscribe();
+        };
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, label + "STOP_SENDING resubscribe session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "STOP_SENDING resubscribe live publish succeeds: " + status.message);
+        const auto response_on = [&](std::uint64_t stream_id) -> std::optional<std::uint64_t> {
+            for (const auto& write : transport.writes) {
+                if (write.stream_id == stream_id) {
+                    const auto type = message_type(write.bytes);
+                    if (type == 0x04 || type == 0x05) return type;
+                }
+            }
+            return std::nullopt;
+        };
+        ok &= expect(stopped && response_on(5) == 0x04,
+                     label + "a catalog SUBSCRIBE after the subscriber stopped the previous one gets SUBSCRIBE_OK");
+        std::optional<std::uint64_t> duplicate_code;
+        for (const auto& write : transport.writes) {
+            openmoq::publisher::transport::RequestError error;
+            if (write.stream_id == 9 && message_type(write.bytes) == 0x05 &&
+                openmoq::publisher::transport::decode_request_error(write.bytes, draft, error)) {
+                duplicate_code = error.error_code;
+            }
+        }
+        ok &= expect(duplicate_code == 0x19,
+                     label + "a catalog SUBSCRIBE while another catalog subscription is active is still a DUPLICATE_SUBSCRIPTION");
+        ok &= expect(std::count(transport.acknowledged_peer_stopped_media_streams.begin(),
+                                transport.acknowledged_peer_stopped_media_streams.end(), 1) == 1,
+                     label + "the request-stream STOP_SENDING is acknowledged once, after ending the subscription");
+    }
+    return ok;
+}
+
+// Draft 18 §5.1.1: once the subscriber stops a subscription's request stream,
+// the publisher resets the track's open subgroup streams with CANCELLED. A
+// PUBLISH that still forwards the track (§5.1) keeps them open, and the track
+// keeps flowing.
+bool test_live_stdin_stop_sending_cancels_subgroups(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    bool ok = true;
+    for (const bool publish_forwards : {false, true}) {
+        const std::string label = publish_forwards ? "PUBLISH still forwards: " : "only the SUBSCRIBE forwards: ";
+        // The subscriber's SUBSCRIBE for the media track, on its request stream.
+        const std::uint64_t subscribe_stream = publish_forwards ? 5 : 1;
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        if (publish_forwards) {
+            // SUBSCRIBE_TRACKS makes the publisher PUBLISH catalog and media;
+            // the media PUBLISH_OK forwards.
+            transport.reads[1].push_back(encode_subscribe_tracks_message(91, kNamespace));
+            transport.reads[4].push_back(encode_publish_ok_message(draft, 2, 0));
+            transport.reads[8].push_back(encode_publish_ok_message(draft, 4, 1));
+            transport.reads[5].push_back(encode_subscribe_message(93, kNamespace, "vide_1", 1, draft));
+        } else {
+            transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "vide_1", 1, draft));
+        }
+        // The subscriber stops its request stream as the first media Object
+        // after its SUBSCRIBE_OK is written.
+        std::optional<std::uint64_t> subgroup_stream;
+        std::size_t object_writes_at_stop = 0;
+        transport.on_try_write_object = [&](MockTransport& mock, const MockTransport::ObjectWriteEvent& event) {
+            const bool subscribed = std::any_of(mock.writes.begin(), mock.writes.end(), [&](const auto& write) {
+                return write.stream_id == subscribe_stream && message_type(write.bytes) == 0x04;
+            });
+            if (subscribed && !subgroup_stream) {
+                subgroup_stream = event.stream_id;
+                object_writes_at_stop = mock.object_write_attempts.size();
+                mock.peer_stopped_media_streams.insert(subscribe_stream);
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
+        MoqtSession session(transport, std::string(kNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, label + "STOP_SENDING cancel session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB),
+                                   make_live_media_fragment(1000, 0xAC)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "STOP_SENDING cancel live publish succeeds: " + status.message);
+        ok &= expect(subgroup_stream.has_value(), label + "the media track opens a subgroup stream");
+        if (!subgroup_stream) continue;
+        ok &= expect(std::count(transport.acknowledged_peer_stopped_media_streams.begin(),
+                                transport.acknowledged_peer_stopped_media_streams.end(), subscribe_stream) == 1,
+                     label + "the request-stream STOP_SENDING is acknowledged once");
+        const bool published_after_stop = transport.object_write_attempts.size() > object_writes_at_stop;
+        if (publish_forwards) {
+            ok &= expect(!reset_with_cancelled(transport, *subgroup_stream),
+                         label + "the open subgroup stream stays open");
+            ok &= expect(published_after_stop, label + "the track keeps flowing after the subscriber stopped");
+        } else {
+            ok &= expect(reset_with_cancelled(transport, *subgroup_stream),
+                         label + "the open subgroup stream is reset with CANCELLED (0x1)");
+            ok &= expect(!published_after_stop, label + "nothing more is published on the unsubscribed track");
+        }
+    }
+    return ok;
+}
+
 // MoqTransport section 2.5: live stdin publishing numbers media and catalog
 // groups from set_initial_group_id() on every draft, not only on draft-22
 // migration.
@@ -11467,6 +11604,8 @@ int main() {
     }
 
     ok &= test_live_stdin_initial_group_id(endpoint, tls);
+    ok &= test_live_stdin_resubscribe_after_stop_sending(endpoint, tls);
+    ok &= test_live_stdin_stop_sending_cancels_subgroups(endpoint, tls);
 
     // A live publisher ends a subscription when the subscriber ends it, with
     // UNSUBSCRIBE on draft 16 and STOP_SENDING or RESET_STREAM on the draft 18

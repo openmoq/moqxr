@@ -3297,6 +3297,16 @@ private:
     std::uint64_t stream_count_ = 0;
 };
 
+// A QUIC stream ID with bit 0x2 clear is bidirectional: a request stream.
+// Media subgroup streams are unidirectional.
+bool is_request_stream(std::uint64_t stream_id) {
+    return (stream_id & 0x2ULL) == 0;
+}
+
+// Retires and acknowledges peer STOP_SENDING on media streams. A STOP_SENDING
+// on a request stream ends that request (draft 18 §5.1.1), so it is left
+// queued for end_peer_stopped_subscriptions() unless include_request_streams
+// drains everything, as close() does.
 template <typename VisitSenders>
 [[nodiscard]] TransportStatus dispatch_peer_stopped_media_streams(
     PublisherTransport& transport,
@@ -3873,6 +3883,77 @@ TransportStatus read_request_stream_message(PublisherTransport& transport,
             return protocol_violation(transport, "request stream closed before a complete message");
         }
     }
+}
+
+// Draft 18 §5.1.1: a subscriber terminates a subscription by sending
+// STOP_SENDING on its request stream, and "The Publisher can destroy
+// subscription state as soon as it has received STOP_SENDING". Ends each
+// active subscription whose request stream the peer stopped, so a later
+// SUBSCRIBE to the same track starts a new subscription instead of failing as
+// a DUPLICATE_SUBSCRIPTION (§5.1). Returns the subscriptions it ended. This is
+// the only consumer of request-stream stops outside close():
+// dispatch_peer_stopped_media_streams() leaves them queued, so a stop is seen
+// here however its arrival interleaves with media dispatch.
+std::vector<SubscribeMessage> end_peer_stopped_subscriptions(
+    PublisherTransport& transport,
+    openmoq::publisher::DraftVersion draft,
+    std::map<std::uint64_t, SubscribeMessage>& active_subscriptions,
+    std::map<std::uint64_t, std::uint64_t>& active_subscription_stream_ids,
+    std::map<std::uint64_t, std::vector<std::uint8_t>>& pending_subscription_request_bytes,
+    std::set<std::pair<std::vector<std::string>, std::string>>* established_subscription_tracks) {
+    std::vector<SubscribeMessage> ended;
+    if (!is_draft18_or_later(draft)) {
+        return ended;
+    }
+    for (const std::uint64_t stream_id : transport.media_stream_peer_stop_events()) {
+        if (!is_request_stream(stream_id)) {
+            continue;
+        }
+        if (const auto code = transport.media_stream_peer_stop_error(stream_id)) {
+            std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
+                      << describe_stream_reset_code(*code) << '\n';
+        }
+        for (auto it = active_subscription_stream_ids.begin(); it != active_subscription_stream_ids.end();) {
+            const auto subscription_it = it->second == stream_id ? active_subscriptions.find(it->first)
+                                                                 : active_subscriptions.end();
+            if (subscription_it == active_subscriptions.end()) {
+                ++it;
+                continue;
+            }
+            const SubscribeMessage& subscription = subscription_it->second;
+            std::cerr << "[moqt-session] live: subscriber ended subscription track=" << subscription.track_name
+                      << " request_id=" << subscription.request_id << " (STOP_SENDING on its request stream)\n";
+            if (established_subscription_tracks != nullptr) {
+                established_subscription_tracks->erase(
+                    std::pair{subscription.track_namespace, subscription.track_name});
+            }
+            pending_subscription_request_bytes.erase(it->first);
+            ended.push_back(subscription);
+            active_subscriptions.erase(subscription_it);
+            it = active_subscription_stream_ids.erase(it);
+        }
+        transport.acknowledge_media_stream_peer_stopped(stream_id);
+    }
+    return ended;
+}
+
+// Draft 18 §5.1.1: the publisher resets the open subgroup streams of a
+// subscription that ended with CANCELLED. Subgroup streams belong to the
+// track, so they stay open while another subscription, or auto-forward,
+// still forwards it.
+TransportStatus cancel_unforwarded_track_subgroups(
+    PublisherTransport& transport,
+    bool auto_forward,
+    const std::set<std::string>& subscribed_tracks,
+    std::map<std::string, SubgroupSenderState>& sender_by_track,
+    const std::string& track_name) {
+    if (auto_forward || subscribed_tracks.contains(track_name)) {
+        return TransportStatus::success();
+    }
+    const auto sender_it = sender_by_track.find(track_name);
+    return sender_it == sender_by_track.end()
+               ? TransportStatus::success()
+               : sender_it->second.cancel_all_open_subgroups(transport, kCancelledErrorCode);
 }
 
 template <typename ApplyUpdate>
@@ -8274,6 +8355,32 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     if (draft_version == DraftVersion::kDraft22)
         discovery_requests.retain(namespace_stream_id_, 0x06, {}, 0);
     process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
+        // PUBLISH-initiated subscriptions are in active_subscriptions too, so
+        // a track the PUBLISH still forwards stays forwarded.
+        TransportStatus teardown_status = TransportStatus::success();
+        for (const auto& ended : end_peer_stopped_subscriptions(
+                 transport_, draft_version, active_subscriptions, active_subscription_stream_ids,
+                 pending_subscription_request_bytes, nullptr)) {
+            const bool still_forwarded = std::any_of(
+                active_subscriptions.begin(), active_subscriptions.end(), [&](const auto& entry) {
+                    return entry.second.track_name == ended.track_name && entry.second.forward != 0;
+                });
+            if (ended.track_name == "catalog") {
+                // No PUBLISH_DONE is owed for a subscription the subscriber ended.
+                const bool catalog_subscribed = std::any_of(
+                    active_subscriptions.begin(), active_subscriptions.end(),
+                    [](const auto& entry) { return entry.second.track_name == "catalog"; });
+                if (!catalog_subscribed) catalog_publish_done_deferred = false;
+                continue;
+            }
+            if (!still_forwarded) {
+                subscribed_tracks.erase(ended.track_name);
+            }
+            const TransportStatus cancel_status = cancel_unforwarded_track_subgroups(
+                transport_, auto_forward_, subscribed_tracks, sender_by_track, ended.track_name);
+            if (!cancel_status.ok && teardown_status.ok) teardown_status = cancel_status;
+        }
+        if (!teardown_status.ok) return {teardown_status, 0};
         const auto control_status = session_control.poll(transport_, draft_version, peer_control_stream_id_, pending_control_bytes_);
         if (!control_status.ok) return {control_status, 0};
         const auto uni_status = peer_unidirectional_streams.poll(transport_, draft_version);
@@ -9390,6 +9497,59 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     LargestObjectByTrack largest_object_by_track;
     std::uint64_t next_subscribe_tracks_publish_request_id = 2;
 
+    // A PUBLISH-initiated subscription is gated by the union of the subscriber's
+    // own SUBSCRIBEs for the track and the PUBLISH's Forward State (draft-16 /
+    // draft-18 section 5.1): objects flow while any of them forwards.
+    const auto refresh_published_track_forwarding =
+        [&](const std::string& track_name) {
+            const bool subscriber_forward = std::any_of(
+                active_subscriptions.begin(),
+                active_subscriptions.end(),
+                [&](const auto& entry) {
+                    return entry.second.track_name == track_name &&
+                           entry.second.forward != 0;
+                });
+            const auto published_it =
+                published_track_settings.find(track_name);
+            const bool publisher_forward =
+                published_it != published_track_settings.end() &&
+                published_it->second.forward != 0;
+            if (subscriber_forward || publisher_forward) {
+                subscribed_tracks.insert(track_name);
+            } else {
+                subscribed_tracks.erase(track_name);
+            }
+        };
+
+    // Ends the subscriptions whose request streams the peer stopped. Runs
+    // before dispatch_peer_stopped_media_streams() acknowledges those stops,
+    // and before a SUBSCRIBE is checked for a duplicate.
+    const auto end_stopped_subscriptions = [&]() -> TransportStatus {
+        TransportStatus first_failure = TransportStatus::success();
+        for (const auto& ended : end_peer_stopped_subscriptions(
+                 transport_, draft_version, active_subscriptions, active_subscription_stream_ids,
+                 pending_subscription_request_bytes, &established_subscription_tracks)) {
+            if (ended.track_name == "catalog") {
+                // No PUBLISH_DONE is owed for a subscription the subscriber ended.
+                const bool catalog_subscribed = std::any_of(
+                    active_subscriptions.begin(), active_subscriptions.end(),
+                    [](const auto& entry) { return entry.second.track_name == "catalog"; });
+                if (!catalog_subscribed) catalog_publish_done_deferred = false;
+                continue;
+            }
+            refresh_published_track_forwarding(ended.track_name);
+            const TransportStatus cancel_status = cancel_unforwarded_track_subgroups(
+                transport_, auto_forward_, subscribed_tracks, sender_by_track, ended.track_name);
+            if (!cancel_status.ok && first_failure.ok) first_failure = cancel_status;
+        }
+        return first_failure;
+    };
+    const auto dispatch_peer_stops = [&]() -> TransportStatus {
+        const TransportStatus teardown_status = end_stopped_subscriptions();
+        return teardown_status.ok ? dispatch_peer_stopped_media_streams(transport_, sender_by_track)
+                                  : teardown_status;
+    };
+
     auto drain_queue = [&]() -> TransportStatus {
         // Send all available fragments. The queue is bounded by stdin_thread's
         // trim logic (keeps at most the latest 2 groups), so we never burst
@@ -9398,8 +9558,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         // ffmpeg's realtime encoding rate naturally limits throughput.
         while (true) {
             const TransportStatus event_status =
-                dispatch_peer_stopped_media_streams(transport_,
-                                                    sender_by_track);
+                dispatch_peer_stops();
             if (!event_status.ok) {
                 return event_status;
             }
@@ -9495,8 +9654,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                          : 128),
                  .publisher = 128});
             const TransportStatus post_write_event_status =
-                dispatch_peer_stopped_media_streams(transport_,
-                                                    sender_by_track);
+                dispatch_peer_stops();
             if (!write_status.ok) {
                 return write_status;
             }
@@ -9610,30 +9768,6 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
         return publish_live_tracks(live_track_names);
     };
-
-    // A PUBLISH-initiated subscription is gated by the union of the subscriber's
-    // own SUBSCRIBEs for the track and the PUBLISH's Forward State (draft-16 /
-    // draft-18 section 5.1): objects flow while any of them forwards.
-    const auto refresh_published_track_forwarding =
-        [&](const std::string& track_name) {
-            const bool subscriber_forward = std::any_of(
-                active_subscriptions.begin(),
-                active_subscriptions.end(),
-                [&](const auto& entry) {
-                    return entry.second.track_name == track_name &&
-                           entry.second.forward != 0;
-                });
-            const auto published_it =
-                published_track_settings.find(track_name);
-            const bool publisher_forward =
-                published_it != published_track_settings.end() &&
-                published_it->second.forward != 0;
-            if (subscriber_forward || publisher_forward) {
-                subscribed_tracks.insert(track_name);
-            } else {
-                subscribed_tracks.erase(track_name);
-            }
-        };
 
     // Applies a REQUEST_UPDATE to a subscription this session established with
     // PUBLISH and answers it with exactly one REQUEST_OK (draft-16 section 9.11,
@@ -9904,10 +10038,15 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         }
                         continue;
                     }
+                    const TransportStatus teardown_status = end_stopped_subscriptions();
+                    if (!teardown_status.ok) return {teardown_status, 0};
                     const auto subscription_key =
                         std::pair{subscribe.track_namespace, subscribe.track_name};
                     if (draft_version == DraftVersion::kDraft18 &&
                         established_subscription_tracks.contains(subscription_key)) {
+                        std::cerr << "[moqt-session] live: rejected subscribe track=" << subscribe.track_name
+                                  << " request_id=" << subscribe.request_id
+                                  << ": REQUEST_ERROR 0x19 duplicate subscription\n";
                         const TransportStatus duplicate_status = transport_.write_stream(
                             request_stream_id,
                             encode_request_error_message(draft_version, subscribe.request_id,
@@ -10387,8 +10526,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 join_stdin_thread();
                 return TransportStatus::success();
             }
-            status = dispatch_peer_stopped_media_streams(transport_,
-                                                         sender_by_track);
+            status = dispatch_peer_stops();
             if (!status.ok) {
                 join_stdin_thread();
                 return status;
@@ -10459,8 +10597,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 join_stdin_thread();
                 return TransportStatus::success();
             }
-            status = dispatch_peer_stopped_media_streams(transport_,
-                                                         sender_by_track);
+            status = dispatch_peer_stops();
             if (!status.ok) {
                 join_stdin_thread();
                 return status;
