@@ -6,6 +6,7 @@
 #include "openmoq/publisher/transport/moqt_session.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -1958,6 +1959,145 @@ bool test_live_stdin_catalog_framerate_from_fragments(const EndpointConfig& endp
             return entry.first != 0 && !entry.second.empty() && entry.second.front() == 0;
         });
         ok &= expect(media_from_group_0, label + "the fragments read ahead are still published, from group 0");
+    }
+    return ok;
+}
+
+// An init segment laid out like a multi-rendition FFmpeg encode: vide_1,
+// soun_2, vide_3 and vide_4, in trak order.
+std::vector<std::uint8_t> make_live_abr_init_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto mdhd = make_full_box("mdhd",
+                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    auto visual_header = std::vector<std::uint8_t>(78, 0);
+    visual_header[24] = 0x01;
+    visual_header[25] = 0x40;
+    visual_header[27] = 0xf0;
+    const auto video_entry = make_box("avc1", concat({visual_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    auto audio_header = std::vector<std::uint8_t>(28, 0);
+    audio_header[17] = 0x02;
+    audio_header[24] = 0xbb;
+    audio_header[25] = 0x80;
+    const auto audio_entry = make_box(
+        "mp4a", concat({audio_header,
+                        make_box("esds", {0x00, 0x00, 0x00, 0x00, 0x03, 0x19, 0x00, 0x02, 0x00, 0x04, 0x11, 0x40,
+                                          0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x10, 0x10})}));
+    const auto trak = [&](std::uint8_t track_id, bool video) {
+        const auto tkhd = make_full_box("tkhd", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, track_id, 0, 0, 0, 0});
+        const auto hdlr = make_full_box("hdlr", video ? std::vector<std::uint8_t>{0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0}
+                                                      : std::vector<std::uint8_t>{0, 0, 0, 0, 's', 'o', 'u', 'n', 0, 0, 0, 0});
+        const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, video ? video_entry : audio_entry}));
+        const auto minf = make_box("minf", make_box("stbl", stsd));
+        return make_box("trak", concat({tkhd, make_box("mdia", concat({mdhd, hdlr, minf}))}));
+    };
+    return concat({ftyp, make_box("moov", concat({trak(1, true), trak(2, false), trak(3, true), trak(4, true)}))});
+}
+
+// One fragment of one sample for track_id, whose 4-byte mdat payload is
+// marker, so a test can find the sample on the data streams.
+std::vector<std::uint8_t> make_live_track_fragment(std::uint32_t track_id, std::uint32_t decode_time, bool sync,
+                                                   const std::array<std::uint8_t, 4>& marker) {
+    auto be32 = [](std::uint32_t value) {
+        std::vector<std::uint8_t> out;
+        append_be32(out, value);
+        return out;
+    };
+    auto flagged_full_box = [&](std::string_view type, std::uint32_t version_flags, std::vector<std::uint8_t> payload) {
+        return make_box(type, concat({be32(version_flags), std::move(payload)}));
+    };
+    const std::uint32_t sample_flags = sync ? 0x02000000U : 0x01010000U;
+    const auto tfhd = flagged_full_box("tfhd", 0x000038, concat({be32(track_id), be32(1000), be32(4), be32(sample_flags)}));
+    const auto tfdt = flagged_full_box("tfdt", 0, be32(decode_time));
+    const auto trun = flagged_full_box("trun", 0x000201, concat({be32(1), be32(16), be32(4)}));
+    const auto moof = make_box("moof", make_box("traf", concat({tfhd, tfdt, trun})));
+    return concat({moof, make_box("mdat", {marker.begin(), marker.end()})});
+}
+
+// Live CMAF stdin input with several video tracks: each track starts a group
+// at its own keyframes, so every group opens with a keyframe, Group IDs are
+// consecutive per track, and the alternates share one Group ID per keyframe
+// instant (MSF section 4). Audio follows the first video track's groups.
+bool test_live_stdin_groups_per_video_track(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    constexpr auto draft = DraftVersion::kDraft16;
+    constexpr std::uint64_t kInitial = 100;
+    // Two GOPs: the reader can run ahead of the paced sender, and the queue
+    // keeps each track's latest two groups, so a third would race the trim.
+    constexpr std::uint8_t kGops = 2;
+    constexpr std::uint8_t kFramesPerGop = 3;
+    bool ok = true;
+    MockTransport transport;
+    transport.reads[0].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 8}));
+    transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+    transport.reads[0].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+    MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+    session.set_initial_group_id(kInitial);
+    ok &= expect(session.connect(endpoint, tls).ok, "per-track groups: session connects");
+
+    // At each frame instant FFmpeg writes vide_1, soun_2, vide_3, vide_4.
+    std::vector<std::uint8_t> bytes = make_live_abr_init_mp4();
+    for (std::uint8_t gop = 0; gop < kGops; ++gop) {
+        for (std::uint8_t frame = 0; frame < kFramesPerGop; ++frame) {
+            const auto time = static_cast<std::uint32_t>((gop * kFramesPerGop + frame) * 1000);
+            for (const std::uint8_t track_id : {1, 2, 3, 4}) {
+                const bool sync = track_id == 2 || frame == 0;
+                const auto fragment = make_live_track_fragment(track_id, time, sync, {0xF5, track_id, gop, frame});
+                bytes.insert(bytes.end(), fragment.begin(), fragment.end());
+            }
+        }
+    }
+    std::istringstream input(std::string(bytes.begin(), bytes.end()));
+    const auto status = session.publish_live(input, draft, true);
+    ok &= expect(status.ok, "per-track groups: live publish succeeds: " + status.message);
+
+    // Each data stream carries one group of one track. Collect its Group ID
+    // and the markers it carries, in order.
+    struct Stream {
+        std::uint64_t group = 0;
+        std::vector<std::uint8_t> bytes;
+    };
+    std::map<std::uint64_t, Stream> streams;
+    for (const auto& write : transport.writes) {
+        if (is_data_stream_write(write) && !streams.contains(write.stream_id)) {
+            std::size_t offset = 0;
+            std::uint64_t type = 0, alias = 0, group = 0;
+            if (decode_varint(write.bytes, offset, type) && decode_varint(write.bytes, offset, alias) &&
+                decode_varint(write.bytes, offset, group)) {
+                streams[write.stream_id].group = group;
+            }
+        }
+        const auto stream = streams.find(write.stream_id);
+        if (stream != streams.end()) {
+            stream->second.bytes.insert(stream->second.bytes.end(), write.bytes.begin(), write.bytes.end());
+        }
+    }
+    // track ID -> (Group ID -> frames in stream order)
+    std::map<std::uint8_t, std::map<std::uint64_t, std::vector<std::pair<std::uint8_t, std::uint8_t>>>> groups;
+    for (const auto& [stream_id, stream] : streams) {
+        static constexpr std::array<std::uint8_t, 5> kMdat{'m', 'd', 'a', 't', 0xF5};
+        for (auto at = std::search(stream.bytes.begin(), stream.bytes.end(), kMdat.begin(), kMdat.end());
+             at != stream.bytes.end() && stream.bytes.end() - at >= 8;
+             at = std::search(at + 1, stream.bytes.end(), kMdat.begin(), kMdat.end())) {
+            groups[at[5]][stream.group].emplace_back(at[6], at[7]);
+        }
+    }
+
+    for (const std::uint8_t track_id : {1, 2, 3, 4}) {
+        const std::string label = "per-track groups: track " + std::to_string(track_id) + ": ";
+        const auto& track_groups = groups[track_id];
+        ok &= expect(track_groups.size() == kGops, label + "one group per GOP, got " +
+                                                       std::to_string(track_groups.size()));
+        std::uint8_t gop = 0;
+        for (const auto& [group_id, frames] : track_groups) {
+            ok &= expect(group_id == kInitial + gop, label + "consecutive Group IDs shared across tracks, got " +
+                                                         std::to_string(group_id));
+            bool whole_gop = frames.size() == kFramesPerGop;
+            for (std::size_t index = 0; whole_gop && index < frames.size(); ++index) {
+                whole_gop = frames[index] == std::pair<std::uint8_t, std::uint8_t>{gop, static_cast<std::uint8_t>(index)};
+            }
+            ok &= expect(whole_gop, label + "each group holds its GOP's frames in order, keyframe first");
+            ++gop;
+        }
     }
     return ok;
 }
@@ -11599,6 +11739,7 @@ int main() {
         const std::vector<std::uint8_t> delivery_timeout_zero_subscribe = {
             0x03, 0x00, 0x13, 0x01, 0x01, 0x05, 0x6d, 0x6f, 0x71, 0x78, 0x72,
             0x07, 0x63, 0x61, 0x74, 0x61, 0x6c, 0x6f, 0x67, 0x01, 0x02, 0x00,
+    ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
         };
         SubscribeMessage delivery_timeout_zero_msg;
         ok &= expect(!openmoq::publisher::transport::decode_subscribe_message(

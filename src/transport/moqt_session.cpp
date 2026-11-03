@@ -9491,18 +9491,31 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         auto& pending_moof = pending_input_moof;
         auto& pending_chunk = pending_input_chunk;
         std::map<std::string, std::size_t> dropped_loc_groups;
-        std::size_t shared_group_id = group_floor;
-        const auto next_group = [&]() {
-            if (shared_group_id >= kMaxGroupId)
-                throw std::overflow_error("live input exhausted group IDs");
-            ++shared_group_id;
+        // Each video track numbers its own groups from group_floor, starting a
+        // group at each of its own keyframes, so the alternates of an input
+        // with aligned keyframes share one Group ID per keyframe instant (MSF
+        // section 4). Every other track follows the first video track's
+        // current group. A track with no group yet has published nothing.
+        struct TrackGroup {
+            std::size_t group_id = 0;
+            std::size_t next_object_id = 0;
         };
-        std::map<std::string, std::size_t> object_id_in_group;  // per track, resets on new group
-        const bool locmaf_audio_only = retain_locmaf_boxes &&
-            std::none_of(tracks.begin(), tracks.end(), [](const auto& track) {
-                return track.handler_type == "vide";
-            });
-        bool first_keyframe_seen = locmaf_audio_only;
+        std::map<std::string, TrackGroup> group_by_track;
+        const auto start_group = [&](const std::string& track_name, std::size_t group_id) {
+            group_by_track[track_name] = TrackGroup{.group_id = group_id, .next_object_id = 0};
+        };
+        const auto next_group_id = [&](const std::string& track_name) -> std::size_t {
+            const auto found = group_by_track.find(track_name);
+            if (found == group_by_track.end()) return static_cast<std::size_t>(group_floor);
+            if (found->second.group_id >= kMaxGroupId)
+                throw std::overflow_error("live input exhausted group IDs");
+            return found->second.group_id + 1;
+        };
+        const auto lead_video = std::find_if(tracks.begin(), tracks.end(), [](const auto& track) {
+            return track.handler_type == "vide";
+        });
+        const std::string lead_video_name = lead_video != tracks.end() ? lead_video->track_name : std::string{};
+        const bool locmaf_audio_only = retain_locmaf_boxes && lead_video == tracks.end();
 
         try {
             bool first_pass = true;
@@ -9604,47 +9617,44 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                 }
                                 pending_chunk.clear();
 
-                                if (locmaf_audio_only && !object_id_in_group.empty()) {
-                                    next_group();
-                                    object_id_in_group.clear();
-                                }
-
-                                // Keyframe-based grouping:
-                                // When a video keyframe arrives, start a new group for ALL tracks.
-                                if (fragment.is_video_keyframe) {
-                                    if (first_keyframe_seen) {
-                                        next_group();
+                                const bool is_video = track != tracks.end() && track->handler_type == "vide";
+                                if (locmaf_audio_only) {
+                                    // Without video, every LOCMAF object starts a group.
+                                    start_group(fragment.track_name, next_group_id(fragment.track_name));
+                                } else if (fragment.is_video_keyframe) {
+                                    start_group(fragment.track_name, next_group_id(fragment.track_name));
+                                } else if (!is_video) {
+                                    const auto lead = group_by_track.find(lead_video_name);
+                                    const auto own = group_by_track.find(fragment.track_name);
+                                    if (lead != group_by_track.end() &&
+                                        (own == group_by_track.end() || own->second.group_id != lead->second.group_id)) {
+                                        start_group(fragment.track_name, lead->second.group_id);
                                     }
-                                    first_keyframe_seen = true;
-                                    // Reset object counters for all tracks on new group
-                                    object_id_in_group.clear();
                                 }
 
-                                if (!first_keyframe_seen) {
-                                    // Drop fragments before first keyframe (can't decode without IDR)
+                                const auto group = group_by_track.find(fragment.track_name);
+                                if (group == group_by_track.end()) {
+                                    // Drop video before its track's first keyframe (can't decode
+                                    // without IDR) and other tracks before the first video group.
                                     pending_moof.clear();
                                     continue;
                                 }
-
-                                // Assign shared group_id and per-track object_id
-                                fragment.group_id = shared_group_id;
-                                fragment.object_id = object_id_in_group[fragment.track_name]++;
+                                fragment.group_id = group->second.group_id;
+                                fragment.object_id = group->second.next_object_id++;
 
                                 {
                                     std::lock_guard<std::mutex> lock(queue->mutex);
                                     queue->fragments.push_back(std::move(fragment));
-                                    // Trim queue: keep only fragments from the latest 2 groups.
-                                    // This prevents unbounded backlog when ffmpeg encodes
-                                    // faster than realtime, while keeping enough data for
-                                    // A/V sync (audio from the previous group).
-                                    if (!queue->fragments.empty()) {
-                                        const std::size_t latest = queue->fragments.back().group_id;
-                                        const std::size_t min_keep = latest > 1 ? latest - 1 : 0;
-                                        while (!queue->fragments.empty() &&
-                                               queue->fragments.front().group_id < min_keep) {
-                                            queue->fragments.pop_front();
-                                        }
-                                    }
+                                    // Trim queue: keep only fragments from each track's latest
+                                    // 2 groups. This prevents unbounded backlog when ffmpeg
+                                    // encodes faster than realtime, while keeping enough data
+                                    // for A/V sync (audio from the previous group). Per track,
+                                    // because each video track numbers its own groups.
+                                    std::erase_if(queue->fragments, [&](const auto& queued) {
+                                        const auto latest = group_by_track.find(queued.track_name);
+                                        return latest != group_by_track.end() &&
+                                               queued.group_id + 1 < latest->second.group_id;
+                                    });
                                 }
                             }
                         } catch (const std::overflow_error&) {
