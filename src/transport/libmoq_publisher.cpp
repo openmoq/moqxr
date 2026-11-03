@@ -658,6 +658,9 @@ bool draft_to_version(DraftVersion draft, moq_version_t* out) {
         case DraftVersion::kDraft18:
             *out = MOQ_VERSION_DRAFT_18;
             return true;
+        case DraftVersion::kDraft22:
+            *out = MOQ_VERSION_DRAFT_22;
+            return true;
         default:
             return false;
     }
@@ -688,7 +691,7 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
     moq_version_t version;
     if (!draft_to_version(config.draft_version, &version)) {
         return TransportStatus::failure(
-            "libmoq publish supports only draft 16 and draft 18");
+            "libmoq publish supports only drafts 16, 18 and 22");
     }
 
     const auto refresh_seconds = config.catalog_republish_interval.count();

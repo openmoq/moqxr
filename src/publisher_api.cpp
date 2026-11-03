@@ -186,9 +186,10 @@ transport::TransportStatus prepare_migration(const transport::TransportStatus& s
 }
 
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
-// libmoq publishes drafts 16 and 18 only; later drafts use MoqtSession.
+// libmoq publishes drafts 16, 18 and 22; other drafts use MoqtSession.
 bool libmoq_publishes_draft(DraftVersion draft) {
-    return draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18;
+    return draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18 ||
+           draft == DraftVersion::kDraft22;
 }
 
 // libmoq's media sender numbers Group IDs itself and offers no setting for the
