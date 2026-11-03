@@ -48,6 +48,8 @@ std::string webtransport_protocol_offer(DraftVersion version) {
             return "\"moqt-21\"";
         case DraftVersion::kDraft22:
             return "\"moqt-22\"";
+        case DraftVersion::kDraft23:
+            return "\"moqt-23\"";
     }
 
     return "";
@@ -105,7 +107,8 @@ transport::FailureKind publish_failure_kind(
 
 constexpr std::size_t kMaxGoawayMigrations = 8;
 
-transport::EndpointConfig migration_endpoint(const transport::EndpointConfig& current, std::string_view uri) {
+transport::EndpointConfig migration_endpoint(const transport::EndpointConfig& current, std::string_view uri,
+                                             DraftVersion draft) {
     if (uri.empty())
         return current;
     const std::string_view scheme = uri.starts_with("moqt://") ? "moqt://" : "https://";
@@ -154,10 +157,10 @@ transport::EndpointConfig migration_endpoint(const transport::EndpointConfig& cu
         scheme == "moqt://" ? transport::TransportKind::kRawQuic : transport::TransportKind::kWebTransport;
     if (endpoint.transport != current.transport) {
         endpoint.alpn =
-            endpoint.transport == transport::TransportKind::kRawQuic ? default_alpn(DraftVersion::kDraft22) : "h3";
+            endpoint.transport == transport::TransportKind::kRawQuic ? default_alpn(draft) : "h3";
         endpoint.application_protocol = endpoint.transport == transport::TransportKind::kRawQuic
-                                            ? default_alpn(DraftVersion::kDraft22)
-                                            : webtransport_protocol_offer(DraftVersion::kDraft22);
+                                            ? default_alpn(draft)
+                                            : webtransport_protocol_offer(draft);
     }
     endpoint.host = std::string(host);
     endpoint.port = static_cast<std::uint16_t>(port);
@@ -170,12 +173,12 @@ transport::EndpointConfig migration_endpoint(const transport::EndpointConfig& cu
 }
 
 transport::TransportStatus prepare_migration(const transport::TransportStatus& status, std::size_t migrations,
-                                             transport::EndpointConfig& endpoint) {
+                                             DraftVersion draft, transport::EndpointConfig& endpoint) {
     if (migrations == kMaxGoawayMigrations) {
         return transport::TransportStatus::failure("GOAWAY migration limit exceeded");
     }
     try {
-        endpoint = migration_endpoint(endpoint, *status.migration_uri);
+        endpoint = migration_endpoint(endpoint, *status.migration_uri, draft);
         return transport::TransportStatus::success();
     } catch (const std::runtime_error& error) {
         return transport::TransportStatus::failure(error.what());
@@ -421,10 +424,11 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         if (!status.ok && stop_requested()) {
             return finish_stopped_publish(active, true);
         }
-        if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
+        if (!status.ok && status.migration_uri && is_draft22_or_later(config_.draft_version)) {
             static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
-            const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
+            const auto migration_status =
+                prepare_migration(status, migrations, config_.draft_version, resolved_endpoint);
             if (!migration_status.ok) {
                 clear_active_session(active, false, migration_status.message);
                 return migration_status;
@@ -672,7 +676,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         if (!status.ok && stop_requested()) {
             return finish_stopped_publish(active, true);
         }
-        if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
+        if (!status.ok && status.migration_uri && is_draft22_or_later(config_.draft_version)) {
             const auto snapshot = active->session->publish_stats();
             prior_bytes += snapshot.bytes_published;
             prior_objects += snapshot.objects_published;
@@ -705,7 +709,8 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
 
             static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
-            const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
+            const auto migration_status =
+                prepare_migration(status, migrations, config_.draft_version, resolved_endpoint);
             if (!migration_status.ok) {
                 clear_active_session(active, false, migration_status.message);
                 return migration_status;
@@ -855,7 +860,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
     bool catalog_chain_complete = false;
     std::optional<std::size_t> replay_catalog_index;
     auto resumable_source = source;
-    if (source_supplies_catalog && source.next_object && config_.draft_version == DraftVersion::kDraft22) {
+    if (source_supplies_catalog && source.next_object && is_draft22_or_later(config_.draft_version)) {
         resumable_source.next_object = [&]() -> std::optional<LiveObject> {
             if (replay_catalog_index && *replay_catalog_index < catalog_chain.size()) {
                 return catalog_chain[(*replay_catalog_index)++];
@@ -920,19 +925,20 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         }
 
         status = active->session->publish_live_objects(
-            source_supplies_catalog && config_.draft_version == DraftVersion::kDraft22 ? resumable_source : source,
+            source_supplies_catalog && is_draft22_or_later(config_.draft_version) ? resumable_source : source,
             config_.draft_version);
         if (!status.ok && stop_requested()) {
             return finish_stopped_publish(active, true);
         }
-        if (!status.ok && status.migration_uri && config_.draft_version == DraftVersion::kDraft22) {
+        if (!status.ok && status.migration_uri && is_draft22_or_later(config_.draft_version)) {
             const auto snapshot = active->session->publish_stats();
             prior_bytes += snapshot.bytes_published;
             prior_objects += snapshot.objects_published;
             prior_groups += snapshot.groups_published;
             static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
-            const auto migration_status = prepare_migration(status, migrations, resolved_endpoint);
+            const auto migration_status =
+                prepare_migration(status, migrations, config_.draft_version, resolved_endpoint);
             if (!migration_status.ok) {
                 clear_active_session(active, false, migration_status.message);
                 return migration_status;

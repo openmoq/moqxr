@@ -1441,7 +1441,7 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                     return protocol_violation(transport, "request stream received GOAWAY");
                 }
                 GoawayMessage goaway;
-                if (draft == DraftVersion::kDraft22 && !decode_goaway_message(message_bytes, draft, goaway)) {
+                if (is_draft22_or_later(draft) && !decode_goaway_message(message_bytes, draft, goaway)) {
                     return protocol_violation(transport, "invalid request GOAWAY");
                 }
                 const TransportStatus reset_status = transport.reset_stream(request_stream_id, 0x0);
@@ -1683,13 +1683,11 @@ TransportStatus reject_unsupported_request(PublisherTransport& transport, DraftV
                                            std::span<const std::uint8_t> bytes,
                                            PeerRequestIdValidator& peer_request_ids) {
     std::size_t offset = 0;
+    std::size_t length = 0;
     std::uint64_t type = 0;
     std::uint64_t request_id = 0;
-    if (!decode_moqint(bytes, offset, draft, type) || bytes.size() - offset < 2)
-        return protocol_violation(transport, "malformed unsupported request");
-    const auto length = (static_cast<std::size_t>(bytes[offset]) << 8) | bytes[offset + 1];
-    offset += 2;
-    if (bytes.size() - offset != length || !decode_moqint(bytes, offset, draft, request_id))
+    if (!decode_control_message_header(bytes, draft, type, offset, length) ||
+        !decode_moqint(bytes, offset, draft, request_id))
         return protocol_violation(transport, "malformed unsupported request");
     const auto status = peer_request_ids.validate(transport, request_id);
     if (!status.ok) return status;
@@ -1730,7 +1728,7 @@ public:
     TransportStatus notify_namespace(PublisherTransport& transport, DraftVersion draft,
                                      std::uint64_t stream_id, std::span<const std::string> prefix,
                                      std::string_view track_namespace) {
-        if (draft != DraftVersion::kDraft22 || !namespace_prefix_matches(prefix, track_namespace))
+        if (!is_draft22_or_later(draft) || !namespace_prefix_matches(prefix, track_namespace))
             return TransportStatus::success();
         const auto components = split_track_namespace_components(track_namespace);
         return transport.write_stream(stream_id,
@@ -1739,7 +1737,7 @@ public:
     TransportStatus goaway(PublisherTransport& transport, DraftVersion draft,
                            std::uint64_t stream_id, std::span<const std::uint8_t> bytes) {
         GoawayMessage message;
-        if (draft == DraftVersion::kDraft22 && !decode_goaway_message(bytes, draft, message))
+        if (is_draft22_or_later(draft) && !decode_goaway_message(bytes, draft, message))
             return protocol_violation(transport, "invalid request GOAWAY");
         if (!goaway_streams_.insert(stream_id).second)
             return protocol_violation(transport, "duplicate request GOAWAY");
@@ -1749,7 +1747,7 @@ public:
     TransportStatus poll(PublisherTransport& transport, DraftVersion draft,
                          PeerRequestIdValidator& peer_request_ids, OnTracksForward&& on_tracks_forward,
                          std::string_view track_namespace) {
-        if (draft != DraftVersion::kDraft22) return TransportStatus::success();
+        if (!is_draft22_or_later(draft)) return TransportStatus::success();
         for (auto& [stream_id, request] : requests_) {
             if (!request.active) continue;
             while (true) {
@@ -1834,7 +1832,7 @@ TransportStatus request_goaway(PublisherTransport& transport, DraftVersion draft
                                 std::uint64_t stream_id, std::span<const std::uint8_t> bytes,
                                 std::set<std::uint64_t>& seen) {
     GoawayMessage message;
-    if (draft == DraftVersion::kDraft22 && !decode_goaway_message(bytes, draft, message))
+    if (is_draft22_or_later(draft) && !decode_goaway_message(bytes, draft, message))
         return protocol_violation(transport, "invalid request GOAWAY");
     if (!seen.insert(stream_id).second)
         return protocol_violation(transport, "duplicate request GOAWAY");
@@ -1845,7 +1843,7 @@ class SessionControlReader {
 public:
     TransportStatus poll(PublisherTransport& transport, DraftVersion draft,
                          std::uint64_t stream_id, std::vector<std::uint8_t>& pending) {
-        if (draft != DraftVersion::kDraft22) return TransportStatus::success();
+        if (!is_draft22_or_later(draft)) return TransportStatus::success();
         while (true) {
             std::size_t size = 0;
             while (next_control_message(pending, draft, size)) {
@@ -2191,17 +2189,13 @@ bool decode_unsubscribe_message(std::span<const std::uint8_t> bytes,
                                 openmoq::publisher::DraftVersion draft,
                                 std::uint64_t& request_id) {
     std::size_t offset = 0;
+    std::size_t payload_length = 0;
     std::uint64_t message_type = 0;
-    if (!decode_moqint(bytes, offset, draft, message_type) || message_type != 0x0a || offset + 2 > bytes.size()) {
+    if (!decode_control_message_header(bytes, draft, message_type, offset, payload_length) || message_type != 0x0a) {
         return false;
     }
-    const std::size_t payload_length =
-        (static_cast<std::size_t>(bytes[offset]) << 8) | static_cast<std::size_t>(bytes[offset + 1]);
-    offset += 2;
     const std::size_t payload_end = offset + payload_length;
-    return payload_end == bytes.size() &&
-           decode_moqint(bytes, offset, draft, request_id) &&
-           offset == payload_end;
+    return decode_moqint(bytes, offset, draft, request_id) && offset == payload_end;
 }
 
 bool find_next_matching_object_index(const openmoq::publisher::PublishPlan& plan,
@@ -4648,7 +4642,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             if (status.ok) subscribe_tracks_next_request_id += matching_tracks.size() * 2;
             return status;
             };
-    if (draft == DraftVersion::kDraft22)
+    if (is_draft22_or_later(draft))
         discovery_requests.retain(namespace_stream_id, 0x06, {}, 0);
     while (true) {
         const TransportStatus event_status =
@@ -8495,7 +8489,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     PeerUnidirectionalStreams peer_unidirectional_streams;
     SessionControlReader session_control;
     std::set<std::uint64_t> request_goaways;
-    if (draft_version == DraftVersion::kDraft22)
+    if (is_draft22_or_later(draft_version))
         discovery_requests.retain(namespace_stream_id_, 0x06, {}, 0);
     process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
         // PUBLISH-initiated subscriptions are in active_subscriptions too, so
@@ -10177,7 +10171,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
     // Helper: process pending SUBSCRIBE/SUBSCRIBE_NAMESPACE messages
     // from the control stream. Returns the number of new subscriptions accepted.
-    if (draft_version == DraftVersion::kDraft22)
+    if (is_draft22_or_later(draft_version))
         discovery_requests.retain(namespace_stream_id_, 0x06, {}, 0);
     auto process_control_messages = [&]() -> std::pair<TransportStatus, std::size_t> {
         const auto control_status = session_control.poll(transport_, draft_version, peer_control_stream_id_, pending_control_bytes_);
@@ -11579,7 +11573,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             });
     };
 
-    if (draft_version == DraftVersion::kDraft22)
+    if (is_draft22_or_later(draft_version))
         discovery_requests.retain(namespace_stream_id_, 0x06, {}, 0);
     auto process_control_messages = [&]() -> TransportStatus {
         const auto control_status = session_control.poll(transport_, draft_version, peer_control_stream_id_, pending_control_bytes_);
@@ -12235,7 +12229,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             retained_catalog_group.push_back(*next);
             retained_source_catalog = std::move(*next);
-            if (draft_version == DraftVersion::kDraft22) {
+            if (is_draft22_or_later(draft_version)) {
                 live_object_catalog_sent = false;
                 catalog_subscription_unserved = catalog_subscription_count() != 0;
             }

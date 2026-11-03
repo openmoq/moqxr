@@ -304,6 +304,8 @@ std::uint64_t draft_version_number(DraftVersion draft) {
             return 0xff000015ULL;
         case DraftVersion::kDraft22:
             return 0xff000016ULL;
+        case DraftVersion::kDraft23:
+            return 0xff000017ULL;
     }
     return 0;
 }
@@ -322,6 +324,8 @@ std::string draft_label(DraftVersion draft) {
             return "draft-21";
         case DraftVersion::kDraft22:
             return "draft-22";
+        case DraftVersion::kDraft23:
+            return "draft-23";
     }
     return "unknown";
 }
