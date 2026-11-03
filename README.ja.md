@@ -18,7 +18,7 @@
 - stdin からの live fragmented MP4、libsrt が利用可能な場合の SRT 経由 MPEG-TS、HTTP/1.1 CTE LL-DASH ingest（chunked または固定長 request）経由の CMAF を受け付けます。
 - `--url` で MSF URL を解析し、`--print-msf-urls` で catalog discovery URL を表示します。
 - FFmpeg 生成ライブメディア、CAT4MOQ 認可、MPEG-2 TS/M2TS パッケージング用の C++ Publisher API example を提供します。
-- draft 16 と 18 では、C11 Media-over-QUIC library [moq5](https://github.com/openmoq/moq5) 経由の公開を選択できます。
+- draft 16、18、22 では、C11 Media-over-QUIC library [moq5](https://github.com/openmoq/moq5) 経由の公開を選択できます。
 
 ## クイックスタート
 
@@ -272,6 +272,6 @@ program を選択するには `--program NUMBER`、object size を変更する�
 
 ## 現在の状態
 
-メインの `openmoq-publisher` CLI は draft 16、18、21、22、23 を受け付けます。draft 22 がデフォルトです。client は選択した draft の ALPN だけを提示します。draft 18 は後続の draft の基盤となる request-stream profile を提供し、draft 21 はそれを拡張し（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）、draft 22 は明示的な LOCATION_FILTER type を追加し、draft 23 は varint の control message Length、FORWARD に代わる PAUSED、REQUEST_ERROR の Error Details、固有の session 終了 code を使います。詳細は [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md) を参照してください。draft 21、22、23 は native backend で公開します。この publisher の moq5 adapter は draft 16 と 18 のままで、その他の draft は moq5 build でも native backend で公開します。draft 14、17、19、20 の text は実装履歴と protocol review 用に `docs/` に残されていますが、メイン CLI では選択できません。独立した MSFTS example は draft-specific test 用に draft 14/16/17/18 の選択を維持し、draft 21、22、23 も受け付けます。
+メインの `openmoq-publisher` CLI は draft 16、18、21、22、23 を受け付けます。draft 22 がデフォルトです。client は選択した draft の ALPN だけを提示します。draft 18 は後続の draft の基盤となる request-stream profile を提供し、draft 21 はそれを拡張し（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）、draft 22 は明示的な LOCATION_FILTER type を追加し、draft 23 は varint の control message Length、FORWARD に代わる PAUSED、REQUEST_ERROR の Error Details、固有の session 終了 code を使います。詳細は [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md) を参照してください。draft 21 と 23 は native backend で公開します。moq5 build では draft 16、18、22 は moq5 経由で公開し、その他の draft は引き続き native backend で公開します。moq5 経由の draft 22 は、閉じたポートに対する確認と unit test でのみ検証しており、draft 22 の relay に対しては実行していません。draft 14、17、19、20 の text は実装履歴と protocol review 用に `docs/` に残されていますが、メイン CLI では選択できません。独立した MSFTS example は draft-specific test 用に draft 14/16/17/18 の選択を維持し、draft 21、22、23 も受け付けます。
 
 デフォルトの picoquic backend と任意の moq5 backend は、どちらも継続的に interoperability test が行われています。詳細な機能範囲、制限、roadmap については [docs/status.md](docs/status.md) と [docs/protocol-mapping.md](docs/protocol-mapping.md) を参照してください。

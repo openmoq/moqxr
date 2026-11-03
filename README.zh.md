@@ -18,7 +18,7 @@
 - 接受来自 stdin 的直播 fragmented MP4、libsrt 可用时通过 SRT 传输的 MPEG-TS，以及通过 HTTP/1.1 CTE LL-DASH ingest（chunked 或固定长度请求）传输的 CMAF。
 - 使用 `--url` 解析 MSF URL，并使用 `--print-msf-urls` 打印 catalog discovery URL。
 - 提供用于 FFmpeg 生成直播媒体、CAT4MOQ 授权和 MPEG-2 TS/M2TS 打包的 C++ Publisher API 示例。
-- 对于 drafts 16 和 18，可选择通过 C11 Media-over-QUIC 库 [moq5](https://github.com/openmoq/moq5) 进行发布。
+- 对于 drafts 16、18 和 22，可选择通过 C11 Media-over-QUIC 库 [moq5](https://github.com/openmoq/moq5) 进行发布。
 
 ## 快速开始
 
@@ -273,6 +273,6 @@ MSFTS 示例遵循 `examples/msfts-publisher/docs/` 中的本地文本 draft，�
 
 ## 当前状态
 
-主 `openmoq-publisher` CLI 接受 drafts 16、18、21、22 和 23；draft 22 是默认值。客户端只提供所选 draft 的 ALPN。draft 18 提供后续 draft 所基于的 request-stream profile，draft 21 在其基础上扩展（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS），draft 22 增加显式 LOCATION_FILTER 类型，draft 23 使用 varint 控制消息 Length、以 PAUSED 取代 FORWARD、REQUEST_ERROR 的 Error Details 以及其特定的会话终止码；参见 [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md)。drafts 21、22 和 23 通过原生后端发布；此 publisher 的 moq5 适配器仍使用 drafts 16 和 18，其他 draft 即使在 moq5 构建中也通过原生后端发布。drafts 14、17、19 和 20 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试，并且也接受 drafts 21、22 和 23。
+主 `openmoq-publisher` CLI 接受 drafts 16、18、21、22 和 23；draft 22 是默认值。客户端只提供所选 draft 的 ALPN。draft 18 提供后续 draft 所基于的 request-stream profile，draft 21 在其基础上扩展（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS），draft 22 增加显式 LOCATION_FILTER 类型，draft 23 使用 varint 控制消息 Length、以 PAUSED 取代 FORWARD、REQUEST_ERROR 的 Error Details 以及其特定的会话终止码；参见 [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md)。drafts 21 和 23 通过原生后端发布。在 moq5 构建中，drafts 16、18 和 22 通过 moq5 发布，其他 draft 仍通过原生后端发布。通过 moq5 发布 draft 22 仅针对已关闭的端口和单元测试进行过测试，尚未针对 draft 22 relay 运行。drafts 14、17、19 和 20 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试，并且也接受 drafts 21、22 和 23。
 
 默认 picoquic backend 和可选 moq5 backend 都在进行持续的互操作性测试。有关详细功能覆盖、限制和 roadmap，请参阅 [docs/status.md](docs/status.md) 和 [docs/protocol-mapping.md](docs/protocol-mapping.md)。

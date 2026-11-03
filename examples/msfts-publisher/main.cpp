@@ -82,23 +82,36 @@ int main(int argc, char** argv) {
         tls.insecure_skip_verify = options.insecure;
 
         std::atomic<bool> publish_finished = false;
-        std::jthread signal_monitor(
-            [&](std::stop_token stop_token) {
-                while (!stop_token.stop_requested() &&
-                       !publish_finished.load(std::memory_order_acquire)) {
-                    if (interrupted != 0) {
-                        static_cast<void>(publisher.disconnect());
-                        return;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::atomic<bool> monitor_stopping = false;
+        // std::thread, not std::jthread: libc++ before 20 (FreeBSD 14) has no
+        // std::jthread or std::stop_token.
+        std::thread signal_monitor([&] {
+            while (!monitor_stopping.load(std::memory_order_acquire) &&
+                   !publish_finished.load(std::memory_order_acquire)) {
+                if (interrupted != 0) {
+                    static_cast<void>(publisher.disconnect());
+                    return;
                 }
-            });
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+        // Stops and joins the monitor on every way out of this scope,
+        // including an exception, as std::jthread did.
+        struct MonitorJoin {
+            std::atomic<bool>& stopping;
+            std::thread& thread;
+            ~MonitorJoin() {
+                stopping.store(true, std::memory_order_release);
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        } monitor_join{monitor_stopping, signal_monitor};
 
         auto live_source = source->live_source();
         const auto status =
             publisher.publish_live_objects(live_source, endpoint, tls);
         publish_finished.store(true, std::memory_order_release);
-        signal_monitor.request_stop();
 
         if (interrupted != 0) {
             std::cerr << "Publishing interrupted\n";
