@@ -316,7 +316,7 @@ keeps the new Group IDs above the previous run's if that run published fewer
 groups than the milliseconds that passed between its start and the restart,
 and the system clock did not step backwards. `publish_live(...)` numbers the
 live media groups and the catalog groups from this value on every draft; on
-draft 22 a GOAWAY migration still resumes above the groups the previous
+drafts 22 and 23 a GOAWAY migration still resumes above the groups the previous
 session sent. The default is 0. A value above `kMaxGroupId` (2^62-1) makes the
 `Publisher` constructor and `set_config` throw. `publish_live_objects(...)`
 sends the Group IDs its source supplies (`LiveDashIngestConfig::initial_group_id`
@@ -453,11 +453,15 @@ By default, the API applies transport-appropriate ALPN:
 - Raw QUIC + draft-16: `moqt-16`
 - Raw QUIC + draft-17: `moqt-17`
 - Raw QUIC + draft-18: `moqt-18`
+- Raw QUIC + draft-21: `moqt-21`
+- Raw QUIC + draft-22: `moqt-22`
+- Raw QUIC + draft-23: `moqt-23`
 - WebTransport: `h3`
 
 For WebTransport, the API sends the MoQ application protocol offer separately
 from QUIC ALPN through `WT-Available-Protocols`: draft-16 offers `"moqt-16"`,
-draft-17 offers `"moqt-17"`, draft-18 offers `"moqt-18"`, and draft-14 keeps
+draft-17 offers `"moqt-17"`, draft-18 offers `"moqt-18"`, drafts 21, 22, and
+23 offer `"moqt-21"`, `"moqt-22"`, and `"moqt-23"`, and draft-14 keeps
 the legacy no-subprotocol behavior.  The quotes are part of the HTTP
 Structured Fields syntax; Raw QUIC ALPN remains the unquoted token.
 

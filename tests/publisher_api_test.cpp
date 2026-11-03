@@ -166,6 +166,8 @@ struct MigrationTransport final : PublisherTransport {
     std::function<void()> before_goaway;
     bool setup_read = false;
     std::uint64_t next_stream = 0;
+    // The draft the relay answers SETUP and requests with.
+    DraftVersion draft = DraftVersion::kDraft22;
     TransportStatus configure(const EndpointConfig& endpoint, const TlsConfig& tls) override {
         record->endpoint = endpoint;
         record->tls = tls;
@@ -218,12 +220,12 @@ struct MigrationTransport final : PublisherTransport {
         }
         if (stream == 3 && !setup_read) {
             setup_read = true;
-            bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = DraftVersion::kDraft22});
+            bytes = openmoq::publisher::transport::encode_server_setup_message({.draft = draft});
             return TransportStatus::success();
         }
         if (source_reads) {
             if (request_responses.erase(stream)) {
-                bytes = openmoq::publisher::transport::encode_request_ok_message(DraftVersion::kDraft22, 0);
+                bytes = openmoq::publisher::transport::encode_request_ok_message(draft, 0);
                 return TransportStatus::success();
             }
             if (stream != 3 || !target || *source_reads < migration_threshold) {
@@ -591,6 +593,7 @@ bool test_disconnect_stops_live_stdin_on_idle_input(bool send_init, bool forward
 
 bool test_goaway_recreates_publisher_transport() {
     bool ok = true;
+    for (const auto draft : {DraftVersion::kDraft22, DraftVersion::kDraft23})
     for (const auto kind : {TransportKind::kRawQuic, TransportKind::kWebTransport}) {
         for (const auto& target :
              {std::string(),
@@ -599,17 +602,19 @@ bool test_goaway_recreates_publisher_transport() {
               kind == TransportKind::kRawQuic ? std::string("https://relay-next.example:4443/moq-next?q=1")
                                               : std::string("moqt://relay-next.example:4443/moq-next?q=1")}) {
             PublisherConfig config;
-            config.draft_version = DraftVersion::kDraft22;
+            config.draft_version = draft;
             config.authorization.setup_credential = openmoq::publisher::cat4moq::Credential{{0xde, 0xad, 0xbe, 0xef}};
             std::vector<std::shared_ptr<MigrationTransport::Record>> records;
             Publisher publisher(config, [&](TransportKind) -> std::unique_ptr<PublisherTransport> {
                 auto record = std::make_shared<MigrationTransport::Record>();
                 records.push_back(record);
-                return std::make_unique<MigrationTransport>(record,
-                                                            records.size() == 1 ? std::optional(target) : std::nullopt);
+                auto transport = std::make_unique<MigrationTransport>(
+                    record, records.size() == 1 ? std::optional(target) : std::nullopt);
+                transport->draft = draft;
+                return transport;
             });
             PreparedPublish prepared;
-            prepared.plan.draft = draft_profile(DraftVersion::kDraft22);
+            prepared.plan.draft = draft_profile(draft);
             EndpointConfig endpoint;
             endpoint.transport = kind;
             endpoint.host = "relay.example";
@@ -636,7 +641,7 @@ bool test_goaway_recreates_publisher_transport() {
                              records[1]->tls.private_key_path == tls.private_key_path &&
                              records[1]->endpoint.alpn == (target.empty()                   ? records[0]->endpoint.alpn
                                                            : target.starts_with("https://") ? "h3"
-                                                                                            : "moqt-22"),
+                                                                                            : default_alpn(draft)),
                          "migration retains TLS client credentials and protocol offer");
             ok &= expect(records[1]->endpoint.transport == (target.empty() ? kind
                                                             : target.starts_with("https://")
@@ -1084,7 +1089,7 @@ int main() {
                      "expected draft-18 webtransport to offer a structured WT protocol token");
     }
 
-    for (const auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22}) {
+    for (const auto draft : {DraftVersion::kDraft21, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
         for (const TransportKind kind : {TransportKind::kWebTransport, TransportKind::kRawQuic}) {
             PublisherConfig config;
             config.draft_version = draft;

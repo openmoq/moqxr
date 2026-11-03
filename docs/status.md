@@ -6,8 +6,8 @@ Current transport and packaging work is past the initial prototype stage. The pu
 
 Draft status:
 
-- draft 14 is the primary target
-- draft 16 is maintained as a secondary compatibility profile
+- draft 18 is the default; draft 23 is the newest profile and is selectable with `--draft 23`
+- draft 14 is retained for API callers and draft 16 is maintained as a compatibility profile
 - draft 17 is selectable and has VI64, request-stream, control-codec, ALPN, and WebTransport protocol-offer support; relay interop coverage remains limited
 - WebTransport publishing to moqx is blocked: moqx omits the `reset_stream_at` transport parameter that WebTransport over HTTP/3 requires of servers, so picoquic withholds the CONNECT and the publisher names the missing parameter ([openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)) unless `--webtransport-allow-missing-reset-stream-at` is given; raw QUIC to moqx and WebTransport to Red5 are unaffected. A local moqx 0.3.5-99 build advertised the parameter and accepted draft-16 WebTransport publishes (the opt-out was not exercised), so newer builds may no longer be affected
 - draft 18 support includes version selection, setup/request framing, request-stream response correlation, fragmented subscriber-interest reads, and same-stream `SUBSCRIBE_OK` responses
@@ -17,6 +17,13 @@ Draft status:
   - draft-21 SUBSCRIBE_OK reports LARGEST_OBJECT as the largest object already sent on the track, so a SUBSCRIBE with FILL_PARAMETERS gets the same open-then-reset fill failure once anything was sent. The catalog track omits it, because its retained copy is re-sent to each new subscriber. Drafts 14/16/18 still omit LARGEST_OBJECT from SUBSCRIBE_OK
   - SUBSCRIBE_TRACKS with a LOCATION_FILTER other than Next Object is declined with REQUEST_ERROR NOT_SUPPORTED; its GROUP_ORDER is validated but not applied
   - range filters (0x25-0x29) are rejected because MAX_FILTER_RANGES is never advertised
+- draft 22 (`--draft 22`, native backend only) keeps the draft-21 publishing semantics, with explicit LOCATION_FILTER types, GOAWAY migration with resume above the groups already sent, NAMESPACE notifications on SUBSCRIBE_NAMESPACE, and PREFIX_OVERLAP rejection of overlapping namespace and track subscriptions
+- draft 23 (`--draft 23`, native backend only) keeps the draft-22 behaviour on the draft-23 wire format: a varint control message Length, PAUSED in place of FORWARD, count-prefixed FILL_PARAMETERS, NAMESPACE Parameters, REQUEST_ERROR Error Details, SUBSCRIBE_TRACKS_ID on the PUBLISHes that answer a SUBSCRIBE_TRACKS, and the draft-23 session termination codes where the session identifies the condition. See [draft23-implementation-plan.md](draft23-implementation-plan.md). Known limitations:
+  - an overlapping SUBSCRIBE_TRACKS is declined with REQUEST_ERROR NOT_SUPPORTED instead of getting a second set of PUBLISHes, because each track has one Track Alias and one set of data streams; overlapping SUBSCRIBE_NAMESPACE is accepted
+  - control messages are limited to 65535 bytes: moqxr never advertises a larger MAX_CONTROL_MESSAGE_SIZE and never sends past the default
+  - malformed messages still close the session with PROTOCOL_VIOLATION rather than the more specific draft-23 codes
+  - PUBLISH does not carry LARGEST_OBJECT, as on earlier drafts
+  - not yet verified against a draft-23 relay
 - drafts 19 and 20 are archived under `docs/` for later review and are not selectable
 - CTE LL-DASH regressions cover FFmpeg-style multi-representation paths and draft-16 await-subscribe delivery
 - the main CLI supports ordered relay failover through repeated `--endpoint` values and `--retry N` same-endpoint retries; transport/connectivity failures are retryable, relay namespace/track rejections skip directly to the next endpoint, and fatal or cancelled work stops

@@ -13,7 +13,7 @@ It packages file and live media for Media over QUIC Transport (MOQT), builds MSF
 - Builds MSF/CMSF version 1 catalogs, initialization data, optional media timelines, and SAP event timelines.
 - Detects and signals existing CMAF CENC content protection for batch input, live fragmented MP4 on stdin, and CTE LL-DASH ingest. It does not encrypt or decrypt media.
 - Emits catalog, initialization, media, probe, and publish-plan files for local inspection.
-- Publishes with the main CLI's supported MOQT draft profiles: draft 16, draft 18 (default), draft 21, and draft 22.
+- Publishes with the main CLI's supported MOQT draft profiles: draft 16, draft 18 (default), draft 21, draft 22, and draft 23.
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
 - Accepts live fragmented MP4 from stdin, MPEG-TS over SRT when libsrt is available, and CMAF over HTTP/1.1 CTE LL-DASH ingest (chunked or fixed-length requests).
 - Parses MSF URLs with `--url` and prints the catalog discovery URL with `--print-msf-urls`.
@@ -73,7 +73,7 @@ checkout with LOCMAF support, run
 [C++ API configuration](docs/publisher-api.md#optional-locmaf-packaging), and
 [validation coverage](docs/testing.md#locmaf-tests).
 
-LOC-04 publishing is available with `--packaging loc --draft 18` (or `--draft 21` / `--draft 22`) on the native
+LOC-04 publishing is available with `--packaging loc --draft 18` (or `--draft 21` / `--draft 22` / `--draft 23`) on the native
 backend. It sends individual H.264/AAC frames with timestamp, timescale, and
 codec configuration properties; CMAF remains the default. See the
 [LOC quickstart](docs/quickstart.md#opt-in-to-loc) for scope and constraints.
@@ -275,7 +275,7 @@ Each live publisher process numbers its Group IDs from 0. If the process restart
 
 - `--initial-group-id time` reads the system clock once at startup and starts at the number of milliseconds since the Unix epoch. This is safe if the previous run published fewer groups than the milliseconds that passed between its start and the restart, and the system clock did not step backwards in between.
 - `--initial-group-id N` starts at the unsigned integer `N`, which must not exceed 2^62-1.
-- The default is 0. The option applies to the media tracks and the catalog of the live sources (stdin, SRT, and CTE LL-DASH) on every draft; it is rejected for file input. On draft 22, a GOAWAY migration still resumes above the groups the previous session sent. The moq5 publishing backend numbers Group IDs itself and rejects a non-zero value.
+- The default is 0. The option applies to the media tracks and the catalog of the live sources (stdin, SRT, and CTE LL-DASH) on every draft; it is rejected for file input. On drafts 22 and 23, a GOAWAY migration still resumes above the groups the previous session sent. The moq5 publishing backend numbers Group IDs itself and rejects a non-zero value.
 - The value is fixed for the process. A `--retry` or endpoint failover reconnect inside the same process starts again from it, so those attempts can reuse Group IDs; the option covers a process restart, not an in-process reconnect.
 
 ## Publishing via moq5
@@ -365,7 +365,7 @@ Localized Publisher API guides are available in [Spanish](docs/publisher-api.es.
 
 ## Current Status
 
-The main `openmoq-publisher` CLI accepts drafts 16, 18, 21, and 22; draft 18 is the default and provides the newer request-stream profile, and draft 21 extends it (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). Draft 22 adds explicit LOCATION_FILTER types while retaining draft-21 publishing semantics. Drafts 21 and 22 are native-backend only; the moq5 backend stays on drafts 16 and 18. Text for drafts 14, 17, 19, and 20 remains in `docs/` for implementation history and protocol review, but those versions are not selectable in the main CLI. The separate MSFTS example retains draft 14/16/17/18 selection for draft-specific testing.
+The main `openmoq-publisher` CLI accepts drafts 16, 18, 21, 22, and 23; draft 18 is the default and provides the newer request-stream profile, and draft 21 extends it (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). Draft 22 adds explicit LOCATION_FILTER types while retaining draft-21 publishing semantics. Draft 23 keeps those semantics with a varint control message Length, PAUSED in place of FORWARD, REQUEST_ERROR Error Details, overlapping namespace subscriptions, and its specific session termination codes; see [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md). Drafts 21, 22, and 23 are native-backend only; the moq5 backend stays on drafts 16 and 18, and other drafts publish through the native backend even in moq5 builds. Text for drafts 14, 17, 19, and 20 remains in `docs/` for implementation history and protocol review, but those versions are not selectable in the main CLI. The separate MSFTS example retains draft 14/16/17/18 selection for draft-specific testing, and also accepts drafts 21, 22, and 23.
 
 The default picoquic backend and the opt-in moq5 backend are both under active interoperability testing. For detailed feature coverage, limitations, and roadmap work, see [docs/status.md](docs/status.md) and [docs/protocol-mapping.md](docs/protocol-mapping.md).
 
