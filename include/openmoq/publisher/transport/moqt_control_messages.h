@@ -229,6 +229,12 @@ bool decode_max_request_id_message(std::span<const std::uint8_t> bytes, MaxReque
 bool decode_goaway_message(std::span<const std::uint8_t> bytes, DraftVersion draft, GoawayMessage& message);
 std::vector<std::uint8_t> encode_namespace_notification(DraftVersion draft, std::span<const std::string> suffix);
 bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draft, std::size_t& message_size);
+// Reads a draft-18+ control message Type and Length; the payload must end exactly at the end of `bytes`.
+bool decode_control_message_header(std::span<const std::uint8_t> bytes,
+                                   DraftVersion draft,
+                                   std::uint64_t& type,
+                                   std::size_t& payload_offset,
+                                   std::size_t& payload_length);
 std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& message);
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uint64_t request_id);
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
