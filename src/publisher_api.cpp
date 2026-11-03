@@ -694,6 +694,14 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                 return exhausted;
             }
             resume_catalog_group_floor = *next_catalog_group_floor;
+            // The migrated session may fail before it reads its input, and a
+            // retry then starts from *resume, which must not be the state from
+            // before this migration.
+            if (resume != nullptr) {
+                resume->bytes = resume_bytes;
+                resume->group_floor = resume_group_floor;
+                resume->catalog_group_floor = resume_catalog_group_floor;
+            }
 
             static_cast<void>(active->close(0));
             clear_active_session(active, false, {});
@@ -708,7 +716,10 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
             const std::string error = "transport live publish failed: " + status.message;
             transport::FailureKind failure_kind =
                 publish_failure_kind(status, *active->transport);
-            if (resume != nullptr && failure_kind == transport::FailureKind::kRetryable) {
+            // Endpoint failover continues from this state too, so a permanent
+            // failure of this endpoint saves it like a retryable one.
+            if (resume != nullptr && (failure_kind == transport::FailureKind::kRetryable ||
+                                      failure_kind == transport::FailureKind::kEndpointPermanent)) {
                 // A session that failed before reading its input leaves no
                 // bytes of its own, so keep the ones it was given.
                 if (!active->session->live_resume_bytes().empty()) {

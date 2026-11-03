@@ -957,6 +957,10 @@ void append_traf_sample_durations(const Mp4Box& traf,
         if ((trun_flags & 0x000400U) != 0) cursor += 4;  // sample_flags
         if ((trun_flags & 0x000800U) != 0) cursor += 4;  // sample_composition_time_offset
         if (duration != 0) durations.push_back(duration);
+        // Without per-sample fields and with a zero default, a huge
+        // sample_count would otherwise spin without advancing the cursor or
+        // collecting a duration.
+        if (default_duration == 0 && (trun_flags & 0x000100U) == 0) return;
     }
 }
 

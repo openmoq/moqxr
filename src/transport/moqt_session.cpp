@@ -3931,10 +3931,7 @@ std::vector<SubscribeMessage> end_peer_stopped_subscriptions(
         if (!is_request_stream(stream_id)) {
             continue;
         }
-        if (const auto code = transport.media_stream_peer_stop_error(stream_id)) {
-            std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
-                      << describe_stream_reset_code(*code) << '\n';
-        }
+        bool matched = false;
         for (auto it = active_subscription_stream_ids.begin(); it != active_subscription_stream_ids.end();) {
             const auto subscription_it = it->second == stream_id ? active_subscriptions.find(it->first)
                                                                  : active_subscriptions.end();
@@ -3943,6 +3940,11 @@ std::vector<SubscribeMessage> end_peer_stopped_subscriptions(
                 continue;
             }
             const SubscribeMessage& subscription = subscription_it->second;
+            matched = true;
+            if (const auto code = transport.media_stream_peer_stop_error(stream_id)) {
+                std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_id << " code="
+                          << describe_stream_reset_code(*code) << '\n';
+            }
             std::cerr << "[moqt-session] live: subscriber ended subscription track=" << subscription.track_name
                       << " request_id=" << subscription.request_id << " (STOP_SENDING on its request stream)\n";
             if (established_subscription_tracks != nullptr) {
@@ -3954,7 +3956,13 @@ std::vector<SubscribeMessage> end_peer_stopped_subscriptions(
             active_subscriptions.erase(subscription_it);
             it = active_subscription_stream_ids.erase(it);
         }
-        transport.acknowledge_media_stream_peer_stopped(stream_id);
+        // A stop that matches no subscription stays queued: its SUBSCRIBE may
+        // not have been parsed yet, and acknowledging it here would leave that
+        // subscription running after the subscriber ended it. close() drains
+        // the stops that never match.
+        if (matched) {
+            transport.acknowledge_media_stream_peer_stopped(stream_id);
+        }
     }
     return ended;
 }
@@ -9150,7 +9158,13 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     init_segment.insert(init_segment.end(), ftyp_bytes.begin(), ftyp_bytes.end());
     init_segment.insert(init_segment.end(), moov_bytes.begin(), moov_bytes.end());
 
+    // A failure before the stdin thread starts must still hand a retry the
+    // media that followed the init segment, which the reader holds unparsed.
     live_resume_bytes_ = init_segment;
+    {
+        const auto unparsed = reader.pending_bytes();
+        live_resume_bytes_.insert(live_resume_bytes_.end(), unparsed.begin(), unparsed.end());
+    }
     init_top_level_boxes = openmoq::publisher::parse_mp4_boxes(init_segment);
     tracks = openmoq::publisher::extract_tracks(init_top_level_boxes, init_segment);
     if (tracks.empty()) {
