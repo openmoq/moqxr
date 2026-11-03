@@ -1919,19 +1919,26 @@ void note_largest_live_object(LargestObjectByTrack& largest_by_track,
     }
 }
 
+std::optional<std::pair<std::size_t, std::size_t>> live_largest_object(
+    const LargestObjectByTrack& largest_by_track,
+    const std::string& track_name) {
+    const auto largest_it = largest_by_track.find(track_name);
+    if (largest_it == largest_by_track.end()) {
+        return std::nullopt;
+    }
+    return largest_it->second;
+}
+
 std::vector<std::uint8_t> encode_live_request_ok_message(
     DraftVersion draft,
     std::uint64_t request_id,
     const std::string& track_name,
     const LargestObjectByTrack& largest_by_track) {
-    const auto largest_it = largest_by_track.find(track_name);
-    if (largest_it == largest_by_track.end()) {
+    const auto largest = live_largest_object(largest_by_track, track_name);
+    if (!largest) {
         return encode_request_ok_message(draft, request_id);
     }
-    return encode_request_ok_message(draft,
-                                     request_id,
-                                     largest_it->second.first,
-                                     largest_it->second.second);
+    return encode_request_ok_message(draft, request_id, largest->first, largest->second);
 }
 
 // Draft-21 §3.4.1: FILL_PARAMETERS on a REQUEST_UPDATE while Forward is 1 and
@@ -8054,6 +8061,12 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     // so send_catalog() answers a later catalog SUBSCRIBE itself (see its
     // `joining` argument) rather than re-sending through publish().
     //
+    // The track's Largest Object as this publisher produced it, whether or
+    // not this session sent it (§9.20.17): media is noted as it is dequeued
+    // and the catalog as it is emitted, so SUBSCRIBE_OK and REQUEST_UPDATE_OK
+    // stay current while a subscription is paused or absent.
+    LargestObjectByTrack largest_object_by_track;
+
     // `joining` is the catalog SUBSCRIBE being answered, if any. A subscriber
     // that joins after the catalog was sent still needs it (MSF section 5):
     // a draft-21+ fill that covers the current catalog group is served on its
@@ -8083,6 +8096,11 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         }
         if (objects.empty()) {
             return TransportStatus::success();
+        }
+        for (const auto& object : objects) {
+            note_largest_live_object(largest_object_by_track, "catalog",
+                                     static_cast<std::size_t>(object.group_id),
+                                     static_cast<std::size_t>(object.object_id));
         }
         std::size_t streams_opened = 0;
         const TransportStatus status = send_catalog_objects(
@@ -8124,6 +8142,11 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         if (objects.empty()) {
             return TransportStatus::success();
         }
+        for (const auto& object : objects) {
+            note_largest_live_object(largest_object_by_track, "catalog",
+                                     static_cast<std::size_t>(object.group_id),
+                                     static_cast<std::size_t>(object.object_id));
+        }
         std::size_t streams_opened = 0;
         const TransportStatus status = send_catalog_objects(
             draft_version,
@@ -8152,7 +8175,6 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     std::map<std::uint64_t, std::vector<std::uint8_t>> pending_published_request_bytes;
     std::set<std::uint64_t> terminated_published_requests;
     std::uint64_t next_published_request_id = 2;
-    LargestObjectByTrack largest_object_by_track;
     std::function<std::pair<TransportStatus, std::size_t>()>
         process_control_messages;
     bool control_fin = false;
@@ -8707,7 +8729,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     continue;
                 }
                 const auto largest = subscribe_ok_largest(
-                    draft_version, subscribe.track_name, largest_sent_object(subscribe.track_name), false);
+                    draft_version, subscribe.track_name, live_largest_object(largest_object_by_track, subscribe.track_name), false);
                 const TransportStatus response_status =
                     transport_.write_stream(
                         request_stream_id,
@@ -9297,6 +9319,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     DeferredCatalogPublishDoneGuard catalog_publish_done_guard(catalog_publish_done_deferred,
                                                                catalog_publish_done_sender);
 
+    // The track's Largest Object as this publisher produced it, whether or
+    // not this session sent it (§9.20.17): media is noted as it is dequeued
+    // and the catalog as it is emitted, so SUBSCRIBE_OK and REQUEST_UPDATE_OK
+    // stay current while a subscription is paused or absent.
+    LargestObjectByTrack largest_object_by_track;
+
     // `joining` is the catalog SUBSCRIBE being answered, if any. A subscriber
     // that joins after the catalog was sent still needs it (MSF section 5):
     // a draft-21+ fill that covers the current catalog group is served on its
@@ -9326,6 +9354,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
         if (objects.empty()) {
             return TransportStatus::success();
+        }
+        for (const auto& object : objects) {
+            note_largest_live_object(largest_object_by_track, "catalog",
+                                     static_cast<std::size_t>(object.group_id),
+                                     static_cast<std::size_t>(object.object_id));
         }
         std::size_t streams_opened = 0;
         const TransportStatus status = send_catalog_objects(
@@ -9367,6 +9400,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
         if (objects.empty()) {
             return TransportStatus::success();
+        }
+        for (const auto& object : objects) {
+            note_largest_live_object(largest_object_by_track, "catalog",
+                                     static_cast<std::size_t>(object.group_id),
+                                     static_cast<std::size_t>(object.object_id));
         }
         std::size_t streams_opened = 0;
         const TransportStatus status = send_catalog_objects(
@@ -9624,7 +9662,6 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     std::map<std::uint64_t, std::vector<std::uint8_t>>
         pending_publish_request_bytes;
     std::set<std::uint64_t> terminated_publish_request_ids;
-    LargestObjectByTrack largest_object_by_track;
     std::uint64_t next_subscribe_tracks_publish_request_id = 2;
 
     // A PUBLISH-initiated subscription is gated by the union of the subscriber's
@@ -10187,7 +10224,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     }
 
                     const auto largest = subscribe_ok_largest(
-                        draft_version, subscribe.track_name, largest_sent_object(subscribe.track_name), false);
+                        draft_version, subscribe.track_name, live_largest_object(largest_object_by_track, subscribe.track_name), false);
                     TransportStatus write_status =
                         transport_.write_stream(request_stream_id,
                                                 encode_subscribe_ok_with_largest(draft_version,
