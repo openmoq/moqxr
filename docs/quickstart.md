@@ -22,7 +22,7 @@ Inspect the same input with an MSF media timeline track enabled:
 ./build/openmoq-publisher --input sample.mp4 --msf-timeline --dump-plan
 ```
 
-Explicitly select the default draft-18 profile:
+Explicitly select the draft-18 profile (the default is draft 22):
 
 ```bash
 ./build/openmoq-publisher --input sample.mp4 --draft 18 --dump-plan

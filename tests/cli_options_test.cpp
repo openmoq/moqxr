@@ -1224,8 +1224,8 @@ int main() {
     }
 
     ok &= expect(parse({"publisher", "--input", "sample.mp4"}).draft_version ==
-                     openmoq::publisher::DraftVersion::kDraft18,
-                 "CLI defaults to draft-18");
+                     openmoq::publisher::DraftVersion::kDraft22,
+                 "CLI defaults to draft-22");
     try {
         parse({"publisher", "--input", "sample.mp4", "--packaging", "loc"});
     } catch (const std::exception& error) {

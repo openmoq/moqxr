@@ -1096,8 +1096,8 @@ int main() {
     ok &= test_live_stdin_goaway_replays_parser_residual();
     ok &= test_live_stdin_migration_keeps_object_identity();
     ok &= test_live_stdin_migration_keeps_object_identity(1700000000000ULL);
-    ok &= expect(PublisherConfig{}.draft_version == DraftVersion::kDraft18,
-                 "publisher API defaults to draft-18");
+    ok &= expect(PublisherConfig{}.draft_version == DraftVersion::kDraft22,
+                 "publisher API defaults to draft-22");
 
     {
         PublisherConfig invalid;
