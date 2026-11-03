@@ -2806,7 +2806,8 @@ int main() {
         };
         const auto is_publish = [](const auto& write) { return message_type(write.bytes) == 0x1d; };
         for (const std::string scenario : {"namespace-overlap", "namespace-goaway", "namespace-prefix-update",
-                 "tracks-overlap", "tracks-publish-id", "tracks-prefix-update", "subscribe-goaway", "fetch"}) {
+                 "tracks-overlap", "tracks-publish-id", "tracks-prefix-update", "subscribe-goaway", "fetch",
+                 "control-fin", "control-duplicate-goaway", "unknown-stream", "unknown-control", "oversized-request"}) {
             MockTransport transport;
             transport.reads[3].push_back(encode_server_setup_message({.draft = d23}));
             transport.keep_open_streams.insert(3);
@@ -2844,6 +2845,21 @@ int main() {
                 transport.keep_open_streams.insert(1);
             } else if (scenario == "fetch") {
                 transport.reads[1].push_back(frame(0x16, {1, 1}));
+            } else if (scenario == "control-fin") {
+                transport.keep_open_streams.erase(3);
+                transport.reads[3].push_back({});
+            } else if (scenario == "control-duplicate-goaway") {
+                auto goaways = frame(0x10, {0, 0});
+                append_bytes(goaways, frame(0x10, {0, 0}));
+                transport.reads[3].push_back(goaways);
+            } else if (scenario == "unknown-stream") {
+                transport.reads[7].push_back({0x81, 0x10});
+            } else if (scenario == "unknown-control") {
+                transport.reads[3].push_back(frame(0x7e, {}));
+            } else if (scenario == "oversized-request") {
+                // SUBSCRIBE whose vi64 Length (70000) exceeds MAX_CONTROL_MESSAGE_SIZE.
+                transport.reads[1].push_back({0x03, 0xc1, 0x11, 0x70, 1});
+                transport.keep_open_streams.insert(1);
             }
             MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
             ok &= expect(session.connect(endpoint, tls).ok, "D23 " + scenario + " connects");
@@ -2865,6 +2881,16 @@ int main() {
             if (scenario == "namespace-goaway" || scenario == "subscribe-goaway") {
                 ok &= expect(!result.ok && transport.last_close_code == 3,
                              "D23 " + scenario + " closes PROTOCOL_VIOLATION: GOAWAY from a request's sender");
+                continue;
+            }
+            // Draft-23 §12.2 session termination codes.
+            const std::map<std::string, std::uint64_t> close_codes{
+                {"control-fin", 0x306}, {"control-duplicate-goaway", 0x303}, {"unknown-stream", 0x200},
+                {"unknown-control", 0x303}, {"oversized-request", 0x401}};
+            if (const auto code = close_codes.find(scenario); code != close_codes.end()) {
+                ok &= expect(!result.ok && transport.last_close_code == code->second,
+                             "D23 " + scenario + " closes with code " + std::to_string(code->second) + ", saw " +
+                                 std::to_string(transport.last_close_code) + ": " + result.message);
                 continue;
             }
             ok &= expect(result.ok && transport.state() == ConnectionState::kConnected,

@@ -434,6 +434,36 @@ TransportStatus protocol_violation(PublisherTransport& transport, std::string_vi
     return TransportStatus::failure(message);
 }
 
+// Draft-23 session termination codes (§12.2) for conditions earlier drafts
+// close with PROTOCOL_VIOLATION.
+constexpr std::uint64_t kInvalidStreamHeaderErrorCode = 0x200;
+constexpr std::uint64_t kMalformedMessageErrorCode = 0x300;
+constexpr std::uint64_t kUnexpectedMessageErrorCode = 0x303;
+constexpr std::uint64_t kClosedControlStreamErrorCode = 0x306;
+constexpr std::uint64_t kFieldLengthExceededErrorCode = 0x401;
+
+TransportStatus session_violation(PublisherTransport& transport,
+                                  openmoq::publisher::DraftVersion draft,
+                                  std::uint64_t draft23_error_code,
+                                  std::string_view message) {
+    if (!openmoq::publisher::is_draft23_or_later(draft)) {
+        return protocol_violation(transport, message);
+    }
+    return close_session(transport, draft23_error_code, message);
+}
+
+// Draft-23 §9: FIELD_LENGTH_EXCEEDED for a control message longer than this
+// endpoint's MAX_CONTROL_MESSAGE_SIZE, instead of buffering it indefinitely.
+TransportStatus check_control_message_length(PublisherTransport& transport,
+                                             openmoq::publisher::DraftVersion draft,
+                                             std::span<const std::uint8_t> pending) {
+    if (!control_message_exceeds_limit(pending, draft)) {
+        return TransportStatus::success();
+    }
+    return close_session(transport, kFieldLengthExceededErrorCode,
+                         "control message exceeds MAX_CONTROL_MESSAGE_SIZE");
+}
+
 TransportStatus authorization_token_status(PublisherTransport& transport,
                                             bool malformed,
                                             bool cache_overflow,
@@ -1417,6 +1447,9 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
         std::size_t consumed = 0;
         while (consumed < buffered.size()) {
             std::size_t message_size = 0;
+            if (const auto length_status = check_control_message_length(
+                    transport, draft, std::span<const std::uint8_t>(buffered).subspan(consumed));
+                !length_status.ok) return length_status;
             if (!next_control_message(std::span<const std::uint8_t>(buffered).subspan(consumed), draft, message_size)) {
                 break;
             }
@@ -1462,7 +1495,7 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                 response_type_allowed = is_request_error || is_request_ok;
             }
             if (!response_type_allowed) {
-                return protocol_violation(transport, "unexpected response type for request stream");
+                return session_violation(transport, draft, kUnexpectedMessageErrorCode, "unexpected response type for request stream");
             }
 
             RequestError request_error;
@@ -1531,10 +1564,10 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                     std::size_t extra_message_size = 0;
                     if (next_control_message(
                             std::span<const std::uint8_t>(buffered).subspan(extra_consumed), draft, extra_message_size)) {
-                        return protocol_violation(transport, "multiple responses on request stream");
+                        return session_violation(transport, draft, kUnexpectedMessageErrorCode, "multiple responses on request stream");
                     }
                     if (extra_fin && !buffered.empty()) {
-                        return protocol_violation(transport, "trailing bytes after request response");
+                        return session_violation(transport, draft, kMalformedMessageErrorCode, "trailing bytes after request response");
                     }
                     if (extra_fin) {
                         set_out_stream();
@@ -1546,7 +1579,8 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
             // Draft-18 request streams are strictly request/response. Any
             // non-response control message on the same request stream is a
             // protocol mismatch for the current request.
-            return protocol_violation(transport, "unexpected response message on request stream");
+            return session_violation(transport, draft, kUnexpectedMessageErrorCode,
+                                     "unexpected response message on request stream");
         }
 
         if (consumed > 0) {
@@ -1654,11 +1688,13 @@ public:
                     std::uint64_t type = 0;
                     if (decode_moqint(state.prefix, offset, draft, type)) {
                         if (!is_known_peer_unidirectional_stream_type(type, draft))
-                            return protocol_violation(transport, "received unknown unidirectional stream type");
+                            return session_violation(transport, draft, kInvalidStreamHeaderErrorCode,
+                                                     "received unknown unidirectional stream type");
                         state.type = type;
                         state.prefix.clear();
                     } else if (fin) {
-                        return protocol_violation(transport, "received truncated unidirectional stream type");
+                        return session_violation(transport, draft, kInvalidStreamHeaderErrorCode,
+                                                 "received truncated unidirectional stream type");
                     }
                 }
                 // Consume padding rather than leaving it in transport receive buffers.
@@ -1754,7 +1790,7 @@ public:
         if (is_draft22_or_later(draft) && !decode_goaway_message(bytes, draft, message))
             return protocol_violation(transport, "invalid request GOAWAY");
         if (!goaway_streams_.insert(stream_id).second)
-            return protocol_violation(transport, "duplicate request GOAWAY");
+            return session_violation(transport, draft, kUnexpectedMessageErrorCode, "duplicate request GOAWAY");
         return TransportStatus::success();
     }
     template<class OnTracksForward>
@@ -1766,6 +1802,8 @@ public:
             if (!request.active) continue;
             while (true) {
                 std::size_t message_size = 0;
+                if (const auto length_status = check_control_message_length(transport, draft, request.pending);
+                    !length_status.ok) return length_status;
                 if (next_control_message(request.pending, draft, message_size)) {
                     const std::span<const std::uint8_t> bytes(request.pending.data(), message_size);
                     std::size_t offset = 0;
@@ -1826,7 +1864,8 @@ public:
                             status = on_tracks_forward(request.request_id);
                         }
                     } else {
-                        return protocol_violation(transport, "unexpected message on retained discovery request");
+                        return session_violation(transport, draft, kUnexpectedMessageErrorCode,
+                                                 "unexpected message on retained discovery request");
                     }
                     if (!status.ok) return status;
                     request.pending.erase(request.pending.begin(), request.pending.begin() + message_size);
@@ -1866,7 +1905,7 @@ TransportStatus request_goaway(PublisherTransport& transport, DraftVersion draft
     if (is_draft22_or_later(draft) && !decode_goaway_message(bytes, draft, message))
         return protocol_violation(transport, "invalid request GOAWAY");
     if (!seen.insert(stream_id).second)
-        return protocol_violation(transport, "duplicate request GOAWAY");
+        return session_violation(transport, draft, kUnexpectedMessageErrorCode, "duplicate request GOAWAY");
     return TransportStatus::success();
 }
 
@@ -1877,13 +1916,17 @@ public:
         if (!is_draft22_or_later(draft)) return TransportStatus::success();
         while (true) {
             std::size_t size = 0;
+            if (const auto length_status = check_control_message_length(transport, draft, pending);
+                !length_status.ok) return length_status;
             while (next_control_message(pending, draft, size)) {
                 const std::span<const std::uint8_t> bytes(pending.data(), size);
                 std::size_t offset = 0;
                 std::uint64_t type = 0;
                 if (!decode_moqint(bytes, offset, draft, type) || type != 0x10)
-                    return protocol_violation(transport, "unknown or misplaced control-stream message");
-                if (goaway_) return protocol_violation(transport, "duplicate control GOAWAY");
+                    return session_violation(transport, draft, kUnexpectedMessageErrorCode,
+                                             "unknown or misplaced control-stream message");
+                if (goaway_) return session_violation(transport, draft, kUnexpectedMessageErrorCode,
+                                                       "duplicate control GOAWAY");
                 GoawayMessage message;
                 if (!decode_goaway_message(bytes, draft, message))
                     return protocol_violation(transport, "invalid control GOAWAY");
@@ -1899,7 +1942,7 @@ public:
             }
             pending.insert(pending.end(), chunk.begin(), chunk.end());
             if (fin)
-                return protocol_violation(transport, "unexpected control-stream FIN");
+                return session_violation(transport, draft, kClosedControlStreamErrorCode, "unexpected control-stream FIN");
             if (chunk.empty()) break;
         }
         if (!goaway_) return TransportStatus::success();
@@ -3917,6 +3960,8 @@ TransportStatus read_request_stream_message(PublisherTransport& transport,
         message_bytes.insert(message_bytes.end(), chunk.begin(), chunk.end());
 
         std::size_t message_size = 0;
+        if (const auto length_status = check_control_message_length(transport, draft, message_bytes);
+            !length_status.ok) return length_status;
         if (next_control_message(message_bytes, draft, message_size)) {
             if (trailing_bytes != nullptr) {
                 trailing_bytes->assign(
@@ -4037,6 +4082,8 @@ TransportStatus poll_retained_subscribe_request_updates(
         bool stream_fin = false;
         while (true) {
             std::size_t message_size = 0;
+            if (const auto length_status = check_control_message_length(transport, draft, pending);
+                !length_status.ok) return length_status;
             if (next_control_message(pending, draft, message_size)) {
                 const std::vector<std::uint8_t> message_bytes(
                     pending.begin(),
@@ -4145,6 +4192,8 @@ TransportStatus poll_retained_publish_request_updates(
         bool stream_fin = false;
         while (true) {
             std::size_t message_size = 0;
+            if (const auto length_status = check_control_message_length(transport, draft, pending);
+                !length_status.ok) return length_status;
             if (next_control_message(pending, draft, message_size)) {
                 const std::vector<std::uint8_t> message_bytes(
                     pending.begin(),
@@ -5046,6 +5095,9 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             for (auto& [existing_request_id, active] : active_subscriptions) {
                 while (true) {
                     std::size_t update_size = 0;
+                    if (const auto length_status =
+                            check_control_message_length(transport, draft, active.pending_request_bytes);
+                        !length_status.ok) return length_status;
                     if (next_control_message(
                             active.pending_request_bytes, draft, update_size)) {
                         const std::vector<std::uint8_t> update_bytes(
@@ -5137,6 +5189,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         }
 
         std::size_t message_size = 0;
+        if (const auto length_status = check_control_message_length(transport, draft, buffer); !length_status.ok)
+            return length_status;
         while (next_control_message(buffer, draft, message_size)) {
             const std::vector<std::uint8_t> message_bytes(buffer.begin(), buffer.begin() + message_size);
             std::size_t offset = 0;
@@ -5151,11 +5205,13 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 ((is_draft18_or_later(draft) && message_type == 0x02) ||
                  message_type == 0x03 || message_type == 0x06 || message_type == 0x50 ||
                  message_type == 0x16 || message_type == 0x1d || message_type == 0x51)) {
-                return protocol_violation(transport, "draft-18 request message received on control stream");
+                return session_violation(transport, draft, kUnexpectedMessageErrorCode,
+                                         "draft-18 request message received on control stream");
             }
             if (message_type == 0x0a) {
                 if (uses_request_streams(draft)) {
-                    return protocol_violation(transport, "UNSUBSCRIBE received on draft-18 control stream");
+                    return session_violation(transport, draft, kUnexpectedMessageErrorCode,
+                                             "UNSUBSCRIBE received on draft-18 control stream");
                 }
                 std::uint64_t unsubscribe_request_id = 0;
                 if (!decode_unsubscribe_message(message_bytes, draft, unsubscribe_request_id)) {
@@ -5191,7 +5247,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                   message_type == 0x03));  // SUBSCRIBE
             if (!is_handled_type) {
                 if (is_draft18_or_later(draft)) {
-                    return protocol_violation(transport, "received unknown or unsupported control-stream message");
+                    return session_violation(transport, draft, kUnexpectedMessageErrorCode,
+                                             "received unknown or unsupported control-stream message");
                 }
                 // Earlier drafts allow this implementation's legacy skip path.
                 if (trace_enabled()) {
@@ -8843,6 +8900,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         }
 
         std::size_t message_size = 0;
+        if (const auto length_status = check_control_message_length(transport_, draft_version, pending_control_bytes_);
+            !length_status.ok) return {length_status, 0};
         while (next_control_message(pending_control_bytes_, draft_version, message_size)) {
             const std::vector<std::uint8_t> message_bytes(
                 pending_control_bytes_.begin(),
@@ -10592,6 +10651,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
 
         std::size_t message_size = 0;
+        if (const auto length_status = check_control_message_length(transport_, draft_version, pending_control_bytes_);
+            !length_status.ok) return {length_status, 0};
         while (next_control_message(pending_control_bytes_, draft_version, message_size)) {
             const std::vector<std::uint8_t> message_bytes(
                 pending_control_bytes_.begin(),
@@ -10605,7 +10666,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             if (is_draft18_or_later(draft_version) && message_type != 0x10 && message_type != 0x02 &&
                 message_type != 0x03 && message_type != 0x06 && message_type != 0x50 &&
                 message_type != 0x16 && message_type != 0x1d && message_type != 0x51) {
-                return {protocol_violation(transport_, "unknown control message"), 0};
+                return {session_violation(transport_, draft_version, kUnexpectedMessageErrorCode, "unknown control message"), 0};
             }
 
             if ((is_draft18_or_later(draft_version) &&
@@ -10614,7 +10675,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                  (message_type == 0x03 || message_type == 0x06 ||
                   message_type == 0x50 || message_type == 0x16 ||
                   message_type == 0x1d || message_type == 0x51))) {
-                return {protocol_violation(transport_, "draft-18 request message received on control stream"), 0};
+                return {session_violation(transport_, draft_version, kUnexpectedMessageErrorCode,
+                                                  "draft-18 request message received on control stream"), 0};
             }
 
             if (message_type == 0x02 &&
@@ -11874,6 +11936,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
 
         std::size_t message_size = 0;
+        if (const auto length_status = check_control_message_length(transport_, draft_version, pending_control_bytes_);
+            !length_status.ok) return length_status;
         while (next_control_message(pending_control_bytes_, draft_version, message_size)) {
             const std::vector<std::uint8_t> message_bytes(
                 pending_control_bytes_.begin(),
@@ -11887,7 +11951,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             if (is_draft18_or_later(draft_version) && message_type != 0x10 && message_type != 0x02 &&
                 message_type != 0x03 && message_type != 0x06 && message_type != 0x50 &&
                 message_type != 0x16 && message_type != 0x1d && message_type != 0x51) {
-                return protocol_violation(transport_, "unknown control message");
+                return session_violation(transport_, draft_version, kUnexpectedMessageErrorCode, "unknown control message");
             }
 
             if ((is_draft18_or_later(draft_version) &&
@@ -11896,7 +11960,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                  (message_type == 0x03 || message_type == 0x06 ||
                   message_type == 0x50 || message_type == 0x16 ||
                   message_type == 0x1d || message_type == 0x51))) {
-                return protocol_violation(transport_, "draft-18 request message received on control stream");
+                return session_violation(transport_, draft_version, kUnexpectedMessageErrorCode,
+                                                  "draft-18 request message received on control stream");
             }
             if (message_type == 0x02 &&
                 draft_version == DraftVersion::kDraft16) {
