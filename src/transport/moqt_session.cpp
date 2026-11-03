@@ -4167,7 +4167,7 @@ TransportStatus poll_retained_subscribe_request_updates(
     return TransportStatus::success();
 }
 
-template <typename ApplyUpdate, typename OnFin>
+template <typename ApplyUpdate, typename OnTerminated>
 TransportStatus poll_retained_publish_request_updates(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
@@ -4178,7 +4178,7 @@ TransportStatus poll_retained_publish_request_updates(
     std::set<std::uint64_t>& terminated_request_ids,
     PeerRequestIdValidator& peer_request_ids,
     ApplyUpdate&& apply_update,
-    OnFin&& on_fin) {
+    OnTerminated&& on_terminated) {
     if (!is_draft18_or_later(draft)) {
         return TransportStatus::success();
     }
@@ -4190,6 +4190,26 @@ TransportStatus poll_retained_publish_request_updates(
         if (stream_it == request_stream_ids.end()) {
             return TransportStatus::failure(
                 "missing draft-18 publish request stream");
+        }
+        // The subscriber ends a subscription by sending STOP_SENDING on its
+        // request stream, and the publisher MUST then reset the subscription's
+        // open streams (draft 22 section 3.1.2; draft 18 section 5.1.1). The
+        // stop stays queued on request streams until it is claimed here.
+        {
+            const auto stops = transport.media_stream_peer_stop_events();
+            if (std::find(stops.begin(), stops.end(), stream_it->second) != stops.end()) {
+                if (const auto code = transport.media_stream_peer_stop_error(stream_it->second)) {
+                    std::cerr << "[moqt-session] peer STOP_SENDING stream=" << stream_it->second << " code="
+                              << describe_stream_reset_code(*code) << '\n';
+                }
+                std::cerr << "[moqt-session] subscriber ended PUBLISH subscription track=" << track_name
+                          << " request_id=" << request_id << " (STOP_SENDING on its request stream)\n";
+                terminated_request_ids.insert(request_id);
+                transport.acknowledge_media_stream_peer_stopped(stream_it->second);
+                const TransportStatus stop_status = on_terminated(track_name, request_id, true);
+                if (!stop_status.ok) return stop_status;
+                continue;
+            }
         }
         auto& pending = pending_bytes[request_id];
         bool stream_fin = false;
@@ -4249,7 +4269,8 @@ TransportStatus poll_retained_publish_request_updates(
                         "truncated REQUEST_UPDATE on PUBLISH stream");
                 }
                 terminated_request_ids.insert(request_id);
-                on_fin(track_name, request_id);
+                const TransportStatus fin_status = on_terminated(track_name, request_id, false);
+                if (!fin_status.ok) return fin_status;
                 break;
             }
 
@@ -6409,7 +6430,15 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             terminated_publish_request_ids,
             peer_request_ids,
             apply_forward_update,
-            [](const std::string&, std::uint64_t) {});
+            [&](const std::string& track_name, std::uint64_t request_id, bool stopped) -> TransportStatus {
+                if (!stopped) return TransportStatus::success();
+                // The subscriber ended the subscription: stop sending the track
+                // and reset its open streams with CANCELLED.
+                if (const auto it = publish_ok_by_request_id.find(request_id); it != publish_ok_by_request_id.end()) {
+                    it->second.forward = 0;
+                }
+                return sender_by_track[track_name].cancel_all_open_subgroups(transport, kCancelledErrorCode);
+            });
     };
     const auto any_forwarding = [&]() {
         return std::any_of(publish_ok_by_request_id.begin(),
@@ -8607,8 +8636,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         // PUBLISH-initiated subscriptions are in active_subscriptions too, so
         // a track the PUBLISH still forwards stays forwarded. Their request
         // streams are in published_stream_ids rather than
-        // active_subscription_stream_ids, so a STOP_SENDING on one is not
-        // matched here yet.
+        // active_subscription_stream_ids, so a STOP_SENDING on one is handled
+        // by poll_retained_publish_request_updates() below.
         TransportStatus teardown_status = TransportStatus::success();
         for (const auto& ended : end_peer_stopped_subscriptions(
                  transport_, draft_version, active_subscriptions, active_subscription_stream_ids,
@@ -8645,11 +8674,24 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             pending_published_request_bytes, terminated_published_requests, peer_request_ids,
             [&](const std::string&, std::uint64_t id, std::uint64_t stream, const RequestUpdateMessage& update) {
                 return apply_subscriber_request_update(id, stream, update);
-            }, [&](const std::string& name, std::uint64_t id) {
+            }, [&](const std::string& name, std::uint64_t id, bool stopped) -> TransportStatus {
                 active_subscriptions.erase(id);
                 const bool forwarding = std::any_of(active_subscriptions.begin(), active_subscriptions.end(),
                     [&](const auto& entry) { return entry.second.track_name == name && entry.second.forward != 0; });
                 if (!forwarding) subscribed_tracks.erase(name);
+                if (!stopped) return TransportStatus::success();
+                if (name == "catalog") {
+                    // No PUBLISH_DONE is owed for a subscription the subscriber ended.
+                    const bool catalog_subscribed = std::any_of(
+                        active_subscriptions.begin(), active_subscriptions.end(),
+                        [](const auto& entry) { return entry.second.track_name == "catalog"; });
+                    if (!catalog_subscribed) catalog_publish_done_deferred = false;
+                    return TransportStatus::success();
+                }
+                // The subscriber's STOP_SENDING ends the subscription even when
+                // auto-forward would keep an unsubscribed track flowing.
+                return cancel_unforwarded_track_subgroups(
+                    transport_, false, subscribed_tracks, sender_by_track, name);
             });
         if (!published_status.ok) return {published_status, 0};
 
@@ -10284,9 +10326,25 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 return apply_published_track_update(
                     track_name, response_stream_id, update);
             },
-            [&](const std::string& track_name, std::uint64_t request_id) {
-                static_cast<void>(track_name);
+            [&](const std::string& track_name, std::uint64_t request_id, bool stopped) -> TransportStatus {
                 static_cast<void>(request_id);
+                if (!stopped) return TransportStatus::success();
+                // The PUBLISH's Forward State no longer counts: forwarding now
+                // follows the subscriber's own SUBSCRIBEs only.
+                published_track_settings.erase(track_name);
+                refresh_published_track_forwarding(track_name);
+                if (track_name == "catalog") {
+                    // No PUBLISH_DONE is owed for a subscription the subscriber ended.
+                    const bool catalog_subscribed = std::any_of(
+                        active_subscriptions.begin(), active_subscriptions.end(),
+                        [](const auto& entry) { return entry.second.track_name == "catalog"; });
+                    if (!catalog_subscribed) catalog_publish_done_deferred = false;
+                    return TransportStatus::success();
+                }
+                // The subscriber's STOP_SENDING ends the subscription even when
+                // auto-forward would keep an unsubscribed track flowing.
+                return cancel_unforwarded_track_subgroups(
+                    transport_, false, subscribed_tracks, sender_by_track, track_name);
             });
     };
 
@@ -11699,9 +11757,17 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                largest_object_by_track.contains(track_name));
                 return TransportStatus::success();
             },
-            [&](const std::string& track_name, std::uint64_t request_id) {
-                static_cast<void>(track_name);
+            [&](const std::string& track_name, std::uint64_t request_id, bool stopped) -> TransportStatus {
                 static_cast<void>(request_id);
+                if (!stopped) return TransportStatus::success();
+                // The PUBLISH's Forward State no longer counts: forwarding now
+                // follows the subscriber's own SUBSCRIBEs only.
+                published_track_settings.erase(track_name);
+                refresh_subscriber_forward_permission(track_name);
+                // The subscriber's STOP_SENDING ends the subscription even when
+                // auto-forward would keep an unsubscribed track flowing.
+                return cancel_unforwarded_track_subgroups(
+                    transport_, false, subscribed_tracks, sender_by_track, track_name);
             });
     };
 

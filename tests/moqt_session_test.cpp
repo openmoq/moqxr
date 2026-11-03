@@ -2259,6 +2259,65 @@ bool test_publish_ok_range_filter_survives_forward_update(const EndpointConfig& 
     return ok;
 }
 
+// Draft 22 section 3.1.2 (and draft 18 section 5.1.1): when the subscriber ends
+// a subscription with STOP_SENDING on its request stream, the publisher MUST
+// reset the subscription's open streams. A PUBLISH-initiated subscription is
+// ended the same way as one the subscriber started with SUBSCRIBE. Only the
+// publish_live_objects path is tested: the other paths take their objects from
+// a reader thread, so when a stop is seen relative to the next object is not
+// deterministic.
+bool test_publish_request_stream_stop_sending_ends_subscription(const EndpointConfig& endpoint,
+                                                                const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "test/live";
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    bool ok = true;
+
+    {
+        // publish_live_objects: the first group's first Object leaves its
+        // subgroup stream open, then the subscriber stops.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_draft18_publish_ok_with_filter(1, 0x04, 0, 0,
+                                                                           openmoq::publisher::kMaxGroupId));
+        std::optional<std::uint64_t> open_subgroup;
+        transport.on_try_write_object = [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+            if (!open_subgroup && !event.bytes.empty() && event.bytes.back() == 'M') {
+                open_subgroup = event.stream_id;
+                current.peer_stopped_media_streams.insert(4);
+            }
+            return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+        };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 0,
+                       .payload = {'M'}, .final_in_subgroup = false},
+            LiveObject{.track_name = "events", .group_id = 1, .subgroup_id = 0, .object_id = 1,
+                       .payload = {'N'}},
+            LiveObject{.track_name = "events", .group_id = 2, .subgroup_id = 0, .object_id = 0,
+                       .payload = {'O'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                return objects[object_index++];
+            },
+        };
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "PUBLISH STOP_SENDING objects: session connects");
+        const auto status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "PUBLISH STOP_SENDING objects: publish succeeds: " + status.message);
+        ok &= expect(open_subgroup.has_value() && reset_with_cancelled(transport, *open_subgroup),
+                     "PUBLISH STOP_SENDING objects: the open subgroup stream is reset with CANCELLED");
+        ok &= expect(session.publish_stats().objects_published == 1,
+                     "PUBLISH STOP_SENDING objects: no object is sent after the subscriber stopped");
+    }
+    return ok;
+}
+
 // MoqTransport section 2.5: live stdin publishing numbers media and catalog
 // groups from set_initial_group_id() on every draft, not only on draft-22
 // migration.
@@ -12333,6 +12392,7 @@ int main() {
 
     ok &= test_live_stdin_initial_group_id(endpoint, tls);
     ok &= test_live_stdin_catalog_framerate_from_fragments(endpoint, tls);
+    ok &= test_publish_request_stream_stop_sending_ends_subscription(endpoint, tls);
     ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
     ok &= test_live_stdin_video_alt_group(endpoint, tls);
     ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
