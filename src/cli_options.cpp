@@ -75,14 +75,15 @@ DraftVersion parse_draft(std::string_view value) {
         return DraftVersion::kDraft21;
     }
     if (value == "22") return DraftVersion::kDraft22;
+    if (value == "23") return DraftVersion::kDraft23;
     // Draft-14 and draft-17 are no longer user-selectable.
     if (value == "14" || value == "17") {
         throw std::runtime_error(
             "draft " + std::string(value) +
-            " is no longer supported; only draft 16, 18, 21, and 22 are available");
+            " is no longer supported; only draft 16, 18, 21, 22, and 23 are available");
     }
 
-    throw std::runtime_error("unsupported draft value: expected 16, 18, 21, or 22");
+    throw std::runtime_error("unsupported draft value: expected 16, 18, 21, 22, or 23");
 }
 
 transport::TransportKind parse_transport_kind(std::string_view value) {
@@ -652,7 +653,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
     if (options.media_packaging == MediaPackaging::kLoc) {
         if (!is_draft18_or_later(options.draft_version)) {
-            throw std::runtime_error("LOC-04 requires --draft 18 or 21");
+            throw std::runtime_error("LOC-04 requires --draft 18 or later");
         }
         if (options.stream_per_object || !options.split_cmaf_chunks) {
             throw std::runtime_error("LOC requires one sample per object and a stream per GOP");
@@ -797,7 +798,7 @@ std::string build_usage(const char* argv0) {
     return build_version_banner() + "\nUsage: " + argv0 +
            " --input <mp4|-> [--live-source auto|stdin|srt|dash] [--srt-config <path>]"
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
-           " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
+           " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22|23] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--video-alt-group <N>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"

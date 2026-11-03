@@ -490,5 +490,6 @@ config, token generation, relay connection, and focused-test workflow.
 - `--coalesce-cmaf-chunks` restores one media object per group for CMAF; it is rejected with LOCMAF
 - draft-16 defaults to ALPN `moqt-16`
 - draft-18 defaults to ALPN `moqt-18`
+- drafts 21, 22, and 23 default to ALPN `moqt-21`, `moqt-22`, and `moqt-23`
 - drafts 14, 17, and 19 are retained as local text or implementation-history references but are not selectable in the main CLI
 - `--alpn` overrides the draft default when targeting a specific relay

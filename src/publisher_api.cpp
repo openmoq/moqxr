@@ -25,7 +25,7 @@ namespace {
 
 void validate_packaging(const PublisherConfig& config) {
     if (config.media_packaging == MediaPackaging::kLoc) {
-        if (!is_draft18_or_later(config.draft_version)) throw std::runtime_error("LOC-04 requires draft 18 or 21");
+        if (!is_draft18_or_later(config.draft_version)) throw std::runtime_error("LOC-04 requires draft 18 or later");
         if (!config.split_cmaf_chunks || config.live_stream_per_object) throw std::runtime_error("LOC requires one sample per object and a stream per GOP");
     }
     if (config.media_packaging == MediaPackaging::kLocmaf &&
@@ -186,6 +186,11 @@ transport::TransportStatus prepare_migration(const transport::TransportStatus& s
 }
 
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+// libmoq publishes drafts 16 and 18 only; later drafts use MoqtSession.
+bool libmoq_publishes_draft(DraftVersion draft) {
+    return draft == DraftVersion::kDraft16 || draft == DraftVersion::kDraft18;
+}
+
 // libmoq's media sender numbers Group IDs itself and offers no setting for the
 // first one, so the libmoq routes refuse a non-zero initial_group_id rather
 // than publish from 0 while the caller expects otherwise.
@@ -310,12 +315,13 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
                                               const transport::TlsConfig& tls,
                                               bool endpoint_alpn_overridden) const {
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
-    // Batch publishing prefers the libmoq service tier unless a custom
-    // TransportFactory was injected (tests still exercise the local path).
-    // The live paths (stdin, SRT, LiveObjectSource) route to libmoq in their
-    // own methods below; the MoqtSession transport now only serves injected-
-    // factory callers and builds without libmoq.
-    if (!transport_factory_injected_) {
+    // Batch publishing on drafts 16 and 18 prefers the libmoq service tier
+    // unless a custom TransportFactory was injected (tests still exercise the
+    // local path). The live paths (stdin, SRT, LiveObjectSource) route to
+    // libmoq in their own methods below; the MoqtSession transport serves
+    // injected-factory callers, drafts libmoq does not speak, and builds
+    // without libmoq.
+    if (routes_to_libmoq()) {
         if (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf ||
             std::any_of(prepared.plan.tracks.begin(), prepared.plan.tracks.end(),
                         [](const auto& track) { return track.packaging == "loc" || track.packaging == "locmaf"; })) {
@@ -490,10 +496,10 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                                                    bool endpoint_alpn_overridden,
                                                    LiveResumeState* resume) const {
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
-    if (!transport_factory_injected_ && (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf)) {
+    if (routes_to_libmoq() && (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf)) {
         return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
     }
-    if (!transport_factory_injected_ && ingest.use_stdin && ingest.srt_callers.empty() &&
+    if (routes_to_libmoq() && ingest.use_stdin && ingest.srt_callers.empty() &&
         endpoint.webtransport_allow_missing_reset_stream_at) {
         return transport::TransportStatus::failure(
             "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
@@ -501,7 +507,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     // Live stdin and SRT publishing prefer the libmoq service tier unless a
     // custom TransportFactory was injected. (publish_live_objects routes to
     // libmoq in its own method.)
-    if (!transport_factory_injected_ && ingest.use_stdin && ingest.srt_callers.empty()) {
+    if (routes_to_libmoq() && ingest.use_stdin && ingest.srt_callers.empty()) {
         if (config_.initial_group_id != 0) {
             return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
         }
@@ -541,7 +547,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     // SRT-only live publishing also prefers the libmoq service tier. Mixed
     // stdin+SRT does not match either branch and falls through to the old path
     // below, which rejects it (consistent with existing validation).
-    if (!transport_factory_injected_ && !ingest.use_stdin && !ingest.srt_callers.empty()) {
+    if (routes_to_libmoq() && !ingest.use_stdin && !ingest.srt_callers.empty()) {
         if (config_.initial_group_id != 0) {
             return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
         }
@@ -786,7 +792,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
     // TransportFactory was injected (legacy MoqtSession tests). libmoq requires
     // real media metadata per track; a bare/legacy LiveTrack fails with a clear
     // message rather than being faked as a generic media track.
-    if (!transport_factory_injected_ && !source_supplies_catalog) {
+    if (routes_to_libmoq() && !source_supplies_catalog) {
         if (config_.initial_group_id != 0) {
             return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
         }
@@ -1123,6 +1129,14 @@ std::string Publisher::stats_json() const {
        << "\"lastError\":\"" << json_escape(snapshot.last_error) << "\""
        << "}";
     return os.str();
+}
+
+bool Publisher::routes_to_libmoq() const {
+#ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+    return !transport_factory_injected_ && libmoq_publishes_draft(config_.draft_version);
+#else
+    return false;
+#endif
 }
 
 Publisher::TransportFactory Publisher::default_transport_factory() {

@@ -16,7 +16,7 @@ This covers:
 - progressive MP4 remux into CMAF-style objects
 - CLI option parsing and validation
 - ordered endpoint parsing, retry-count validation, retry/failover sequencing, failure classification, cancellation, and bounded live-object replay
-- MOQT setup and control-message encoding/decoding for drafts 14, 16, 17, 18, 21, and 22
+- MOQT setup and control-message encoding/decoding for drafts 14, 16, 17, 18, 21, 22, and 23
 - binary namespace announcement plus subscribe-serving or forward-publish control/object sequencing
 - draft-18 fragmented request-stream reads and same-stream `SUBSCRIBE_OK` responses
 - draft-16 LL-DASH await-subscribe behavior with catalog plus multiple FFmpeg-style representation paths
@@ -32,6 +32,10 @@ This covers:
   overlap checks, retained request updates, and GOAWAY validation
 - draft-22 migration across native QUIC and WebTransport, preserving credentials,
   TLS configuration, stdin parser state, and caller-supplied catalog chains
+- draft-23 vi64 control framing and the 65535-byte limit, MAX_CONTROL_MESSAGE_SIZE,
+  PAUSED, count-prefixed FILL_PARAMETERS, NAMESPACE Parameters, REQUEST_ERROR Error
+  Details, SUBSCRIBE_TRACKS_ID, overlapping namespace subscriptions, the GOAWAY
+  sender rule, session termination codes, and GOAWAY migration
 
 The draft-22 migration loop creates a fresh session and allows at most eight
 consecutive GOAWAY migrations. Caller-supplied catalogs retain the latest
