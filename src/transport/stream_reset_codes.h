@@ -17,7 +17,7 @@ inline const char* stream_reset_code_name(std::uint64_t code) {
         case 0x3: return "SESSION_CLOSED";
         case 0x4: return "GOING_AWAY";
         case 0x5: return "TOO_FAR_BEHIND";
-        case 0x6: return "UNKNOWN_OBJECT_STATUS";
+        case 0x6: return "UNKNOWN_OBJECT_STATUS";  // removed in draft 23; moqxr never sends it
         case 0x7: return "EXPIRED_AUTH_TOKEN";
         case 0x9: return "EXCESSIVE_LOAD";
         case 0x12: return "MALFORMED_TRACK";
