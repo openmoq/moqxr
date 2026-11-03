@@ -6709,10 +6709,10 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                     .group_order = publish_ok_it->second.group_order,
                                     .forward = publish_ok_it->second.forward,
                                     .filter_type = publish_ok_it->second.filter_type == 0 ? 0x03 : publish_ok_it->second.filter_type,
-                                    .start_group_id = 0,
-                                    .start_object_id = 0,
-                                    .end_group_id = 0,
-                                    .end_object_id = std::nullopt,
+                                    .start_group_id = publish_ok_it->second.start_group_id,
+                                    .start_object_id = publish_ok_it->second.start_object_id,
+                                    .end_group_id = publish_ok_it->second.end_group_id,
+                                    .end_object_id = publish_ok_it->second.end_object_id,
                                     .delivery_timeouts = publish_ok_it->second.delivery_timeouts,
                                 },
                             .track = track_it->second,
@@ -8451,11 +8451,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             SubscribeMessage subscription;
             subscription.request_id = next_published_request_id;
             subscription.track_name = name;
-            subscription.subscriber_priority = response.subscriber_priority;
-            subscription.group_order = response.group_order;
-            subscription.forward = response.forward;
-            subscription.filter_type = response.filter_type;
-            subscription.delivery_timeouts = response.delivery_timeouts;
+            apply_publish_ok_settings(response, subscription);
             active_subscriptions.emplace(next_published_request_id, subscription);
             published_request_ids.emplace(name, next_published_request_id);
             published_stream_ids.emplace(next_published_request_id, stream_id);
@@ -9974,11 +9970,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             SubscribeMessage settings;
             settings.request_id = publish_request_id;
             settings.track_name = track_name;
-            settings.subscriber_priority = publish_ok.subscriber_priority;
-            settings.group_order = publish_ok.group_order;
-            settings.forward = publish_ok.forward;
-            settings.filter_type = publish_ok.filter_type;
-            settings.delivery_timeouts = publish_ok.delivery_timeouts;
+            apply_publish_ok_settings(publish_ok, settings);
             published_track_settings.insert_or_assign(
                 track_name, settings);
             if (track_name == "catalog") {
@@ -10683,11 +10675,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         SubscribeMessage settings;
                         settings.request_id = publish_ok_msg.request_id;
                         settings.track_name = it->second;
-                        settings.subscriber_priority = publish_ok_msg.subscriber_priority;
-                        settings.group_order = publish_ok_msg.group_order;
-                        settings.forward = publish_ok_msg.forward;
-                        settings.filter_type = publish_ok_msg.filter_type;
-                        settings.delivery_timeouts = publish_ok_msg.delivery_timeouts;
+                        apply_publish_ok_settings(publish_ok_msg, settings);
                         published_track_settings.insert_or_assign(it->second, settings);
                         refresh_published_track_forwarding(it->second);
                         ++new_subs;
@@ -11248,11 +11236,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             SubscribeMessage settings;
             settings.request_id = next_publish_request_id;
             settings.track_name = track_name;
-            settings.subscriber_priority = publish_ok.subscriber_priority;
-            settings.group_order = publish_ok.group_order;
-            settings.forward = publish_ok.forward;
-            settings.filter_type = publish_ok.filter_type;
-            settings.delivery_timeouts = publish_ok.delivery_timeouts;
+            apply_publish_ok_settings(publish_ok, settings);
             published_track_settings.insert_or_assign(track_name, settings);
             published_track_request_ids.insert_or_assign(track_name, next_publish_request_id);
             publish_stream_id_by_request_id_.insert_or_assign(next_publish_request_id, stream_id);

@@ -1115,6 +1115,29 @@ std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
     return message;
 }
 
+// Draft-18 PUBLISH_OK (REQUEST_OK alias) carrying FORWARD and a
+// SUBSCRIPTION_FILTER, as relays such as moqx send it.
+std::vector<std::uint8_t> encode_draft18_publish_ok_with_filter(std::uint8_t forward,
+                                                                std::uint64_t filter_type,
+                                                                std::size_t start_group_id,
+                                                                std::size_t start_object_id,
+                                                                std::size_t end_group_id) {
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    std::vector<std::uint8_t> payload = encode_moqint(draft, 2);
+    append_bytes(payload, encode_moqint(draft, 0x10));  // FORWARD, uint8 value
+    payload.push_back(forward);
+    append_bytes(payload, encode_moqint(draft, 0x21 - 0x10));  // SUBSCRIPTION_FILTER delta
+    const std::vector<std::uint8_t> filter = encode_draft18_family_filter_value(
+        draft, filter_type, start_group_id, start_object_id, end_group_id);
+    append_bytes(payload, encode_moqint(draft, filter.size()));
+    payload.insert(payload.end(), filter.begin(), filter.end());
+
+    std::vector<std::uint8_t> message = encode_moqint(draft, 0x07);
+    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    message.insert(message.end(), payload.begin(), payload.end());
+    return message;
+}
+
 void queue_subscribe_requests(MockTransport& transport,
                               DraftVersion draft,
                               std::string_view track_namespace,
@@ -2144,6 +2167,80 @@ bool test_live_stdin_video_alt_group(const EndpointConfig& endpoint, const TlsCo
         ok &= expect(catalogs > 0, label + "a catalog is published");
         ok &= expect(alt_groups == (alt_group ? 2 * catalogs : 0),
                      label + "each catalog must give both video tracks the altGroup");
+    }
+    return ok;
+}
+
+// openmoq/moqxr#99: a relay answers PUBLISH with PUBLISH_OK Forward=0 and an
+// AbsoluteRange filter {0/0 .. 2^62-1}, then sends REQUEST_UPDATE Forward=1
+// once a subscriber arrives. The filter's start/end must survive into the
+// publisher-side settings; dropping them left {0/0 .. 0} and only Group 0
+// was ever forwarded.
+bool test_publish_ok_range_filter_survives_forward_update(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "test/live";
+    constexpr std::size_t kEndGroup = openmoq::publisher::kMaxGroupId;
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    bool ok = true;
+
+    {
+        // Live stdin (CMAF) in forward mode.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_draft18_publish_ok_with_filter(0, 0x04, 0, 0, kEndGroup));
+        std::size_t publish_stream_reads = 0;
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (stream_id == 4 && ++publish_stream_reads == 2) {
+                current.reads[4].push_back(encode_request_update_message(draft, 1, 1));
+            }
+        };
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "#99 stdin: session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB),
+                                   make_live_media_fragment(1000, 0xAC), make_live_media_fragment(2000, 0xAD),
+                                   make_live_media_fragment(3000, 0xAE)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, "#99 stdin: live publish succeeds: " + status.message);
+        const auto groups = data_stream_groups(transport, draft);
+        const auto media = groups.find(1);
+        ok &= expect(media != groups.end() &&
+                         std::find(media->second.begin(), media->second.end(), 3) != media->second.end(),
+                     "#99 stdin: groups above 0 must be sent after REQUEST_UPDATE Forward=1 "
+                     "under an AbsoluteRange {0/0 .. 2^62-1} PUBLISH_OK filter");
+    }
+
+    {
+        // publish_live_objects in forward mode.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_draft18_publish_ok_with_filter(0, 0x04, 0, 0, kEndGroup));
+        std::size_t publish_stream_reads = 0;
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (stream_id == 4 && ++publish_stream_reads == 2) {
+                current.reads[4].push_back(encode_request_update_message(draft, 1, 1));
+            }
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&object_index]() -> std::optional<LiveObject> {
+                if (object_index >= 3) {
+                    return std::nullopt;
+                }
+                const std::size_t group = object_index++ + 1;
+                return LiveObject{.track_name = "events", .group_id = group, .subgroup_id = 0, .object_id = 0,
+                                  .payload = {'M'}};
+            },
+        };
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "#99 objects: session connects");
+        const auto status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "#99 objects: publish succeeds: " + status.message);
+        ok &= expect(session.publish_stats().objects_published == 3,
+                     "#99 objects: every group above 0 must be sent after REQUEST_UPDATE Forward=1 "
+                     "under an AbsoluteRange {0/0 .. 2^62-1} PUBLISH_OK filter");
     }
     return ok;
 }
@@ -11785,6 +11882,7 @@ int main() {
         const std::vector<std::uint8_t> delivery_timeout_zero_subscribe = {
             0x03, 0x00, 0x13, 0x01, 0x01, 0x05, 0x6d, 0x6f, 0x71, 0x78, 0x72,
             0x07, 0x63, 0x61, 0x74, 0x61, 0x6c, 0x6f, 0x67, 0x01, 0x02, 0x00,
+    ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
     ok &= test_live_stdin_video_alt_group(endpoint, tls);
     ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
         };

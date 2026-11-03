@@ -2515,11 +2515,14 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
                 !decode_moqint_impl(bytes, offset, draft, start_object_id)) {
                 return false;
             }
+            message.start_group_id = static_cast<std::size_t>(start_group_id);
+            message.start_object_id = static_cast<std::size_t>(start_object_id);
             if (message.filter_type == 0x04) {
                 std::uint64_t end_group_id = 0;
                 if (!decode_moqint_impl(bytes, offset, draft, end_group_id)) {
                     return false;
                 }
+                message.end_group_id = static_cast<std::size_t>(end_group_id);
             }
         }
 
@@ -2547,6 +2550,10 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
     message.subscriber_priority = 128;
     message.group_order = 0;
     message.filter_type = 0;
+    message.start_group_id = 0;
+    message.start_object_id = 0;
+    message.end_group_id = 0;
+    message.end_object_id.reset();
 
     std::uint64_t previous_parameter_type = 0;
     for (std::uint64_t index = 0; index < parameter_count; ++index) {
@@ -2612,6 +2619,10 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
                     return false;
                 }
                 message.filter_type = filter_message.filter_type;
+                message.start_group_id = filter_message.start_group_id;
+                message.start_object_id = filter_message.start_object_id;
+                message.end_group_id = filter_message.end_group_id;
+                message.end_object_id = filter_message.end_object_id;
                 break;
             }
             default:
@@ -2620,6 +2631,18 @@ bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
         offset += static_cast<std::size_t>(parameter_length);
     }
     return offset == payload_end;
+}
+
+void apply_publish_ok_settings(const PublishOk& publish_ok, SubscribeMessage& settings) {
+    settings.subscriber_priority = publish_ok.subscriber_priority;
+    settings.group_order = publish_ok.group_order;
+    settings.forward = publish_ok.forward;
+    settings.filter_type = publish_ok.filter_type;
+    settings.start_group_id = publish_ok.start_group_id;
+    settings.start_object_id = publish_ok.start_object_id;
+    settings.end_group_id = publish_ok.end_group_id;
+    settings.end_object_id = publish_ok.end_object_id;
+    settings.delivery_timeouts = publish_ok.delivery_timeouts;
 }
 
 bool decode_publish_error(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishError& message) {
