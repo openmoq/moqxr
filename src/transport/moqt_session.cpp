@@ -3836,20 +3836,19 @@ using PublishedObjectSink =
 using LargestSentLookup =
     std::function<std::optional<std::pair<std::size_t, std::size_t>>(const std::string& track_name)>;
 
-// Draft-21 SUBSCRIBE_OK reports the largest object already sent on the track
-// (§9.20.18). The catalog is left out because its retained copy is re-sent to
-// each new subscriber, which a Next Object filter would then drop.
-// Draft-21+ SUBSCRIBE_OK LARGEST_OBJECT (§9.20.17). The batch and
-// publish_live_objects() paths re-send their retained catalog at its existing
-// Location to each new subscriber, so they omit the catalog's Largest Object;
-// otherwise a Next Object filter would exclude that re-send. publish_live()
-// sends a later subscriber a new catalog group instead, so it reports it.
+// Draft-18+ SUBSCRIBE_OK LARGEST_OBJECT: "If Objects have been published on
+// this Track the Publisher MUST include this parameter" (draft 18 §10.2.11,
+// draft 21 §9.20.18, draft 22 §9.20.17). The batch and publish_live_objects()
+// paths re-send their retained catalog at its existing Location to each new
+// subscriber, so they omit the catalog's Largest Object; otherwise a Next
+// Object filter would exclude that re-send. publish_live() sends a later
+// subscriber a new catalog group instead, so it reports it.
 std::optional<std::pair<std::size_t, std::size_t>> subscribe_ok_largest(
     openmoq::publisher::DraftVersion draft,
     const std::string& track_name,
     std::optional<std::pair<std::size_t, std::size_t>> largest_sent,
     bool omit_catalog = true) {
-    if (!openmoq::publisher::is_draft21_or_later(draft) || (omit_catalog && track_name == "catalog")) {
+    if (!openmoq::publisher::is_draft18_or_later(draft) || (omit_catalog && track_name == "catalog")) {
         return std::nullopt;
     }
     return largest_sent;

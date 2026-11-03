@@ -2094,6 +2094,59 @@ bool test_live_stdin_catalog_resume_reports_current_largest(const EndpointConfig
     return true;
 }
 
+// Draft 18 §10.2.11: "If Objects have been published on this Track the
+// Publisher MUST include" LARGEST_OBJECT. A relay answers a later subscriber
+// from it, and a joining FETCH needs it. A live stdin media SUBSCRIBE that
+// arrives after a media object went out reports it; the first catalog
+// SUBSCRIBE, answered before any catalog object exists, has none to report.
+bool test_live_stdin_draft18_subscribe_ok_reports_largest(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    constexpr auto draft = DraftVersion::kDraft18;
+    MockTransport transport;
+    transport.keep_open_streams.insert(1);
+    transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+    transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+    transport.reads[4].push_back(encode_publish_namespace_ok_message(draft, 2));
+    transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+    // Once the media object has been written, a media subscriber arrives.
+    bool queued = false;
+    transport.on_try_write_object = [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) {
+        if (!queued && !event.bytes.empty() && event.bytes.back() == 0xAB) {
+            current.reads[5].push_back(encode_subscribe_message(3, kNamespace, "vide_1", 1, draft));
+            queued = true;
+        }
+        return ObjectWriteResult{ObjectWriteDisposition::kAccepted, {}};
+    };
+    MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(3));
+    session.set_catalog_republish_interval(std::chrono::seconds(1));
+    bool ok = expect(session.connect(endpoint, tls).ok, "draft-18 largest: session connects");
+    const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB)});
+    std::istringstream input(std::string(bytes.begin(), bytes.end()));
+    const auto status = session.publish_live(input, draft, true);
+    ok &= expect(status.ok, "draft-18 largest: live publish succeeds: " + status.message);
+    const auto subscribe_ok_on = [&](std::uint64_t stream_id) -> std::optional<std::vector<std::uint8_t>> {
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == stream_id && message_type(write.bytes) == 0x04) return write.bytes;
+        }
+        return std::nullopt;
+    };
+    const auto reports = [&](std::uint64_t stream_id, std::uint64_t request_id, std::size_t group,
+                             std::size_t object) {
+        const auto subscribe_ok = subscribe_ok_on(stream_id);
+        for (std::uint64_t alias = 0; alias < 8; ++alias) {
+            using openmoq::publisher::transport::encode_subscribe_ok_message;
+            if (subscribe_ok == encode_subscribe_ok_message(draft, request_id, alias, group, object, true)) return true;
+        }
+        return false;
+    };
+    using openmoq::publisher::transport::encode_subscribe_ok_message;
+    ok &= expect(queued, "draft-18 largest: the media object is written");
+    ok &= expect(subscribe_ok_on(1) == encode_subscribe_ok_message(draft, 1, 0, 0, 0, false),
+                 "draft-18 largest: the first catalog SUBSCRIBE_OK omits LARGEST_OBJECT before any catalog is sent");
+    ok &= expect(reports(5, 3, 0, 0), "draft-18 largest: a media SUBSCRIBE_OK reports LARGEST_OBJECT {0,0}");
+    return ok;
+}
+
 bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsConfig& tls) {
     constexpr std::uint64_t kInitial = 1700000000000ULL;
     constexpr std::string_view kNamespace = "interop";
@@ -9539,8 +9592,8 @@ int main() {
         for (const bool live : {true, false}) {
             // Draft-21 SUBSCRIBE_OK reports the largest object already sent on
             // the track (§9.20.18); a later SUBSCRIBE with FILL_PARAMETERS then
-            // gets a fill fetch stream that is opened and reset. Draft-18 keeps
-            // omitting LARGEST_OBJECT.
+            // gets a fill fetch stream that is opened and reset. Draft 18
+            // rejects the second SUBSCRIBE to the track as a duplicate.
             const bool draft21 = openmoq::publisher::is_draft21_or_later(draft);
             MockTransport transport;
             transport.keep_open_streams.insert(1);
@@ -12874,6 +12927,7 @@ int main() {
     }
     ok &= test_live_stdin_catalog_reaches_every_subscriber(endpoint, tls);
     ok &= test_live_stdin_catalog_resume_reports_current_largest(endpoint, tls);
+    ok &= test_live_stdin_draft18_subscribe_ok_reports_largest(endpoint, tls);
 
     return ok ? 0 : 1;
 }
