@@ -12,7 +12,7 @@ DraftProfile draft_profile(DraftVersion version) {
                 .subscribe_namespace_label = "Track Namespace",
                 .track_alias_label = "Track Alias",
                 .object_status_label = "Object Status",
-                .notes = "Primary profile. Use this for baseline publisher interoperability.",
+                .notes = "Legacy profile retained for API callers and baseline interoperability.",
             };
         case DraftVersion::kDraft16:
             return {
@@ -20,7 +20,7 @@ DraftProfile draft_profile(DraftVersion version) {
                 .subscribe_namespace_label = "Track Namespace",
                 .track_alias_label = "Track Alias",
                 .object_status_label = "Object Status",
-                .notes = "Secondary profile. Verify control message details against transport integration.",
+                .notes = "Compatibility profile. Verify control message details against transport integration.",
             };
         case DraftVersion::kDraft17:
             return {
@@ -36,7 +36,7 @@ DraftProfile draft_profile(DraftVersion version) {
                 .subscribe_namespace_label = "Track Namespace",
                 .track_alias_label = "Track Alias",
                 .object_status_label = "Object Status",
-                .notes = "Current target profile. Control/request stream semantics differ from draft-16.",
+                .notes = "Draft-18 profile. Control/request stream semantics differ from draft-16.",
             };
         case DraftVersion::kDraft23:
             return {
@@ -48,13 +48,21 @@ DraftProfile draft_profile(DraftVersion version) {
                          "REQUEST_ERROR carries Error Details, overlapping namespace subscriptions.",
             };
         case DraftVersion::kDraft22:
+            return {
+                .version = version,
+                .subscribe_namespace_label = "Track Namespace",
+                .track_alias_label = "Track Alias",
+                .object_status_label = "Object Status",
+                .notes = "Default profile (draft-22). Draft-21 semantics with explicit LOCATION_FILTER types "
+                         "and GOAWAY migration.",
+            };
         case DraftVersion::kDraft21:
             return {
                 .version = version,
                 .subscribe_namespace_label = "Track Namespace",
                 .track_alias_label = "Track Alias",
                 .object_status_label = "Object Status",
-                .notes = "Draft-21/22 profile. Extends draft-18 semantics: PUBLISH_OK drops GROUP_ORDER, "
+                .notes = "Draft-21 profile. Extends draft-18 semantics: PUBLISH_OK drops GROUP_ORDER, "
                          "SUBSCRIBE_TRACKS gains it and Range Filters, SETUP gains MAX_REQUEST_UPDATES.",
             };
     }

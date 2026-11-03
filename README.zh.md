@@ -13,7 +13,7 @@
 - 构建 MSF/CMSF version 1 catalog、初始化数据、可选 media timeline 和 SAP event timeline。
 - 对批量输入、stdin 上的直播 fragmented MP4 和 CTE LL-DASH ingest，检测并标识已有的 CMAF CENC 内容保护。它不会加密或解密媒体。
 - 输出 catalog、初始化、媒体、probe 和发布计划文件，以便在本地检查。
-- 使用主 CLI 支持的 MOQT draft profile 发布：draft 16（默认）、draft 18 和 draft 21。
+- 使用主 CLI 支持的 MOQT draft profile 发布：draft 16、draft 18、draft 21、draft 22（默认）和 draft 23。
 - 当 picoquic 和 picotls 可用时，通过 Raw QUIC 或 WebTransport 发布。
 - 接受来自 stdin 的直播 fragmented MP4、libsrt 可用时通过 SRT 传输的 MPEG-TS，以及通过 HTTP/1.1 CTE LL-DASH ingest（chunked 或固定长度请求）传输的 CMAF。
 - 使用 `--url` 解析 MSF URL，并使用 `--print-msf-urls` 打印 catalog discovery URL。
@@ -52,14 +52,14 @@ ctest --test-dir build --output-on-failure
 ./build/openmoq-publisher --input sample.mp4 --emit-dir out/
 ```
 
-使用默认 draft-16 profile 发布到 relay：
+使用默认 draft-22 profile 发布到 relay：
 
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --input sample.mp4 \
   --endpoint moqt://relay.example.com:443/moq \
   --namespace media \
-  --draft 16 \
+  --draft 22 \
   --forward 0 \
   --timeout 10 \
   --paced
@@ -273,6 +273,6 @@ MSFTS 示例遵循 `examples/msfts-publisher/docs/` 中的本地文本 draft，�
 
 ## 当前状态
 
-主 `openmoq-publisher` CLI 接受 drafts 16、18 和 21；draft 16 仍是默认值，draft 18 提供较新的 request-stream profile，draft 21 在其基础上扩展（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）。draft 21 仅适用于原生后端；moq5 后端仍使用 drafts 16 和 18。drafts 14、17、19 和 20 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试。
+主 `openmoq-publisher` CLI 接受 drafts 16、18、21、22 和 23；draft 22 是默认值。客户端只提供所选 draft 的 ALPN。draft 18 提供后续 draft 所基于的 request-stream profile，draft 21 在其基础上扩展（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS），draft 22 增加显式 LOCATION_FILTER 类型，draft 23 使用 varint 控制消息 Length、以 PAUSED 取代 FORWARD、REQUEST_ERROR 的 Error Details 以及其特定的会话终止码；参见 [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md)。drafts 21、22 和 23 通过原生后端发布；此 publisher 的 moq5 适配器仍使用 drafts 16 和 18，其他 draft 即使在 moq5 构建中也通过原生后端发布。drafts 14、17、19 和 20 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试，并且也接受 drafts 21、22 和 23。
 
 默认 picoquic backend 和可选 moq5 backend 都在进行持续的互操作性测试。有关详细功能覆盖、限制和 roadmap，请参阅 [docs/status.md](docs/status.md) 和 [docs/protocol-mapping.md](docs/protocol-mapping.md)。

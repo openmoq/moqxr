@@ -18,7 +18,7 @@ struct MsftsPublisherOptions {
     std::string track_name = "transport";
     std::uint16_t program = 0;
     std::size_t packets_per_object = 7;
-    publisher::DraftVersion draft = publisher::DraftVersion::kDraft17;
+    publisher::DraftVersion draft = publisher::DraftVersion::kDraft22;
     bool insecure = false;
     bool help = false;
 };
