@@ -185,8 +185,18 @@ struct PublishOk {
     std::uint8_t subscriber_priority = 0;
     std::uint8_t group_order = 0;
     std::uint64_t filter_type = 0;
+    // Range of an AbsoluteStart/AbsoluteRange (draft-21: LOCATION) filter;
+    // left at zero for filter types without one.
+    std::size_t start_group_id = 0;
+    std::size_t start_object_id = 0;
+    std::size_t end_group_id = 0;
+    std::optional<std::size_t> end_object_id;
     DeliveryTimeouts delivery_timeouts;
 };
+
+// Copies the subscription state a PUBLISH_OK establishes (priority, order,
+// forward state, filter and delivery timeouts) into publisher-side settings.
+void apply_publish_ok_settings(const PublishOk& publish_ok, SubscribeMessage& settings);
 
 struct PublishError {
     std::uint64_t request_id = 0;
