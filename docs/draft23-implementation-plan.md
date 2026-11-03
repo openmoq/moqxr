@@ -1,6 +1,6 @@
 # Draft-23 Implementation Plan
 
-This plan tracks adding `draft-ietf-moq-transport-23` support to `moqxr`, and making it the default draft.
+This plan tracks adding `draft-ietf-moq-transport-23` support to `moqxr`.
 
 Reference: [draft-ietf-moq-transport-23.txt](draft-ietf-moq-transport-23.txt) (2 November 2026).
 
@@ -44,6 +44,6 @@ The d22 PREFIX_OVERLAP rules stay exact `== kDraft22` checks.
 
 ## Known limitations
 - Session close codes come from the session's own checks. Decoders still report only success or failure, so a malformed message closes with PROTOCOL_VIOLATION. d23 allows that when no more specific code applies.
-- The client offers one ALPN, chosen with `--draft` (default 23). A d23 publisher can't fall back to an older draft on a relay that doesn't speak d23.
+- The client offers one ALPN, chosen with `--draft` (default 22). A d23 publisher can't fall back to an older draft on a relay that doesn't speak d23.
 - PUBLISH does not carry LARGEST_OBJECT on any draft after 14. The stdin and live-object paths have no per-track Largest at PUBLISH time to report.
 - Not yet verified against a d23 relay.

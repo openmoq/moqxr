@@ -6,7 +6,7 @@ Current transport and packaging work is past the initial prototype stage. The pu
 
 Draft status:
 
-- draft 18 is the default; draft 23 is the newest profile and is selectable with `--draft 23`
+- draft 22 is the default; draft 23 is the newest profile and is selectable with `--draft 23`
 - draft 14 is retained for API callers and draft 16 is maintained as a compatibility profile
 - draft 17 is selectable and has VI64, request-stream, control-codec, ALPN, and WebTransport protocol-offer support; relay interop coverage remains limited
 - WebTransport publishing to moqx is blocked: moqx omits the `reset_stream_at` transport parameter that WebTransport over HTTP/3 requires of servers, so picoquic withholds the CONNECT and the publisher names the missing parameter ([openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)) unless `--webtransport-allow-missing-reset-stream-at` is given; raw QUIC to moqx and WebTransport to Red5 are unaffected. A local moqx 0.3.5-99 build advertised the parameter and accepted draft-16 WebTransport publishes (the opt-out was not exercised), so newer builds may no longer be affected

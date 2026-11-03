@@ -2686,7 +2686,8 @@ bool test_draft23_fill_parameters() {
                  "draft-23 REQUEST_UPDATE records counted FILL_PARAMETERS");
 
     // Drafts 21 and 22 read SUBSCRIBER_PRIORITY inside FILL_PARAMETERS as a uint8 too.
-    ok &= expect(decode_subscribe_message(build_subscribe(DraftVersion::kDraft22, "t", 1, {0x23, 2, 0x20, 0x90}),
+    // Their value is a Length (3) around a Number of Parameters (1) and the parameter.
+    ok &= expect(decode_subscribe_message(build_subscribe(DraftVersion::kDraft22, "t", 1, {0x23, 3, 1, 0x20, 0x90}),
                                           DraftVersion::kDraft22, subscribe) &&
                      subscribe.fill_requested,
                  "draft-22 FILL_PARAMETERS reads SUBSCRIBER_PRIORITY as a uint8");

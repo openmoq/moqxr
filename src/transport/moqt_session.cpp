@@ -1260,6 +1260,9 @@ TransportStatus collect_control_acknowledgements(PublisherTransport& transport,
     while (namespace_responses < expected_namespace_responses || publish_responses < expected_publish_responses) {
         std::size_t consumed = 0;
         std::size_t message_size = 0;
+        if (const auto length_status = check_control_message_length(transport, draft, buffer); !length_status.ok) {
+            return length_status;
+        }
         while (next_control_message(std::span<const std::uint8_t>(buffer).subspan(consumed), draft, message_size)) {
             const std::vector<std::uint8_t> message_bytes(buffer.begin() + static_cast<std::ptrdiff_t>(consumed),
                                                           buffer.begin() + static_cast<std::ptrdiff_t>(consumed + message_size));
@@ -6354,6 +6357,11 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
         // strictly sequential peer request ids, and dropping it would lose a
         // request the relay is waiting on.
         std::size_t size = 0;
+        if (const auto length_status =
+                check_control_message_length(transport, plan.draft.version, pending_control_bytes);
+            !length_status.ok) {
+            return length_status;
+        }
         while (next_control_message(pending_control_bytes, plan.draft.version, size)) {
             const std::span<const std::uint8_t> bytes(pending_control_bytes.data(), size);
             std::size_t offset = 0;
@@ -7213,6 +7221,10 @@ TransportStatus exercise_live_srt_publish_flow_for_testing(
                 ++*control_poll_count;
             }
             std::size_t message_size = 0;
+            if (const auto length_status = check_control_message_length(transport, draft, pending_control_bytes);
+                !length_status.ok) {
+                return {length_status, 0};
+            }
             while (next_control_message(
                 pending_control_bytes, draft, message_size)) {
                 const std::vector<std::uint8_t> message(
@@ -12845,6 +12857,11 @@ TransportStatus MoqtSession::ensure_setup(openmoq::publisher::DraftVersion draft
 
     while (true) {
         std::size_t message_size = 0;
+        if (const auto length_status = check_control_message_length(
+                transport_, draft, std::span<const std::uint8_t>(response).subspan(consumed));
+            !length_status.ok) {
+            return length_status;
+        }
         if (!next_control_message(std::span<const std::uint8_t>(response).subspan(consumed), draft, message_size)) {
             if (fin) {
                 break;
