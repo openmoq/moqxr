@@ -262,14 +262,16 @@ bool append_moqint(std::vector<std::uint8_t>& out, DraftVersion draft, std::uint
 }
 
 // Control message Length is 16 bits before draft-23 and a vi64 from draft-23
-// (draft-23 §9). A payload that a 16-bit Length cannot carry fails instead of
-// being truncated.
+// (draft-23 §9). Every draft caps the body at 65535 bytes: a 16-bit Length
+// cannot carry more, and draft-23 forbids exceeding the peer's
+// MAX_CONTROL_MESSAGE_SIZE, which is never below that default. An oversized
+// body fails instead of being truncated.
 bool append_control_length(std::vector<std::uint8_t>& out, DraftVersion draft, std::size_t length) {
+    if (length > kDefaultMaxControlMessageSize) {
+        return false;
+    }
     if (is_draft23_or_later(draft)) {
         return append_moqint(out, draft, length);
-    }
-    if (length > std::numeric_limits<std::uint16_t>::max()) {
-        return false;
     }
     append_uint16(out, static_cast<std::uint16_t>(length));
     return true;
