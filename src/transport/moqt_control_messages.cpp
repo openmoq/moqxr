@@ -759,6 +759,17 @@ std::vector<std::uint8_t> encode_namespace_notification(DraftVersion draft, std:
     return bytes;
 }
 
+bool control_message_exceeds_limit(std::span<const std::uint8_t> bytes, DraftVersion draft) {
+    if (!is_draft23_or_later(draft)) {
+        return false;  // a 16-bit Length cannot exceed the limit
+    }
+    std::size_t offset = 0;
+    std::uint64_t type = 0;
+    std::size_t length = 0;
+    return decode_moqint_impl(bytes, offset, draft, type) && read_control_length(bytes, offset, draft, length) &&
+           length > kDefaultMaxControlMessageSize;
+}
+
 bool decode_control_message_header(std::span<const std::uint8_t> bytes,
                                    DraftVersion draft,
                                    std::uint64_t& type,

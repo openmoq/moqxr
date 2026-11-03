@@ -241,6 +241,10 @@ bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draf
 // Largest control message moqxr accepts. It never advertises a larger
 // draft-23 MAX_CONTROL_MESSAGE_SIZE, so this is also the draft-23 default.
 inline constexpr std::size_t kDefaultMaxControlMessageSize = 65535;
+// True when bytes begin a draft-23 control message whose Length exceeds
+// kDefaultMaxControlMessageSize. Such a message never completes within the
+// limit, so the receiver closes instead of buffering it (draft-23 §9).
+bool control_message_exceeds_limit(std::span<const std::uint8_t> bytes, DraftVersion draft);
 // Reads a draft-18+ control message Type and Length; the payload must end exactly at the end of `bytes`.
 bool decode_control_message_header(std::span<const std::uint8_t> bytes,
                                    DraftVersion draft,
