@@ -462,6 +462,15 @@ void append_be16(std::vector<std::uint8_t>& out, std::uint16_t value) {
     out.push_back(static_cast<std::uint8_t>(value & 0xffU));
 }
 
+// Control message Length: 16 bits before draft-23, vi64 from draft-23.
+void append_control_length(std::vector<std::uint8_t>& out, DraftVersion draft, std::size_t length) {
+    if (openmoq::publisher::is_draft23_or_later(draft)) {
+        append_bytes(out, encode_moqint(draft, length));
+        return;
+    }
+    append_be16(out, static_cast<std::uint16_t>(length));
+}
+
 void append_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xffU));
     out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xffU));
@@ -611,7 +620,7 @@ std::vector<std::uint8_t> encode_publish_namespace_ok_message(DraftVersion draft
         payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     }
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x07);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -634,7 +643,7 @@ std::vector<std::uint8_t> encode_subscribe_namespace_message(DraftVersion draft,
 
     std::vector<std::uint8_t> message = encode_moqint(draft, draft18_family(draft) ? 0x50 : 0x11);
     if (draft == DraftVersion::kDraft16 || draft18_family(draft)) {
-        append_be16(message, static_cast<std::uint16_t>(payload.size()));
+        append_control_length(message, draft, payload.size());
     } else {
         const std::vector<std::uint8_t> length = encode_varint(payload.size());
         message.insert(message.end(), length.begin(), length.end());
@@ -772,14 +781,19 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             payload.insert(payload.end(), timeout_value.begin(), timeout_value.end());
             previous_type = 0x06;
         }
-        // FORWARD (0x10, even) delta from previous type, value=forward
-        const std::vector<std::uint8_t> forward_delta = encode_moqint(draft, 0x10 - previous_type);
-        const std::vector<std::uint8_t> forward_value = encode_moqint(draft, forward);
+        // FORWARD (0x10, even) delta from previous type, value=forward.
+        // Draft-23 sends PAUSED (0x11), a uint8 holding the inverse.
+        const bool paused_param = openmoq::publisher::is_draft23_or_later(draft);
+        const std::uint64_t forward_type = paused_param ? 0x11 : 0x10;
+        const std::vector<std::uint8_t> forward_delta = encode_moqint(draft, forward_type - previous_type);
+        const std::vector<std::uint8_t> forward_value =
+            paused_param ? std::vector<std::uint8_t>{static_cast<std::uint8_t>(forward == 0 ? 1 : 0)}
+                         : encode_moqint(draft, forward);
         payload.insert(payload.end(), forward_delta.begin(), forward_delta.end());
         payload.insert(payload.end(), forward_value.begin(), forward_value.end());
-        // SUBSCRIBER_PRIORITY (0x20, even) delta=0x10. draft-17/18 encode the
+        // SUBSCRIBER_PRIORITY (0x20, even). draft-17/18 encode the
         // value as a single uint8 byte; earlier drafts use a varint.
-        const std::vector<std::uint8_t> priority_delta = encode_moqint(draft, 0x20 - 0x10);
+        const std::vector<std::uint8_t> priority_delta = encode_moqint(draft, 0x20 - forward_type);
         const bool uint8_params =
             draft == DraftVersion::kDraft17 || draft18_family(draft);
         const std::vector<std::uint8_t> priority_value =
@@ -814,7 +828,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
             }
         }
         // Draft-22 LOCATION_FILTER carries no Length (section 9.20.9).
-        const std::vector<std::uint8_t> filter_len = draft == DraftVersion::kDraft22
+        const std::vector<std::uint8_t> filter_len = openmoq::publisher::is_draft22_or_later(draft)
                                                          ? std::vector<std::uint8_t>{}
                                                          : encode_moqint(draft, filter_value.size());
         payload.insert(payload.end(), filter_delta.begin(), filter_delta.end());
@@ -836,7 +850,7 @@ std::vector<std::uint8_t> encode_subscribe_message(std::uint64_t request_id,
     }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x03);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -864,7 +878,7 @@ std::vector<std::uint8_t> encode_subscribe_tracks_message(std::uint64_t request_
     }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x51);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -890,7 +904,7 @@ std::vector<std::uint8_t> encode_archived_subscribe_update_message(
     payload.push_back(forward);
     payload.insert(payload.end(), parameter_count.begin(), parameter_count.end());
     std::vector<std::uint8_t> message = encode_varint(0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, DraftVersion::kDraft16, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -898,7 +912,7 @@ std::vector<std::uint8_t> encode_archived_subscribe_update_message(
 std::vector<std::uint8_t> encode_unsubscribe_message(DraftVersion draft, std::uint64_t request_id) {
     std::vector<std::uint8_t> payload = encode_moqint(draft, request_id);
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x0a);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -925,7 +939,7 @@ std::vector<std::uint8_t> encode_request_update_message(DraftVersion draft,
     }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -953,7 +967,7 @@ std::vector<std::uint8_t> encode_request_update_filter_message(
     payload.insert(payload.end(), filter.begin(), filter.end());
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -980,7 +994,7 @@ std::vector<std::uint8_t> encode_request_update_authorization_message(
     }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -1011,7 +1025,7 @@ std::vector<std::uint8_t> encode_malformed_request_update_parameter(
     }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -1040,7 +1054,7 @@ std::vector<std::uint8_t> encode_duplicate_request_update_parameter(
     }
 
     std::vector<std::uint8_t> message = encode_moqint(draft, 0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, draft, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -1056,7 +1070,7 @@ std::vector<std::uint8_t> encode_draft18_request_update_delta_overflow(
 
     std::vector<std::uint8_t> message =
         encode_moqint(DraftVersion::kDraft18, 0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, DraftVersion::kDraft18, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -1073,7 +1087,7 @@ std::vector<std::uint8_t> encode_legacy_subscribe_update_message(std::uint64_t t
     payload.push_back(0x01);
 
     std::vector<std::uint8_t> message = encode_varint(0x02);
-    append_be16(message, static_cast<std::uint16_t>(payload.size()));
+    append_control_length(message, DraftVersion::kDraft16, payload.size());
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
 }
@@ -1109,7 +1123,7 @@ std::vector<std::uint8_t> encode_publish_ok_message(DraftVersion draft,
         const std::vector<std::uint8_t> length = encode_varint(payload.size());
         message.insert(message.end(), length.begin(), length.end());
     } else {
-        append_be16(message, static_cast<std::uint16_t>(payload.size()));
+        append_control_length(message, draft, payload.size());
     }
     message.insert(message.end(), payload.begin(), payload.end());
     return message;
@@ -2771,6 +2785,116 @@ int main() {
                 ok &= expect(std::none_of(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
                     return write.bytes.size() > 2 && write.bytes[0] == 0x1d;
                 }), "D22 updated track prefix prevents publication outside that prefix");
+            }
+        }
+    }
+    {
+        // Draft-23 discovery and request-stream rules (draft-23 sections 3.6,
+        // 4.2, 9.2, 9.5.2).
+        constexpr DraftVersion d23 = DraftVersion::kDraft23;
+        const auto frame = [](std::uint8_t type, std::vector<std::uint8_t> body) {
+            std::vector<std::uint8_t> bytes{type};
+            append_control_length(bytes, DraftVersion::kDraft23, body.size());
+            append_bytes(bytes, body);
+            return bytes;
+        };
+        // {request id, namespace "interop", parameters}.
+        const auto namespace_body = [](std::uint8_t id, std::vector<std::uint8_t> parameters = {0}) {
+            std::vector<std::uint8_t> body{id, 1, 7, 'i', 'n', 't', 'e', 'r', 'o', 'p'};
+            append_bytes(body, parameters);
+            return body;
+        };
+        const auto is_publish = [](const auto& write) { return message_type(write.bytes) == 0x1d; };
+        for (const std::string scenario : {"namespace-overlap", "namespace-goaway", "namespace-prefix-update",
+                 "tracks-overlap", "tracks-publish-id", "tracks-prefix-update", "subscribe-goaway", "fetch"}) {
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = d23}));
+            transport.keep_open_streams.insert(3);
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(d23, 0));
+            if (scenario.starts_with("namespace-")) {
+                auto request = frame(0x50, namespace_body(1));
+                if (scenario == "namespace-goaway") append_bytes(request, frame(0x10, {0, 0}));
+                if (scenario == "namespace-prefix-update") append_bytes(request, frame(0x02, {3, 1, 0x34, 0}));
+                transport.reads[1].push_back(request);
+                transport.keep_open_streams.insert(1);
+                if (scenario == "namespace-overlap") {
+                    transport.reads[5].push_back(frame(0x50, namespace_body(3)));
+                    transport.keep_open_streams.insert(5);
+                }
+            } else if (scenario.starts_with("tracks-")) {
+                // PAUSED (0x11) keeps the overlap scenario from publishing.
+                const bool paused = scenario == "tracks-overlap";
+                auto request = frame(0x51, namespace_body(1, paused ? std::vector<std::uint8_t>{1, 0x11, 1}
+                                                                    : std::vector<std::uint8_t>{0}));
+                if (scenario == "tracks-prefix-update")
+                    append_bytes(request, frame(0x02, {3, 1, 0x34, 1, 7, 'i', 'n', 't', 'e', 'r', 'o', 'p'}));
+                transport.reads[1].push_back(request);
+                transport.keep_open_streams.insert(1);
+                if (scenario == "tracks-overlap") {
+                    transport.reads[5].push_back(frame(0x51, namespace_body(3, {1, 0x11, 1})));
+                    transport.keep_open_streams.insert(5);
+                } else {
+                    transport.reads[4].push_back(encode_publish_namespace_ok_message(d23, 2));
+                    transport.reads[8].push_back(encode_publish_namespace_ok_message(d23, 4));
+                }
+            } else if (scenario == "subscribe-goaway") {
+                auto request = encode_subscribe_message(1, "interop", "vide_1", 1, d23);
+                append_bytes(request, frame(0x10, {0, 0}));
+                transport.reads[1].push_back(request);
+                transport.keep_open_streams.insert(1);
+            } else if (scenario == "fetch") {
+                transport.reads[1].push_back(frame(0x16, {1, 1}));
+            }
+            MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "D23 " + scenario + " connects");
+            const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(d23), source_bytes));
+            const auto request_error_on = [&](std::uint64_t stream) -> std::optional<std::uint64_t> {
+                for (const auto& write : transport.writes) {
+                    openmoq::publisher::transport::RequestError error;
+                    if (write.stream_id == stream &&
+                        openmoq::publisher::transport::decode_request_error(write.bytes, d23, error))
+                        return error.error_code;
+                }
+                return std::nullopt;
+            };
+            const auto wrote = [&](std::uint64_t stream, const std::vector<std::uint8_t>& bytes) {
+                return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                    return write.stream_id == stream && write.bytes == bytes;
+                });
+            };
+            if (scenario == "namespace-goaway" || scenario == "subscribe-goaway") {
+                ok &= expect(!result.ok && transport.last_close_code == 3,
+                             "D23 " + scenario + " closes PROTOCOL_VIOLATION: GOAWAY from a request's sender");
+                continue;
+            }
+            ok &= expect(result.ok && transport.state() == ConnectionState::kConnected,
+                         "D23 " + scenario + " keeps session: " + result.message);
+            if (scenario == "namespace-overlap") {
+                ok &= expect(!request_error_on(5) && wrote(5, frame(0x08, {0, 0})),
+                             "D23 accepts an overlapping SUBSCRIBE_NAMESPACE and announces the namespace");
+            }
+            if (scenario == "namespace-prefix-update") {
+                ok &= expect(wrote(1, frame(0x08, {1, 7, 'i', 'n', 't', 'e', 'r', 'o', 'p', 0})),
+                             "D23 updated NAMESPACE uses the new relative prefix and an empty Parameters block");
+            }
+            if (scenario == "tracks-overlap") {
+                ok &= expect(request_error_on(5) == std::optional<std::uint64_t>{0x3},
+                             "D23 declines an overlapping SUBSCRIBE_TRACKS as NOT_SUPPORTED");
+            }
+            if (scenario == "tracks-publish-id" || scenario == "tracks-prefix-update") {
+                const auto publishes = std::count_if(transport.writes.begin(), transport.writes.end(), is_publish);
+                ok &= expect(publishes == 2, "D23 " + scenario + " PUBLISHes each track once, saw " +
+                                                 std::to_string(publishes));
+                ok &= expect(std::all_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                    const std::vector<std::uint8_t> tail{1, 0x36, 1};  // one parameter: SUBSCRIBE_TRACKS_ID 1
+                    return !is_publish(write) ||
+                           (write.bytes.size() > tail.size() &&
+                            std::equal(tail.begin(), tail.end(), write.bytes.end() - tail.size()));
+                }), "D23 " + scenario + " PUBLISH carries SUBSCRIBE_TRACKS_ID");
+            }
+            if (scenario == "fetch") {
+                ok &= expect(request_error_on(1) == std::optional<std::uint64_t>{0x3},
+                             "D23 FETCH is refused NOT_SUPPORTED");
             }
         }
     }

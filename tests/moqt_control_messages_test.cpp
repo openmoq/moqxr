@@ -2543,8 +2543,8 @@ bool test_draft23_framing_and_setup() {
                      is_draft18_or_later(d23) && !openmoq::publisher::is_draft23_or_later(DraftVersion::kDraft22),
                  "draft-23 inherits the draft-18+ predicates");
 
-    // Draft-23 §9: Length is a vi64. Payload sizes of 63 and 64 straddle the
-    // one- and two-byte vi64 forms; draft-22 always writes two bytes.
+    // Draft-23 §9: Length is a vi64, one byte up to 127 and two bytes above;
+    // draft-22 always writes two bytes.
     for (const std::size_t reason_size : {std::size_t{40}, std::size_t{200}}) {
         const auto bytes = encode_request_error_message(d23, 4, 0x10, 0, std::string(reason_size, 'r'));
         std::uint64_t type = 0;
@@ -2552,7 +2552,7 @@ bool test_draft23_framing_and_setup() {
         std::size_t payload_length = 0;
         ok &= expect(decode_control_message_header(bytes, d23, type, payload_offset, payload_length) &&
                          type == 0x05 && payload_offset + payload_length == bytes.size() &&
-                         payload_offset == (payload_length < 64 ? 2u : 3u),
+                         payload_offset == (payload_length <= 127 ? 2u : 3u),
                      "draft-23 REQUEST_ERROR uses a vi64 Length");
         std::size_t size = 0;
         ok &= expect(next_control_message(bytes, d23, size) && size == bytes.size(),
@@ -2564,16 +2564,20 @@ bool test_draft23_framing_and_setup() {
                      "draft-22 does not read a vi64 Length");
     }
 
-    // A payload over 65535 bytes needs a vi64 Length; a 16-bit Length fails
-    // instead of truncating.
+    // A body over 65535 bytes fails instead of truncating: a 16-bit Length
+    // cannot carry it, and draft-23 never sends past the default
+    // MAX_CONTROL_MESSAGE_SIZE.
     TrackMessage big{.draft = DraftVersion::kDraft22, .track_name = "t", .track_namespace = "n",
                      .authorization_token = std::vector<std::uint8_t>(70000, 0x01)};
     ok &= expect(encode_track_message(big).empty(), "draft-22 refuses a PUBLISH over 65535 bytes");
     big.draft = d23;
+    ok &= expect(encode_track_message(big).empty(), "draft-23 refuses a PUBLISH over 65535 bytes");
+    big.authorization_token = std::vector<std::uint8_t>(1000, 0x01);
     const auto big_bytes = encode_track_message(big);
     std::size_t big_size = 0;
-    ok &= expect(!big_bytes.empty() && next_control_message(big_bytes, d23, big_size) && big_size == big_bytes.size(),
-                 "draft-23 frames a PUBLISH over 65535 bytes");
+    ok &= expect(!big_bytes.empty() && next_control_message(big_bytes, d23, big_size) && big_size == big_bytes.size() &&
+                     (big_bytes[1] & 0xc0) == 0x80,
+                 "draft-23 frames a 1000+ byte PUBLISH with a two-byte vi64 Length");
 
     // Server SETUP: vi64 Length, and MAX_CONTROL_MESSAGE_SIZE (0x09) of at least 65535.
     ServerSetupMessage setup;

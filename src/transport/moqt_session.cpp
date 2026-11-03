@@ -663,9 +663,9 @@ const char* control_message_type_name(std::uint64_t message_type,
         case 0x16:
             return "FETCH";
         case 0x17:
-            return "FETCH_OK";
-        case 0x18:
             return "FETCH_CANCEL";
+        case 0x18:
+            return "FETCH_OK";  // reserved in draft 23
         case 0x1a:
             return "REQUESTS_BLOCKED";
         case 0x1b:
@@ -1701,6 +1701,14 @@ TransportStatus reject_unsupported_request(PublisherTransport& transport, DraftV
                                      "request type not supported"), true);
 }
 
+// Draft-22 refuses overlapping SUBSCRIBE_TRACKS with PREFIX_OVERLAP.
+// Draft-23 removes that code and expects a PUBLISH per matching request, but
+// each track here has one Track Alias and one set of data streams, so an
+// overlapping SUBSCRIBE_TRACKS is declined as NOT_SUPPORTED instead.
+std::uint64_t subscribe_tracks_overlap_error_code(DraftVersion draft) {
+    return is_draft23_or_later(draft) ? 0x3 : 0x30;
+}
+
 class DiscoveryRequests {
 public:
     struct Request {
@@ -1710,6 +1718,10 @@ public:
         std::vector<std::uint8_t> pending;
         bool fin = false;
         bool active = true;
+        // SUBSCRIBE_TRACKS: its Request ID, carried as SUBSCRIBE_TRACKS_ID on
+        // draft-23, and whether its PUBLISHes have been sent.
+        std::uint64_t request_id = 0;
+        bool published = false;
     };
     bool overlaps_tracks(std::span<const std::string> prefix) const {
         return std::any_of(requests_.begin(), requests_.end(), [&](const auto& entry) {
@@ -1722,8 +1734,10 @@ public:
         });
     }
     void retain(std::uint64_t stream_id, std::uint64_t type, std::vector<std::string> prefix,
-                std::uint8_t forward, std::vector<std::uint8_t> pending = {}) {
-        requests_.emplace(stream_id, Request{type, std::move(prefix), forward, std::move(pending), false});
+                std::uint8_t forward, std::vector<std::uint8_t> pending = {},
+                std::uint64_t request_id = 0, bool published = false) {
+        requests_.emplace(stream_id, Request{type, std::move(prefix), forward, std::move(pending), false, true,
+                                             request_id, published});
     }
     TransportStatus notify_namespace(PublisherTransport& transport, DraftVersion draft,
                                      std::uint64_t stream_id, std::span<const std::string> prefix,
@@ -1760,6 +1774,10 @@ public:
                         return protocol_violation(transport, "invalid retained request message");
                     TransportStatus status;
                     if (type == 0x10) {
+                        // Draft-23 §9.2: only a request's receiver sends GOAWAY on its stream,
+                        // and the peer sent SUBSCRIBE_NAMESPACE and SUBSCRIBE_TRACKS.
+                        if (is_draft23_or_later(draft) && request.type != 0x06)
+                            return protocol_violation(transport, "GOAWAY from the sender of a request");
                         status = goaway(transport, draft, stream_id, bytes);
                     } else if (type == 0x02 && request.type != 0x06) {
                         RequestUpdateMessage update;
@@ -1772,14 +1790,17 @@ public:
                             update.subscription_filter || update.fill_requested || update.new_group_request ||
                             update.object_delivery_timeout_ms || update.subgroup_delivery_timeout_ms)
                             return protocol_violation(transport, "invalid discovery update parameter");
+                        // Draft-23 allows overlapping namespace subscriptions (§4.2).
                         const bool overlap = update.track_namespace_prefix &&
+                            !(is_draft23_or_later(draft) && request.type == 0x50) &&
                             std::any_of(requests_.begin(), requests_.end(), [&](const auto& entry) {
                                 return entry.first != stream_id && entry.second.active && entry.second.type == request.type &&
                                     namespace_prefixes_overlap(*update.track_namespace_prefix, entry.second.prefix);
                             });
                         if (overlap || update.has_unnegotiated_range_filter) {
                             status = transport.write_stream(stream_id, encode_request_error_message(draft,
-                                update.request_id, overlap ? 0x30 : 0x36, 0, "invalid discovery update"), true);
+                                update.request_id, overlap ? subscribe_tracks_overlap_error_code(draft) : 0x36, 0,
+                                "invalid discovery update"), true);
                             if (!status.ok) return status;
                             request.active = false;
                             request.pending.clear();
@@ -1787,17 +1808,23 @@ public:
                         }
                         if (update.track_namespace_prefix) request.prefix = *update.track_namespace_prefix;
                         const auto updated_forward = update.forward.value_or(request.forward);
+                        // Draft-23 §9.5.2: a prefix update never re-PUBLISHes a track
+                        // already published for this SUBSCRIBE_TRACKS.
                         const bool resume_tracks = request.type == 0x51 &&
                             updated_forward == 1 &&
                             namespace_prefix_matches(request.prefix, track_namespace) &&
-                            (request.forward == 0 || update.track_namespace_prefix.has_value());
+                            (request.forward == 0 || update.track_namespace_prefix.has_value()) &&
+                            !(is_draft23_or_later(draft) && request.published);
                         if (request.type == 0x51 && update.forward) request.forward = *update.forward;
                         status = transport.write_stream(stream_id, encode_request_ok_message(draft, update.request_id), false);
                         if (!status.ok) return status;
                         if (request.type == 0x50 && update.track_namespace_prefix)
                             status = notify_namespace(transport, draft, stream_id, request.prefix, track_namespace);
                         if (!status.ok) return status;
-                        if (resume_tracks) status = on_tracks_forward();
+                        if (resume_tracks) {
+                            request.published = true;
+                            status = on_tracks_forward(request.request_id);
+                        }
                     } else {
                         return protocol_violation(transport, "unexpected message on retained discovery request");
                     }
@@ -1828,9 +1855,13 @@ private:
     std::set<std::uint64_t> goaway_streams_;
 };
 
+// peer_sent_request: the GOAWAY arrived on a request the peer sent, such as
+// SUBSCRIBE. Draft-23 §9.2 lets only a request's receiver send GOAWAY on it.
 TransportStatus request_goaway(PublisherTransport& transport, DraftVersion draft,
                                 std::uint64_t stream_id, std::span<const std::uint8_t> bytes,
-                                std::set<std::uint64_t>& seen) {
+                                std::set<std::uint64_t>& seen, bool peer_sent_request) {
+    if (peer_sent_request && is_draft23_or_later(draft))
+        return protocol_violation(transport, "GOAWAY from the sender of a request");
     GoawayMessage message;
     if (is_draft22_or_later(draft) && !decode_goaway_message(bytes, draft, message))
         return protocol_violation(transport, "invalid request GOAWAY");
@@ -3823,7 +3854,8 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         std::map<std::uint64_t, DormantPublishedTrack>* dormant_published_tracks,
                                         std::map<std::uint64_t, std::uint64_t>* request_id_by_track_alias,
                                         const NowFunction& now_function,
-                                        std::uint64_t first_request_id = 2);
+                                        std::uint64_t first_request_id = 2,
+                                        std::optional<std::uint64_t> subscribe_tracks_request_id = std::nullopt);
 
 using PublishedObjectSink =
     std::function<void(const std::string&, std::uint64_t group_id, std::uint64_t object_id, std::size_t)>;
@@ -4013,7 +4045,8 @@ TransportStatus poll_retained_subscribe_request_updates(
                 std::size_t type_offset = 0;
                 std::uint64_t type = 0;
                 if (decode_moqint(message_bytes, type_offset, draft, type) && type == 0x10) {
-                    const auto status = request_goaway(transport, draft, stream_it->second, message_bytes, request_goaways);
+                    const auto status =
+                        request_goaway(transport, draft, stream_it->second, message_bytes, request_goaways, true);
                     if (!status.ok) return status;
                     pending.erase(pending.begin(), pending.begin() + message_size);
                     continue;
@@ -4120,7 +4153,8 @@ TransportStatus poll_retained_publish_request_updates(
                 std::size_t type_offset = 0;
                 std::uint64_t type = 0;
                 if (decode_moqint(message_bytes, type_offset, draft, type) && type == 0x10) {
-                    const auto status = request_goaway(transport, draft, stream_it->second, message_bytes, request_goaways);
+                    const auto status =
+                        request_goaway(transport, draft, stream_it->second, message_bytes, request_goaways, false);
                     if (!status.ok) return status;
                     pending.erase(pending.begin(), pending.begin() + message_size);
                     continue;
@@ -4631,14 +4665,14 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         return TransportStatus::success();
     };
 
-    const auto publish_discovered_tracks = [&]() -> TransportStatus {
+    const auto publish_discovered_tracks = [&](std::uint64_t subscribe_tracks_request_id) -> TransportStatus {
             std::vector<PublishedTrack> matching_tracks;
             for (const auto& [name, track] : tracks_by_name) matching_tracks.push_back(track);
             std::map<std::uint64_t, std::uint64_t> stream_ids;
             const auto status = publish_selected_tracks(transport, control_stream_id, plan, loop_state,
                 matching_tracks, peer_max_request_id, track_namespace, authorization_token, paced,
                 pending_control_bytes, stream_ids, dormant_published_tracks, nullptr, now_function,
-                subscribe_tracks_next_request_id);
+                subscribe_tracks_next_request_id, subscribe_tracks_request_id);
             if (status.ok) subscribe_tracks_next_request_id += matching_tracks.size() * 2;
             return status;
             };
@@ -4854,7 +4888,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             return namespace_prefixes_overlap(
                                 subscribe_namespace.track_namespace_prefix, established_prefix);
                         });
-                    if (overlaps_established_namespace) {
+                    // Draft-23 allows overlapping namespace subscriptions (§4.2).
+                    if (overlaps_established_namespace && !is_draft23_or_later(draft)) {
                         const TransportStatus write_status = transport.write_stream(
                             request_stream_id,
                             encode_request_error_message(
@@ -4921,9 +4956,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (!request_id_status.ok) {
                     return request_id_status;
                 }
-                if (draft == DraftVersion::kDraft22 && discovery_requests.overlaps_tracks(subscribe_tracks.track_namespace_prefix)) {
+                if (is_draft22_or_later(draft) && discovery_requests.overlaps_tracks(subscribe_tracks.track_namespace_prefix)) {
                     const auto overlap_status = transport.write_stream(request_stream_id,
-                        encode_request_error_message(draft, subscribe_tracks.request_id, 0x30, 0, "track prefix overlap"), true);
+                        encode_request_error_message(draft, subscribe_tracks.request_id,
+                                                     subscribe_tracks_overlap_error_code(draft), 0,
+                                                     "track prefix overlap"), true);
                     if (!overlap_status.ok) return overlap_status;
                     continue;
                 }
@@ -4964,7 +5001,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 }
 
                 discovery_requests.retain(request_stream_id, 0x51,
-                    subscribe_tracks.track_namespace_prefix, subscribe_tracks.forward, std::move(trailing_request_bytes));
+                    subscribe_tracks.track_namespace_prefix, subscribe_tracks.forward, std::move(trailing_request_bytes),
+                    subscribe_tracks.request_id, subscribe_tracks.forward != 0);
                 if (subscribe_tracks.forward == 0) {
                     continue;
                 }
@@ -4992,7 +5030,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                             dormant_published_tracks,
                                             nullptr,
                                             now_function,
-                                            subscribe_tracks_next_request_id);
+                                            subscribe_tracks_next_request_id,
+                                            subscribe_tracks.request_id);
                 if (!publish_status.ok) {
                     return publish_status;
                 }
@@ -5016,7 +5055,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         std::size_t type_offset = 0;
                         std::uint64_t type = 0;
                         if (decode_moqint(update_bytes, type_offset, draft, type) && type == 0x10) {
-                            const auto status = request_goaway(transport, draft, active.request_stream_id, update_bytes, request_goaways);
+                            const auto status = request_goaway(transport, draft, active.request_stream_id, update_bytes,
+                                                               request_goaways, true);
                             if (!status.ok) return status;
                             active.pending_request_bytes.erase(active.pending_request_bytes.begin(), active.pending_request_bytes.begin() + update_size);
                             continue;
@@ -6605,7 +6645,8 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         std::map<std::uint64_t, DormantPublishedTrack>* dormant_published_tracks,
                                         std::map<std::uint64_t, std::uint64_t>* request_id_by_track_alias,
                                         const NowFunction& now_function,
-                                        std::uint64_t first_request_id) {
+                                        std::uint64_t first_request_id,
+                                        std::optional<std::uint64_t> subscribe_tracks_request_id) {
     if (tracks.empty()) {
         return TransportStatus::success();
     }
@@ -6634,6 +6675,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
             .content_exists = track.content_exists,
             .authorization_token = track_auth.token,
             .dpop_proof = track_auth.proof,
+            .subscribe_tracks_request_id = subscribe_tracks_request_id,
         };
         TransportStatus status = TransportStatus::success();
         if (uses_request_streams(plan.draft.version)) {
@@ -8425,7 +8467,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             return TransportStatus::success();
         };
 
-    const auto publish_discovered_tracks = [&]() -> TransportStatus {
+    const auto publish_discovered_tracks = [&](std::uint64_t subscribe_tracks_request_id) -> TransportStatus {
         for (const auto& [name, alias] : alias_by_track) {
             if (published_request_ids.contains(name)) continue;
             AuthorizationValues authorization;
@@ -8439,6 +8481,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 .request_id = next_published_request_id, .track_alias = alias,
                 .content_exists = largest_object_by_track.contains(name),
                 .authorization_token = authorization.token, .dpop_proof = authorization.proof,
+                .subscribe_tracks_request_id = subscribe_tracks_request_id,
             };
             if (const auto largest = largest_sent_object(name)) {
                 message.largest_group_id = largest->first;
@@ -8616,7 +8659,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                         established_namespace_prefixes.end(), [&](const auto& prefix) {
                             return namespace_prefixes_overlap(request.track_namespace_prefix, prefix);
                         });
-                    if (overlap) {
+                    // Draft-23 allows overlapping namespace subscriptions (§4.2).
+                    if (overlap && !is_draft23_or_later(draft_version)) {
                         const auto rejected = transport_.write_stream(request_stream_id,
                             encode_request_error_message(draft_version, request.request_id, 0x30, 0,
                                                          "namespace prefix overlap"), true);
@@ -8653,8 +8697,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     const auto id_status = peer_request_ids.validate(transport_, request.request_id);
                     if (!id_status.ok) return {id_status, 0};
                     std::uint64_t error = 0;
-                    if (draft_version == DraftVersion::kDraft22 && discovery_requests.overlaps_tracks(request.track_namespace_prefix))
-                        error = 0x30;
+                    if (is_draft22_or_later(draft_version) && discovery_requests.overlaps_tracks(request.track_namespace_prefix))
+                        error = subscribe_tracks_overlap_error_code(draft_version);
                     else if (declines_subscribe_tracks_filter(draft_version, request)) error = kRequestErrorInvalidFilter;
                     else if (!namespace_prefix_matches(request.track_namespace_prefix, track_namespace_, draft_version == DraftVersion::kDraft16)) error = 0x2;
                     if (error != 0) {
@@ -8668,9 +8712,9 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                         encode_request_ok_message(draft_version, request.request_id), false);
                     if (!accepted.ok) return {accepted, 0};
                     discovery_requests.retain(request_stream_id, 0x51, request.track_namespace_prefix, request.forward,
-                                              std::move(trailing_request_bytes));
+                                              std::move(trailing_request_bytes), request.request_id, request.forward != 0);
                     if (request.forward != 0 && namespace_prefix_matches(request.track_namespace_prefix, track_namespace_, draft_version == DraftVersion::kDraft16)) {
-                        const auto published = publish_discovered_tracks();
+                        const auto published = publish_discovered_tracks(request.request_id);
                         if (!published.ok) return {published, 0};
                     }
                     continue;
@@ -9925,7 +9969,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     // for the reply. Idempotent per track: a name already published is skipped,
     // so the forward-mode preannounce (media tracks only) and a later
     // SUBSCRIBE_TRACKS (catalog plus media) compose without duplicate PUBLISHes.
-    auto publish_live_tracks = [&](const std::vector<std::string>& live_track_names) -> TransportStatus {
+    auto publish_live_tracks = [&](const std::vector<std::string>& live_track_names,
+                                   std::optional<std::uint64_t> subscribe_tracks_request_id = std::nullopt)
+        -> TransportStatus {
         if (!uses_request_streams(draft_version)) {
             return TransportStatus::success();
         }
@@ -9956,6 +10002,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 .content_exists = true,
                 .authorization_token = std::move(track_auth.token),
                 .dpop_proof = std::move(track_auth.proof),
+                .subscribe_tracks_request_id = subscribe_tracks_request_id,
             };
             PublishOk publish_ok;
             std::uint64_t track_stream_id = 0;
@@ -9998,12 +10045,12 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         return TransportStatus::success();
     };
 
-    auto publish_live_tracks_for_subscribe_tracks = [&]() -> TransportStatus {
+    auto publish_live_tracks_for_subscribe_tracks = [&](std::uint64_t subscribe_tracks_request_id) -> TransportStatus {
         std::vector<std::string> live_track_names = {"catalog"};
         for (const auto& track : tracks) {
             live_track_names.push_back(track.track_name);
         }
-        return publish_live_tracks(live_track_names);
+        return publish_live_tracks(live_track_names, subscribe_tracks_request_id);
     };
 
     // Applies a REQUEST_UPDATE to a subscription this session established with
@@ -10178,7 +10225,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         if (!control_status.ok) return {control_status, 0};
         const auto uni_status = peer_unidirectional_streams.poll(transport_, draft_version);
         if (!uni_status.ok) return {uni_status, 0};
-        const auto retained_status = discovery_requests.poll(transport_, draft_version, peer_request_ids, [&]() { return publish_live_tracks_for_subscribe_tracks(); }, track_namespace_);
+        const auto retained_status = discovery_requests.poll(transport_, draft_version, peer_request_ids, [&](std::uint64_t subscribe_tracks_request_id) {
+            return publish_live_tracks_for_subscribe_tracks(subscribe_tracks_request_id);
+        }, track_namespace_);
         if (!retained_status.ok) return {retained_status, 0};
 
         std::size_t new_subs = 0;
@@ -10393,7 +10442,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                             return namespace_prefixes_overlap(
                                 subscribe_namespace.track_namespace_prefix, established_prefix);
                         });
-                    if (overlaps_established_namespace) {
+                    // Draft-23 allows overlapping namespace subscriptions (§4.2).
+                    if (overlaps_established_namespace && !is_draft23_or_later(draft_version)) {
                         const TransportStatus overlap_status = transport_.write_stream(
                             request_stream_id,
                             encode_request_error_message(draft_version,
@@ -10451,9 +10501,11 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 if (!request_id_status.ok) {
                     return {request_id_status, 0};
                 }
-                if (draft_version == DraftVersion::kDraft22 && discovery_requests.overlaps_tracks(subscribe_tracks.track_namespace_prefix)) {
+                if (is_draft22_or_later(draft_version) && discovery_requests.overlaps_tracks(subscribe_tracks.track_namespace_prefix)) {
                     const auto overlap_status = transport_.write_stream(request_stream_id,
-                        encode_request_error_message(draft_version, subscribe_tracks.request_id, 0x30, 0, "track prefix overlap"), true);
+                        encode_request_error_message(draft_version, subscribe_tracks.request_id,
+                                                     subscribe_tracks_overlap_error_code(draft_version), 0,
+                                                     "track prefix overlap"), true);
                     if (!overlap_status.ok) return {overlap_status, 0};
                     continue;
                 }
@@ -10495,12 +10547,13 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     return {write_status, 0};
                 }
                 discovery_requests.retain(request_stream_id, 0x51,
-                    subscribe_tracks.track_namespace_prefix, subscribe_tracks.forward, std::move(trailing_request_bytes));
+                    subscribe_tracks.track_namespace_prefix, subscribe_tracks.forward, std::move(trailing_request_bytes),
+                    subscribe_tracks.request_id, subscribe_tracks.forward != 0);
                 if (subscribe_tracks.forward == 0) {
                     continue;
                 }
 
-                TransportStatus publish_status = publish_live_tracks_for_subscribe_tracks();
+                TransportStatus publish_status = publish_live_tracks_for_subscribe_tracks(subscribe_tracks.request_id);
                 if (!publish_status.ok) {
                     return {publish_status, 0};
                 }
@@ -11208,7 +11261,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     LargestObjectByTrack largest_object_by_track;
     std::uint64_t next_publish_request_id = 2;
 
-    auto publish_tracks = [&]() -> TransportStatus {
+    auto publish_tracks = [&](std::optional<std::uint64_t> subscribe_tracks_request_id = std::nullopt)
+        -> TransportStatus {
         if (!uses_request_streams(draft_version) || !published_track_request_ids.empty()) {
             return TransportStatus::success();
         }
@@ -11225,6 +11279,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 .content_exists = true,
                 .authorization_token = track_auth.token,
                 .dpop_proof = track_auth.proof,
+                .subscribe_tracks_request_id = subscribe_tracks_request_id,
             };
             PublishOk publish_ok;
             std::uint64_t stream_id = 0;
@@ -11580,7 +11635,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         if (!control_status.ok) return control_status;
         const auto uni_status = peer_unidirectional_streams.poll(transport_, draft_version);
         if (!uni_status.ok) return uni_status;
-        const auto retained_status = discovery_requests.poll(transport_, draft_version, peer_request_ids, [&]() { return publish_tracks(); }, track_namespace_);
+        const auto retained_status = discovery_requests.poll(transport_, draft_version, peer_request_ids, [&](std::uint64_t subscribe_tracks_request_id) {
+            return publish_tracks(subscribe_tracks_request_id);
+        }, track_namespace_);
         if (!retained_status.ok) return retained_status;
 
         TransportStatus update_status = process_publish_request_updates();
@@ -11692,7 +11749,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                             return namespace_prefixes_overlap(
                                 subscribe_namespace.track_namespace_prefix, established_prefix);
                         });
-                    if (overlaps_established_namespace) {
+                    // Draft-23 allows overlapping namespace subscriptions (§4.2).
+                    if (overlaps_established_namespace && !is_draft23_or_later(draft_version)) {
                         const TransportStatus overlap_status = transport_.write_stream(
                             request_stream_id,
                             encode_request_error_message(draft_version,
@@ -11760,9 +11818,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 if (!request_id_status.ok) {
                     return request_id_status;
                 }
-                if (draft_version == DraftVersion::kDraft22 && discovery_requests.overlaps_tracks(subscribe_tracks.track_namespace_prefix)) {
+                if (is_draft22_or_later(draft_version) && discovery_requests.overlaps_tracks(subscribe_tracks.track_namespace_prefix)) {
                     const auto overlap_status = transport_.write_stream(request_stream_id,
-                        encode_request_error_message(draft_version, subscribe_tracks.request_id, 0x30, 0, "track prefix overlap"), true);
+                        encode_request_error_message(draft_version, subscribe_tracks.request_id,
+                                                     subscribe_tracks_overlap_error_code(draft_version), 0,
+                                                     "track prefix overlap"), true);
                     if (!overlap_status.ok) return overlap_status;
                     continue;
                 }
@@ -11801,11 +11861,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     return write_status;
                 }
                 discovery_requests.retain(request_stream_id, 0x51,
-                    subscribe_tracks.track_namespace_prefix, subscribe_tracks.forward, std::move(trailing_request_bytes));
+                    subscribe_tracks.track_namespace_prefix, subscribe_tracks.forward, std::move(trailing_request_bytes),
+                    subscribe_tracks.request_id, subscribe_tracks.forward != 0);
                 if (subscribe_tracks.forward == 0) {
                     continue;
                 }
-                TransportStatus publish_status = publish_tracks();
+                TransportStatus publish_status = publish_tracks(subscribe_tracks.request_id);
                 if (!publish_status.ok) {
                     return publish_status;
                 }
