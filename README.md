@@ -143,6 +143,31 @@ ffmpeg -hide_banner -stream_loop -1 -re \
  --input -
 ```
 
+#### Multiple video renditions
+
+Every track in the input is published, named in `trak` order (`vide_1`, `vide_2`, `soun_3`, ...). When the video tracks are renditions of one picture, `--video-alt-group <N>` puts each of them in MSF alternate group `N` (`"altGroup":N` in the catalog, MSF section 5.2.12), so a subscriber knows to pick one. Audio tracks are not grouped, and an input with a single video track gets no `altGroup`. Without the option the catalog has no `altGroup`, because the publisher cannot tell renditions from, for example, two camera angles.
+
+MSF requires the tracks of an alternate group to be time-aligned, so encode them with the same frame rate and keyframe interval and without scene-cut keyframes:
+
+```bash
+ffmpeg -hide_banner -re -i input.mp4 \
+ -filter_complex "[0:v]split=2[high][low_in];[low_in]scale=-2:360[low]" \
+ -map "[high]" -map "[low]" -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -b:v:0 3000k -b:v:1 800k \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --publish-catalog \
+ --input - \
+ --video-alt-group 1
+```
+
+The option applies to live stdin publishing on the native backend. It is rejected for file, SRT and LL-DASH input; the LL-DASH ingest already sets `altGroup` 1 on its video tracks when there are two or more. The moq5 backend builds its own catalog and refuses the option.
+
 ### SRT ingest
 
 The publisher is an SRT caller. Create `/tmp/srt_callers.json` with the SRT listener address and MPEG-TS/CMAF settings:

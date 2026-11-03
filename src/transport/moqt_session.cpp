@@ -7683,7 +7683,8 @@ using LiveLocmafEncoders = std::map<std::string, std::unique_ptr<openmoq::publis
 openmoq::publisher::LiveCatalog prepare_live_catalog(
     std::vector<openmoq::publisher::TrackDescription>& tracks,
     std::span<const std::uint8_t> init, MediaPackaging packaging,
-    LiveLocmafEncoders& encoders, LiveLocEncoders& loc_encoders) {
+    LiveLocmafEncoders& encoders, LiveLocEncoders& loc_encoders,
+    std::optional<std::uint32_t> video_alt_group = std::nullopt) {
     if (packaging == MediaPackaging::kLoc) {
         openmoq::publisher::ParsedMp4 parsed;
         parsed.bytes.assign(init.begin(), init.end());
@@ -7695,7 +7696,7 @@ openmoq::publisher::LiveCatalog prepare_live_catalog(
             track.packaging = "loc";
         }
     }
-    auto catalog = openmoq::publisher::build_live_catalog(tracks, init, true);
+    auto catalog = openmoq::publisher::build_live_catalog(tracks, init, true, {}, video_alt_group);
     if (packaging != MediaPackaging::kLocmaf) return catalog;
     for (auto& track : tracks) {
         const auto found = std::find_if(catalog.track_initializations.begin(),
@@ -7712,7 +7713,7 @@ openmoq::publisher::LiveCatalog prepare_live_catalog(
                       << track.track_name << ": " << error.what() << '\n';
         }
     }
-    return openmoq::publisher::build_live_catalog(tracks, init, true);
+    return openmoq::publisher::build_live_catalog(tracks, init, true, {}, video_alt_group);
 }
 
 class LiveSrtLocConverter {
@@ -9212,7 +9213,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     LiveLocEncoders loc_encoders;
     openmoq::publisher::LiveCatalog live_catalog;
     try {
-        live_catalog = prepare_live_catalog(tracks, init_segment, media_packaging_, locmaf_encoders, loc_encoders);
+        live_catalog = prepare_live_catalog(tracks, init_segment, media_packaging_, locmaf_encoders, loc_encoders,
+                                            video_alt_group_);
     } catch (const std::runtime_error& error) {
         return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
     }

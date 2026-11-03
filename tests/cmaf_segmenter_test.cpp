@@ -3,11 +3,13 @@
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <array>
 #include <sstream>
 #include <string>
@@ -856,6 +858,43 @@ std::vector<std::uint8_t> make_multitrack_init_mp4() {
     return concat({ftyp, moov});
 }
 
+// make_multitrack_init_mp4() with a second avc1 track (track 2) ahead of the
+// audio track (track 3): two video renditions and one audio track.
+std::vector<std::uint8_t> make_two_video_init_mp4() {
+    const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+    const auto make_trak = [](std::uint8_t track_id, const std::string& handler,
+                              const std::vector<std::uint8_t>& sample_entry) {
+        const auto tkhd = make_full_box("tkhd", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, track_id, 0, 0, 0, 0});
+        const auto hdlr = make_full_box(
+            "hdlr", {0, 0, 0, 0, static_cast<std::uint8_t>(handler[0]), static_cast<std::uint8_t>(handler[1]),
+                     static_cast<std::uint8_t>(handler[2]), static_cast<std::uint8_t>(handler[3]), 0, 0, 0, 0});
+        const auto stsd = make_full_box("stsd", concat({std::vector<std::uint8_t>{0, 0, 0, 1}, sample_entry}));
+        const auto minf = make_box("minf", make_box("stbl", stsd));
+        return make_box("trak", concat({tkhd, make_box("mdia", concat({hdlr, minf}))}));
+    };
+    auto video_header = std::vector<std::uint8_t>(78, 0);
+    video_header[24] = 0x01;
+    video_header[25] = 0x40;
+    video_header[26] = 0x00;
+    video_header[27] = 0xf0;
+    const auto video_sample_entry =
+        make_box("avc1", concat({video_header, make_box("avcC", {1, 100, 0, 12, 0xff})}));
+    auto audio_header = std::vector<std::uint8_t>(28, 0);
+    audio_header[17] = 0x02;
+    audio_header[24] = 0xbb;
+    audio_header[25] = 0x80;
+    const auto audio_sample_entry =
+        make_box("mp4a", concat({audio_header, make_box("esds", {0x00, 0x00, 0x00, 0x00, 0x03, 0x19, 0x00, 0x02, 0x00, 0x04, 0x11, 0x40, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x10, 0x10})}));
+    const auto make_trex = [](std::uint8_t track_id) {
+        return make_full_box("trex", {0, 0, 0, track_id, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    };
+    const auto mvex = make_box("mvex", concat({make_trex(1), make_trex(2), make_trex(3)}));
+    const auto moov = make_box("moov", concat({make_trak(1, "vide", video_sample_entry),
+                                               make_trak(2, "vide", video_sample_entry),
+                                               make_trak(3, "soun", audio_sample_entry), mvex}));
+    return concat({ftyp, moov});
+}
+
 std::vector<std::uint8_t> make_hevc_init_mp4(std::uint8_t general_profile_byte,
                                              std::uint32_t compatibility_flags,
                                              std::array<std::uint8_t, 6> constraint_bytes,
@@ -1597,6 +1636,49 @@ int main() {
         live_catalog_rejected_bad_track = true;
     }
     ok &= expect(live_catalog_rejected_bad_track, "expected live catalog to reject missing track init data");
+
+    // MSF section 5.2.12: video_alt_group puts every video track, and no audio
+    // track, in one alternate group, but only when there are two video tracks
+    // to alternate between.
+    {
+        const auto alt_group_of = [](const LiveCatalog& catalog, std::string_view track_name) {
+            const auto found = std::find_if(catalog.msf_catalog.tracks.begin(), catalog.msf_catalog.tracks.end(),
+                                            [&](const MsfTrack& track) { return track.name == track_name; });
+            return found == catalog.msf_catalog.tracks.end() ? std::optional<std::uint32_t>{} : found->alt_group;
+        };
+        const auto two_video_init_bytes = make_two_video_init_mp4();
+        const auto two_video_tracks = extract_tracks(parse_mp4_boxes(two_video_init_bytes), two_video_init_bytes);
+        ok &= expect(two_video_tracks.size() == 3 && two_video_tracks[0].track_name == "vide_1" &&
+                         two_video_tracks[1].track_name == "vide_2" && two_video_tracks[2].track_name == "soun_3",
+                     "expected the two-video fixture to yield vide_1, vide_2 and soun_3");
+
+        const auto grouped = build_live_catalog(two_video_tracks, two_video_init_bytes, true, {}, 7);
+        const std::string grouped_text(grouped.catalog_payload.begin(), grouped.catalog_payload.end());
+        ok &= expect(alt_group_of(grouped, "vide_1") == 7u && alt_group_of(grouped, "vide_2") == 7u,
+                     "expected both video tracks in the requested altGroup");
+        ok &= expect(!alt_group_of(grouped, "soun_3").has_value(), "expected no altGroup on the audio track");
+        // A subscriber may require every track of an alternate group to share
+        // one targetLatency.
+        ok &= expect(grouped.msf_catalog.tracks.size() == 3 &&
+                         grouped.msf_catalog.tracks[0].target_latency_ms == grouped.msf_catalog.tracks[1].target_latency_ms,
+                     "expected the alternate video tracks to share one targetLatency");
+        std::size_t alt_group_count = 0;
+        for (auto at = grouped_text.find("\"altGroup\":7"); at != std::string::npos;
+             at = grouped_text.find("\"altGroup\":7", at + 1)) {
+            ++alt_group_count;
+        }
+        ok &= expect(alt_group_count == 2, "expected exactly two altGroup fields in the serialized catalog");
+
+        const auto ungrouped = build_live_catalog(two_video_tracks, two_video_init_bytes, true);
+        const std::string ungrouped_text(ungrouped.catalog_payload.begin(), ungrouped.catalog_payload.end());
+        ok &= expect_not_contains(ungrouped_text, "\"altGroup\"",
+                                  "expected no altGroup when video_alt_group is unset");
+
+        const auto single_video = build_live_catalog(multitrack_segmented.tracks, multitrack_init_bytes, true, {}, 1);
+        const std::string single_video_text(single_video.catalog_payload.begin(), single_video.catalog_payload.end());
+        ok &= expect_not_contains(single_video_text, "\"altGroup\"",
+                                  "expected no altGroup for a single video track");
+    }
 
     const auto hevc_main_bytes = make_hevc_init_mp4(0x01, 0x60000000, {0xB0, 0x00, 0x00, 0x00, 0x00, 0x00}, 90);
     // 0x40000000 is bit 30 (0-indexed from the LSB); reversed across 32 bits

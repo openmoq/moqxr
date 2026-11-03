@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -491,10 +492,9 @@ std::vector<std::uint8_t> concat(std::initializer_list<std::vector<std::uint8_t>
     return out;
 }
 
-std::vector<std::uint8_t> make_live_init_mp4() {
+// video_track_count identical avc1 tracks, numbered from track 1.
+std::vector<std::uint8_t> make_live_init_mp4(std::uint8_t video_track_count = 1) {
     const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
-    const auto tkhd = make_full_box("tkhd",
-                                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0});
     const auto mdhd = make_full_box("mdhd",
                                     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});  // timescale 24000 at bytes 8-11
     const auto hdlr = make_full_box("hdlr", {0, 0, 0, 0, 'v', 'i', 'd', 'e', 0, 0, 0, 0});
@@ -508,8 +508,14 @@ std::vector<std::uint8_t> make_live_init_mp4() {
     const auto stbl = make_box("stbl", stsd);
     const auto minf = make_box("minf", stbl);
     const auto mdia = make_box("mdia", concat({mdhd, hdlr, minf}));
-    const auto trak = make_box("trak", concat({tkhd, mdia}));
-    const auto moov = make_box("moov", trak);
+    std::vector<std::uint8_t> traks;
+    for (std::uint8_t track_id = 1; track_id <= video_track_count; ++track_id) {
+        const auto tkhd = make_full_box("tkhd",
+                                        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, track_id, 0, 0, 0, 0});
+        const auto trak = make_box("trak", concat({tkhd, mdia}));
+        traks.insert(traks.end(), trak.begin(), trak.end());
+    }
+    const auto moov = make_box("moov", traks);
     return concat({ftyp, moov});
 }
 
@@ -2098,6 +2104,46 @@ bool test_live_stdin_groups_per_video_track(const EndpointConfig& endpoint, cons
             ok &= expect(whole_gop, label + "each group holds its GOP's frames in order, keyframe first");
             ++gop;
         }
+    }
+    return ok;
+}
+
+// MSF section 5.2.12: set_video_alt_group() puts the video tracks of a live
+// stdin catalog in one alternate group; unset, the catalog has no altGroup.
+bool test_live_stdin_video_alt_group(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    constexpr auto draft = DraftVersion::kDraft16;
+    bool ok = true;
+    for (const auto alt_group : {std::optional<std::uint32_t>{}, std::optional<std::uint32_t>{3}}) {
+        const std::string label = alt_group ? "altGroup 3: " : "no altGroup: ";
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 8}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[0].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        session.set_video_alt_group(alt_group);
+        ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+        const auto bytes = concat({make_live_init_mp4(2), make_live_media_fragment(0, 0xAB)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "live publish succeeds: " + status.message);
+        std::size_t catalogs = 0;
+        std::size_t alt_groups = 0;
+        for (const auto& write : transport.writes) {
+            if (!is_data_stream_write(write)) continue;
+            const std::string text(write.bytes.begin(), write.bytes.end());
+            if (text.find("\"tracks\"") == std::string::npos) continue;
+            ++catalogs;
+            for (auto at = text.find("\"altGroup\":3"); at != std::string::npos;
+                 at = text.find("\"altGroup\":3", at + 1)) {
+                ++alt_groups;
+            }
+            ok &= expect(alt_group || text.find("\"altGroup\"") == std::string::npos,
+                         label + "catalog must carry no altGroup");
+        }
+        ok &= expect(catalogs > 0, label + "a catalog is published");
+        ok &= expect(alt_groups == (alt_group ? 2 * catalogs : 0),
+                     label + "each catalog must give both video tracks the altGroup");
     }
     return ok;
 }
@@ -11739,6 +11785,7 @@ int main() {
         const std::vector<std::uint8_t> delivery_timeout_zero_subscribe = {
             0x03, 0x00, 0x13, 0x01, 0x01, 0x05, 0x6d, 0x6f, 0x71, 0x78, 0x72,
             0x07, 0x63, 0x61, 0x74, 0x61, 0x6c, 0x6f, 0x67, 0x01, 0x02, 0x00,
+    ok &= test_live_stdin_video_alt_group(endpoint, tls);
     ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
         };
         SubscribeMessage delivery_timeout_zero_msg;

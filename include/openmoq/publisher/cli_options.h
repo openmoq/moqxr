@@ -93,6 +93,9 @@ struct CliOptions {
     // "time" is resolved once, during parsing, to milliseconds since the Unix
     // epoch. Live input only.
     std::uint64_t initial_group_id = 0;
+    // --video-alt-group <N>; see PublisherConfig::video_alt_group. Live stdin
+    // only.
+    std::optional<std::uint32_t> video_alt_group;
     // Parsed eagerly by parse_cli_options so a malformed --drm-config file is
     // reported before publishing begins, rather than publishing with partial
     // DRM configuration.

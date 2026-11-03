@@ -179,6 +179,10 @@ public:
     // a larger migration floor still wins. Above kMaxGroupId it fails.
     void set_initial_group_id(std::uint64_t group_id) { initial_group_id_ = group_id; }
 
+    // See PublisherConfig::video_alt_group. Live stdin only: SRT callers are
+    // independent sources, not alternates of one another.
+    void set_video_alt_group(std::optional<std::uint32_t> alt_group) { video_alt_group_ = alt_group; }
+
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     void reset_publish_stats();
@@ -242,6 +246,7 @@ private:
     std::vector<std::uint8_t> live_resume_bytes_;
     std::uint64_t live_resume_group_floor_ = 0;
     std::uint64_t initial_group_id_ = 0;
+    std::optional<std::uint32_t> video_alt_group_;
     std::unordered_map<std::string, std::uint64_t> last_group_by_track_;
     std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> largest_sent_by_track_;
     std::atomic<bool> stop_requested_{false};
