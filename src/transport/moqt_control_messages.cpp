@@ -1330,6 +1330,16 @@ bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, 
             if (!decode_numeric_message_parameter(bytes, offset, draft, parameter_type, ignored_value)) {
                 return false;
             }
+        } else if (uses_moq_vi64(draft) && parameter_type == 0x09) {
+            // LARGEST_OBJECT is a bare Location on drafts 17+ despite its odd
+            // type, as append_largest_object_parameter writes it; draft 16
+            // frames it as an odd Key-Value-Pair with a length.
+            std::uint64_t group_id = 0;
+            std::uint64_t object_id = 0;
+            if (!decode_moqint_impl(bytes.subspan(0, payload_end), offset, draft, group_id) ||
+                !decode_moqint_impl(bytes.subspan(0, payload_end), offset, draft, object_id)) {
+                return false;
+            }
         } else {
             std::uint64_t parameter_length = 0;
             if (!decode_moqint_impl(bytes, offset, draft, parameter_length) || !fits(offset, parameter_length, payload_end)) {
