@@ -117,6 +117,17 @@ struct DeliveryTimeouts {
     std::uint64_t subgroup_ms = 0;
 };
 
+// A draft-22 LOCATION_FILTER as received: its Location Filter Type and the
+// fields that type carries (§9.20.9). filter_type above maps it onto the
+// draft-18 model, which cannot express a relative start before the next group.
+struct LocationFilterForm {
+    std::uint64_t type = 0;
+    std::uint64_t start_group = 0;
+    std::uint64_t start_object = 0;
+    std::uint64_t end_group_delta = 0;
+    std::uint64_t end_object = 0;
+};
+
 struct SubscribeMessage {
     std::uint64_t request_id = 0;
     std::vector<std::string> track_namespace;
@@ -133,6 +144,10 @@ struct SubscribeMessage {
     DeliveryTimeouts delivery_timeouts;
     // Draft-21 FILL_PARAMETERS presence.
     bool fill_requested = false;
+    // Draft 22 only: the subscription's LOCATION_FILTER, and the one inside
+    // FILL_PARAMETERS, when present. Together they give the fill range (§3.4).
+    std::optional<LocationFilterForm> location_filter;
+    std::optional<LocationFilterForm> fill_location_filter;
     bool has_unnegotiated_range_filter = false;
     bool malformed_authorization_token = false;
     bool authorization_token_cache_overflow = false;
@@ -196,6 +211,14 @@ struct PublishError {
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
 std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id);
+// Draft-22 fetch stream Object (§11.4.1) in Subgroup 0, carrying its absolute
+// Group ID, Object ID and Publisher Priority and no Properties, as the first
+// Object on a fetch stream must.
+std::vector<std::uint8_t> encode_fetch_object(DraftVersion draft,
+                                              std::uint64_t group_id,
+                                              std::uint64_t object_id,
+                                              std::uint8_t publisher_priority,
+                                              std::span<const std::uint8_t> payload);
 bool decode_vi64(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 // Validates datagram framing before a publisher discards unknown-alias objects.

@@ -652,6 +652,24 @@ std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t 
     return bytes;
 }
 
+std::vector<std::uint8_t> encode_fetch_object(DraftVersion draft,
+                                              std::uint64_t group_id,
+                                              std::uint64_t object_id,
+                                              std::uint8_t publisher_priority,
+                                              std::span<const std::uint8_t> payload) {
+    // Serialization Flags: Subgroup ID zero (0x00), Object ID Delta (0x04),
+    // Group ID Delta (0x08) and Priority (0x10) present, no Properties.
+    constexpr std::uint64_t kFlags = 0x04 | 0x08 | 0x10;
+    std::vector<std::uint8_t> bytes;
+    append_moqint(bytes, draft, kFlags);
+    append_moqint(bytes, draft, group_id);
+    append_moqint(bytes, draft, object_id);
+    bytes.push_back(publisher_priority);
+    append_moqint(bytes, draft, payload.size());
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
 std::vector<std::uint8_t> encode_varint(std::uint64_t value) {
     std::vector<std::uint8_t> bytes;
     if (!append_varint(bytes, value)) {
@@ -1494,6 +1512,15 @@ bool decode_location_filter(std::span<const std::uint8_t> bytes,
         message.start_group_id = static_cast<std::size_t>(fields[0]);
         message.start_object_id = static_cast<std::size_t>(fields[1]);
     }
+    if (explicit_type) {
+        message.location_filter = LocationFilterForm{
+            .type = *explicit_type,
+            .start_group = fields[0],
+            .start_object = fields[1],
+            .end_group_delta = fields[2],
+            .end_object = fields[3],
+        };
+    }
     return offset == end;
 }
 
@@ -1543,10 +1570,13 @@ bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
     return offset == end;
 }
 
+// Validates a FILL_PARAMETERS value. On draft 22, also reports the nested
+// LOCATION_FILTER, if any, through location_filter.
 bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
                               std::size_t begin,
                               std::size_t end,
-                              DraftVersion draft) {
+                              DraftVersion draft,
+                              std::optional<LocationFilterForm>* location_filter = nullptr) {
     if (!openmoq::publisher::is_draft21_or_later(draft)) return false;
     // The value is encoded "as if they were Parameters for a separate message"
     // (§9.20.15), and a message's parameter block is bounded by a count rather
@@ -1580,6 +1610,7 @@ bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
                 SubscribeMessage filter;
                 std::size_t filter_offset = offset;
                 if (!decode_location_filter(bytes, filter_offset, filter_end, filter, draft)) return false;
+                if (location_filter != nullptr) *location_filter = filter.location_filter;
                 offset = filter_end;
                 break;
             }
@@ -1694,6 +1725,8 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
     message.end_group_id = 0;
     message.end_object_id.reset();
     message.fill_requested = false;
+    message.location_filter.reset();
+    message.fill_location_filter.reset();
 
     std::uint64_t parameter_count = 0;
     if (!decode_moqint_impl(bytes, offset, draft, parameter_count)) {
@@ -1788,7 +1821,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
                 if (!openmoq::publisher::is_draft21_or_later(draft) || message.fill_requested ||
                     !validate_fill_parameters(bytes, offset,
                                               offset + static_cast<std::size_t>(parameter_length),
-                                              draft)) {
+                                              draft, &message.fill_location_filter)) {
                     return false;
                 }
                 message.fill_requested = true;

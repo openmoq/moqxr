@@ -2054,6 +2054,20 @@ bool test_draft22_fill_parameters_parameter_count() {
                      subscribe.track_name == "catalog" && subscribe.forward == 1 &&
                      subscribe.filter_type == 0x02 && subscribe.fill_requested,
                  "draft-22 SUBSCRIBE accepts a counted FILL_PARAMETERS current-group join");
+    ok &= expect(subscribe.location_filter && subscribe.location_filter->type == 0x05 &&
+                     subscribe.fill_location_filter && subscribe.fill_location_filter->type == 0x01 &&
+                     subscribe.fill_location_filter->start_group == 1,
+                 "draft-22 SUBSCRIBE keeps the subscription and fill LOCATION_FILTER forms");
+    SubscribeMessage absolute_fill;
+    ok &= expect(decode_subscribe_message(build_draft22_catalog_subscribe({0x01, 0x21, 0x04, 0x03, 0x01, 0x02, 0x07}),
+                                          draft, absolute_fill) &&
+                     absolute_fill.fill_location_filter &&
+                     absolute_fill.fill_location_filter->type == 0x04 &&
+                     absolute_fill.fill_location_filter->start_group == 3 &&
+                     absolute_fill.fill_location_filter->start_object == 1 &&
+                     absolute_fill.fill_location_filter->end_group_delta == 2 &&
+                     absolute_fill.fill_location_filter->end_object == 7,
+                 "draft-22 SUBSCRIBE keeps an Absolute Range fill LOCATION_FILTER");
 
     SubscribeMessage with_group_order;
     ok &= expect(decode_subscribe_message(build_draft22_catalog_subscribe(
