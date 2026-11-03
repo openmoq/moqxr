@@ -8074,13 +8074,22 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     auto send_catalog = [&](std::uint64_t track_alias,
                             const SubscribeMessage* joining = nullptr) -> TransportStatus {
         std::vector<openmoq::publisher::CatalogObject> objects;
+        // The fill covers the catalog object that was current when the
+        // SUBSCRIBE_OK reported its Largest Object, so serve it before a changed
+        // catalog replaces it. A changed catalog is then still sent on the
+        // subscription below.
+        bool fill_served = false;
+        if (joining != nullptr) {
+            const TransportStatus fill_status = serve_catalog_fill(draft_version, *joining, fill_served);
+            if (!fill_status.ok) {
+                return fill_status;
+            }
+        }
         try {
             objects = catalog_publisher_.publish(live_catalog.msf_catalog);
             if (objects.empty() && joining != nullptr) {
-                bool fill_served = false;
-                const TransportStatus fill_status = serve_catalog_fill(draft_version, *joining, fill_served);
-                if (!fill_status.ok || fill_served) {
-                    return fill_status;
+                if (fill_served) {
+                    return TransportStatus::success();
                 }
                 objects = catalog_publisher_.force_independent();
             }
@@ -9332,13 +9341,22 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     auto send_catalog = [&](std::uint64_t track_alias,
                             const SubscribeMessage* joining = nullptr) -> TransportStatus {
         std::vector<openmoq::publisher::CatalogObject> objects;
+        // The fill covers the catalog object that was current when the
+        // SUBSCRIBE_OK reported its Largest Object, so serve it before a changed
+        // catalog replaces it. A changed catalog is then still sent on the
+        // subscription below.
+        bool fill_served = false;
+        if (joining != nullptr) {
+            const TransportStatus fill_status = serve_catalog_fill(draft_version, *joining, fill_served);
+            if (!fill_status.ok) {
+                return fill_status;
+            }
+        }
         try {
             objects = catalog_publisher_.publish(live_catalog.msf_catalog);
             if (objects.empty() && joining != nullptr) {
-                bool fill_served = false;
-                const TransportStatus fill_status = serve_catalog_fill(draft_version, *joining, fill_served);
-                if (!fill_status.ok || fill_served) {
-                    return fill_status;
+                if (fill_served) {
+                    return TransportStatus::success();
                 }
                 objects = catalog_publisher_.force_independent();
             }
@@ -11969,10 +11987,24 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             if (!send_status.ok) {
                 return send_status;
             }
-        } else {
+        } else if (const bool resend_wanted = std::any_of(
+                       active_subscriptions.begin(), active_subscriptions.end(), [&](const auto& entry) {
+                           if (entry.second.track_name != "catalog") return false;
+                           return std::any_of(retained_catalog_group.begin(), retained_catalog_group.end(),
+                                              [&](const openmoq::publisher::LiveObject& object) {
+                                                  openmoq::publisher::CmsfObject probe;
+                                                  probe.group_id = object.group_id;
+                                                  probe.object_id = object.object_id;
+                                                  return object_matches_filter(probe, entry.second);
+                                              });
+                       });
+                   resend_wanted) {
             // The track's sender cannot send this catalog Group again: resend
             // it whole, at its own Locations, on a fresh stream that ends with
             // its last Object, after resetting an unfinished earlier resend.
+            // The resend is skipped when no catalog subscription's filter
+            // includes the Group (an Absolute Start after it, or an end before
+            // it), because the stream is shared by every catalog subscription.
             const TransportStatus previous_status =
                 catalog_resend.cancel_all_open_subgroups(transport_, kCancelledErrorCode);
             if (!previous_status.ok) {
