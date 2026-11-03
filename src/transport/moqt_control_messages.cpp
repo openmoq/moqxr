@@ -1512,15 +1512,19 @@ bool decode_location_filter(std::span<const std::uint8_t> bytes,
         message.start_group_id = static_cast<std::size_t>(fields[0]);
         message.start_object_id = static_cast<std::size_t>(fields[1]);
     }
-    if (explicit_type) {
-        message.location_filter = LocationFilterForm{
-            .type = *explicit_type,
-            .start_group = fields[0],
-            .start_object = fields[1],
-            .end_group_delta = fields[2],
-            .end_object = fields[3],
-        };
+    // Draft 21 has no Filter Type: the fields present give it (§9.20.10).
+    // Each count maps to the draft-22 type with that many fields, and the
+    // only two-field filter that is all zeros is Next Object.
+    if (!explicit_type) {
+        explicit_type = count == 2 && fields[0] == 0 && fields[1] == 0 ? 5 : count;
     }
+    message.location_filter = LocationFilterForm{
+        .type = *explicit_type,
+        .start_group = fields[0],
+        .start_object = fields[1],
+        .end_group_delta = fields[2],
+        .end_object = fields[3],
+    };
     return offset == end;
 }
 
@@ -1570,7 +1574,7 @@ bool decode_subscribe_filter(std::span<const std::uint8_t> bytes,
     return offset == end;
 }
 
-// Validates a FILL_PARAMETERS value. On draft 22, also reports the nested
+// Validates a FILL_PARAMETERS value. On drafts 21 and 22, also reports the nested
 // LOCATION_FILTER, if any, through location_filter.
 bool validate_fill_parameters(std::span<const std::uint8_t> bytes,
                               std::size_t begin,
