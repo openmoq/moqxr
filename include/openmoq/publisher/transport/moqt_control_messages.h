@@ -30,6 +30,9 @@ struct SetupMessage {
 struct ServerSetupMessage {
     DraftVersion draft = DraftVersion::kDraft14;
     std::uint64_t max_request_id = 0;
+    // Draft-23 MAX_CONTROL_MESSAGE_SIZE (Setup Option 0x09): the largest
+    // control message the peer accepts. 65535 when the option is absent.
+    std::uint64_t max_control_message_size = 65535;
     std::optional<std::uint64_t> unsupported_server_option_error_code;
     bool malformed_authorization_token = false;
 };
@@ -66,6 +69,9 @@ struct TrackMessage {
     // DPoP proof for authorization_token, sent as a second AUTHORIZATION TOKEN
     // parameter; ignored when there is no credential to accompany.
     std::optional<std::vector<std::uint8_t>> dpop_proof;
+    // Draft-23 SUBSCRIBE_TRACKS_ID (0x36): the SUBSCRIBE_TRACKS request this
+    // PUBLISH answers. Ignored on earlier drafts.
+    std::optional<std::uint64_t> subscribe_tracks_request_id;
 };
 
 struct PublishNamespaceOk {
@@ -207,6 +213,9 @@ bool validate_publisher_datagram(std::span<const std::uint8_t> bytes, DraftVersi
 // 9.3.6, 9.3.8; draft-18 sections 10.2.16-10.2.18); drafts up to 16 encode
 // them as variable-length integers.
 inline constexpr std::uint64_t kParamForward = 0x10;
+// Draft-23 replaces FORWARD with PAUSED, an odd-typed uint8 whose value is the
+// inverse of FORWARD (draft-23 section 9.19.18).
+inline constexpr std::uint64_t kParamPaused = 0x11;
 inline constexpr std::uint64_t kParamSubscriberPriority = 0x20;
 inline constexpr std::uint64_t kParamGroupOrder = 0x22;
 
@@ -229,6 +238,9 @@ bool decode_max_request_id_message(std::span<const std::uint8_t> bytes, MaxReque
 bool decode_goaway_message(std::span<const std::uint8_t> bytes, DraftVersion draft, GoawayMessage& message);
 std::vector<std::uint8_t> encode_namespace_notification(DraftVersion draft, std::span<const std::string> suffix);
 bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draft, std::size_t& message_size);
+// Largest control message moqxr accepts. It never advertises a larger
+// draft-23 MAX_CONTROL_MESSAGE_SIZE, so this is also the draft-23 default.
+inline constexpr std::size_t kDefaultMaxControlMessageSize = 65535;
 // Reads a draft-18+ control message Type and Length; the payload must end exactly at the end of `bytes`.
 bool decode_control_message_header(std::span<const std::uint8_t> bytes,
                                    DraftVersion draft,
