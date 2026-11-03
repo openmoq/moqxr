@@ -166,6 +166,11 @@ public:
         preannounce_tracks_ = enabled;
     }
 
+    // See PublisherConfig::await_subscriber_indefinitely.
+    void set_await_subscriber_indefinitely(bool enabled) {
+        await_subscriber_indefinitely_ = enabled;
+    }
+
     void set_media_packaging(MediaPackaging packaging) { media_packaging_ = packaging; }
 
     // See PublisherConfig::initial_group_id. publish_live() numbers live media
@@ -209,6 +214,7 @@ private:
     bool auto_forward_ = false;
     bool publish_catalog_ = false;
     bool preannounce_tracks_ = false;
+    bool await_subscriber_indefinitely_ = false;
     bool paced_ = false;
     bool loop_ = false;
     std::chrono::seconds subscriber_timeout_ = std::chrono::seconds(30);
