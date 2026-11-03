@@ -12,7 +12,7 @@ DraftProfile draft_profile(DraftVersion version) {
                 .subscribe_namespace_label = "Track Namespace",
                 .track_alias_label = "Track Alias",
                 .object_status_label = "Object Status",
-                .notes = "Primary profile. Use this for baseline publisher interoperability.",
+                .notes = "Legacy profile retained for API callers and baseline interoperability.",
             };
         case DraftVersion::kDraft16:
             return {
@@ -36,7 +36,7 @@ DraftProfile draft_profile(DraftVersion version) {
                 .subscribe_namespace_label = "Track Namespace",
                 .track_alias_label = "Track Alias",
                 .object_status_label = "Object Status",
-                .notes = "Current target profile. Control/request stream semantics differ from draft-16.",
+                .notes = "Draft-18 profile. Control/request stream semantics differ from draft-16.",
             };
         case DraftVersion::kDraft23:
             return {
@@ -44,7 +44,7 @@ DraftProfile draft_profile(DraftVersion version) {
                 .subscribe_namespace_label = "Track Namespace",
                 .track_alias_label = "Track Alias",
                 .object_status_label = "Object Status",
-                .notes = "Draft-23 profile. Varint control message Length, PAUSED replaces FORWARD, "
+                .notes = "Current target profile (draft-23). Varint control message Length, PAUSED replaces FORWARD, "
                          "REQUEST_ERROR carries Error Details, overlapping namespace subscriptions.",
             };
         case DraftVersion::kDraft22:

@@ -20,7 +20,7 @@ enum class DraftVersion {
 inline constexpr std::uint64_t kMaxGroupId = (std::uint64_t{1} << 62) - 1;
 
 struct DraftProfile {
-    DraftVersion version = DraftVersion::kDraft18;
+    DraftVersion version = DraftVersion::kDraft23;
     std::string subscribe_namespace_label;
     std::string track_alias_label;
     std::string object_status_label;

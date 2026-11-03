@@ -13,7 +13,7 @@ It packages file and live media for Media over QUIC Transport (MOQT), builds MSF
 - Builds MSF/CMSF version 1 catalogs, initialization data, optional media timelines, and SAP event timelines.
 - Detects and signals existing CMAF CENC content protection for batch input, live fragmented MP4 on stdin, and CTE LL-DASH ingest. It does not encrypt or decrypt media.
 - Emits catalog, initialization, media, probe, and publish-plan files for local inspection.
-- Publishes with the main CLI's supported MOQT draft profiles: draft 16, draft 18 (default), draft 21, draft 22, and draft 23.
+- Publishes with the main CLI's supported MOQT draft profiles: draft 16, draft 18, draft 21, draft 22, and draft 23 (default).
 - Publishes over Raw QUIC or WebTransport when picoquic and picotls are available.
 - Accepts live fragmented MP4 from stdin, MPEG-TS over SRT when libsrt is available, and CMAF over HTTP/1.1 CTE LL-DASH ingest (chunked or fixed-length requests).
 - Parses MSF URLs with `--url` and prints the catalog discovery URL with `--print-msf-urls`.
@@ -78,14 +78,14 @@ backend. It sends individual H.264/AAC frames with timestamp, timescale, and
 codec configuration properties; CMAF remains the default. See the
 [LOC quickstart](docs/quickstart.md#opt-in-to-loc) for scope and constraints.
 
-Publish to a relay with the default draft-18 profile:
+Publish to a relay with the default draft-23 profile:
 
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --input sample.mp4 \
   --endpoint moqt://relay.example.com:443/moq \
   --namespace media \
-  --draft 18 \
+  --draft 23 \
   --forward 0 \
   --timeout 30 \
   --paced
@@ -365,7 +365,7 @@ Localized Publisher API guides are available in [Spanish](docs/publisher-api.es.
 
 ## Current Status
 
-The main `openmoq-publisher` CLI accepts drafts 16, 18, 21, 22, and 23; draft 18 is the default and provides the newer request-stream profile, and draft 21 extends it (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). Draft 22 adds explicit LOCATION_FILTER types while retaining draft-21 publishing semantics. Draft 23 keeps those semantics with a varint control message Length, PAUSED in place of FORWARD, REQUEST_ERROR Error Details, overlapping namespace subscriptions, and its specific session termination codes; see [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md). Drafts 21, 22, and 23 are native-backend only; the moq5 backend stays on drafts 16 and 18, and other drafts publish through the native backend even in moq5 builds. Text for drafts 14, 17, 19, and 20 remains in `docs/` for implementation history and protocol review, but those versions are not selectable in the main CLI. The separate MSFTS example retains draft 14/16/17/18 selection for draft-specific testing, and also accepts drafts 21, 22, and 23.
+The main `openmoq-publisher` CLI accepts drafts 16, 18, 21, 22, and 23; draft 23 is the default. The client offers only the selected draft's ALPN, so pass `--draft 22` (or older) for a relay that does not speak draft 23. Draft 18 provides the request-stream profile the later drafts build on, and draft 21 extends it (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). Draft 22 adds explicit LOCATION_FILTER types while retaining draft-21 publishing semantics. Draft 23 keeps those semantics with a varint control message Length, PAUSED in place of FORWARD, REQUEST_ERROR Error Details, overlapping namespace subscriptions, and its specific session termination codes; see [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md). Drafts 21, 22, and 23 are native-backend only; the moq5 backend stays on drafts 16 and 18, and other drafts publish through the native backend even in moq5 builds. Text for drafts 14, 17, 19, and 20 remains in `docs/` for implementation history and protocol review, but those versions are not selectable in the main CLI. The separate MSFTS example retains draft 14/16/17/18 selection for draft-specific testing, and also accepts drafts 21, 22, and 23.
 
 The default picoquic backend and the opt-in moq5 backend are both under active interoperability testing. For detailed feature coverage, limitations, and roadmap work, see [docs/status.md](docs/status.md) and [docs/protocol-mapping.md](docs/protocol-mapping.md).
 

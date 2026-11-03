@@ -13,7 +13,7 @@ Empaqueta medios de archivo y en vivo para Media over QUIC Transport (MOQT), cre
 - Crea catálogos MSF/CMSF versión 1, datos de inicialización, timelines multimedia opcionales y timelines de eventos SAP.
 - Detecta y señaliza la protección de contenido CMAF CENC existente para entrada por lotes, MP4 fragmentado en vivo mediante stdin e ingest CTE LL-DASH. No cifra ni descifra medios.
 - Emite archivos de catálogo, inicialización, medios, prueba y plan de publicación para inspección local.
-- Publica con los perfiles de draft MOQT compatibles con la CLI principal: draft 16 (predeterminado), draft 18 y draft 21.
+- Publica con los perfiles de draft MOQT compatibles con la CLI principal: draft 16, draft 18, draft 21, draft 22 y draft 23 (predeterminado).
 - Publica mediante Raw QUIC o WebTransport cuando picoquic y picotls están disponibles.
 - Acepta MP4 fragmentado en vivo desde stdin, MPEG-TS sobre SRT cuando libsrt está disponible y CMAF mediante ingest CTE LL-DASH de HTTP/1.1 (solicitudes chunked o de longitud fija).
 - Analiza URLs MSF con `--url` e imprime la URL de descubrimiento del catálogo con `--print-msf-urls`.
@@ -52,14 +52,14 @@ Emitir el catálogo y los objetos multimedia empaquetados:
 ./build/openmoq-publisher --input sample.mp4 --emit-dir out/
 ```
 
-Publicar en un relay con el perfil draft-16 predeterminado:
+Publicar en un relay con el perfil draft-23 predeterminado:
 
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --input sample.mp4 \
   --endpoint moqt://relay.example.com:443/moq \
   --namespace media \
-  --draft 16 \
+  --draft 23 \
   --forward 0 \
   --timeout 10 \
   --paced
@@ -274,6 +274,6 @@ Las guías localizadas de la API Publisher están disponibles en [español](docs
 
 ## Estado Actual
 
-La CLI principal `openmoq-publisher` acepta los drafts 16, 18 y 21; el draft 16 sigue siendo el predeterminado, el draft 18 proporciona el perfil más reciente basado en request streams y el draft 21 lo amplía (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). El draft 21 solo está disponible en el backend nativo; el backend moq5 sigue en los drafts 16 y 18. El texto de los drafts 14, 17, 19 y 20 permanece en `docs/` para el historial de implementación y la revisión del protocolo, pero esas versiones no se pueden seleccionar en la CLI principal. El ejemplo MSFTS independiente conserva la selección de los drafts 14/16/17/18 para pruebas específicas por draft.
+La CLI principal `openmoq-publisher` acepta los drafts 16, 18, 21, 22 y 23; el draft 23 es el predeterminado. El cliente solo ofrece el ALPN del draft seleccionado, así que use `--draft 22` (o anterior) con un relay que no admita el draft 23. El draft 18 proporciona el perfil basado en request streams sobre el que se construyen los drafts posteriores, el draft 21 lo amplía (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS), el draft 22 añade tipos explícitos de LOCATION_FILTER y el draft 23 usa un Length de mensaje de control varint, PAUSED en lugar de FORWARD, Error Details en REQUEST_ERROR y sus códigos de cierre de sesión específicos. Los drafts 21, 22 y 23 solo están disponibles en el backend nativo; el backend moq5 sigue en los drafts 16 y 18, y los demás drafts publican con el backend nativo también en compilaciones con moq5. El texto de los drafts 14, 17, 19 y 20 permanece en `docs/` para el historial de implementación y la revisión del protocolo, pero esas versiones no se pueden seleccionar en la CLI principal. El ejemplo MSFTS independiente conserva la selección de los drafts 14/16/17/18 para pruebas específicas por draft y también acepta los drafts 21, 22 y 23.
 
 Tanto el backend picoquic predeterminado como el backend moq5 opcional están bajo pruebas activas de interoperabilidad. Para conocer la cobertura detallada de funciones, las limitaciones y el roadmap, consulte [docs/status.md](docs/status.md) y [docs/protocol-mapping.md](docs/protocol-mapping.md).
