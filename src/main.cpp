@@ -15,7 +15,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
-#include <stop_token>
 #include <thread>
 #include <utility>
 
@@ -115,28 +114,52 @@ public:
     StopMonitor(const openmoq::publisher::Publisher& publisher, DashStopTarget& dash)
         : publisher_(publisher), dash_(dash) {
         install_stop_signal_handlers();
-        watcher_ = std::jthread([this](std::stop_token token) { watch(token); });
+        watcher_ = std::thread([this] { watch(); });
+    }
+
+    StopMonitor(const StopMonitor&) = delete;
+    StopMonitor& operator=(const StopMonitor&) = delete;
+
+    // Stops and joins the watcher. std::jthread would do this itself, but
+    // libc++ before 20 (FreeBSD 14) has no std::jthread or std::stop_token.
+    ~StopMonitor() {
+        stopping_.store(true, std::memory_order_release);
+        if (watcher_.joinable()) {
+            watcher_.join();
+        }
     }
 
 private:
-    void watch(std::stop_token token) {
+    void watch() {
         while (stop_signal == 0) {
-            if (token.stop_requested()) {
+            if (stopping_.load(std::memory_order_acquire)) {
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         const auto deadline = std::chrono::steady_clock::now() + kStopTimeout;
-        std::jthread closer([this](std::stop_token closer_token) {
-            while (!closer_token.stop_requested()) {
+        std::atomic<bool> closer_stopping{false};
+        std::thread closer([this, &closer_stopping] {
+            while (!closer_stopping.load(std::memory_order_acquire)) {
                 static_cast<void>(publisher_.disconnect(0));
                 dash_.stop();
-                for (int i = 0; i < 10 && !closer_token.stop_requested(); ++i) {
+                for (int i = 0; i < 10 && !closer_stopping.load(std::memory_order_acquire); ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
             }
         });
-        while (!token.stop_requested()) {
+        // Stops and joins the closer on every way out of this function.
+        struct CloserJoin {
+            std::atomic<bool>& stopping;
+            std::thread& thread;
+            ~CloserJoin() {
+                stopping.store(true, std::memory_order_release);
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        } closer_join{closer_stopping, closer};
+        while (!stopping_.load(std::memory_order_acquire)) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 std::cerr << "publisher interrupted by " << stop_signal_name(stop_signal)
                           << "; did not stop within " << kStopTimeout.count()
@@ -149,7 +172,8 @@ private:
 
     const openmoq::publisher::Publisher& publisher_;
     DashStopTarget& dash_;
-    std::jthread watcher_;
+    std::atomic<bool> stopping_{false};
+    std::thread watcher_;
 };
 
 std::string endpoint_label(
