@@ -1066,6 +1066,19 @@ TransportStatus PicoquicClient::connect() {
 }
 
 ConnectionState PicoquicClient::state() const {
+#ifdef OPENMOQ_HAS_PICOQUIC
+    // state_ only changes in connect() and close(). A connection the peer
+    // dropped (relay killed, idle timeout) is lost, not still connected, so
+    // callers such as publish_failure_kind() can retry it. A close we asked
+    // for stays kConnected until close() runs, so our own protocol
+    // violations are not retried as lost connections.
+    if (state_ == ConnectionState::kConnected && impl_ != nullptr) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->disconnected && !impl_->close_requested) {
+            return ConnectionState::kFailed;
+        }
+    }
+#endif
     return state_;
 }
 
