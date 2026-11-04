@@ -283,6 +283,7 @@ int main(int argc, char** argv) {
             .forward = options.forward,
             .publish_catalog = options.publish_catalog,
             .preannounce_tracks = options.preannounce_tracks,
+            .moq_impl_id = options.moq_impl_id,
             .include_sap = options.include_sap,
             .include_msf_timeline = options.include_msf_timeline,
             .split_cmaf_chunks = options.split_cmaf_chunks,

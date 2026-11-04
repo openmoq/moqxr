@@ -55,6 +55,10 @@ struct PublisherConfig {
     // sends it does not process the PUBLISH_OK it would receive, so the request
     // would be made and its answer ignored.
     bool preannounce_tracks = false;
+    // Send the MOQT_IMPLEMENTATION Setup Option ("openmoq-publisher/<version>").
+    // The drafts say SHOULD, but the value can fingerprint the endpoint, so it is
+    // off by default. CLI: --moq-impl-id.
+    bool moq_impl_id = false;
     bool include_sap = false;
     bool include_msf_timeline = false;
     bool split_cmaf_chunks = true;

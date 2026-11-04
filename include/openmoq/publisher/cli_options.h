@@ -75,6 +75,8 @@ struct CliOptions {
     transport::LibmoqBackend libmoq_backend = transport::LibmoqBackend::kAuto;
     // See PublisherConfig::preannounce_tracks.
     bool preannounce_tracks = false;
+    // See PublisherConfig::moq_impl_id.
+    bool moq_impl_id = false;
     bool dump_plan = false;
     bool print_msf_urls = false;
     // --version: parse_cli_options returns as soon as it is seen, skipping
