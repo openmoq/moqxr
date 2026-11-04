@@ -1846,6 +1846,13 @@ std::uint64_t subscribe_tracks_overlap_error_code(DraftVersion draft) {
     return is_draft23_or_later(draft) ? 0x3 : 0x30;
 }
 
+TransportStatus read_request_stream_message(PublisherTransport& transport,
+                                            std::uint64_t request_stream_id,
+                                            openmoq::publisher::DraftVersion draft,
+                                            std::chrono::milliseconds timeout,
+                                            std::vector<std::uint8_t>& message_bytes,
+                                            std::vector<std::uint8_t>* trailing_bytes);
+
 class DiscoveryRequests {
 public:
     struct Request {
@@ -1898,6 +1905,8 @@ public:
     TransportStatus poll(PublisherTransport& transport, DraftVersion draft,
                          PeerRequestIdValidator& peer_request_ids, OnTracksForward&& on_tracks_forward,
                          std::string_view track_namespace) {
+        if (draft == DraftVersion::kDraft16)
+            return poll_draft16_namespace_streams(transport, peer_request_ids, track_namespace);
         if (!is_draft22_or_later(draft)) return TransportStatus::success();
         for (auto& [stream_id, request] : requests_) {
             if (!request.active) continue;
@@ -1991,8 +2000,70 @@ public:
         return TransportStatus::success();
     }
 private:
+    // Draft 16 section 3: the only bidirectional stream besides the control
+    // stream opens with SUBSCRIBE_NAMESPACE. Its Request ID still counts in the
+    // peer's sequence (section 9.1), so it must be read before a later SUBSCRIBE
+    // on the control stream is checked. The publisher already announced the
+    // namespace with PUBLISH_NAMESPACE, so the reply is a bare REQUEST_OK.
+    TransportStatus poll_draft16_namespace_streams(PublisherTransport& transport,
+                                                   PeerRequestIdValidator& peer_request_ids,
+                                                   std::string_view track_namespace) {
+        constexpr auto draft = DraftVersion::kDraft16;
+        while (true) {
+            std::uint64_t stream_id = 0;
+            const TransportStatus accept_status = transport.accept_stream(
+                StreamDirection::kBidirectional, stream_id, std::chrono::milliseconds(0));
+            if (!accept_status.ok) {
+                if (no_stream_data(accept_status)) return TransportStatus::success();
+                return accept_status;
+            }
+            std::vector<std::uint8_t> bytes;
+            const TransportStatus read_status = read_request_stream_message(
+                transport, stream_id, draft, std::chrono::milliseconds(1000), bytes, nullptr);
+            if (!read_status.ok) return read_status;
+            trace_control_message(bytes, draft);
+
+            std::size_t offset = 0;
+            std::uint64_t type = 0;
+            if (!decode_moqint(bytes, offset, draft, type) || type != 0x11)
+                return protocol_violation(transport, "bidirectional stream did not open with SUBSCRIBE_NAMESPACE");
+            SubscribeNamespaceMessage request;
+            if (!decode_subscribe_namespace_message(bytes, draft, request))
+                return protocol_violation(transport, "received invalid SUBSCRIBE_NAMESPACE");
+            const TransportStatus token_status = authorization_token_status(
+                transport, request.malformed_authorization_token,
+                request.authorization_token_cache_overflow, request.unknown_authorization_token_alias);
+            if (!token_status.ok) return token_status;
+            const TransportStatus id_status = peer_request_ids.validate(transport, request.request_id);
+            if (!id_status.ok) return id_status;
+
+            // Section 6.1: overlapping namespace subscriptions get PREFIX_OVERLAP.
+            const bool overlap = std::any_of(draft16_prefixes_.begin(), draft16_prefixes_.end(),
+                [&](const auto& prefix) { return namespace_prefixes_overlap(request.track_namespace_prefix, prefix); });
+            if (overlap) {
+                const TransportStatus rejected = transport.write_stream(stream_id,
+                    encode_request_error_message(draft, request.request_id, 0x30, 0, "namespace prefix overlap"), true);
+                if (!rejected.ok) return rejected;
+                continue;
+            }
+            if (!namespace_prefix_matches(request.track_namespace_prefix, track_namespace, true)) {
+                const TransportStatus rejected = transport.write_stream(stream_id,
+                    encode_request_error_message(draft, request.request_id,
+                                                 does_not_exist_request_error_code(draft), 0,
+                                                 "unsupported namespace prefix"), true);
+                if (!rejected.ok) return rejected;
+                continue;
+            }
+            const TransportStatus ok_status = transport.write_stream(
+                stream_id, encode_request_ok_message(draft, request.request_id), false);
+            if (!ok_status.ok) return ok_status;
+            draft16_prefixes_.push_back(std::move(request.track_namespace_prefix));
+        }
+    }
+
     std::map<std::uint64_t, Request> requests_;
     std::set<std::uint64_t> goaway_streams_;
+    std::vector<std::vector<std::string>> draft16_prefixes_;
 };
 
 // peer_sent_request: the GOAWAY arrived on a request the peer sent, such as
