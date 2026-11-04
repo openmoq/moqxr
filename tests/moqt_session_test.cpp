@@ -7863,6 +7863,50 @@ int main() {
                 : "expected every peer-stop event, including terminal overflow, to be acknowledged");
     }
 
+    {
+        // Draft 16 section 3: SUBSCRIBE_NAMESPACE opens its own bidirectional
+        // stream. Its Request ID (1) counts in the peer's sequence, so the
+        // SUBSCRIBE requests that follow on the control stream (3, 5) must not
+        // be rejected as out of order, and the stream gets one REQUEST_OK.
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        queue_subscribe_requests(transport, DraftVersion::kDraft16, kTestTrackNamespace,
+                                 {{3, "catalog"}, {5, "vide_1"}}, false, 1);
+        transport.reads[1].push_back(
+            encode_subscribe_namespace_message(DraftVersion::kDraft16, 1, kTestTrackNamespace));
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok, "draft-16 SUBSCRIBE_NAMESPACE stream session connects");
+        const TransportStatus namespace_stream_status = session.publish(
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft16), source_bytes));
+        ok &= expect(namespace_stream_status.ok,
+                     "draft-16 SUBSCRIBE_NAMESPACE on its own stream counts toward the request id sequence");
+        std::size_t request_ok_count = 0;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id == 1 && message_type(write.bytes) == 0x07) ++request_ok_count;
+        }
+        ok &= expect(request_ok_count == 1, "draft-16 SUBSCRIBE_NAMESPACE stream gets exactly one REQUEST_OK");
+    }
+
+    {
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({
+            .draft = DraftVersion::kDraft16,
+            .max_request_id = 8,
+        }));
+        queue_subscribe_requests(transport, DraftVersion::kDraft16, kTestTrackNamespace, {{3, "catalog"}}, false, 1);
+        transport.reads[1].push_back(
+            encode_subscribe_message(1, kTestTrackNamespace, "vide_1", 1, DraftVersion::kDraft16));
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok, "draft-16 stray bidirectional stream session connects");
+        const TransportStatus stray_status = session.publish(
+            materialize_publish_plan(make_span_backed_plan(DraftVersion::kDraft16), source_bytes));
+        ok &= expect(!stray_status.ok,
+                     "draft-16 bidirectional stream not opened by SUBSCRIBE_NAMESPACE is a protocol violation");
+    }
+
     MockTransport draft16_transport;
     draft16_transport.reads[0].push_back(encode_server_setup_message({
         .draft = DraftVersion::kDraft16,
