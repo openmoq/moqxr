@@ -13,12 +13,12 @@ Ele empacota mídia de arquivo e ao vivo para Media over QUIC Transport (MOQT), 
 - Cria catálogos MSF/CMSF versão 1, dados de inicialização, timelines de mídia opcionais e timelines de eventos SAP.
 - Detecta e sinaliza proteção de conteúdo CMAF CENC existente para entrada em lote, MP4 fragmentado ao vivo via stdin e ingest CTE LL-DASH. Não criptografa nem descriptografa a mídia.
 - Emite arquivos de catálogo, inicialização, mídia, probe e plano de publicação para inspeção local.
-- Publica com os perfis de draft MOQT aceitos pela CLI principal: draft 16 (padrão), draft 18 e draft 21.
+- Publica com os perfis de draft MOQT aceitos pela CLI principal: draft 16, draft 18, draft 21, draft 22 (padrão) e draft 23.
 - Publica por Raw QUIC ou WebTransport quando picoquic e picotls estão disponíveis.
 - Aceita MP4 fragmentado ao vivo via stdin, MPEG-TS sobre SRT quando libsrt está disponível e CMAF via ingest CTE LL-DASH HTTP/1.1 (requisições chunked ou de tamanho fixo).
 - Analisa URLs MSF com `--url` e imprime a URL de descoberta do catálogo com `--print-msf-urls`.
 - Fornece exemplos da API Publisher C++ para mídia ao vivo gerada por FFmpeg, autorização CAT4MOQ e empacotamento MPEG-2 TS/M2TS.
-- Opcionalmente encaminha a publicação pela biblioteca C11 Media-over-QUIC [moq5](https://github.com/openmoq/moq5) para os drafts 16 e 18.
+- Opcionalmente encaminha a publicação pela biblioteca C11 Media-over-QUIC [moq5](https://github.com/openmoq/moq5) para os drafts 16, 18 e 22.
 
 ## Início Rápido
 
@@ -52,14 +52,14 @@ Emitir o catálogo e os objetos de mídia empacotados:
 ./build/openmoq-publisher --input sample.mp4 --emit-dir out/
 ```
 
-Publicar para um relay com o perfil draft-16 padrão:
+Publicar para um relay com o perfil draft-22 padrão:
 
 ```bash
 OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --input sample.mp4 \
   --endpoint moqt://relay.example.com:443/moq \
   --namespace media \
-  --draft 16 \
+  --draft 22 \
   --forward 0 \
   --timeout 10 \
   --paced
@@ -274,6 +274,6 @@ Guias localizados da API Publisher estão disponíveis em [espanhol](docs/publis
 
 ## Status Atual
 
-A CLI principal `openmoq-publisher` aceita os drafts 16, 18 e 21; o draft 16 permanece como padrão, o draft 18 fornece o perfil mais recente baseado em request streams e o draft 21 o estende (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). O draft 21 está disponível apenas no backend nativo; o backend moq5 continua nos drafts 16 e 18. O texto dos drafts 14, 17, 19 e 20 permanece em `docs/` para o histórico de implementação e a revisão do protocolo, mas essas versões não podem ser selecionadas na CLI principal. O exemplo MSFTS separado mantém a seleção dos drafts 14/16/17/18 para testes específicos de draft.
+A CLI principal `openmoq-publisher` aceita os drafts 16, 18, 21, 22 e 23; o draft 22 é o padrão. O cliente oferece apenas o ALPN do draft selecionado. O draft 18 fornece o perfil baseado em request streams sobre o qual os drafts posteriores se apoiam, o draft 21 o estende (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS), o draft 22 adiciona tipos explícitos de LOCATION_FILTER e o draft 23 usa um Length de mensagem de controle varint, PAUSED no lugar de FORWARD, Error Details em REQUEST_ERROR e seus códigos específicos de encerramento de sessão; veja [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md). Os drafts 21 e 23 são publicados pelo backend nativo. Em builds com moq5, os drafts 16, 18 e 22 passam pelo moq5 e os demais drafts continuam publicando pelo backend nativo. O draft 22 via moq5 foi testado apenas contra uma porta fechada e pelos testes unitários; não foi executado contra um relay draft 22. O texto dos drafts 14, 17, 19 e 20 permanece em `docs/` para o histórico de implementação e a revisão do protocolo, mas essas versões não podem ser selecionadas na CLI principal. O exemplo MSFTS separado mantém a seleção dos drafts 14/16/17/18 para testes específicos de draft e também aceita os drafts 21, 22 e 23.
 
 Tanto o backend picoquic padrão quanto o backend moq5 opcional estão em testes ativos de interoperabilidade. Para cobertura detalhada de recursos, limitações e roadmap, consulte [docs/status.md](docs/status.md) e [docs/protocol-mapping.md](docs/protocol-mapping.md).

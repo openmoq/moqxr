@@ -1,6 +1,6 @@
 # Protocol Mapping Notes
 
-This project keeps `draft-ietf-moq-transport-14` as the primary publisher profile and treats `draft-ietf-moq-transport-16` as a secondary compatibility target.
+This document records the draft-14 and draft-16 mappings and the LOC mapping. The default publisher profile is `draft-ietf-moq-transport-22`; see [status.md](status.md) for the supported drafts and [draft23-implementation-plan.md](draft23-implementation-plan.md) for draft 23.
 
 ## Draft-14 primary assumptions
 
