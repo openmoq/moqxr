@@ -25,6 +25,10 @@ struct SetupMessage {
     // DPoP proof for authorization_token, sent as a second AUTHORIZATION TOKEN
     // parameter; ignored when there is no credential to accompany.
     std::optional<std::vector<std::uint8_t>> dpop_proof;
+    // MOQT_IMPLEMENTATION (Setup Option 0x07), e.g. "openmoq-publisher/0.4.12".
+    // Sent only when set; the draft says SHOULD, so the CLI opts in with
+    // --moq-impl-id.
+    std::optional<std::string> implementation;
 };
 
 struct ServerSetupMessage {
@@ -83,6 +87,10 @@ struct RequestError {
     std::uint64_t error_code = 0;
     std::uint64_t retry_interval = 0;
     std::string reason;
+    // Draft 23 REDIRECT Error Detail with a non-empty Track Name. The Track Name must
+    // be empty for namespace-scoped requests (section 9.4.2.1), which only the caller
+    // knows, so the decoder reports it instead of rejecting it.
+    bool redirect_has_track_name = false;
 };
 
 struct SubscribeNamespaceMessage {
@@ -242,6 +250,23 @@ bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std
 // Validates datagram framing before a publisher discards unknown-alias objects.
 // Padding is consumed without interpreting its contents.
 bool validate_publisher_datagram(std::span<const std::uint8_t> bytes, DraftVersion draft);
+
+// Why the latest decode on this calling thread failed, as the draft-23 session
+// termination code (section 12.2) a receiver closes with: INVALID_PARAMETER for an
+// unknown or repeated parameter, FIELD_LENGTH_EXCEEDED for an over-long field, and so
+// on. Returns 0 when the failure has no code more specific than PROTOCOL_VIOLATION,
+// which includes every draft before 23. Reading it clears it. The decode_* functions
+// and validate_publisher_datagram() clear it on entry, so call this straight after
+// the decode that failed.
+std::uint64_t take_decode_fault();
+void clear_decode_fault();
+
+// For a draft-23 request-opening message that could not be handled: the session
+// termination code that names why it is malformed, or 0 when it is well formed.
+// MALFORMED_MESSAGE when its length disagrees with its contents or a required
+// element is missing, INVALID_TRACK_NAMESPACE or FIELD_LENGTH_EXCEEDED for a bad
+// Track Namespace. Earlier drafts return 0.
+std::uint64_t diagnose_malformed_request(std::span<const std::uint8_t> bytes, DraftVersion draft);
 
 // Message-parameter ids shared by the SUBSCRIBE-family decoders. draft-17 and
 // draft-18 define these three as uint8 on the wire (draft-17 sections 9.3.5,

@@ -43,7 +43,7 @@ moqxr only publishes, so only part of the d22 → d23 diff reaches it.
 The d22 PREFIX_OVERLAP rules stay exact `== kDraft22` checks.
 
 ## Known limitations
-- Session close codes come from the session's own checks. Decoders still report only success or failure, so a malformed message closes with PROTOCOL_VIOLATION. d23 allows that when no more specific code applies.
+- Decoders still report only success or failure, but on draft 23 they record why in a per-thread fault (`take_decode_fault()` in `moqt_control_messages.h`), which the session reads when it closes: INVALID_TRACK_NAMESPACE, INVALID_PARAMETER, MALFORMED_KEY_VALUE, the two overflow codes and INVALID_STREAM_HEADER, MALFORMED_OBJECT and INVALID_OBJECT_STATUS for datagrams. A failure with no recorded cause (an unparseable Length or a message cut short in a place the decoder does not name) closes with PROTOCOL_VIOLATION, which d23 allows when no more specific code applies. The session itself picks UNEXPECTED_MESSAGE, ROLE_VIOLATION and INVALID_FIELD from the message type and stream.
 - The client offers one ALPN, chosen with `--draft` (default 22). A d23 publisher can't fall back to an older draft on a relay that doesn't speak d23.
 - PUBLISH does not carry LARGEST_OBJECT on any draft after 14. The stdin and live-object paths have no per-track Largest at PUBLISH time to report.
 - Not yet verified against a d23 relay.

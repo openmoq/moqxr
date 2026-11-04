@@ -24,11 +24,13 @@ Draft status:
 - draft 23 (`--draft 23`, native backend only) keeps the draft-22 behaviour on the draft-23 wire format: a varint control message Length, PAUSED in place of FORWARD, count-prefixed FILL_PARAMETERS, NAMESPACE Parameters, REQUEST_ERROR Error Details, SUBSCRIBE_TRACKS_ID on the PUBLISHes that answer a SUBSCRIBE_TRACKS, and the draft-23 session termination codes where the session identifies the condition. See [draft23-implementation-plan.md](draft23-implementation-plan.md). Known limitations:
   - an overlapping SUBSCRIBE_TRACKS is declined with REQUEST_ERROR NOT_SUPPORTED instead of getting a second set of PUBLISHes, because each track has one Track Alias and one set of data streams; overlapping SUBSCRIBE_NAMESPACE is accepted
   - control messages are limited to 65535 bytes: moqxr never advertises a larger MAX_CONTROL_MESSAGE_SIZE and never sends past the default
-  - malformed messages still close the session with PROTOCOL_VIOLATION rather than the more specific draft-23 codes
+  - malformed input closes the session with the code section 12.2 names (INVALID_PARAMETER, INVALID_TRACK_NAMESPACE, MALFORMED_KEY_VALUE, MALFORMED_MESSAGE, INVALID_FIELD, ROLE_VIOLATION, the two overflow codes, and the data-plane codes for datagrams and subgroup headers); PROTOCOL_VIOLATION remains for a failure the decoder cannot attribute, such as a message cut short at an unnamed field
+  - a second answer to a PUBLISH or PUBLISH_NAMESPACE, a REQUEST_UPDATE from the receiving side, and any other message that does not belong on a request stream close with UNEXPECTED_MESSAGE; PUBLISH_DONE finishes the request stream with a FIN
   - PUBLISH does not carry LARGEST_OBJECT, as on earlier drafts
   - not yet verified against a draft-23 relay
 - drafts 19 and 20 are archived under `docs/` for later review and are not selectable
 - CTE LL-DASH regressions cover FFmpeg-style multi-representation paths and draft-16 await-subscribe delivery
+- `--moq-impl-id` sends the MOQT_IMPLEMENTATION Setup Option (`openmoq-publisher/<version>`) in SETUP on every draft (Setup Option 0x07; draft 14 text assigns 0x05 to it, which draft 15 corrected). The drafts say SHOULD, so it is a candidate to become the default; it is off for now because the version string can fingerprint the endpoint (draft 23 section 15.8, Implementation Identification Fingerprinting)
 - the main CLI supports ordered relay failover through repeated `--endpoint` values and `--retry N` same-endpoint retries; transport/connectivity failures are retryable, relay namespace/track rejections skip directly to the next endpoint, and fatal or cancelled work stops
 
 ## LOC Status

@@ -700,6 +700,9 @@ int webtransport_callback(picoquic_cnx_t* cnx,
                 // objects use unknown aliases and can be discarded.
                 return 0;
             }
+            // Draft 23 names the cause (section 12.2); earlier drafts use 0x3.
+            const std::uint64_t datagram_fault = take_decode_fault();
+            const std::uint64_t datagram_close_code = datagram_fault != 0 ? datagram_fault : 0x3;
             {
                 std::lock_guard<std::mutex> lock(impl->mutex);
                 if (impl->failed || impl->close_requested) {
@@ -708,12 +711,14 @@ int webtransport_callback(picoquic_cnx_t* cnx,
                 impl->failed = true;
                 impl->protocol_error_close = true;
                 impl->close_requested = true;
-                impl->close_error_code = 0x3;
+                impl->close_error_code = datagram_close_code;
                 // Session termination is reliable even when the negotiated
                 // media delivery timeout is shorter than a network RTT.
                 impl->close_drain.bound = (std::max)(impl->close_drain.bound, kDefaultCloseDrainTimeout);
                 impl->close_drain.arm();
-                impl->last_error = "invalid MOQT datagram (PROTOCOL_VIOLATION)";
+                impl->last_error = datagram_close_code == 0x3
+                                       ? "invalid MOQT datagram (PROTOCOL_VIOLATION)"
+                                       : "invalid MOQT datagram (code " + std::to_string(datagram_close_code) + ")";
                 for (auto* open : impl->pending_opens) {
                     if (open != nullptr) {
                         open->failed = true;
@@ -730,13 +735,13 @@ int webtransport_callback(picoquic_cnx_t* cnx,
             // this queued stream data before tearing the connection down.
             if (impl->control_stream_ctx != nullptr) {
                 const int ret = picowt_send_close_session_message(
-                    cnx, impl->control_stream_ctx, 0x3, "invalid MOQT datagram");
+                    cnx, impl->control_stream_ctx, static_cast<std::uint32_t>(datagram_close_code), "invalid MOQT datagram");
                 trace("invalid datagram close session capsule queued ret=" + std::to_string(ret));
                 if (ret == 0) {
                     return 0;
                 }
             }
-            return picoquic_close_ex(cnx, 0x3, "invalid MOQT datagram");
+            return picoquic_close_ex(cnx, datagram_close_code, "invalid MOQT datagram");
         }
         case picohttp_callback_free: {
             if (stream_ctx != nullptr) {

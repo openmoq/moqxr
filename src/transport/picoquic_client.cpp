@@ -584,13 +584,17 @@ int client_callback(picoquic_cnx_t* cnx,
         }
         case picoquic_callback_datagram: {
             if (!validate_publisher_datagram(std::span<const std::uint8_t>(bytes, length), impl->datagram_draft)) {
+                // Draft 23 names the cause (section 12.2); earlier drafts use 0x3.
+                const std::uint64_t fault = take_decode_fault();
+                const std::uint64_t close_code = fault != 0 ? fault : 0x3;
                 {
                     std::lock_guard<std::mutex> lock(impl->mutex);
                     impl->failed = true;
-                    impl->last_error = "invalid MOQT datagram (PROTOCOL_VIOLATION)";
+                    impl->last_error = close_code == 0x3 ? "invalid MOQT datagram (PROTOCOL_VIOLATION)"
+                                                         : "invalid MOQT datagram (code " + std::to_string(close_code) + ")";
                     impl->condition.notify_all();
                 }
-                return picoquic_close_ex(cnx, 0x3, "invalid MOQT datagram");
+                return picoquic_close_ex(cnx, close_code, "invalid MOQT datagram");
             }
             // This publisher never subscribes to incoming tracks. Every received
             // Object alias is unknown, which MOQT permits us to discard.

@@ -162,6 +162,11 @@ public:
         catalog_republish_interval_ = interval;
     }
 
+    // See PublisherConfig::moq_impl_id.
+    void set_moq_impl_id(bool enabled) {
+        moq_impl_id_ = enabled;
+    }
+
     // See PublisherConfig::preannounce_tracks.
     void set_preannounce_tracks(bool enabled) {
         preannounce_tracks_ = enabled;
@@ -225,6 +230,7 @@ private:
     bool auto_forward_ = false;
     bool publish_catalog_ = false;
     bool preannounce_tracks_ = false;
+    bool moq_impl_id_ = false;
     bool await_subscriber_indefinitely_ = false;
     bool paced_ = false;
     bool loop_ = false;

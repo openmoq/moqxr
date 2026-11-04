@@ -2,10 +2,12 @@
 #include "openmoq/publisher/cat4moq.h"
 #include "cat4moq_wire_test_utils.h"
 #include "openmoq/publisher/moq_draft.h"
+#include "openmoq/publisher/version.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/moqt_session.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2997,6 +2999,223 @@ int main() {
             if (scenario == "fetch") {
                 ok &= expect(request_error_on(1) == std::optional<std::uint64_t>{0x3},
                              "D23 FETCH is refused NOT_SUPPORTED");
+            }
+        }
+    }
+    {
+        // Draft-23 interop fixes (issues 110-116).
+        constexpr DraftVersion d23 = DraftVersion::kDraft23;
+        const auto hex = [](std::uint64_t value) {
+            char text[24];
+            std::snprintf(text, sizeof text, "0x%llx", static_cast<unsigned long long>(value));
+            return std::string(text);
+        };
+        const auto frame = [](std::uint8_t type, std::vector<std::uint8_t> body) {
+            std::vector<std::uint8_t> bytes{type};
+            append_control_length(bytes, DraftVersion::kDraft23, body.size());
+            append_bytes(bytes, body);
+            return bytes;
+        };
+        // SUBSCRIBE {request id, namespace "interop", track "vide_1", no parameters}.
+        const auto subscribe_vide = [&](std::uint8_t request_id) {
+            return frame(0x03, {request_id, 1, 7, 'i', 'n', 't', 'e', 'r', 'o', 'p', 6, 'v', 'i', 'd', 'e', '_', '1', 0});
+        };
+        {
+            // Section 3.1 / 6.4.2.2: the publisher ends a subscription with
+            // PUBLISH_DONE "and closing the stream", so the request stream gets a FIN.
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = d23}));
+            transport.keep_open_streams.insert(3);
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(d23, 0));
+            transport.reads[1].push_back(subscribe_vide(1));
+            MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "D23 PUBLISH_DONE FIN connects");
+            const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(d23), source_bytes));
+            ok &= expect(result.ok, "D23 PUBLISH_DONE FIN publish succeeds: " + result.message);
+            const bool fin_on_publish_done = std::any_of(
+                transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+                    return write.stream_id == 1 && message_type(write.bytes) == 0x0b && write.fin;
+                });
+            ok &= expect(fin_on_publish_done, "D23 PUBLISH_DONE is written with a FIN on the SUBSCRIBE stream");
+        }
+        // Section 4.1 / 9.5 / 9.10: the peer's single answer to PUBLISH_NAMESPACE is
+        // all it may send on that stream. A second answer, a REQUEST_UPDATE from the
+        // wrong side or a PUBLISH_STATE_NOTIFY, buffered behind the first, closes the
+        // session with UNEXPECTED_MESSAGE (also when it is read in the same chunk).
+        for (const auto& [label, extra] : std::vector<std::pair<std::string, std::vector<std::uint8_t>>>{
+                 {"second REQUEST_OK", frame(0x07, {0, 0})},
+                 {"misdirected REQUEST_UPDATE", frame(0x02, {0, 0})},
+                 {"PUBLISH_STATE_NOTIFY", frame(0x22, {0})}}) {
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = d23}));
+            transport.keep_open_streams.insert(3);
+            auto answer = encode_publish_namespace_ok_message(d23, 0);
+            append_bytes(answer, extra);
+            transport.reads[0].push_back(answer);
+            MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "D23 " + label + " after PUBLISH_NAMESPACE_OK connects");
+            const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(d23), source_bytes));
+            ok &= expect(!result.ok && transport.last_close_code == 0x303,
+                         "D23 closes with UNEXPECTED_MESSAGE for a " + label + " on PUBLISH_NAMESPACE, saw " +
+                             hex(transport.last_close_code) + ": " + result.message);
+        }
+        // Section 12.2: each malformed input closes the session with the code the draft
+        // names for it, not PROTOCOL_VIOLATION. "setup" replaces the peer's SETUP, "request"
+        // is the first message on a new bidirectional stream, "control" follows the SETUP on
+        // the control stream, "answer" replaces the peer's answer to PUBLISH_NAMESPACE and
+        // "uni" is a unidirectional stream the peer opens.
+        {
+            const auto vi = [](std::uint64_t value) {
+                std::vector<std::uint8_t> bytes;
+                if (value == std::numeric_limits<std::uint64_t>::max()) {
+                    bytes.assign(9, 0xff);
+                } else {
+                    bytes = encode_moqint(d23, value);
+                }
+                return bytes;
+            };
+            const auto cat = [](std::initializer_list<std::vector<std::uint8_t>> parts) {
+                std::vector<std::uint8_t> result;
+                for (const auto& part : parts) append_bytes(result, part);
+                return result;
+            };
+            const auto text = [](std::string_view value) { return std::vector<std::uint8_t>(value.begin(), value.end()); };
+            const auto field = [&](const std::vector<std::uint8_t>& value) { return cat({vi(value.size()), value}); };
+            const auto subscribe_with = [&](const std::vector<std::vector<std::uint8_t>>& fields,
+                                            const std::vector<std::uint8_t>& parameters) {
+                std::vector<std::uint8_t> names = vi(fields.size());
+                for (const auto& value : fields) append_bytes(names, field(value));
+                return frame(0x03, cat({vi(1), names, field(text("vide_1")), parameters}));
+            };
+            const std::vector<std::vector<std::uint8_t>> media{text("interop")};
+            const auto redirect = [&](const std::vector<std::uint8_t>& track_name) {
+                return cat({vi(1), field(cat({field({}), vi(1), field(text("interop")), field(track_name)}))});
+            };
+            const auto request_error = [&](std::uint64_t code, const std::vector<std::uint8_t>& reason,
+                                           const std::vector<std::uint8_t>& details) {
+                return frame(0x05, cat({vi(code), vi(0), field(reason), details}));
+            };
+            // SETUP (type 0x2f00) with option type 2^64-1 (length 0) followed by a delta of 1.
+            const std::vector<std::uint8_t> setup_overflow_body =
+                cat({vi(std::numeric_limits<std::uint64_t>::max()), vi(0), vi(1), vi(0)});
+            const std::vector<std::uint8_t> setup_overflow =
+                cat({vi(0x2f00), vi(setup_overflow_body.size()), setup_overflow_body});
+            struct Malformed {
+                std::string label;
+                std::string where;
+                std::vector<std::uint8_t> bytes;
+                std::uint64_t code;
+            };
+            const std::vector<Malformed> malformed{
+                {"request stream starting with an unknown message", "request", {0x3f, 0}, 0x303},
+                {"request stream starting with SUBSCRIBE_OK", "request", {4, 2, 7, 0}, 0x303},
+                {"PUBLISH_NAMESPACE whose Length cuts the Track Namespace short", "request", {6, 1, 0}, 0x300},
+                {"SUBSCRIBE with an empty namespace field", "request", subscribe_with({{}}, vi(0)), 0x302},
+                {"SUBSCRIBE with 33 namespace fields", "request",
+                 subscribe_with(std::vector<std::vector<std::uint8_t>>(33, text("a")), vi(0)), 0x302},
+                {"SUBSCRIBE with a 4100 byte namespace field", "request",
+                 subscribe_with({std::vector<std::uint8_t>(4100, 'a')}, vi(0)), 0x401},
+                {"SUBSCRIBE with an unknown parameter", "request", subscribe_with(media, cat({vi(1), vi(0x7e), vi(1)})), 0x305},
+                {"SUBSCRIBE with GROUP_ORDER 7", "request", subscribe_with(media, cat({vi(1), vi(0x22), {7}})), 0x305},
+                {"SUBSCRIBE with a repeated parameter", "request",
+                 subscribe_with(media, cat({vi(2), vi(0x22), {1}, vi(0), {1}})), 0x305},
+                {"SUBSCRIBE with a LOCATION_FILTER that overflows", "request",
+                 subscribe_with(media, cat({vi(1), vi(0x21), vi(3), vi(std::numeric_limits<std::uint64_t>::max()), vi(0), vi(1)})),
+                 0x400},
+                {"SETUP option type overflow", "setup", setup_overflow, 0x400},
+                {"GOAWAY with a URI over 8192 bytes", "control",
+                 frame(0x10, cat({vi(8193), std::vector<std::uint8_t>(8193, 'u'), vi(0)})), 0x401},
+                {"PUBLISH_NAMESPACE answer with a reason phrase over 1024 bytes", "answer",
+                 request_error(0x10, std::vector<std::uint8_t>(1025, 'x'), {}), 0x401},
+                {"PUBLISH_NAMESPACE_OK carrying Track Properties", "answer", frame(0x07, cat({vi(0), {0x21, 1, 'x'}})), 0x301},
+                {"REDIRECT without its detail", "answer", request_error(0x34, {}, {}), 0x300},
+                {"REDIRECT naming a track for a namespace", "answer", request_error(0x34, {}, redirect(text("x"))), 0x301},
+                {"subgroup stream with the reserved Subgroup ID mode", "uni", {0x16, 7, 0, 0}, 0x200},
+            };
+            for (const auto& entry : malformed) {
+                MockTransport transport;
+                transport.reads[3].push_back(entry.where == "setup" ? entry.bytes : encode_server_setup_message({.draft = d23}));
+                transport.keep_open_streams.insert(3);
+                transport.reads[0].push_back(entry.where == "answer" ? entry.bytes : encode_publish_namespace_ok_message(d23, 0));
+                if (entry.where == "request") {
+                    transport.reads[1].push_back(entry.bytes);
+                    transport.keep_open_streams.insert(1);
+                } else if (entry.where == "control") {
+                    transport.reads[3].push_back(entry.bytes);
+                } else if (entry.where == "uni") {
+                    transport.reads[7].push_back(entry.bytes);
+                }
+                MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+                ok &= expect(session.connect(endpoint, tls).ok, "D23 " + entry.label + " connects");
+                const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(d23), source_bytes));
+                ok &= expect(!result.ok && transport.last_close_code == entry.code,
+                             "D23 closes with " + hex(entry.code) + " for " + entry.label + ", saw " +
+                                 hex(transport.last_close_code) + ": " + result.message);
+            }
+        }
+        // Section 9.10: a PUBLISH_STATE_NOTIFY is a publisher's message, so a publisher that
+        // receives one on a SUBSCRIBE it answered closes with ROLE_VIOLATION.
+        {
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = d23}));
+            transport.keep_open_streams.insert(3);
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(d23, 0));
+            auto request = subscribe_vide(1);
+            append_bytes(request, frame(0x22, {0}));
+            transport.reads[1].push_back(request);
+            transport.keep_open_streams.insert(1);
+            MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "D23 PUBLISH_STATE_NOTIFY on SUBSCRIBE connects");
+            const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(d23), source_bytes));
+            ok &= expect(!result.ok && transport.last_close_code == 0x304,
+                         "D23 closes with ROLE_VIOLATION for a PUBLISH_STATE_NOTIFY on SUBSCRIBE, saw " +
+                             hex(transport.last_close_code) + ": " + result.message);
+        }
+        // Section 3.1: a second answer to a PUBLISH is out of order, whether it arrives with
+        // the first or later.
+        for (const bool with_first_answer : {true, false}) {
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = d23}));
+            transport.keep_open_streams.insert(3);
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(d23, 0));
+            // The publisher opens a request stream for each track it PUBLISHes (4 and 8).
+            for (const std::uint64_t stream : {std::uint64_t{4}, std::uint64_t{8}}) {
+                auto answer = encode_publish_ok_message(d23, stream == 4 ? 2 : 4, 1);
+                if (with_first_answer) {
+                    append_bytes(answer, frame(0x07, {0, 0}));
+                    transport.reads[stream].push_back(answer);
+                } else {
+                    transport.reads[stream].push_back(answer);
+                    transport.reads[stream].push_back(frame(0x07, {0, 0}));
+                }
+                transport.keep_open_streams.insert(stream);
+            }
+            MoqtSession session(transport, "interop", true, false, false, std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "D23 second PUBLISH answer connects");
+            const auto result = session.publish(materialize_publish_plan(make_span_backed_plan(d23), source_bytes));
+            ok &= expect(!result.ok && transport.last_close_code == 0x303,
+                         std::string("D23 closes with UNEXPECTED_MESSAGE for a second PUBLISH answer ") +
+                             (with_first_answer ? "in the same read" : "in a later read") + ", saw " +
+                             hex(transport.last_close_code) + ": " + result.message);
+        }
+        // MOQT_IMPLEMENTATION (section 9.1.5) is opt-in: --moq-impl-id.
+        for (const DraftVersion draft : {DraftVersion::kDraft22, d23}) {
+            for (const bool enabled : {false, true}) {
+                MockTransport transport;
+                transport.reads[3].push_back(encode_server_setup_message({.draft = draft}));
+                transport.keep_open_streams.insert(3);
+                MoqtSession session(transport, "interop", false, false, false, std::chrono::seconds(1));
+                session.set_moq_impl_id(enabled);
+                ok &= expect(session.connect(endpoint, tls).ok, "MOQT_IMPLEMENTATION SETUP connects");
+                static_cast<void>(session.publish(materialize_publish_plan(make_span_backed_plan(draft), source_bytes)));
+                const std::string expected = "openmoq-publisher/" + std::string(openmoq::publisher::version());
+                const bool sent = std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                    return std::search(write.bytes.begin(), write.bytes.end(), expected.begin(), expected.end()) !=
+                           write.bytes.end();
+                });
+                ok &= expect(sent == enabled, std::string("SETUP carries MOQT_IMPLEMENTATION only with --moq-impl-id (draft ") +
+                                                  openmoq::publisher::to_string(draft) + ", enabled=" +
+                                                  (enabled ? "true" : "false") + ")");
             }
         }
     }

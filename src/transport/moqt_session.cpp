@@ -5,6 +5,7 @@
 #include "openmoq/publisher/locmaf_encoder.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
+#include "openmoq/publisher/version.h"
 #include "../live_media_queue.h"
 #include "../loc_packager.h"
 #include "../loop_timestamps.h"
@@ -429,7 +430,10 @@ bool deadline_reached(
 }
 
 TransportStatus protocol_violation(PublisherTransport& transport, std::string_view message) {
-    const TransportStatus close_status = transport.close(kProtocolViolationErrorCode);
+    // A draft-23 decoder names the cause of its failure (section 12.2); PROTOCOL_VIOLATION
+    // is the code for when no more specific one applies, and for every earlier draft.
+    const std::uint64_t fault = take_decode_fault();
+    const TransportStatus close_status = transport.close(fault != 0 ? fault : kProtocolViolationErrorCode);
     static_cast<void>(close_status);
     return TransportStatus::failure(message);
 }
@@ -437,8 +441,12 @@ TransportStatus protocol_violation(PublisherTransport& transport, std::string_vi
 // Draft-23 session termination codes (§12.2) for conditions earlier drafts
 // close with PROTOCOL_VIOLATION.
 constexpr std::uint64_t kInvalidStreamHeaderErrorCode = 0x200;
+constexpr std::uint64_t kMalformedObjectErrorCode = 0x201;
+constexpr std::uint64_t kInvalidObjectStatusErrorCode = 0x202;
 constexpr std::uint64_t kMalformedMessageErrorCode = 0x300;
+constexpr std::uint64_t kInvalidFieldErrorCode = 0x301;
 constexpr std::uint64_t kUnexpectedMessageErrorCode = 0x303;
+constexpr std::uint64_t kRoleViolationErrorCode = 0x304;
 constexpr std::uint64_t kClosedControlStreamErrorCode = 0x306;
 constexpr std::uint64_t kFieldLengthExceededErrorCode = 0x401;
 
@@ -450,6 +458,33 @@ TransportStatus session_violation(PublisherTransport& transport,
         return protocol_violation(transport, message);
     }
     return close_session(transport, draft23_error_code, message);
+}
+
+// A bidirectional stream opened by the peer whose first message this publisher does not
+// serve. Draft 23 section 6.3: a stream that begins with anything other than one of the
+// seven request messages is UNEXPECTED_MESSAGE. A request message that is cut short or
+// whose Length disagrees with its contents is malformed (sections 8.7, 9), and a bad Track
+// Namespace names its own code. A well-formed request is just unsupported here.
+TransportStatus unsupported_request_violation(PublisherTransport& transport,
+                                              openmoq::publisher::DraftVersion draft,
+                                              std::uint64_t request_type,
+                                              std::span<const std::uint8_t> message_bytes,
+                                              std::string_view message) {
+    if (openmoq::publisher::is_draft23_or_later(draft)) {
+        constexpr std::uint64_t kRequestTypes[] = {0x03, 0x06, 0x0d, 0x16, 0x1d, 0x50, 0x51};
+        if (std::find(std::begin(kRequestTypes), std::end(kRequestTypes), request_type) ==
+            std::end(kRequestTypes)) {
+            return close_session(transport, kUnexpectedMessageErrorCode,
+                                 "request stream began with a message that is not a request");
+        }
+        if (const std::uint64_t fault = take_decode_fault(); fault != 0) {
+            return close_session(transport, fault, message);  // the decoder named its own cause
+        }
+        if (const std::uint64_t code = diagnose_malformed_request(message_bytes, draft); code != 0) {
+            return close_session(transport, code, message);
+        }
+    }
+    return protocol_violation(transport, message);
 }
 
 // Draft-23 §9: FIELD_LENGTH_EXCEEDED for a control message longer than this
@@ -502,6 +537,24 @@ TransportStatus request_update_decode_failure(
         return close_session(transport, 0x17, message);
     }
     return protocol_violation(transport, message);
+}
+
+// Draft-23 section 9.5 and 9.10: once its request is answered, the peer that sent a
+// SUBSCRIBE or accepted a PUBLISH may send REQUEST_UPDATE (and the receiver of a
+// request, GOAWAY). A PUBLISH_STATE_NOTIFY is only ever sent by a publisher, so a
+// publisher that receives one has the peer in the wrong role; any other message,
+// such as a second answer, is out of order. Earlier drafts keep their own checks.
+TransportStatus unexpected_requester_message(PublisherTransport& transport,
+                                             openmoq::publisher::DraftVersion draft,
+                                             std::uint64_t message_type) {
+    if (!openmoq::publisher::is_draft23_or_later(draft) || message_type == 0x02 || message_type == 0x10) {
+        return TransportStatus::success();
+    }
+    if (message_type == 0x22) {
+        return close_session(transport, kRoleViolationErrorCode,
+                             "PUBLISH_STATE_NOTIFY received by the publisher of the subscription");
+    }
+    return close_session(transport, kUnexpectedMessageErrorCode, "unexpected message on a request stream");
 }
 
 bool trace_enabled() {
@@ -1502,15 +1555,44 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
             }
 
             RequestError request_error;
-            if (decode_request_error(message_bytes, draft, request_error)) {
+            const bool request_error_decoded = decode_request_error(message_bytes, draft, request_error);
+            // Read now: the decoders that run next for other response types clear it.
+            const std::uint64_t request_error_fault = request_error_decoded ? 0 : take_decode_fault();
+            if (request_error_decoded) {
+                // Draft 23 section 9.4.2.1: a REDIRECT for a request about a namespace
+                // (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) has no Track Name.
+                if (openmoq::publisher::is_draft23_or_later(draft) && request_error.redirect_has_track_name &&
+                    (request_type == 0x06 || request_type == 0x50 || request_type == 0x51)) {
+                    return close_session(transport, kInvalidFieldErrorCode,
+                                         "REDIRECT names a track for a namespace-scoped request");
+                }
                 return TransportStatus::failure(
                     "request failed: " + request_error.reason,
                     FailureKind::kEndpointPermanent);
             }
 
+            // Draft 23 section 3.1: a second answer to a PUBLISH, or a message only a
+            // publisher sends, can already follow the answer in the same read.
+            const auto check_trailing_messages = [&]() -> TransportStatus {
+                for (std::size_t offset = consumed; offset < buffered.size();) {
+                    const auto rest = std::span<const std::uint8_t>(buffered).subspan(offset);
+                    std::size_t size = 0;
+                    if (!next_control_message(rest, draft, size)) break;
+                    std::size_t type_offset = 0;
+                    std::uint64_t type = 0;
+                    static_cast<void>(decode_moqint(rest.first(size), type_offset, draft, type));
+                    if (const auto status = unexpected_requester_message(transport, draft, type); !status.ok) {
+                        return status;
+                    }
+                    offset += size;
+                }
+                return TransportStatus::success();
+            };
+
             if (expect_publish_ack) {
                 PublishOk decoded_publish_ok;
                 if (decode_publish_ok(message_bytes, draft, decoded_publish_ok)) {
+                    if (const auto status = check_trailing_messages(); !status.ok) return status;
                     note_delivery_timeouts(transport, decoded_publish_ok.delivery_timeouts);
                     if (publish_ok != nullptr) {
                         *publish_ok = decoded_publish_ok;
@@ -1536,6 +1618,7 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                     publish_ok->filter_type = 0;
                 }
                 if (expect_publish_ack) {
+                    if (const auto status = check_trailing_messages(); !status.ok) return status;
                     if (trailing_bytes != nullptr) {
                         trailing_bytes->assign(
                             buffered.begin() + static_cast<std::ptrdiff_t>(consumed), buffered.end());
@@ -1548,7 +1631,12 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                     consumed = 0;
                 }
                 // Request streams are single request/single terminal response.
-                // Reject additional response messages on the same stream.
+                // Reject additional response messages on the same stream. A second
+                // answer can already be buffered behind the first when both arrive
+                // in one read, so look at what is buffered before reading again.
+                if (std::size_t leftover_size = 0; next_control_message(buffered, draft, leftover_size)) {
+                    return session_violation(transport, draft, kUnexpectedMessageErrorCode, "multiple responses on request stream");
+                }
                 while (true) {
                     std::vector<std::uint8_t> extra_chunk;
                     bool extra_fin = false;
@@ -1579,6 +1667,13 @@ TransportStatus send_request_stream_and_wait(PublisherTransport& transport,
                 }
             }
 
+            // A response of the right type that does not decode is malformed in the way
+            // its decoder found (draft 23 section 12.2); that fault is read now, as the
+            // decoder that ran last was for another response type.
+            if (openmoq::publisher::is_draft23_or_later(draft) && (is_request_error || is_request_ok)) {
+                const std::uint64_t fault = is_request_error ? request_error_fault : take_decode_fault();
+                if (fault != 0) return close_session(transport, fault, "invalid response on request stream");
+            }
             // Draft-18 request streams are strictly request/response. Any
             // non-response control message on the same request stream is a
             // protocol mismatch for the current request.
@@ -1637,6 +1732,9 @@ bool is_known_peer_unidirectional_stream_type(std::uint64_t type,
                                               openmoq::publisher::DraftVersion draft) {
     if (type == 0x05 || type == 0x2f00 || type == 0x132b3e28) return true;
     if (!is_draft18_or_later(draft)) return false;
+    // Draft 23 section 11.3.1: SUBGROUP_ID_MODE 0b11 (bits 1-2) is reserved, so such a
+    // header is invalid rather than a subgroup stream.
+    if (openmoq::publisher::is_draft23_or_later(draft) && (type & 0x06) == 0x06) return false;
     return type <= 0x7f && (type & 0x90) == 0x10;
 }
 
@@ -3842,7 +3940,9 @@ TransportStatus finalize_subscription(PublisherTransport& transport,
         response_stream_id,
         encode_publish_done_message(
             draft, request_id, stream_count, status_code, reason),
-        false);
+        // Draft 23 section 3.1 / 6.4.2.2: PUBLISH_DONE ends the request stream, so a
+        // request-stream draft finishes it. Earlier drafts share the control stream.
+        uses_request_streams(draft));
     if (!write_status.ok) {
         return write_status;
     }
@@ -4101,6 +4201,11 @@ TransportStatus poll_retained_subscribe_request_updates(
                     pending.erase(pending.begin(), pending.begin() + message_size);
                     continue;
                 }
+                if (const auto status = unexpected_requester_message(
+                        transport, draft, type);
+                    !status.ok) {
+                    return status;
+                }
                 RequestUpdateMessage update;
                 RequestUpdateDecodeError decode_error =
                     RequestUpdateDecodeError::kNone;
@@ -4230,6 +4335,11 @@ TransportStatus poll_retained_publish_request_updates(
                     if (!status.ok) return status;
                     pending.erase(pending.begin(), pending.begin() + message_size);
                     continue;
+                }
+                if (const auto status = unexpected_requester_message(
+                        transport, draft, type);
+                    !status.ok) {
+                    return status;
                 }
                 RequestUpdateMessage update;
                 RequestUpdateDecodeError decode_error =
@@ -5015,7 +5125,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                                encode_request_error_message(
                                                    draft, 0, 0x1, 0, "unsupported request stream"),
                                                true);
-                    return write_status.ok ? protocol_violation(transport, "received unsupported request stream")
+                    return write_status.ok ? unsupported_request_violation(transport, draft, request_type, message_bytes,
+                                                                            "received unsupported request stream")
                                            : write_status;
                 }
                 const TransportStatus token_status = authorization_token_status(
@@ -5136,6 +5247,11 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             if (!status.ok) return status;
                             active.pending_request_bytes.erase(active.pending_request_bytes.begin(), active.pending_request_bytes.begin() + update_size);
                             continue;
+                        }
+                        if (const auto status = unexpected_requester_message(
+                                transport, draft, type);
+                            !status.ok) {
+                            return status;
                         }
                         RequestUpdateMessage update;
                         RequestUpdateDecodeError decode_error =
@@ -8844,8 +8960,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 if (request_type != 0x03 ||
                     !decode_subscribe_message(
                         request_bytes, draft_version, subscribe)) {
-                    return {protocol_violation(
-                                transport_,
+                    return {unsupported_request_violation(
+                                transport_, draft_version, request_type, request_bytes,
                                 "received unsupported request stream"),
                             0};
                 }
@@ -10618,7 +10734,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                 encode_request_error_message(
                                                     draft_version, 0, 0x1, 0, "unsupported request stream"),
                                                 true);
-                    return {write_status.ok ? protocol_violation(transport_, "received unsupported request stream")
+                    return {write_status.ok ? unsupported_request_violation(transport_, draft_version, request_type,
+                                                                            request_bytes,
+                                                                            "received unsupported request stream")
                                             : write_status,
                             0};
                 }
@@ -11947,7 +12065,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                 encode_request_error_message(
                                                     draft_version, 0, 0x1, 0, "unsupported request stream"),
                                                 true);
-                    return write_status.ok ? protocol_violation(transport_, "received unsupported request stream")
+                    return write_status.ok ? unsupported_request_violation(transport_, draft_version, request_type,
+                                                                           request_bytes,
+                                                                           "received unsupported request stream")
                                            : write_status;
                 }
                 const TransportStatus token_status = authorization_token_status(
@@ -12900,6 +13020,9 @@ TransportStatus MoqtSession::ensure_setup(openmoq::publisher::DraftVersion draft
         .max_request_id = max_request_id,
         .authorization_token = setup_auth.token,
         .dpop_proof = setup_auth.proof,
+        .implementation = moq_impl_id_
+                              ? std::optional<std::string>("openmoq-publisher/" + std::string(openmoq::publisher::version()))
+                              : std::nullopt,
     });
     status = write_frame(control_stream_id_, setup_bytes, false);
     if (!status.ok) {

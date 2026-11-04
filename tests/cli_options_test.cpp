@@ -506,6 +506,15 @@ int main() {
     }
 
     {
+        // MOQT_IMPLEMENTATION is a SHOULD in every draft, but is opt-in because the
+        // value can fingerprint the endpoint.
+        const CliOptions off = parse({"openmoq-publisher", "--input", "sample.mp4"});
+        ok &= expect(!off.moq_impl_id, "expected MOQT_IMPLEMENTATION to be off by default");
+        const CliOptions on = parse({"openmoq-publisher", "--input", "sample.mp4", "--moq-impl-id"});
+        ok &= expect(on.moq_impl_id, "expected --moq-impl-id to send MOQT_IMPLEMENTATION in SETUP");
+    }
+
+    {
         // Timeline tracks are not rebased under --loop; the session warns
         // rather than refusing, so existing invocations keep working.
         const CliOptions options =

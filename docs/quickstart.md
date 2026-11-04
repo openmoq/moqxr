@@ -177,6 +177,25 @@ catalog and media tracks before `--timeout` expires. The publisher does not
 automatically switch modes after a rejection. See the [mode table and rejection
 troubleshooting](relay-interop.md#choose-a-file-publishing-mode).
 
+## Identify the Publisher in SETUP
+
+Every draft says an endpoint SHOULD send a MOQT_IMPLEMENTATION Setup Option so a
+relay operator can tell which implementation and version they are talking to
+(draft 23 section 9.1.5). The publisher leaves it out by default, because the
+value can fingerprint an endpoint. Add `--moq-impl-id` to send
+`openmoq-publisher/<version>` in SETUP:
+
+```bash
+./build/openmoq-publisher \
+  --input sample.mp4 \
+  --endpoint moqt://relay.example.com:443/moq \
+  --namespace interop \
+  --moq-impl-id
+```
+
+It works with every `--draft`, on native QUIC and WebTransport. There is no API
+setting for it yet.
+
 ## Endpoint Failover and Retries
 
 Repeat `--endpoint` to provide relay targets in preference order. `--retry N`

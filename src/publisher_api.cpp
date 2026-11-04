@@ -409,6 +409,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
             config_.authorization);
         active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_moq_impl_id(config_.moq_impl_id);
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
 
@@ -632,6 +633,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
             config_.authorization);
         active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_moq_impl_id(config_.moq_impl_id);
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
         active->session->set_initial_group_id(config_.initial_group_id);
@@ -914,6 +916,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
             config_.authorization);
         active->session->set_catalog_republish_interval(config_.catalog_republish_interval);
         active->session->set_preannounce_tracks(config_.preannounce_tracks);
+        active->session->set_moq_impl_id(config_.moq_impl_id);
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
 

@@ -826,6 +826,235 @@ bool test_setup_serdes_for_all_drafts() {
     return ok;
 }
 
+// MOQT_IMPLEMENTATION (option/parameter 0x07, drafts 14-23 section "MOQT
+// IMPLEMENTATION") is the last option in SETUP, and is absent unless asked for.
+bool test_setup_implementation_option() {
+    bool ok = true;
+    const std::string implementation = "openmoq-publisher/0.4.12";
+    for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17,
+                               DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22,
+                               DraftVersion::kDraft23}) {
+        for (TransportKind transport : {TransportKind::kRawQuic, TransportKind::kWebTransport}) {
+            const bool raw = transport == TransportKind::kRawQuic;
+            const std::string label = draft_label(draft) + (raw ? " raw" : " webtransport") + " MOQT_IMPLEMENTATION";
+            SetupMessage setup{
+                .draft = draft,
+                .transport = transport,
+                .authority = "relay.example.com:4433",
+                .path = "/moq/live",
+                .max_request_id = 32,
+            };
+            const std::vector<std::uint8_t> without = encode_setup_message(setup);
+            setup.implementation = implementation;
+            const std::vector<std::uint8_t> with = encode_setup_message(setup);
+
+            const auto contains_implementation = [&](const std::vector<std::uint8_t>& bytes) {
+                return std::search(bytes.begin(), bytes.end(), implementation.begin(), implementation.end()) !=
+                       bytes.end();
+            };
+            ok &= expect(!contains_implementation(without), label + " is not sent by default");
+            ok &= expect(contains_implementation(with), label + " is sent when requested");
+            std::size_t message_size = 0;
+            ok &= expect(next_control_message(without, draft, message_size) && message_size == without.size(),
+                         label + " default SETUP frames exactly");
+            ok &= expect(next_control_message(with, draft, message_size) && message_size == with.size(),
+                         label + " SETUP frames exactly with the option");
+            if (with.size() < implementation.size() + 2) continue;
+
+            // The option closes the message: [type or delta][length][value].
+            const std::size_t value_at = with.size() - implementation.size();
+            ok &= expect(std::equal(implementation.begin(), implementation.end(), with.begin() + value_at),
+                         label + " value ends the SETUP message");
+            ok &= expect(with[value_at - 1] == implementation.size(), label + " value is length prefixed");
+            // Draft 14 and 15+ differ: 14 and 16 send a parameter count, 16 and 17+ delta-encode the type.
+            std::uint8_t expected_type = 0x07;
+            if (draft == DraftVersion::kDraft16) expected_type = raw ? 2 : 5;  // after AUTHORITY (5) or MAX_REQUEST_ID (2)
+            if (draft != DraftVersion::kDraft14 && draft != DraftVersion::kDraft16) expected_type = raw ? 2 : 7;  // after AUTHORITY or from 0
+            ok &= expect(with[value_at - 2] == expected_type, label + " option type is 0x07");
+
+            if (draft == DraftVersion::kDraft14 || draft == DraftVersion::kDraft16) {
+                const auto parameter_count = [&](const std::vector<std::uint8_t>& bytes) {
+                    Uint16Frame frame;
+                    std::size_t offset = 0;
+                    std::uint64_t count = 0;
+                    std::uint64_t scratch = 0;
+                    if (!expect_uint16_frame(bytes, 0x20, frame, label + " frame")) return std::uint64_t{0};
+                    offset = frame.payload_offset;
+                    if (draft == DraftVersion::kDraft14) {
+                        read_varint(bytes, offset, scratch);  // version count
+                        read_varint(bytes, offset, scratch);  // version
+                    }
+                    read_varint(bytes, offset, count);
+                    return count;
+                };
+                ok &= expect(parameter_count(with) == parameter_count(without) + 1,
+                             label + " parameter count includes the option");
+            }
+        }
+    }
+    return ok;
+}
+
+// Draft 23 section 12.2 names the session termination code for each malformed input.
+// The decoders still only say "no", but record why, for take_decode_fault().
+bool test_draft23_decode_faults() {
+    using openmoq::publisher::transport::GoawayMessage;
+    using openmoq::publisher::transport::decode_goaway_message;
+    using openmoq::publisher::transport::diagnose_malformed_request;
+    using openmoq::publisher::transport::take_decode_fault;
+    using openmoq::publisher::transport::validate_publisher_datagram;
+    using Bytes = std::vector<std::uint8_t>;
+    bool ok = true;
+    constexpr DraftVersion d23 = DraftVersion::kDraft23;
+
+    const auto vi = [](std::uint64_t value) {
+        Bytes bytes;
+        if (value == std::numeric_limits<std::uint64_t>::max()) {
+            bytes.assign(9, 0xff);
+        } else {
+            append_vi64(bytes, value);
+        }
+        return bytes;
+    };
+    const auto cat = [](std::initializer_list<Bytes> parts) {
+        Bytes result;
+        for (const auto& part : parts) result.insert(result.end(), part.begin(), part.end());
+        return result;
+    };
+    const auto text = [](std::string_view value) { return Bytes(value.begin(), value.end()); };
+    const auto field = [&](const Bytes& value) { return cat({vi(value.size()), value}); };
+    const auto msg = [&](std::uint64_t type, const Bytes& body) { return cat({vi(type), vi(body.size()), body}); };
+    const auto names = [&](const std::vector<Bytes>& fields) {
+        Bytes result = vi(fields.size());
+        for (const auto& value : fields) result = cat({result, field(value)});
+        return result;
+    };
+    const std::vector<Bytes> media{text("media")};
+    const auto subscribe = [&](const std::vector<Bytes>& fields, const Bytes& parameters) {
+        return msg(0x03, cat({vi(1), names(fields), field(text("track")), parameters}));
+    };
+    const auto one_parameter = [&](std::uint64_t type, const Bytes& value) { return cat({vi(1), vi(type), value}); };
+
+    // SUBSCRIBE: Track Namespace (8.7) and Message Parameters (9.19).
+    const std::vector<std::pair<std::string, std::pair<Bytes, std::uint64_t>>> subscribe_faults{
+        {"empty namespace field", {subscribe({Bytes{}}, vi(0)), 0x302}},
+        {"33 namespace fields", {subscribe(std::vector<Bytes>(33, text("a")), vi(0)), 0x302}},
+        {"namespace field over 4096 bytes", {subscribe({Bytes(4100, 'a')}, vi(0)), 0x401}},
+        {"unknown parameter", {subscribe(media, one_parameter(0x7e, vi(1))), 0x305}},
+        {"LARGEST_OBJECT outside SUBSCRIBE", {subscribe(media, one_parameter(9, cat({vi(2), Bytes{0, 0}}))), 0x305}},
+        {"GROUP_ORDER 7", {subscribe(media, one_parameter(0x22, Bytes{7})), 0x305}},
+        {"PAUSED 2", {subscribe(media, one_parameter(0x11, Bytes{2})), 0x305}},
+        {"INCLUDE_PROPERTIES 2", {subscribe(media, one_parameter(0x35, Bytes{2})), 0x305}},
+        {"LOCATION_FILTER type 9", {subscribe(media, one_parameter(0x21, vi(9))), 0x305}},
+        {"LOCATION_FILTER start plus delta overflows",
+         {subscribe(media, one_parameter(0x21, cat({vi(3), vi(std::numeric_limits<std::uint64_t>::max()), vi(0), vi(1)}))),
+          0x400}},
+        {"FILL_PARAMETERS with a parameter it may not carry",
+         {subscribe(media, one_parameter(0x23, cat({vi(1), vi(2), vi(5)}))), 0x305}},
+        {"repeated GROUP_ORDER", {subscribe(media, cat({vi(2), vi(0x22), Bytes{1}, vi(0), Bytes{1}})), 0x305}},
+    };
+    for (const auto& [label, input] : subscribe_faults) {
+        SubscribeMessage decoded;
+        ok &= expect(!decode_subscribe_message(input.first, d23, decoded), "d23 SUBSCRIBE rejects " + label);
+        const std::uint64_t fault = take_decode_fault();
+        ok &= expect(fault == input.second, "d23 SUBSCRIBE " + label + " names code " + std::to_string(input.second) +
+                                                ", saw " + std::to_string(fault));
+        ok &= expect(take_decode_fault() == 0, "reading the fault clears it (" + label + ")");
+        // Earlier drafts keep PROTOCOL_VIOLATION, so they record nothing.
+        SubscribeMessage earlier;
+        static_cast<void>(decode_subscribe_message(input.first, DraftVersion::kDraft22, earlier));
+        ok &= expect(take_decode_fault() == 0, "draft 22 records no fault for " + label);
+    }
+    {
+        SubscribeMessage decoded;
+        ok &= expect(decode_subscribe_message(subscribe(media, vi(0)), d23, decoded), "d23 well-formed SUBSCRIBE decodes");
+        ok &= expect(take_decode_fault() == 0, "a successful decode records no fault");
+    }
+
+    // SETUP options (8.3): DELTA_ENCODING_OVERFLOW and MALFORMED_KEY_VALUE.
+    const std::vector<std::pair<std::string, std::pair<Bytes, std::uint64_t>>> setup_faults{
+        {"option type delta overflow",
+         {msg(0x2f00, cat({vi(std::numeric_limits<std::uint64_t>::max()), vi(0), vi(1), vi(0)})), 0x400}},
+        {"MAX_CONTROL_MESSAGE_SIZE with a truncated value", {msg(0x2f00, cat({vi(9), vi(1), Bytes{0x80}})), 0x6}},
+    };
+    for (const auto& [label, input] : setup_faults) {
+        ServerSetupMessage setup;
+        ok &= expect(!decode_setup_response_message(input.first, d23, setup), "d23 SETUP rejects " + label);
+        const std::uint64_t fault = take_decode_fault();
+        ok &= expect(fault == input.second, "d23 SETUP " + label + " names code " + std::to_string(input.second) +
+                                                ", saw " + std::to_string(fault));
+    }
+
+    // GOAWAY (9.2): the New Session URI is at most 8192 bytes.
+    {
+        GoawayMessage goaway;
+        ok &= expect(!decode_goaway_message(msg(0x10, cat({vi(8193), Bytes(8193, 'u'), vi(0)})), d23, goaway),
+                     "d23 GOAWAY rejects a New Session URI over 8192 bytes");
+        ok &= expect(take_decode_fault() == 0x401, "d23 GOAWAY URI over 8192 bytes is FIELD_LENGTH_EXCEEDED");
+        ok &= expect(decode_goaway_message(msg(0x10, cat({vi(0), vi(0)})), d23, goaway), "d23 empty GOAWAY decodes");
+    }
+
+    // Object Datagram (11.2.1): flags {type, alias, group, object id, priority, ...}.
+    const std::vector<std::pair<std::string, std::pair<Bytes, std::uint64_t>>> datagram_faults{
+        {"unknown type", {Bytes{0x40, 7, 0, 0, 0, 'x'}, 0x200}},
+        {"reserved bit 4", {Bytes{0x10, 7, 0, 0, 0, 'x'}, 0x200}},
+        {"STATUS with END_OF_GROUP", {Bytes{0x22, 7, 0, 0, 0, 0}, 0x200}},
+        {"PROPERTIES with a length of 0", {Bytes{0x01, 7, 0, 0, 0, 0, 'x'}, 0x201}},
+        {"Properties on a non-Normal status", {Bytes{0x21, 7, 0, 0, 0, 2, 2, 5, 3}, 0x202}},
+    };
+    for (const auto& [label, input] : datagram_faults) {
+        ok &= expect(!validate_publisher_datagram(input.first, d23), "d23 datagram rejects " + label);
+        const std::uint64_t fault = take_decode_fault();
+        ok &= expect(fault == input.second, "d23 datagram " + label + " names code " + std::to_string(input.second) +
+                                                ", saw " + std::to_string(fault));
+        static_cast<void>(validate_publisher_datagram(input.first, DraftVersion::kDraft22));
+        ok &= expect(take_decode_fault() == 0, "draft 22 datagram " + label + " records no fault");
+    }
+
+    // REQUEST_OK / REQUEST_ERROR (9.3, 9.4, 8.5).
+    {
+        PublishNamespaceOk request_ok;
+        ok &= expect(decode_request_ok(msg(0x07, vi(0)), d23, request_ok), "d23 empty REQUEST_OK decodes");
+        ok &= expect(!decode_request_ok(msg(0x07, cat({vi(0), Bytes{0x21, 1, 'x'}})), d23, request_ok),
+                     "d23 REQUEST_OK for PUBLISH_NAMESPACE rejects Track Properties");
+        ok &= expect(take_decode_fault() == 0x301, "d23 REQUEST_OK with Track Properties is INVALID_FIELD");
+
+        RequestError error;
+        const auto request_error = [&](std::uint64_t code, const Bytes& reason, const Bytes& details) {
+            return msg(0x05, cat({vi(code), vi(0), field(reason), details}));
+        };
+        ok &= expect(!decode_request_error(request_error(0x10, Bytes(1025, 'x'), {}), d23, error),
+                     "d23 REQUEST_ERROR rejects a reason phrase over 1024 bytes");
+        ok &= expect(take_decode_fault() == 0x401, "d23 reason phrase over 1024 bytes is FIELD_LENGTH_EXCEEDED");
+        ok &= expect(decode_request_error(request_error(0x10, Bytes(1024, 'x'), {}), d23, error),
+                     "d23 REQUEST_ERROR accepts a reason phrase of 1024 bytes");
+        ok &= expect(!decode_request_error(request_error(0x34, {}, {}), d23, error),
+                     "d23 REQUEST_ERROR REDIRECT requires its Error Detail");
+        ok &= expect(take_decode_fault() == 0x300, "d23 REDIRECT without its detail is MALFORMED_MESSAGE");
+        const auto redirect = [&](const Bytes& track_name) {
+            return cat({vi(1), field(cat({field({}), names(media), field(track_name)}))});
+        };
+        ok &= expect(decode_request_error(request_error(0x34, {}, redirect({})), d23, error) &&
+                         !error.redirect_has_track_name,
+                     "d23 REDIRECT without a Track Name decodes");
+        ok &= expect(decode_request_error(request_error(0x34, {}, redirect(text("x"))), d23, error) &&
+                         error.redirect_has_track_name,
+                     "d23 REDIRECT reports a Track Name for the caller to judge");
+    }
+
+    // A request-opening message that cannot be served (section 6.3, 8.7, 9).
+    ok &= expect(diagnose_malformed_request(msg(0x06, Bytes{0}), d23) == 0x300,
+                 "a PUBLISH_NAMESPACE with no Track Namespace is MALFORMED_MESSAGE");
+    ok &= expect(diagnose_malformed_request(Bytes{0x06, 5, 0}, d23) == 0x300,
+                 "a Length larger than the message is MALFORMED_MESSAGE");
+    ok &= expect(diagnose_malformed_request(subscribe(media, vi(0)), d23) == 0, "a well-formed request is not malformed");
+    ok &= expect(diagnose_malformed_request(subscribe({Bytes{}}, vi(0)), d23) == 0x302,
+                 "an empty namespace field in a request is INVALID_TRACK_NAMESPACE");
+    ok &= expect(diagnose_malformed_request(Bytes{0x06, 1, 0}, DraftVersion::kDraft22) == 0,
+                 "earlier drafts name no code");
+    return ok;
+}
+
 bool test_publisher_control_message_encoders_for_all_drafts() {
     bool ok = true;
     for (DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16, DraftVersion::kDraft17, DraftVersion::kDraft18}) {
@@ -2798,6 +3027,8 @@ int main() {
     ok &= test_draft22_fill_parameters_parameter_count();
     ok &= test_object_properties();
     ok &= test_setup_serdes_for_all_drafts();
+    ok &= test_setup_implementation_option();
+    ok &= test_draft23_decode_faults();
     ok &= test_draft21_identity();
     ok &= test_draft18_and_21_unknown_setup_option_duplicates();
     ok &= test_draft18_and_21_track_namespace_constraints();
