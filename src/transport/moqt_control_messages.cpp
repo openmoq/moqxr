@@ -898,6 +898,7 @@ bool decode_control_message_header(std::span<const std::uint8_t> bytes,
                                    std::uint64_t& type,
                                    std::size_t& payload_offset,
                                    std::size_t& payload_length) {
+    clear_decode_fault();
     std::size_t offset = 0;
     if (!decode_moqint_impl(bytes, offset, draft, type) ||
         !read_control_length(bytes, offset, draft, payload_length) ||
@@ -1301,6 +1302,7 @@ bool decode_server_setup_message(std::span<const std::uint8_t> bytes, ServerSetu
 bool decode_setup_response_message(std::span<const std::uint8_t> bytes,
                                    DraftVersion expected_draft,
                                    ServerSetupMessage& message) {
+    clear_decode_fault();
     std::size_t offset = 0;
     std::uint64_t message_type = 0;
     if (!decode_moqint_impl(bytes, offset, expected_draft, message_type)) {
@@ -1357,6 +1359,7 @@ std::vector<std::uint8_t> encode_server_setup_message(const ServerSetupMessage& 
 }
 
 bool decode_max_request_id_message(std::span<const std::uint8_t> bytes, MaxRequestIdMessage& message) {
+    clear_decode_fault();
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     if (!parse_control_length_message(bytes, DraftVersion::kDraft16, kMaxRequestIdType, payload_offset, payload_length)) {
@@ -2637,6 +2640,7 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
 
 bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
                                      SubscribeUpdateMessage& message) {
+    clear_decode_fault();
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     if (!parse_control_length_message(
@@ -2713,6 +2717,7 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
 }
 
 bool decode_track_status_message(std::span<const std::uint8_t> bytes, DraftVersion draft, SubscribeMessage& message) {
+    clear_decode_fault();
     constexpr std::uint8_t kTrackStatusType = 0x0d;
     if (!is_draft18_or_later(draft) || bytes.empty() || bytes[0] != kTrackStatusType) {
         return false;
@@ -3022,6 +3027,7 @@ std::vector<std::uint8_t> encode_subgroup_object(DraftVersion draft,
 }
 
 bool decode_publish_namespace_ok(std::span<const std::uint8_t> bytes, PublishNamespaceOk& message) {
+    clear_decode_fault();
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     if (!parse_control_length_message(bytes, DraftVersion::kDraft16, kPublishNamespaceOkType, payload_offset, payload_length)) {
@@ -3032,6 +3038,7 @@ bool decode_publish_namespace_ok(std::span<const std::uint8_t> bytes, PublishNam
 }
 
 bool decode_publish_namespace_error(std::span<const std::uint8_t> bytes, PublishNamespaceError& message) {
+    clear_decode_fault();
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     if (!parse_control_length_message(bytes, DraftVersion::kDraft16, kPublishNamespaceErrorType, payload_offset, payload_length)) {
@@ -3044,6 +3051,7 @@ bool decode_publish_namespace_error(std::span<const std::uint8_t> bytes, Publish
 }
 
 bool decode_publish_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishOk& message) {
+    clear_decode_fault();
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     const bool request_ok_alias = is_draft18_or_later(draft);
@@ -3222,6 +3230,7 @@ void apply_publish_ok_settings(const PublishOk& publish_ok, SubscribeMessage& se
 }
 
 bool decode_publish_error(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishError& message) {
+    clear_decode_fault();
     std::size_t payload_offset = 0;
     std::size_t payload_length = 0;
     if (!parse_publish_family_message(bytes, draft, kPublishErrorType, payload_offset, payload_length)) {
