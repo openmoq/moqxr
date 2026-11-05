@@ -897,6 +897,47 @@ bool test_setup_implementation_option() {
 
 // Draft 23 section 12.2 names the session termination code for each malformed input.
 // The decoders still only say "no", but record why, for take_decode_fault().
+bool test_track_status_and_fetch_messages() {
+    using namespace openmoq::publisher::transport;
+    bool ok = true;
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+
+    // TRACK_STATUS has the SUBSCRIBE layout under type 0xD (section 10.14).
+    const auto subscribe_layout = [](std::uint8_t type) {
+        std::vector<std::uint8_t> body{5, 1, 7, 'i', 'n', 't', 'e', 'r', 'o', 'p', 6, 'v', 'i', 'd', 'e', '_', '1', 0};
+        std::vector<std::uint8_t> message{type, 0, static_cast<std::uint8_t>(body.size())};
+        message.insert(message.end(), body.begin(), body.end());
+        return message;
+    };
+    const auto track_status = subscribe_layout(0x0d);
+    SubscribeMessage decoded;
+    ok &= expect(decode_track_status_message(track_status, draft, decoded), "draft-18 TRACK_STATUS decodes");
+    ok &= expect(decoded.request_id == 5 && decoded.track_name == "vide_1", "TRACK_STATUS fields decode");
+    ok &= expect(!decode_track_status_message(track_status, DraftVersion::kDraft16, decoded),
+                 "TRACK_STATUS decodes only on drafts 18 and later");
+    ok &= expect(!decode_track_status_message(subscribe_layout(0x03), draft, decoded),
+                 "a SUBSCRIBE is not a TRACK_STATUS");
+
+    // Joining FETCH: Request ID 7, relative (0x2), joining request 1, start 0, no parameters.
+    const std::vector<std::uint8_t> joining{0x16, 0, 5, 7, 2, 1, 0, 0};
+    FetchMessage fetch;
+    ok &= expect(decode_fetch_message(joining, draft, fetch), "draft-18 Joining FETCH decodes");
+    ok &= expect(fetch.request_id == 7 && fetch.fetch_type == 2 && fetch.joining_request_id == 1 &&
+                     fetch.joining_start == 0,
+                 "Joining FETCH fields decode");
+    ok &= expect(!decode_fetch_message(joining, DraftVersion::kDraft22, fetch), "FETCH decodes only on draft 18");
+    const std::vector<std::uint8_t> bad_type{0x16, 0, 4, 7, 4, 0, 0};
+    ok &= expect(!decode_fetch_message(bad_type, draft, fetch), "an unknown Fetch Type does not decode");
+    const std::vector<std::uint8_t> trailing{0x16, 0, 6, 7, 2, 1, 0, 0, 0};
+    ok &= expect(!decode_fetch_message(trailing, draft, fetch), "trailing bytes in FETCH do not decode");
+
+    // FETCH_OK: End Of Track 0, End Location {0, 1}, no parameters.
+    ok &= expect(encode_fetch_ok_message(draft, false, 0, 1) ==
+                     std::vector<std::uint8_t>({0x18, 0, 4, 0, 0, 1, 0}),
+                 "FETCH_OK encodes End Of Track, End Location and an empty parameter list");
+    return ok;
+}
+
 bool test_draft23_decode_faults() {
     using openmoq::publisher::transport::GoawayMessage;
     using openmoq::publisher::transport::decode_goaway_message;
@@ -3029,6 +3070,7 @@ int main() {
     ok &= test_setup_serdes_for_all_drafts();
     ok &= test_setup_implementation_option();
     ok &= test_draft23_decode_faults();
+    ok &= test_track_status_and_fetch_messages();
     ok &= test_draft21_identity();
     ok &= test_draft18_and_21_unknown_setup_option_duplicates();
     ok &= test_draft18_and_21_track_namespace_constraints();

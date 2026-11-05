@@ -2822,9 +2822,16 @@ int main() {
                            openmoq::publisher::transport::decode_request_error(write.bytes, DraftVersion::kDraft22, error);
                 }), "D22 " + scenario + " writes no REQUEST_ERROR");
             }
-            if (scenario == "track-status" || scenario == "tracks-overlap") {
-                const auto stream = scenario == "track-status" ? 1 : 5;
-                const auto error_code = scenario == "track-status" ? 3 : 0x30;
+            if (scenario == "track-status") {
+                // TRACK_STATUS for a published track is answered with TRACK_STATUS_OK
+                // (a REQUEST_OK), then the stream ends with a FIN (section 9.13).
+                ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+                    return write.stream_id == 1 && write.fin && message_type(write.bytes) == 0x07;
+                }), "D22 track-status gets TRACK_STATUS_OK and a FIN");
+            }
+            if (scenario == "tracks-overlap") {
+                const auto stream = 5;
+                const auto error_code = 0x30;
                 bool found = false;
                 for (const auto& write : transport.writes) {
                     openmoq::publisher::transport::RequestError error;
@@ -3219,6 +3226,103 @@ int main() {
             }
         }
     }
+    {
+        // Draft 18 TRACK_STATUS (section 10.14) and the catalog Joining FETCH
+        // (section 10.12.2), each on its own request stream.
+        constexpr DraftVersion draft = DraftVersion::kDraft18;
+        const auto framed = [](std::uint8_t type, const std::vector<std::uint8_t>& body) {
+            std::vector<std::uint8_t> message{type, static_cast<std::uint8_t>(body.size() >> 8),
+                                              static_cast<std::uint8_t>(body.size() & 0xff)};
+            message.insert(message.end(), body.begin(), body.end());
+            return message;
+        };
+        const auto track_status = [&](std::uint64_t request_id, std::string_view track) {
+            auto message = encode_subscribe_message(request_id, kTestTrackNamespace, track, 1, draft);
+            message[0] = 0x0d;  // TRACK_STATUS has the SUBSCRIBE layout
+            return message;
+        };
+        std::vector<std::uint8_t> ns_field{1, static_cast<std::uint8_t>(kTestTrackNamespace.size())};
+        ns_field.insert(ns_field.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        const auto joining_fetch = [&](std::uint8_t request_id, std::uint8_t type, std::uint8_t joining_id) {
+            return framed(0x16, {request_id, type, joining_id, 0, 0});
+        };
+        std::vector<std::uint8_t> standalone{9, 1};
+        standalone.insert(standalone.end(), ns_field.begin(), ns_field.end());
+        for (const char c : std::string_view("vide_1")) standalone.push_back(static_cast<std::uint8_t>(c));
+        standalone.insert(standalone.begin() + 2 + ns_field.size(), 6);
+        standalone.insert(standalone.end(), {0, 0, 0, 0, 0});
+
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft));
+        transport.reads[5].push_back(track_status(3, "vide_1"));
+        transport.reads[9].push_back(track_status(5, "nope"));
+        transport.reads[13].push_back(joining_fetch(7, 0x2, 1));
+        transport.reads[17].push_back(joining_fetch(11, 0x2, 99));
+        transport.reads[21].push_back(framed(0x16, standalone));
+        for (const auto id : {1, 5, 9, 13, 17, 21}) transport.keep_open_streams.insert(id);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "D18 TRACK_STATUS and FETCH session connects");
+        static_cast<void>(session.publish(
+            materialize_publish_plan(make_span_backed_plan(draft), source_bytes)));
+
+        const auto error_on = [&](std::uint64_t stream) -> std::optional<std::uint64_t> {
+            for (const auto& write : transport.writes) {
+                openmoq::publisher::transport::RequestError error;
+                if (write.stream_id == stream && write.fin &&
+                    openmoq::publisher::transport::decode_request_error(write.bytes, draft, error)) {
+                    return error.error_code;
+                }
+            }
+            return std::nullopt;
+        };
+        const auto finished_with = [&](std::uint64_t stream, std::uint64_t type) {
+            return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                return write.stream_id == stream && write.fin && message_type(write.bytes) == type;
+            });
+        };
+        ok &= expect(finished_with(5, 0x07), "D18 TRACK_STATUS for a published track gets TRACK_STATUS_OK and a FIN");
+        ok &= expect(error_on(9) == std::optional<std::uint64_t>(0x10),
+                     "D18 TRACK_STATUS for an unknown track gets DOES_NOT_EXIST");
+        ok &= expect(finished_with(13, 0x18), "D18 Joining FETCH of the catalog gets FETCH_OK and a FIN");
+        ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+                         return (write.stream_id & 0x3) == 0x2 && write.fin && message_type(write.bytes) == 0x05;
+                     }),
+                     "D18 Joining FETCH of the catalog sends the catalog object on a FETCH_HEADER stream");
+        ok &= expect(error_on(17) == std::optional<std::uint64_t>(0x32),
+                     "D18 Joining FETCH of an unknown subscription gets INVALID_JOINING_REQUEST_ID");
+        ok &= expect(error_on(21) == std::optional<std::uint64_t>(0x3),
+                     "D18 standalone FETCH gets NOT_SUPPORTED");
+    }
+
+    {
+        // Draft 16 section 4: a limited endpoint answers FETCH and TRACK_STATUS
+        // with NOT_SUPPORTED instead of ignoring them.
+        constexpr DraftVersion draft = DraftVersion::kDraft16;
+        MockTransport transport;
+        transport.reads[0].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 8}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        std::vector<std::uint8_t> requests{0x0d, 0, 2, 1, 0,   // TRACK_STATUS, Request ID 1
+                                           0x16, 0, 2, 3, 0};  // FETCH, Request ID 3
+        append_bytes(requests, encode_subscribe_message(5, kTestTrackNamespace, "catalog", 1, draft));
+        transport.reads[0].push_back(requests);
+        MoqtSession session(transport, std::string(kTestTrackNamespace));
+        ok &= expect(session.connect(endpoint, tls).ok, "D16 unsupported request session connects");
+        static_cast<void>(session.publish(
+            materialize_publish_plan(make_span_backed_plan(draft), source_bytes)));
+        std::size_t not_supported = 0;
+        for (const auto& write : transport.writes) {
+            openmoq::publisher::transport::RequestError error;
+            if (write.stream_id == 0 &&
+                openmoq::publisher::transport::decode_request_error(write.bytes, draft, error) &&
+                error.error_code == 0x3) {
+                ++not_supported;
+            }
+        }
+        ok &= expect(not_supported == 2, "D16 TRACK_STATUS and FETCH each get NOT_SUPPORTED");
+    }
+
     if (std::getenv("OPENMOQ_D22_ONLY") != nullptr) return ok ? 0 : 1;
     std::string authority;
     std::string path;

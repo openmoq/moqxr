@@ -941,6 +941,7 @@ bool next_control_message(std::span<const std::uint8_t> bytes, DraftVersion draf
         case kSubscribeNamespaceTypeDraft18:
         case kSubscribeTracksType:
         case 0x0a:  // UNSUBSCRIBE
+        case 0x0d:  // TRACK_STATUS (draft-16)
         case 0x10:  // GOAWAY
         case 0x14:  // SUBSCRIBE_DONE (draft-14)
         case 0x16:  // FETCH
@@ -2694,6 +2695,115 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kSubscribeOkType);
+    if (!append_control_length(message_bytes, draft, payload.size())) {
+        return {};
+    }
+    message_bytes.insert(message_bytes.end(), payload.begin(), payload.end());
+    return message_bytes;
+}
+
+bool decode_track_status_message(std::span<const std::uint8_t> bytes, DraftVersion draft, SubscribeMessage& message) {
+    constexpr std::uint8_t kTrackStatusType = 0x0d;
+    if (!is_draft18_or_later(draft) || bytes.empty() || bytes[0] != kTrackStatusType) {
+        return false;
+    }
+    std::vector<std::uint8_t> as_subscribe(bytes.begin(), bytes.end());
+    as_subscribe[0] = static_cast<std::uint8_t>(kSubscribeType);
+    return decode_subscribe_message(as_subscribe, draft, message);
+}
+
+bool decode_fetch_message(std::span<const std::uint8_t> bytes, DraftVersion draft, FetchMessage& message) {
+    clear_decode_fault();
+    constexpr std::uint64_t kFetchType = 0x16;
+    if (draft != DraftVersion::kDraft18) {
+        return false;
+    }
+    std::size_t payload_offset = 0;
+    std::size_t payload_length = 0;
+    if (!parse_control_length_message(bytes, draft, kFetchType, payload_offset, payload_length)) {
+        return false;
+    }
+    std::size_t offset = payload_offset;
+    const std::size_t payload_end = payload_offset + payload_length;
+    const auto bounded = bytes.subspan(0, payload_end);
+    if (!decode_moqint_impl(bounded, offset, draft, message.request_id) ||
+        !decode_moqint_impl(bounded, offset, draft, message.fetch_type)) {
+        return false;
+    }
+    if (message.fetch_type == 0x1) {
+        std::vector<std::string> track_namespace;
+        std::uint64_t track_name_length = 0;
+        std::uint64_t field = 0;
+        if (!decode_track_namespace(bounded, offset, draft, track_namespace) ||
+            !decode_moqint_impl(bounded, offset, draft, track_name_length) ||
+            !fits(offset, track_name_length, payload_end)) {
+            return false;
+        }
+        offset += static_cast<std::size_t>(track_name_length);
+        for (int i = 0; i < 4; ++i) {  // Start and End Location
+            if (!decode_moqint_impl(bounded, offset, draft, field)) return false;
+        }
+    } else if (message.fetch_type == 0x2 || message.fetch_type == 0x3) {
+        if (!decode_moqint_impl(bounded, offset, draft, message.joining_request_id) ||
+            !decode_moqint_impl(bounded, offset, draft, message.joining_start)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    std::uint64_t parameters = 0;
+    if (!decode_moqint_impl(bounded, offset, draft, parameters)) {
+        return false;
+    }
+    std::uint64_t previous_parameter_type = 0;
+    for (std::uint64_t index = 0; index < parameters; ++index) {
+        std::uint64_t parameter_type = 0;
+        if (!decode_parameter_type(bytes, offset, draft, previous_parameter_type, true, parameter_type)) {
+            return false;
+        }
+        if ((parameter_type & 0x1ULL) == 0) {
+            std::uint64_t value = 0;
+            if (!decode_numeric_message_parameter(bounded, offset, draft, parameter_type, value)) {
+                return false;
+            }
+            continue;
+        }
+        std::uint64_t parameter_length = 0;
+        if (!decode_moqint_impl(bounded, offset, draft, parameter_length) ||
+            !fits(offset, parameter_length, payload_end)) {
+            return false;
+        }
+        if (parameter_type == kParamAuthorizationToken) {
+            bool is_register = false;
+            bool uses_alias = false;
+            if (!valid_authorization_token(bytes, offset, offset + static_cast<std::size_t>(parameter_length),
+                                           draft, &is_register, &uses_alias)) {
+                message.malformed_authorization_token = true;
+            } else {
+                message.unknown_authorization_token_alias =
+                    message.unknown_authorization_token_alias || uses_alias;
+                message.authorization_token_cache_overflow =
+                    message.authorization_token_cache_overflow || is_register;
+            }
+        }
+        offset += static_cast<std::size_t>(parameter_length);
+    }
+    return offset == payload_end;
+}
+
+std::vector<std::uint8_t> encode_fetch_ok_message(DraftVersion draft,
+                                                  bool end_of_track,
+                                                  std::size_t end_group_id,
+                                                  std::size_t end_object_id) {
+    constexpr std::uint64_t kFetchOkType = 0x18;
+    std::vector<std::uint8_t> payload;
+    payload.push_back(end_of_track ? 1 : 0);
+    append_location(payload, draft, end_group_id, end_object_id);
+    append_moqint(payload, draft, 0);  // no parameters; Track Properties empty
+
+    std::vector<std::uint8_t> message_bytes;
+    append_moqint(message_bytes, draft, kFetchOkType);
     if (!append_control_length(message_bytes, draft, payload.size())) {
         return {};
     }
