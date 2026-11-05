@@ -72,6 +72,7 @@ struct SmokeServer {
     std::map<std::uint64_t, std::uint64_t> media_stream_reset_errors;
     std::set<std::uint64_t> stop_sending_stream_ids;
     std::set<std::uint64_t> stop_sending_sent_streams;
+    std::set<std::uint64_t> streams_with_data;
     std::vector<std::uint8_t> control_bytes;
     std::size_t publish_response_count = 0;
     bool loop_ready = false;
@@ -188,16 +189,19 @@ int smoke_server_callback(picoquic_cnx_t* cnx,
             if (stream_id != 0 && (stream_id & 0x2) == 0) {
                 server->request_stream_bytes_received += length;
             }
+            if (bytes != nullptr && length != 0) {
+                server->streams_with_data.insert(stream_id);
+                if (server->stop_sending_stream_ids.contains(stream_id) &&
+                    !server->stop_sending_sent_streams.contains(stream_id)) {
+                    server->stop_sending_sent_streams.insert(stream_id);
+                    if (picoquic_stop_sending(cnx, stream_id, 0x01) != 0) {
+                        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+                    }
+                }
+            }
             if ((stream_id & 0x3) == 0x2) {
                 if (bytes != nullptr && length != 0) {
                     server->media_stream_bytes.insert(server->media_stream_bytes.end(), bytes, bytes + length);
-                    if (server->stop_sending_stream_ids.contains(stream_id) &&
-                        !server->stop_sending_sent_streams.contains(stream_id)) {
-                        server->stop_sending_sent_streams.insert(stream_id);
-                        if (picoquic_stop_sending(cnx, stream_id, 0x01) != 0) {
-                            return PICOQUIC_ERROR_UNEXPECTED_ERROR;
-                        }
-                    }
                 }
                 if (event == picoquic_callback_stream_fin) {
                     server->media_stream_fin_received = true;
@@ -828,6 +832,84 @@ int main() {
                          peer_stopped_stream_id) &&
                      delivery_client.peer_stopped_media_stream_count_for_testing() == 0,
                  "expected raw-QUIC acknowledgement to release retained peer-stop state");
+
+    {
+        // A response the session writes to a request stream the peer has
+        // already stopped must not hold back responses on other streams.
+        std::uint64_t stopped_request_stream_id = 0;
+        ok &= expect(delivery_client.open_stream(openmoq::publisher::transport::StreamDirection::kBidirectional,
+                                                 stopped_request_stream_id).ok,
+                     "expected peer-stopped raw-QUIC request stream open to succeed");
+        {
+            std::lock_guard<std::mutex> lock(delivery_server.mutex);
+            delivery_server.stop_sending_stream_ids.insert(stopped_request_stream_id);
+        }
+        ok &= expect(delivery_client.write_stream(stopped_request_stream_id, std::vector<std::uint8_t>{0x03}, false).ok,
+                     "expected the first write on the peer-stopped raw-QUIC request stream to succeed");
+        const auto stop_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!delivery_client.media_stream_peer_stopped(stopped_request_stream_id) &&
+               std::chrono::steady_clock::now() < stop_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ok &= expect(delivery_client.media_stream_peer_stopped(stopped_request_stream_id),
+                     "expected STOP_SENDING on the raw-QUIC request stream");
+        delivery_client.acknowledge_media_stream_peer_stopped(stopped_request_stream_id);
+        ok &= expect(delivery_client.write_stream(stopped_request_stream_id, std::vector<std::uint8_t>{0x07}, false).ok,
+                     "expected a write on the peer-stopped raw-QUIC request stream to be accepted and dropped");
+
+        std::uint64_t next_request_stream_id = 0;
+        ok &= expect(delivery_client.open_stream(openmoq::publisher::transport::StreamDirection::kBidirectional,
+                                                 next_request_stream_id).ok,
+                     "expected the next raw-QUIC request stream open to succeed");
+        ok &= expect(delivery_client.write_stream(next_request_stream_id, std::vector<std::uint8_t>{0x04}, false).ok,
+                     "expected the next raw-QUIC request stream write to succeed");
+        std::unique_lock<std::mutex> lock(delivery_server.mutex);
+        ok &= expect(delivery_server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                         return delivery_server.streams_with_data.contains(next_request_stream_id);
+                     }),
+                     "expected a write behind one to a peer-stopped raw-QUIC request stream to reach the peer");
+    }
+
+    {
+        // Likewise for a write that reaches picoquic after this side reset
+        // the stream.
+        std::uint64_t reset_request_stream_id = 0;
+        ok &= expect(delivery_client.open_stream(openmoq::publisher::transport::StreamDirection::kBidirectional,
+                                                 reset_request_stream_id).ok,
+                     "expected locally reset raw-QUIC request stream open to succeed");
+        ok &= expect(delivery_client.write_stream(reset_request_stream_id, std::vector<std::uint8_t>{0x05}, false).ok,
+                     "expected the first write on the locally reset raw-QUIC request stream to succeed");
+        {
+            std::unique_lock<std::mutex> lock(delivery_server.mutex);
+            ok &= expect(delivery_server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return delivery_server.streams_with_data.contains(reset_request_stream_id);
+                         }),
+                         "expected the first write on the locally reset raw-QUIC request stream to arrive");
+        }
+        ok &= expect(delivery_client.reset_stream(reset_request_stream_id, 0x00).ok,
+                     "expected the raw-QUIC request stream reset to succeed");
+        {
+            std::unique_lock<std::mutex> lock(delivery_server.mutex);
+            ok &= expect(delivery_server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return delivery_server.media_stream_reset_errors.contains(reset_request_stream_id);
+                         }),
+                         "expected the peer to see the raw-QUIC request stream reset");
+        }
+        ok &= expect(delivery_client.write_stream(reset_request_stream_id, std::vector<std::uint8_t>{0x07}, false).ok,
+                     "expected a write on the locally reset raw-QUIC request stream to be accepted and dropped");
+
+        std::uint64_t next_request_stream_id = 0;
+        ok &= expect(delivery_client.open_stream(openmoq::publisher::transport::StreamDirection::kBidirectional,
+                                                 next_request_stream_id).ok,
+                     "expected the raw-QUIC request stream after the reset one to open");
+        ok &= expect(delivery_client.write_stream(next_request_stream_id, std::vector<std::uint8_t>{0x04}, false).ok,
+                     "expected the raw-QUIC request stream write after the reset one to succeed");
+        std::unique_lock<std::mutex> lock(delivery_server.mutex);
+        ok &= expect(delivery_server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                         return delivery_server.streams_with_data.contains(next_request_stream_id);
+                     }),
+                     "expected a write behind one to a locally reset raw-QUIC request stream to reach the peer");
+    }
 
     constexpr std::size_t kPeerStopStressCount = 24;
     std::vector<std::uint64_t> peer_stop_stress_streams;
