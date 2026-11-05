@@ -170,6 +170,18 @@ struct SubscribeMessage {
     bool unknown_authorization_token_alias = false;
 };
 
+// Draft 18 FETCH (section 10.12). Standalone fetches carry the track and range;
+// joining fetches name the subscription they join.
+struct FetchMessage {
+    std::uint64_t request_id = 0;
+    std::uint64_t fetch_type = 0;  // 0x1 standalone, 0x2 relative joining, 0x3 absolute joining
+    std::uint64_t joining_request_id = 0;
+    std::uint64_t joining_start = 0;
+    bool malformed_authorization_token = false;
+    bool authorization_token_cache_overflow = false;
+    bool unknown_authorization_token_alias = false;
+};
+
 // The optional values carried by REQUEST_UPDATE are deliberately distinct
 // from SubscribeMessage defaults: an omitted parameter retains the existing
 // request value.
@@ -341,6 +353,17 @@ bool decode_request_update_message(std::span<const std::uint8_t> bytes,
                                    std::uint64_t discovery_request_type = 0);
 bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
                                      SubscribeUpdateMessage& message);
+// Draft 18 FETCH. Standalone fetches are decoded far enough to frame and
+// validate; only the fields in FetchMessage are kept.
+bool decode_fetch_message(std::span<const std::uint8_t> bytes, DraftVersion draft, FetchMessage& message);
+// Drafts 18 and later: TRACK_STATUS (0xD) has the SUBSCRIBE layout
+// (section 10.14), so it decodes into a SubscribeMessage.
+bool decode_track_status_message(std::span<const std::uint8_t> bytes, DraftVersion draft, SubscribeMessage& message);
+// Draft 18 FETCH_OK with no parameters and no Track Properties.
+std::vector<std::uint8_t> encode_fetch_ok_message(DraftVersion draft,
+                                                  bool end_of_track,
+                                                  std::size_t end_group_id,
+                                                  std::size_t end_object_id);
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
                                                       std::uint64_t request_id,
                                                       std::uint64_t track_alias,
