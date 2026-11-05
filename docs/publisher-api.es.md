@@ -430,48 +430,21 @@ std::cout << "bytes=" << stats.bytes_published
           << " groups=" << stats.groups_published << "\n";
 ```
 
-Campos actuales:
+Campos de `PublisherStats`:
 
-- `publishingLive`: si la sesión activa está en modo live-publish
-- `bytesPublished`: total de bytes de payload publicados en la sesión actual o anterior
-- `objectsPublished`: total de objetos publicados en la sesión actual o anterior
-- `groupsPublished`: total de unidades (track, group) publicadas en la sesión actual o anterior
-- `splitCmafChunks`: modo de packaging actual (`true` = chunks divididos, `false` = chunks fusionados)
-- `includeSap`: si el packaging de tracks/objetos SAP está habilitado
-- `includeMsfTimeline`: si el packaging de tracks/objetos de la timeline de medios MSF está habilitado
-- `transport`, `host`, `port`, `path`: contexto del endpoint para la sesión actual o anterior
-- `connectionId`: último ID de conexión de transporte conocido
-- `lastError`: último error a nivel de publisher, si existe
+- `publishing_live`: si la sesión activa está en modo de publicación en vivo
+- `bytes_published`: total de bytes de payload publicados en la sesión actual/última
+- `objects_published`: total de objetos publicados en la sesión actual/última
+- `groups_published`: total de unidades (track, group) publicadas en la sesión actual/última
+- `split_cmaf_chunks`: modo de empaquetado actual (`true` = chunks divididos, `false` = chunks combinados)
+- `include_sap`: si el empaquetado de track/objeto SAP está habilitado
+- `include_msf_timeline`: si el empaquetado de track/objeto de la línea de tiempo de medios MSF está habilitado
+- `transport`: `TransportKind::kRawQuic` o `TransportKind::kWebTransport`
+- `host`, `port`, `path`: contexto del endpoint de la sesión actual/última
+- `connection_id`: último ID de conexión de transporte conocido
+- `last_error`: último error a nivel de publisher, si lo hay
 
-`stats_json()` sigue disponible para integraciones existentes, pero está deprecado porque una API de polling JSON implica soporte de telemetría en tiempo de ejecución que la API publisher bloqueante no proporciona.
-- `transport`: `"raw_quic"` o `"webtransport"`
-- `host`: host del endpoint configurado
-- `port`: puerto del endpoint configurado
-- `path`: ruta del endpoint configurado
-- `connectionId`: identificador de conexión de transporte, cuando esté disponible
-- `lastError`: último mensaje de error registrado
-
-Ejemplo:
-
-```json
-{
-  "active": true,
-  "connected": true,
-  "publishingLive": false,
-  "bytesPublished": 123456,
-  "objectsPublished": 84,
-  "groupsPublished": 42,
-  "splitCmafChunks": true,
-  "includeSap": false,
-  "includeMsfTimeline": false,
-  "transport": "webtransport",
-  "host": "relay.example.com",
-  "port": 443,
-  "path": "/moq",
-  "connectionId": "wt-140735229359104",
-  "lastError": ""
-}
-```
+`stats_json()` sigue disponible para integraciones existentes, pero está deprecado porque una API de polling JSON implica soporte de telemetría en tiempo de ejecución que la API de publisher bloqueante no ofrece. Devuelve los mismos valores como un único objeto JSON con claves en camelCase (`bytesPublished`, `connectionId`, etc.), con `transport` como `"raw_quic"` o `"webtransport"`, y dos campos adicionales, `active` y `connected`, que describen la sesión. Use `stats()` en código nuevo.
 
 ## 15. Ejemplo completo
 

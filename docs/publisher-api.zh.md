@@ -455,49 +455,21 @@ std::cout << "bytes=" << stats.bytes_published
           << " groups=" << stats.groups_published << "\n";
 ```
 
-当前字段：
+`PublisherStats` 的字段：
 
-- `publishingLive`：活动会话是否为 live-publish 模式
-- `bytesPublished`：当前或上一会话中已发布的 payload 字节总数
-- `objectsPublished`：当前或上一会话中已发布的对象总数
-- `groupsPublished`：当前或上一会话中已发布的 (track, group) 单元总数
-- `splitCmafChunks`：当前 packaging 模式（`true` = 拆分 chunk，`false` = 合并 chunk）
-- `includeSap`：是否启用 SAP track/object packaging
-- `includeMsfTimeline`：是否启用 MSF media timeline track/object packaging
-- `transport`、`host`、`port`、`path`：当前或上一会话的 endpoint 上下文
-- `connectionId`：最后已知的 transport connection ID
-- `lastError`：最后一个 publisher 级错误，如果有
+- `publishing_live`: 活动会话是否处于实时发布模式
+- `bytes_published`: 当前/最近一次会话中已发布的 payload 总字节数
+- `objects_published`: 当前/最近一次会话中已发布的对象总数
+- `groups_published`: 当前/最近一次会话中已发布的 (track, group) 单元总数
+- `split_cmaf_chunks`: 当前打包模式（`true` = 拆分 chunk，`false` = 合并 chunk）
+- `include_sap`: 是否启用 SAP track/对象打包
+- `include_msf_timeline`: 是否启用 MSF 媒体时间线 track/对象打包
+- `transport`: `TransportKind::kRawQuic` 或 `TransportKind::kWebTransport`
+- `host`, `port`, `path`: 当前/最近一次会话的 endpoint 信息
+- `connection_id`: 最近已知的传输连接 ID
+- `last_error`: 最近一次 publisher 级别的错误（如有）
 
-`stats_json()` 仍可用于现有集成，但已弃用，因为 JSON polling API 会暗示存在运行时 telemetry 支持，而阻塞式 publisher API 并不提供这种支持。
-
-- `transport`：`"raw_quic"` 或 `"webtransport"`
-- `host`：配置的 endpoint host
-- `port`：配置的 endpoint port
-- `path`：配置的 endpoint path
-- `connectionId`：transport connection identifier，可用时存在
-- `lastError`：最后跟踪的错误消息
-
-示例：
-
-```json
-{
-  "active": true,
-  "connected": true,
-  "publishingLive": false,
-  "bytesPublished": 123456,
-  "objectsPublished": 84,
-  "groupsPublished": 42,
-  "splitCmafChunks": true,
-  "includeSap": false,
-  "includeMsfTimeline": false,
-  "transport": "webtransport",
-  "host": "relay.example.com",
-  "port": 443,
-  "path": "/moq",
-  "connectionId": "wt-140735229359104",
-  "lastError": ""
-}
-```
+`stats_json()` 仍可用于现有集成，但已弃用，因为 JSON polling API 暗示存在运行时遥测支持，而阻塞式 publisher API 并不提供。它以单个 JSON 对象返回相同的值，键名为 camelCase（`bytesPublished`、`connectionId` 等），`transport` 为 `"raw_quic"` 或 `"webtransport"`，并额外包含描述会话的 `active` 和 `connected` 两个字段。新代码请使用 `stats()`。
 
 ## 15. 完整示例
 

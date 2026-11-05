@@ -426,49 +426,21 @@ std::cout << "bytes=" << stats.bytes_published
           << " groups=" << stats.groups_published << "\n";
 ```
 
-現在のフィールド:
+`PublisherStats` のフィールド:
 
-- `publishingLive`: アクティブなセッションが live-publish モードかどうか
-- `bytesPublished`: 現在または直近のセッションで公開された payload バイトの合計
-- `objectsPublished`: 現在または直近のセッションで公開されたオブジェクトの合計
-- `groupsPublished`: 現在または直近のセッションで公開された (track, group) 単位の合計
-- `splitCmafChunks`: 現在の packaging モード (`true` = chunk を分割、`false` = chunk を結合)
-- `includeSap`: SAP track/object packaging が有効かどうか
-- `includeMsfTimeline`: MSF media timeline track/object packaging が有効かどうか
-- `transport`, `host`, `port`, `path`: 現在または直近のセッションの endpoint コンテキスト
-- `connectionId`: 最後に確認された transport connection ID
-- `lastError`: publisher レベルの最後のエラーがあればその内容
+- `publishing_live`: アクティブなセッションがライブ公開モードかどうか
+- `bytes_published`: 現在または直近のセッションで公開されたペイロードの合計バイト数
+- `objects_published`: 現在または直近のセッションで公開されたオブジェクトの合計数
+- `groups_published`: 現在または直近のセッションで公開された (track, group) 単位の合計数
+- `split_cmaf_chunks`: 現在のパッケージングモード (`true` = 分割チャンク、`false` = 結合チャンク)
+- `include_sap`: SAP の track/オブジェクトのパッケージングが有効かどうか
+- `include_msf_timeline`: MSF メディアタイムラインの track/オブジェクトのパッケージングが有効かどうか
+- `transport`: `TransportKind::kRawQuic` または `TransportKind::kWebTransport`
+- `host`, `port`, `path`: 現在または直近のセッションのエンドポイント情報
+- `connection_id`: 最後に判明したトランスポート接続 ID
+- `last_error`: publisher レベルの最後のエラー (ある場合)
 
-`stats_json()` は既存の統合向けに引き続き利用できますが、非推奨です。JSON polling API は、ブロッキングな publisher API が提供しない実行時 telemetry のサポートを示唆してしまうためです。
-
-- `transport`: `"raw_quic"` または `"webtransport"`
-- `host`: 設定済み endpoint host
-- `port`: 設定済み endpoint port
-- `path`: 設定済み endpoint path
-- `connectionId`: transport connection identifier。利用可能な場合
-- `lastError`: 最後に追跡されたエラーメッセージ
-
-例:
-
-```json
-{
-  "active": true,
-  "connected": true,
-  "publishingLive": false,
-  "bytesPublished": 123456,
-  "objectsPublished": 84,
-  "groupsPublished": 42,
-  "splitCmafChunks": true,
-  "includeSap": false,
-  "includeMsfTimeline": false,
-  "transport": "webtransport",
-  "host": "relay.example.com",
-  "port": 443,
-  "path": "/moq",
-  "connectionId": "wt-140735229359104",
-  "lastError": ""
-}
-```
+`stats_json()` は既存の統合向けに引き続き利用できますが、JSON ポーリング API は、ブロッキング型の publisher API が提供しない実行時テレメトリのサポートを想起させるため、非推奨です。同じ値を camelCase のキー (`bytesPublished`、`connectionId` など) を持つ 1 つの JSON オブジェクトとして返し、`transport` は `"raw_quic"` または `"webtransport"` になり、セッションを表す `active` と `connected` の 2 つのフィールドが追加されます。新しいコードでは `stats()` を使用してください。
 
 ## 15. 完全な例
 

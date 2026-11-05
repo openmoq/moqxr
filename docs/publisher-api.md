@@ -598,50 +598,21 @@ std::cout << "bytes=" << stats.bytes_published
           << " groups=" << stats.groups_published << "\n";
 ```
 
-Current fields:
+Fields of `PublisherStats`:
 
-- `publishingLive`: whether the active session is live-publish mode
-- `bytesPublished`: total payload bytes published in the current/last session
-- `objectsPublished`: total objects published in the current/last session
-- `groupsPublished`: total (track, group) units published in the current/last session
-- `splitCmafChunks`: current packaging mode (`true` = split chunks, `false` = coalesced chunks)
-- `includeSap`: whether SAP track/object packaging is enabled
-- `includeMsfTimeline`: whether MSF media timeline track/object packaging is enabled
-- `transport`, `host`, `port`, `path`: endpoint context for the current/last session
-- `connectionId`: last known transport connection ID
-- `lastError`: last publisher-level error, if any
+- `publishing_live`: whether the active session is in live-publish mode
+- `bytes_published`: total payload bytes published in the current/last session
+- `objects_published`: total objects published in the current/last session
+- `groups_published`: total (track, group) units published in the current/last session
+- `split_cmaf_chunks`: current packaging mode (`true` = split chunks, `false` = coalesced chunks)
+- `include_sap`: whether SAP track/object packaging is enabled
+- `include_msf_timeline`: whether MSF media timeline track/object packaging is enabled
+- `transport`: `TransportKind::kRawQuic` or `TransportKind::kWebTransport`
+- `host`, `port`, `path`: endpoint context for the current/last session
+- `connection_id`: last known transport connection ID
+- `last_error`: last publisher-level error, if any
 
-`stats_json()` remains available for existing integrations, but it is deprecated
-because a JSON polling API implies runtime telemetry support that the blocking
-publisher API does not provide.
-- `transport`: `"raw_quic"` or `"webtransport"`
-- `host`: configured endpoint host
-- `port`: configured endpoint port
-- `path`: configured endpoint path
-- `connectionId`: transport connection identifier (when available)
-- `lastError`: last tracked error message
-
-Example:
-
-```json
-{
-  "active": true,
-  "connected": true,
-  "publishingLive": false,
-  "bytesPublished": 123456,
-  "objectsPublished": 84,
-  "groupsPublished": 42,
-  "splitCmafChunks": true,
-  "includeSap": false,
-  "includeMsfTimeline": false,
-  "transport": "webtransport",
-  "host": "relay.example.com",
-  "port": 443,
-  "path": "/moq",
-  "connectionId": "wt-140735229359104",
-  "lastError": ""
-}
-```
+`stats_json()` remains available for existing integrations, but it is deprecated because a JSON polling API implies runtime telemetry support that the blocking publisher API does not provide. It returns the same values as one JSON object with camelCase keys (`bytesPublished`, `connectionId`, and so on), `transport` as `"raw_quic"` or `"webtransport"`, and two extra fields, `active` and `connected`, that describe the session. Use `stats()` in new code.
 
 ## 15. Complete Example
 
