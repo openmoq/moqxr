@@ -39,7 +39,7 @@ Cree un `PublisherConfig` una sola vez y páselo a `Publisher`.
 #include "openmoq/publisher/publisher_api.h"
 
 openmoq::publisher::PublisherConfig config;
-config.draft_version = openmoq::publisher::DraftVersion::kDraft14;
+config.draft_version = openmoq::publisher::DraftVersion::kDraft22;
 config.track_namespace = "media";
 config.forward = false;
 config.publish_catalog = false;
@@ -49,9 +49,22 @@ config.split_cmaf_chunks = true;
 config.paced = false;
 config.loop = false;
 config.subscriber_timeout = std::chrono::seconds(30);
+config.await_subscriber_indefinitely = false;
 
 openmoq::publisher::Publisher publisher(config);
 ```
+
+`DraftVersion::kDraft22` es el valor predeterminado. La CLI acepta los drafts 16, 18, 21, 22 y 23; el enum conserva además `kDraft14` y `kDraft17` para la API y el ejemplo MSFTS.
+
+Otros campos de `PublisherConfig`, todos desactivados o vacíos de forma predeterminada:
+
+- `preannounce_tracks`: envía un `PUBLISH` por cada track justo después de `PUBLISH_NAMESPACE`, antes de que exista cualquier subscriber (CLI: `--preannounce-tracks`).
+- `moq_impl_id`: envía la opción de Setup `MOQT_IMPLEMENTATION` (`openmoq-publisher/<version>`) (CLI: `--moq-impl-id`).
+- `vod`: marca el catalog como VOD en lugar de en vivo (CLI: `--vod`). VOD nunca se infiere de la entrada.
+- `catalog_republish_interval`: vuelve a publicar el catalog con esta frecuencia para que no desaparezca de la caché de un relay; cero lo desactiva (CLI: `--catalog-republish-interval`).
+- `drm_systems`: una lista de entradas `DrmSystemConfig` que proporcionan campos de despliegue (`la_url`, `cert_url`, `robustness`) para los sistemas DRM encontrados en los medios (CLI: `--drm-config`).
+- `video_alt_group`: asigna este `altGroup` a todos los tracks de video de la entrada stdin en vivo (CLI: `--video-alt-group`).
+- `libmoq_backend`: stack QUIC para la ruta de publicación libmoq (`kAuto`, `kPicoquic`, `kMvfst`, `kMsquic`) (CLI: `--libmoq-backend`).
 
 ### Packaging LOC opcional
 
@@ -193,6 +206,8 @@ endpoint.path = "/moq";
 endpoint.path_explicit = true;
 ```
 
+Asigne `endpoint.webtransport_allow_missing_reset_stream_at = true` para enviar el CONNECT de WebTransport incluso cuando el servidor omite el parámetro de transporte `reset_stream_at` (CLI: `--webtransport-allow-missing-reset-stream-at`; consulte [cumplimiento de WebTransport](webtransport-compliance.md)).
+
 Controles TLS opcionales:
 
 ```cpp
@@ -226,6 +241,8 @@ Helpers de conveniencia:
 - `publish_file(path, endpoint, tls)`
 - `publish_stream(input, source_name, endpoint, tls)`
 
+Para terminar limpiamente una transmisión en vivo, llame a `end_broadcast(EndBroadcastMode::kConvertToVod)` (el catalog final marca todos los tracks como no en vivo y agrega `trackDuration` cuando se conoce) o a `end_broadcast(EndBroadcastMode::kTerminate)` (el catalog final establece `isComplete` en true con un array `tracks` vacío); a continuación se envía `PUBLISH_DONE` con estado `Track Ended` para las solicitudes que la sesión aún sigue (sección 11.3 de MSF). Devuelve un estado de fallo cuando no hay ninguna sesión activa, y escribe el catalog final solo para una sesión conducida mediante `publish_live()`.
+
 ## 9. Publicación de entrada en vivo (stdin/stream incremental)
 
 La ruta en vivo predeterminada espera MP4 fragmentado, lo que coincide con los pipelines de ffmpeg/CMAF:
@@ -243,6 +260,14 @@ if (!status.ok) {
 ```
 
 `publish_live(...)` usa análisis incremental y un flujo de publicación en vivo en lugar de almacenar en búfer hasta EOF.
+
+Un publisher en vivo numera sus Group IDs desde 0, así que un proceso reiniciado que publica de nuevo los mismos tracks reutiliza Group IDs de su ejecución anterior. La sección 2.5 de MoqTransport sugiere iniciar un track reanudado por encima de todos los groups usados antes, por ejemplo a partir de la hora actual. Asigne `PublisherConfig::initial_group_id` para hacerlo:
+
+```cpp
+config.initial_group_id = openmoq::publisher::time_based_initial_group_id();
+```
+
+`time_based_initial_group_id()` devuelve milisegundos desde la época Unix. Mantiene los nuevos Group IDs por encima de los de la ejecución anterior si esta publicó menos groups que los milisegundos transcurridos entre su inicio y el reinicio, y el reloj del sistema no retrocedió. `publish_live(...)` numera los groups de medios en vivo y los groups del catalog a partir de este valor en todos los drafts; en los drafts 22 y 23, una migración por GOAWAY sigue reanudando por encima de los groups que envió la sesión anterior. Para reintentar de la misma forma una publicación en vivo fallida, pase un único `LiveResumeState` a cada intento de `publish_live(ingest, stdin_input, endpoint, tls, endpoint_alpn_overridden, &resume)` sobre la misma entrada: un fallo reintentable registra en él los bytes de stdin no enviados y los siguientes Group IDs de medios y de catalog, el siguiente intento se reanuda desde ellos, y una publicación exitosa lo limpia. La CLI hace esto para `--retry` y el failover de endpoint. El valor predeterminado es 0. Un valor por encima de `kMaxGroupId` (2^62-1) hace que el constructor de `Publisher` y `set_config` lancen una excepción. `publish_live_objects(...)` envía los Group IDs que proporciona su fuente (`LiveDashIngestConfig::initial_group_id` los establece para la ingesta DASH), y el backend libmoq rechaza un valor distinto de cero porque numera los Group IDs por sí mismo.
 
 ## 10. Publicación en vivo de objetos arbitrarios
 
@@ -314,9 +339,11 @@ Este modo requiere exactamente un track llamado `catalog`, al menos un track que
 
 **Control por demanda (relays lazy).** Cuando se selecciona el backend libmoq, la ruta de publicación espera al menos un subscriber de medios downstream antes de producir medios: un relay lazy reenvía un SUBSCRIBE solo cuando un reproductor se suscribe. Hasta entonces no se escribe nada (batch/objects/stdin no consumen su fuente; SRT en vivo descarta fragmentos para mantenerse acotado). Si no aparece ningún subscriber dentro de `PublisherConfig::subscriber_timeout`, la llamada falla con `timed out waiting for media subscriber` en lugar de quedarse colgada.
 
+**Espera de subscriber (backend `MoqtSession`).** De forma predeterminada, `publish_live_objects` espera a su primer subscriber de medios sin leer su fuente. La espera termina tras `PublisherConfig::subscriber_timeout`, y la llamada devuelve éxito, a menos que se establezca `PublisherConfig::await_subscriber_indefinitely`. Con ese ajuste, solo `disconnect()` o el fin de la sesión terminan la espera, y mientras tanto el publisher lee la fuente: descarta los Objects de medios y conserva el catalog más reciente para el primer subscriber, de modo que la fuente nunca queda retenida. El backend libmoq rechaza el ajuste, y las sobrecargas de `publish_live` (stdin, SRT) lo ignoran. El publisher no regula el ritmo de los Objects que descarta, así que una fuente de archivo con pacing puede llegar a su fin antes de que llegue el primer subscriber. `subscriber_timeout` también limita cada lectura del request stream, por lo que una espera ilimitada ya no necesita un timeout enorme. El plazo se aplica solo antes del primer subscriber: cuando se va el último subscriber (UNSUBSCRIBE en el draft 16, un request stream cancelado en el draft 18), el publisher finaliza esa suscripción, reinicia (reset) sus streams de subgroup abiertos con CANCELLED, sigue leyendo y descartando los Objects de la fuente, responde a un SUBSCRIBE posterior y retorna cuando termina la fuente.
+
 Si el peer detiene un stream (STOP_SENDING) o el publicador lo ha reiniciado (reset), el transporte descarta cualquier escritura aún en cola para ese stream en lugar de reintentarla, de modo que las respuestas de control en otros streams no queden retenidas detrás de ella. El peer ve el stream terminado en ambos casos.
 
-Llamar a `disconnect()` desde otro thread detiene rápidamente una publicación `publish_live_objects` en ejecución (o de stdin/SRT en vivo); el bucle del driver se interrumpe, el endpoint se interrumpe y la llamada devuelve éxito. En el caso de stdin, la cancelación se observa una vez que retorna la lectura bloqueante actual.
+Llamar a `disconnect()` desde otro thread detiene rápidamente una publicación en ejecución (batch, `publish_live_objects` o stdin/SRT en vivo); el bucle del driver se interrumpe, la conexión se cierra y la llamada devuelve éxito. Una publicación detenida no se reintenta y no sigue una migración por GOAWAY. El stdin real se consulta mediante polling en POSIX, por lo que una entrada inactiva no retrasa la detención; cualquier otro `std::istream` se observa una vez que retorna su lectura bloqueante actual.
 
 > **Nota heredada:** las entradas `LiveTrack{.track_name = ...}` simples sin metadatos
 > multimedia (un track de objetos genérico de tipo "events") se rechazan en la ruta normal
@@ -334,9 +361,12 @@ De forma predeterminada, la API aplica el ALPN adecuado para el transporte:
 - Raw QUIC + draft-16: `moqt-16`
 - Raw QUIC + draft-17: `moqt-17`
 - Raw QUIC + draft-18: `moqt-18`
+- Raw QUIC + draft-21: `moqt-21`
+- Raw QUIC + draft-22: `moqt-22`
+- Raw QUIC + draft-23: `moqt-23`
 - WebTransport: `h3`
 
-Para WebTransport, la API envía la oferta del protocolo de aplicación MoQ separada del ALPN de QUIC mediante `WT-Available-Protocols`: draft-16 ofrece `"moqt-16"`, draft-17 ofrece `"moqt-17"`, draft-18 ofrece `"moqt-18"`, y draft-14 mantiene el comportamiento heredado sin subprotocolo. Las comillas forman parte de la sintaxis HTTP Structured Fields; el ALPN de Raw QUIC conserva el token sin comillas.
+Para WebTransport, la API envía la oferta del protocolo de aplicación MoQ separada del ALPN de QUIC mediante `WT-Available-Protocols`: draft-16 ofrece `"moqt-16"`, draft-17 ofrece `"moqt-17"`, draft-18 ofrece `"moqt-18"`, los drafts 21, 22 y 23 ofrecen `"moqt-21"`, `"moqt-22"` y `"moqt-23"`, y draft-14 mantiene el comportamiento heredado sin subprotocolo. Las comillas forman parte de la sintaxis HTTP Structured Fields; el ALPN de Raw QUIC conserva el token sin comillas.
 
 Si su aplicación ya configuró el ALPN del endpoint y quiere conservarlo:
 
@@ -358,6 +388,7 @@ Todas las llamadas de publicación de la API devuelven `TransportStatus`:
 
 - `status.ok == true`: éxito
 - `status.ok == false`: fallo; inspeccione `status.message`
+- `status.failure_kind` clasifica un fallo como `kRetryable`, `kEndpointPermanent`, `kFatal` o `kCancelled`; una migración por GOAWAY también establece `status.migration_uri` y `status.migration_timeout_ms`
 
 Patrón recomendado:
 
@@ -454,7 +485,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.subscriber_timeout = std::chrono::seconds(30);
@@ -576,7 +607,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.paced = true;

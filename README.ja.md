@@ -17,8 +17,9 @@
 - picoquic と picotls が利用可能な場合、Raw QUIC または WebTransport で公開します。
 - stdin からの live fragmented MP4、libsrt が利用可能な場合の SRT 経由 MPEG-TS、HTTP/1.1 CTE LL-DASH ingest（chunked または固定長 request）経由の CMAF を受け付けます。
 - `--url` で MSF URL を解析し、`--print-msf-urls` で catalog discovery URL を表示します。
+- 繰り返し指定する `--endpoint` による順序付き relay failover と、`--retry` による同一 endpoint での再試行回数の設定をサポートします。
 - FFmpeg 生成ライブメディア、CAT4MOQ 認可、MPEG-2 TS/M2TS パッケージング用の C++ Publisher API example を提供します。
-- draft 16、18、22 では、C11 Media-over-QUIC library [moq5](https://github.com/openmoq/moq5) 経由の公開を選択できます。
+- draft 16、18、22 では、C11 Media-over-QUIC library [moq5](https://github.com/openmoq/moq5) 経由の公開を任意で選択できます。moq5 が実装していない draft 21 と 23 は、moq5 build でも native backend で公開します。
 
 ## クイックスタート
 
@@ -52,6 +53,26 @@ catalog とパッケージ化された media object を出力:
 ./build/openmoq-publisher --input sample.mp4 --emit-dir out/
 ```
 
+CMAF が引き続きデフォルトです。デフォルト backend で file、live stdin、SRT、CTE LL-DASH の公開に
+[LOCMAF-01](docs/draft-einarsson-moq-locmaf-01.txt)（packaging version `0.3`）をオプトインするには、`--packaging locmaf` を追加します。
+publisher は CMAF の初期化データとエンコード済み sample バイトを保持し、catalog で LOCMAF を通知し、完全な header を出力するため、
+途中参加や queue drop が先行する delta object に依存しません。file 入力は元の CMAF chunk を、暗号化 box や補助 box を含めて保持します。
+source の制約により、track 全体を CMAF のままにすることもあります。live track が対象外になった場合は、通知済みの packaging を変更せずに失敗します。
+`--stream-per-object`、`--coalesce-cmaf-chunks`、libmoq publishing backend は、現在 LOCMAF と併用できません。
+多重化された fragment は先に demux する必要があります（FFmpeg では `separate_moof` を使用）。
+
+`--emit-dir` は、通常の catalog と初期化 segment とともに、LOCMAF media を `.locmafobj` として書き出します。
+LOCMAF 対応の moq-playa checkout に対する再生の同等性チェックを行うには、
+`bun scripts/test-locmaf-playa.mjs build/openmoq-publisher ../moq-playa`
+を実行します（FFmpeg と ffprobe が必要）。
+[LOCMAF quickstart](docs/quickstart.md#opt-in-to-locmaf)、
+[C++ API 設定](docs/publisher-api.md#optional-locmaf-packaging)、
+[検証範囲](docs/testing.md#locmaf-tests) を参照してください。
+
+LOC-04 の公開は、native backend 上で `--packaging loc --draft 18`（または `--draft 21` / `--draft 22` / `--draft 23`）により利用できます。
+タイムスタンプ、timescale、codec 設定の各 property を付けて H.264/AAC のフレームを個別に送信します。CMAF が引き続きデフォルトです。
+範囲と制約については [LOC quickstart](docs/quickstart.md#opt-in-to-loc) を参照してください。
+
 デフォルトの draft-22 profile で relay へ公開:
 
 ```bash
@@ -61,11 +82,23 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --namespace media \
   --draft 22 \
   --forward 0 \
-  --timeout 10 \
+  --timeout 30 \
   --paced
 ```
 
-`--forward 1` は object を直ちに送信します。`--forward 0` は relay が subscriber interest を転送するまで待機します。表示される `connection_id=` は transport と MOQT の setup のみを確認するもので、namespace の受理や downstream subscription は確認しません。
+file 入力では、`--forward 0` は namespace を announce し、catalog と media track に対する inbound の
+`SUBSCRIBE` request を待ちます。catalog は `--publish-catalog` なしでも利用できます。このオプションは catalog の `PUBLISH` を
+先行して送信し、relay がそれを受け入れることを必要とします。`--forward 1` は catalog と media track の両方を先行して publish し、
+relay が forwarding を許可している場合に object を送信します。
+relay が `PUBLISH is not supported` を返す場合は、`--publish-catalog` なしで `--forward 0` を使用してください。
+[公開モードとトラブルシューティング](docs/relay-interop.md#choose-a-file-publishing-mode) を参照してください。
+
+表示される `connection_id=` は transport と MOQT の setup のみを確認するもので、namespace の受理や downstream subscription は確認しません。
+
+endpoint を優先順に追加し、`--retry N` を使うと、現在の endpoint を `N` 回再試行してから次に進みます。たとえば
+`--endpoint primary:4433 --endpoint backup:4433 --retry 2` では、primary に最大 3 回、
+その後 backup に最大 3 回接続を試みます。失敗時の処理と live source の詳細については、
+[CLI quick start](docs/quickstart.md#endpoint-failover-and-retries) を参照してください。
 
 Windows では、`./build/openmoq-publisher` を `build\Release\openmoq-publisher.exe` または選択した build configuration のパスに置き換えてください。
 
@@ -78,6 +111,53 @@ CLI では一度に 1 つの live source を使用します。
 | Fragmented MP4 | `--live-source stdin --input -` | 標準入力の CMAF/fMP4 | 対応するすべての platform で利用可能 |
 | SRT | `--live-source srt --srt-config FILE` | SRT 経由 MPEG-TS | libsrt が必要。この経路では CENC metadata を利用不可 |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | CMAF `POST` または `PUT` request（chunked または `Content-Length` 付き） | listener は現在 Unix 系 platform が必要 |
+
+### Fragmented MP4 ingest
+
+publisher は標準入力から fragmented MP4 を読み取ります。入力には `ftyp` + `moov` + `moof`/`mdat` fragment が含まれている必要があり、publisher は MSF/CMSF catalog と media object を出力します。
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+ -i fragmented.mp4 \
+ -map 0:v:0 -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --transport webtransport \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --draft 16 \
+ --publish-catalog \
+ --live-source stdin \
+ --input -
+```
+
+#### 複数の video rendition
+
+入力内のすべての track が公開され、`trak` の順序で命名されます（`vide_1`、`vide_2`、`soun_3`、...）。video track が 1 つの映像の rendition である場合、`--video-alt-group <N>` を指定すると、それぞれが MSF alternate group `N` に入り（catalog では `"altGroup":N`、MSF section 5.2.12）、subscriber はいずれか 1 つを選べばよいことが分かります。audio track はグループ化されず、video track が 1 つだけの入力には `altGroup` が付きません。このオプションがない場合、publisher は rendition と、たとえば 2 つのカメラアングルとを区別できないため、catalog に `altGroup` は付きません。
+
+MSF では alternate group の track が時間的に揃っている必要があるため、同じ frame rate と keyframe interval で、scene-cut keyframe なしでエンコードしてください。
+
+```bash
+ffmpeg -hide_banner -re -i input.mp4 \
+ -filter_complex "[0:v]split=2[high][low_in];[low_in]scale=-2:360[low]" \
+ -map "[high]" -map "[low]" -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -b:v:0 3000k -b:v:1 800k \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --publish-catalog \
+ --input - \
+ --video-alt-group 1
+```
+
+このオプションは native backend での live stdin 公開に適用されます。file、SRT、LL-DASH 入力では拒否されます。LL-DASH ingest は、video track が 2 つ以上ある場合、すでに video track に `altGroup` 1 を設定しています。moq5 backend は独自に catalog を構築するため、このオプションを拒否します。
 
 ### SRT ingest
 
@@ -119,7 +199,7 @@ ffmpeg -hide_banner -stream_loop -1 -re \
   -i input.mp4 \
   -map 0:v:0 -map 0:a:0 \
   -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
-  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -c:a aac -b:a 128k -ar 48000 -ac 2 \
   -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
 ```
 
@@ -131,13 +211,13 @@ ffmpeg -hide_banner -stream_loop -1 -re \
   --srt-config /tmp/srt_callers.json \
   --endpoint 127.0.0.1:4443 \
   --transport raw \
-  --namespace live \
+  --namespace live/srt \
   --draft 16 \
   --timeout 120 \
   --forward 0
 ```
 
-対応する SRT mode は `caller` のみです。設定した host と port は既存の SRT listener を指す必要があります。relay への即時 smoke test には `--forward 1`、subscriber interest を待つ場合は `--forward 0` を使用します。
+`srt.mode` を `caller` にすると既存の SRT listener に接続し、`listener` にすると設定した host と port を bind して受信する SRT source を受け付けます。listener mode は設定エントリごとに 1 つの接続を受け付け、同じ MPEG-TS ingest pipeline を使用します。relay への即時 smoke test には `--forward 1`、subscriber interest を待つ場合は `--forward 0` を使用します。
 
 ### CTE LL-DASH ingest
 
@@ -150,7 +230,7 @@ HTTP/1.1 chunked CMAF listener と MoQ relay target を指定して publisher �
   --dash-path /ingest \
   --endpoint https://127.0.0.1:4433/moq \
   --transport webtransport \
-  --namespace live \
+  --namespace live/dash \
   --draft 18 \
   --publish-catalog \
   --forward 1 \
@@ -201,6 +281,19 @@ ffmpeg -re \
 
 詳細は [CLI quick start](docs/quickstart.md)、[FFmpeg recipe](docs/ffmpeg.md)、[SRT technical note](docs/srt-ingest-technical-note.md) を参照してください。
 
+### live publisher の再起動
+
+各 live publisher プロセスは Group ID を 0 から採番します。プロセスが再起動して同じ namespace と track 名を再び公開すると、新しい group は前回の実行がすでに公開した Group ID を再利用するため、2 つの異なる object が 1 つの Location を共有してしまいます。MoqTransport section 2.5 は、再開する publisher が、以前に使用したすべての group より大きい値（たとえば現在時刻に基づく値）を初期 Group ID に設定することを提案しています。これを行うには `--initial-group-id` を使用します。
+
+```bash
+./build/openmoq-publisher --input - --initial-group-id time ...
+```
+
+- `--initial-group-id time` は起動時にシステム時計を 1 回読み取り、Unix epoch からのミリ秒数から開始します。前回の実行が、その開始から再起動までに経過したミリ秒数より少ない group しか公開しておらず、かつその間にシステム時計が巻き戻っていなければ、これで安全です。
+- `--initial-group-id N` は符号なし整数 `N` から開始します。`N` は 2^62-1 を超えてはいけません。
+- デフォルトは 0 です。このオプションは、すべての draft で live source（stdin、SRT、CTE LL-DASH）の media track と catalog に適用され、file 入力では拒否されます。draft 22 と 23 では、GOAWAY による移行は引き続き前の session が送信した group より上から再開します。moq5 publishing backend は Group ID を自身で採番し、0 以外の値を拒否します。
+- 値はプロセスごとに固定されます。stdin と SRT 入力では、同一プロセス内の `--retry` や endpoint failover による再接続は、失敗した session が送信した Group ID より上から続行し、最初からやり直しません。stdin 入力は init segment から再開します。moq5 publishing backend はこれに関与しません。resume state を無視するため、そこでの retry は Group 0 から再開し、stdin 入力は再生できません。
+
 ## moq5 による公開
 
 任意の [moq5](https://github.com/openmoq/moq5) backend は、batch、live stdin、live SRT、live object の公開を moq5 service tier 経由で処理します。service tier は catalog publication、CMSF/CMAF validation、subscriber demand gating、bounded backpressure、graceful transport drain を担当します。
@@ -216,7 +309,16 @@ ctest --test-dir build-libmoq --output-on-failure
 
 デフォルト build は組み込み transport path を維持します。backend の状態、dependency discovery、設定の詳細は [docs/build.md](docs/build.md) を参照してください。
 
+この backend での CAT4MoQ には、moq5 の `MOQ_SERVICE_AUTH_API_VERSION >= 1` が必要です。
+連携した変更をテストする間は、対応する `feature/cat4moq` checkout とともに
+`-DOPENMOQ_LIBMOQ_SOURCE_DIR=../moq5` を使用してください。それより古い moq5
+依存関係では、設定された credential が接続前に拒否されます。backend の制限と互換 profile については
+[auth 設計](docs/cat4moq-design.md) を参照してください。
+
 ## サンプル
+
+example は `cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON` で明示的に有効にし、
+`cmake --build build` でビルドします。
 
 | サンプル | Target | 目的 |
 | --- | --- | --- |
@@ -225,6 +327,10 @@ ctest --test-dir build-libmoq --output-on-failure
 | MSFTS publisher | `openmoq-publisher-msfts-example` | packet-aligned MPEG-2 TS または M2TS object を `Publisher::publish_live_objects(...)` で公開 |
 
 MSFTS example は `examples/msfts-publisher/docs/` の local text draft に従い、PAT/PMT data を検出して 1 つの program を選択し、無関係な PID を除外して、`packaging: "m2ts"` の MSF version 1 catalog を出力します。
+
+この example は、先頭 4096 個の source packet 内で単一 packet の PAT/PMT section を検出します。
+PCR に基づくタイミングではなく固定 10 ms の object pacing を使い、1 つの group を公開し、
+`m2tsRandomAccess: false` を宣言します。random-access 境界の識別や program の変更の追跡は行いません。
 
 ```bash
 ./build/examples/msfts-publisher/openmoq-publisher-msfts-example \
@@ -250,6 +356,7 @@ program を選択するには `--program NUMBER`、object size を変更する�
 | Relay interoperability | [docs/relay-interop.md](docs/relay-interop.md) |
 | C++ Publisher API | [docs/publisher-api.md](docs/publisher-api.md) |
 | CAT4MOQ auth example | [examples/auth/README.md](examples/auth/README.md) |
+| CAT4MoQ profile と実装状況 | [docs/cat4moq-design.md](docs/cat4moq-design.md), [docs/cat4moq-plan.md](docs/cat4moq-plan.md) |
 | MSFTS text draft | [examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt](examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt) |
 | Protocol mapping | [docs/protocol-mapping.md](docs/protocol-mapping.md) |
 | WebTransport compliance | [docs/webtransport-compliance.md](docs/webtransport-compliance.md) |
@@ -272,6 +379,10 @@ program を選択するには `--program NUMBER`、object size を変更する�
 
 ## 現在の状態
 
-メインの `openmoq-publisher` CLI は draft 16、18、21、22、23 を受け付けます。draft 22 がデフォルトです。client は選択した draft の ALPN だけを提示します。draft 18 は後続の draft の基盤となる request-stream profile を提供し、draft 21 はそれを拡張し（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）、draft 22 は明示的な LOCATION_FILTER type を追加し、draft 23 は varint の control message Length、FORWARD に代わる PAUSED、REQUEST_ERROR の Error Details、固有の session 終了 code を使います。詳細は [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md) を参照してください。draft 21 と 23 は native backend で公開します。moq5 build では draft 16、18、22 は moq5 経由で公開し、その他の draft は引き続き native backend で公開します。moq5 経由の draft 22 は、閉じたポートに対する確認と unit test でのみ検証しており、draft 22 の relay に対しては実行していません。draft 14、17、19、20 の text は実装履歴と protocol review 用に `docs/` に残されていますが、メイン CLI では選択できません。独立した MSFTS example は draft-specific test 用に draft 14/16/17/18 の選択を維持し、draft 21、22、23 も受け付けます。
+メインの `openmoq-publisher` CLI は draft 16、18、21、22、23 を受け付けます。draft 22 がデフォルトです。draft 18 は新しい request-stream profile を提供し、draft 21 はそれを拡張します（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）。draft 22 は、draft 21 の publishing semantics を維持しつつ、明示的な LOCATION_FILTER type を追加します。draft 23 はそれらの semantics を維持したまま、varint の control message Length、FORWARD に代わる PAUSED、REQUEST_ERROR の Error Details、重複する namespace subscription、固有の session 終了 code を使います。詳細は [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md) を参照してください。draft 21 と 23 は native backend で公開します。moq5 build では draft 16、18、22 は moq5 経由で公開し、その他の draft は引き続き native backend で公開します。moq5 経由の draft 22 は、閉じたポートに対する確認と unit test でのみ検証しており、draft 22 の relay に対しては実行していません。draft 14、17、19、20 の text は実装履歴と protocol review 用に `docs/` に残されていますが、メイン CLI では選択できません。独立した MSFTS example は draft-specific test 用に draft 14/16/17/18 の選択を維持し、draft 21、22、23 も受け付けます。
 
 デフォルトの picoquic backend と任意の moq5 backend は、どちらも継続的に interoperability test が行われています。詳細な機能範囲、制限、roadmap については [docs/status.md](docs/status.md) と [docs/protocol-mapping.md](docs/protocol-mapping.md) を参照してください。
+
+## 帰属
+
+[Paul Gregoire](https://github.com/mondain) が OpenMOQ のために最初に作成しました

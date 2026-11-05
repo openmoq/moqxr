@@ -39,7 +39,7 @@ Create a `PublisherConfig` once and pass it to `Publisher`.
 #include "openmoq/publisher/publisher_api.h"
 
 openmoq::publisher::PublisherConfig config;
-config.draft_version = openmoq::publisher::DraftVersion::kDraft14;
+config.draft_version = openmoq::publisher::DraftVersion::kDraft22;
 config.track_namespace = "media";
 config.forward = false;
 config.publish_catalog = false;
@@ -53,6 +53,28 @@ config.await_subscriber_indefinitely = false;
 
 openmoq::publisher::Publisher publisher(config);
 ```
+
+`DraftVersion::kDraft22` is the default. The CLI accepts drafts 16, 18, 21, 22,
+and 23; the enum also keeps `kDraft14` and `kDraft17` for the API and the
+MSFTS example.
+
+Other `PublisherConfig` fields, all off or empty by default:
+
+- `preannounce_tracks`: send a `PUBLISH` for each track right after
+  `PUBLISH_NAMESPACE`, before any subscriber exists (CLI: `--preannounce-tracks`).
+- `moq_impl_id`: send the `MOQT_IMPLEMENTATION` Setup Option
+  (`openmoq-publisher/<version>`) (CLI: `--moq-impl-id`).
+- `vod`: mark the catalog as VOD rather than live (CLI: `--vod`). VOD is never
+  inferred from the input.
+- `catalog_republish_interval`: republish the catalog this often so it does not
+  fall out of a relay cache; zero disables it (CLI: `--catalog-republish-interval`).
+- `drm_systems`: a list of `DrmSystemConfig` entries that supply deployment
+  fields (`la_url`, `cert_url`, `robustness`) for DRM systems found in the media
+  (CLI: `--drm-config`).
+- `video_alt_group`: give every video track of live stdin input this `altGroup`
+  (CLI: `--video-alt-group`).
+- `libmoq_backend`: QUIC stack for the libmoq publish route (`kAuto`, `kPicoquic`,
+  `kMvfst`, `kMsquic`) (CLI: `--libmoq-backend`).
 
 ### Optional LOC packaging
 
@@ -250,6 +272,11 @@ endpoint.path = "/moq";
 endpoint.path_explicit = true;
 ```
 
+Set `endpoint.webtransport_allow_missing_reset_stream_at = true` to send the
+WebTransport CONNECT even when the server omits the `reset_stream_at` transport
+parameter (CLI: `--webtransport-allow-missing-reset-stream-at`; see
+[WebTransport compliance](webtransport-compliance.md)).
+
 Optional TLS controls:
 
 ```cpp
@@ -282,6 +309,14 @@ Convenience helpers:
 
 - `publish_file(path, endpoint, tls)`
 - `publish_stream(input, source_name, endpoint, tls)`
+
+To end a live broadcast cleanly, call `end_broadcast(EndBroadcastMode::kConvertToVod)`
+(final catalog marks every track not live and adds `trackDuration` where known) or
+`end_broadcast(EndBroadcastMode::kTerminate)` (final catalog sets `isComplete` true
+with an empty `tracks` array), then `PUBLISH_DONE` with status `Track Ended` is sent
+for the requests the session still tracks (MSF section 11.3). It returns a failure
+status when no session is active, and writes the final catalog only for a session
+driven through `publish_live()`.
 
 ## 9. Live Input Publish (Incremental stdin/stream)
 
@@ -510,6 +545,7 @@ All API publish calls return `TransportStatus`:
 
 - `status.ok == true`: success
 - `status.ok == false`: failure, inspect `status.message`
+- `status.failure_kind` classifies a failure as `kRetryable`, `kEndpointPermanent`, `kFatal`, or `kCancelled`; a GOAWAY migration also sets `status.migration_uri` and `status.migration_timeout_ms`
 
 Recommended pattern:
 
@@ -619,7 +655,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.subscriber_timeout = std::chrono::seconds(30);
@@ -741,7 +777,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.paced = true;

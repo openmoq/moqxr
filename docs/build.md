@@ -31,9 +31,12 @@ The CMake target remains `openmoq_publisher_lib`, so projects that include this 
 
 Configuring with `-DBUILD_SHARED_LIBS=ON -DOPENMOQ_INSTALL=OFF` builds `libopenmoq_publisher` and the managed picotls/picoquic libraries as shared libraries instead, for build-tree use; see `BUILD_SHARED_LIBS` in `docs/dependencies.md` for the constraints.
 
-The default build also compiles the MSFTS Publisher API example:
+The example executables are not part of the default build
+(`OPENMOQ_BUILD_EXAMPLES` defaults to `OFF`). To compile the MSFTS Publisher API
+example, configure with examples enabled:
 
 ```bash
+cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON
 cmake --build build --target openmoq-publisher-msfts-example
 ./build/examples/msfts-publisher/openmoq-publisher-msfts-example --help
 ```
@@ -41,9 +44,7 @@ cmake --build build --target openmoq-publisher-msfts-example
 Its CMake target links only `openmoq_publisher_lib`; it does not consume moq5
 or picoquic APIs directly.
 
-To omit this and the other example executables (for instance in embedded or
-packaging builds), configure with `-DOPENMOQ_BUILD_EXAMPLES=OFF`. See
-`docs/dependencies.md` for details, including the interaction with
+See `docs/dependencies.md` for details, including the interaction with
 `OPENMOQ_BUILD_TESTS`.
 
 ## Managed Pico Dependencies
@@ -178,6 +179,16 @@ GitHub Actions workflows set `OPENSSL_ROOT_DIR` automatically from the runner's 
 ## Useful CMake Options
 
 - `-DOPENMOQ_ENABLE_PICOQUIC=ON|OFF`
+- `-DOPENMOQ_ENABLE_SRT=ON|OFF` (default `ON`; SRT ingest is disabled with a
+  message when libsrt is not found)
+- `-DOPENMOQ_BUILD_TESTS=ON|OFF` (default `ON`)
+- `-DOPENMOQ_BUILD_EXAMPLES=ON|OFF` (default `OFF`)
+- `-DOPENMOQ_PICOQUIC_THREAD_CHECK=ON|OFF` (default follows
+  `OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS`; aborts on picoquic API calls from a thread
+  other than the packet-loop thread)
+- `-DOPENMOQ_INSTALL=ON|OFF` (default `ON` for a top-level build) and
+  `-DOPENMOQ_INSTALL_DEVELOPMENT=ON|OFF` (default `OFF`; installs the public
+  headers and a self-contained static Publisher library)
 - `-DOPENMOQ_DEPENDENCY_REFRESH_INTERVAL_HOURS=24`
 - `-DOPENMOQ_PICOQUIC_SOURCE_DIR=/path/to/picoquic` (explicit local override)
 - `-DOPENMOQ_PICOTLS_SOURCE_DIR=/path/to/picotls` (explicit local override)

@@ -17,8 +17,9 @@ Confeziona media da file e live per Media over QUIC Transport (MOQT), costruisce
 - Pubblica tramite Raw QUIC o WebTransport quando picoquic e picotls sono disponibili.
 - Accetta MP4 frammentato live da stdin, MPEG-TS su SRT quando libsrt è disponibile e CMAF tramite ingest CTE LL-DASH HTTP/1.1 (richieste chunked o a lunghezza fissa).
 - Analizza URL MSF con `--url` e stampa l'URL di discovery del catalogo con `--print-msf-urls`.
+- Supporta il failover ordinato tra relay con opzioni `--endpoint` ripetute e retry configurabili sullo stesso endpoint con `--retry`.
 - Fornisce esempi dell'API Publisher C++ per media live generati da FFmpeg, autorizzazione CAT4MOQ e packaging MPEG-2 TS/M2TS.
-- Può instradare la pubblicazione tramite la libreria C11 Media-over-QUIC [moq5](https://github.com/openmoq/moq5) per i draft 16, 18 e 22.
+- Può instradare la pubblicazione tramite la libreria C11 Media-over-QUIC [moq5](https://github.com/openmoq/moq5) per i draft 16, 18 e 22. I draft 21 e 23, che moq5 non implementa, vengono pubblicati dal backend nativo anche nelle build con moq5.
 
 ## Avvio Rapido
 
@@ -52,6 +53,31 @@ Emettere il catalogo e gli oggetti media confezionati:
 ./build/openmoq-publisher --input sample.mp4 --emit-dir out/
 ```
 
+CMAF resta il valore predefinito. Aggiungete `--packaging locmaf` per attivare
+[LOCMAF-01](docs/draft-einarsson-moq-locmaf-01.txt), packaging versione `0.3`, per la
+pubblicazione da file, stdin live, SRT o CTE LL-DASH sul backend predefinito. Il
+publisher conserva l'inizializzazione CMAF e i byte dei campioni codificati, segnala LOCMAF nel
+catalogo ed emette header completi, in modo che i late join e gli scarti di coda non dipendano
+da oggetti delta precedenti. L'input da file conserva i chunk CMAF originali, inclusi
+i box di cifratura e ausiliari; i vincoli della sorgente possono mantenere un'intera track
+in CMAF. Una track live che diventa non idonea fallisce invece di cambiare il
+packaging annunciato. `--stream-per-object`, `--coalesce-cmaf-chunks` e il
+backend di pubblicazione libmoq sono attualmente incompatibili con LOCMAF.
+I frammenti multiplexati devono prima essere demultiplexati (per FFmpeg, usate `separate_moof`).
+
+`--emit-dir` scrive i media LOCMAF come `.locmafobj` insieme al catalogo e ai
+segmenti di inizializzazione consueti. Per un controllo di equivalenza di riproduzione
+con un checkout di moq-playa con supporto LOCMAF, eseguite
+`bun scripts/test-locmaf-playa.mjs build/openmoq-publisher ../moq-playa`
+(richiede FFmpeg e ffprobe). Vedere l'[avvio rapido LOCMAF](docs/quickstart.md#opt-in-to-locmaf),
+la [configurazione dell'API C++](docs/publisher-api.md#optional-locmaf-packaging) e la
+[copertura di validazione](docs/testing.md#locmaf-tests).
+
+La pubblicazione LOC-04 è disponibile con `--packaging loc --draft 18` (oppure `--draft 21` / `--draft 22` / `--draft 23`) sul backend
+nativo. Invia singoli frame H.264/AAC con proprietà di timestamp, timescale e
+configurazione del codec; CMAF resta il valore predefinito. Vedere l'
+[avvio rapido LOC](docs/quickstart.md#opt-in-to-loc) per ambito e vincoli.
+
 Pubblicare verso un relay con il profilo draft-22 predefinito:
 
 ```bash
@@ -61,11 +87,27 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --namespace media \
   --draft 22 \
   --forward 0 \
-  --timeout 10 \
+  --timeout 30 \
   --paced
 ```
 
-`--forward 1` invia immediatamente gli oggetti. `--forward 0` attende che il relay inoltri l'interesse di un subscriber. Un `connection_id=` stampato conferma solo il setup del trasporto e di MOQT; non conferma l'accettazione del namespace o una sottoscrizione downstream.
+Per l'input da file, `--forward 0` annuncia il namespace e attende le richieste
+`SUBSCRIBE` in ingresso per le track di catalogo e media. Il catalogo è disponibile
+senza `--publish-catalog`; quell'opzione invia proattivamente il `PUBLISH` del catalogo
+e richiede che il relay lo accetti. `--forward 1` pubblica proattivamente sia il
+catalogo sia le track media e invia gli oggetti quando il relay consente l'inoltro.
+Se il relay segnala `PUBLISH is not supported`, usate `--forward 0` senza
+`--publish-catalog`. Vedere [modalità di pubblicazione e risoluzione dei problemi](docs/relay-interop.md#choose-a-file-publishing-mode).
+
+Un `connection_id=` stampato conferma solo il setup del trasporto e di MOQT; non
+conferma l'accettazione del namespace o una sottoscrizione downstream.
+
+Aggiungete gli endpoint in ordine di preferenza e usate `--retry N` per ritentare ogni
+endpoint corrente `N` volte prima di passare al successivo. Ad esempio, `--endpoint primary:4433
+--endpoint backup:4433 --retry 2` effettua fino a tre tentativi sul primario,
+poi fino a tre tentativi sul backup. Vedere l'
+[avvio rapido della CLI](docs/quickstart.md#endpoint-failover-and-retries) per la gestione
+dei fallimenti e i dettagli sulle sorgenti live.
 
 Su Windows, sostituite `./build/openmoq-publisher` con `build\Release\openmoq-publisher.exe` o con il percorso della configurazione di build selezionata.
 
@@ -78,6 +120,53 @@ La CLI espone una sola sorgente live alla volta:
 | MP4 frammentato | `--live-source stdin --input -` | CMAF/fMP4 su standard input | Disponibile su tutte le piattaforme supportate |
 | SRT | `--live-source srt --srt-config FILE` | MPEG-TS su SRT | Richiede libsrt; i metadati CENC non sono disponibili in questo percorso |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | Richieste CMAF `POST` o `PUT`, chunked o con `Content-Length` | Il listener richiede attualmente una piattaforma Unix-like |
+
+### Ingest MP4 frammentato
+
+Il publisher legge MP4 frammentato dallo standard input. L'input deve contenere frammenti `ftyp` + `moov` + `moof`/`mdat`, e il publisher emetterà cataloghi MSF/CMSF e oggetti media.
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+ -i fragmented.mp4 \
+ -map 0:v:0 -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --transport webtransport \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --draft 16 \
+ --publish-catalog \
+ --live-source stdin \
+ --input -
+```
+
+#### Più rendition video
+
+Ogni track dell'input viene pubblicata, con nomi nell'ordine di `trak` (`vide_1`, `vide_2`, `soun_3`, ...). Quando le track video sono rendition della stessa immagine, `--video-alt-group <N>` inserisce ciascuna di esse nell'alternate group MSF `N` (`"altGroup":N` nel catalogo, MSF sezione 5.2.12), così un subscriber sa di dover sceglierne una. Le track audio non vengono raggruppate, e un input con una sola track video non riceve `altGroup`. Senza l'opzione il catalogo non ha `altGroup`, perché il publisher non può distinguere le rendition da, ad esempio, due angolazioni di camera.
+
+MSF richiede che le track di un alternate group siano allineate nel tempo, quindi codificatele con lo stesso frame rate e lo stesso intervallo tra keyframe e senza keyframe da scene-cut:
+
+```bash
+ffmpeg -hide_banner -re -i input.mp4 \
+ -filter_complex "[0:v]split=2[high][low_in];[low_in]scale=-2:360[low]" \
+ -map "[high]" -map "[low]" -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -b:v:0 3000k -b:v:1 800k \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --publish-catalog \
+ --input - \
+ --video-alt-group 1
+```
+
+L'opzione si applica alla pubblicazione da stdin live sul backend nativo. Viene rifiutata per input da file, SRT e LL-DASH; l'ingest LL-DASH imposta già `altGroup` 1 sulle proprie track video quando ce ne sono due o più. Il backend moq5 costruisce un proprio catalogo e rifiuta l'opzione.
 
 ### Ingest SRT
 
@@ -119,7 +208,7 @@ ffmpeg -hide_banner -stream_loop -1 -re \
   -i input.mp4 \
   -map 0:v:0 -map 0:a:0 \
   -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
-  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -c:a aac -b:a 128k -ar 48000 -ac 2 \
   -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
 ```
 
@@ -131,17 +220,17 @@ Nel secondo terminale, avviare il caller SRT e il publisher MoQ:
   --srt-config /tmp/srt_callers.json \
   --endpoint 127.0.0.1:4443 \
   --transport raw \
-  --namespace live \
+  --namespace live/srt \
   --draft 16 \
   --timeout 120 \
   --forward 0
 ```
 
-L'unica modalità SRT supportata è `caller`; l'host e la porta configurati devono identificare un listener SRT esistente. Usare `--forward 1` per uno smoke test immediato del relay oppure mantenere `--forward 0` per attendere l'interesse di un subscriber.
+Impostare `srt.mode` su `caller` per connettersi a un listener SRT esistente, oppure su `listener` per fare il bind dell'host e della porta configurati e accettare una sorgente SRT in ingresso. La modalità listener accetta una connessione per ogni voce configurata e usa la stessa pipeline di ingest MPEG-TS. Usare `--forward 1` per uno smoke test immediato del relay oppure mantenere `--forward 0` per attendere l'interesse di un subscriber.
 
 ### Ingest CTE LL-DASH
 
-Avviare il publisher con un listener CMAF chunked HTTP/1.1 e un relay MoQ di destinazione:
+Avviare il publisher con un listener CMAF HTTP/1.1 e un relay MoQ di destinazione:
 
 ```bash
 ./build/openmoq-publisher \
@@ -150,7 +239,7 @@ Avviare il publisher con un listener CMAF chunked HTTP/1.1 e un relay MoQ di des
   --dash-path /ingest \
   --endpoint https://127.0.0.1:4433/moq \
   --transport webtransport \
-  --namespace live \
+  --namespace live/dash \
   --draft 18 \
   --publish-catalog \
   --forward 1 \
@@ -201,6 +290,19 @@ Ogni percorso sotto `/ingest` mantiene uno stato del parser indipendente e produ
 
 Consultare l'[avvio rapido della CLI](docs/quickstart.md), le [ricette FFmpeg](docs/ffmpeg.md) e la [nota tecnica SRT](docs/srt-ingest-technical-note.md) per ulteriori dettagli.
 
+### Riavvio di un publisher live
+
+Ogni processo publisher live numera i propri Group ID a partire da 0. Se il processo si riavvia e pubblica di nuovo lo stesso namespace e gli stessi nomi di track, i suoi nuovi group riusano Group ID che l'esecuzione precedente aveva già pubblicato, quindi due oggetti diversi condividono una sola Location. MoqTransport sezione 2.5 suggerisce che un publisher che riprende imposti il proprio Group ID iniziale a un valore maggiore di ogni group usato in precedenza, ad esempio uno basato sull'ora corrente. Usate `--initial-group-id` per farlo:
+
+```bash
+./build/openmoq-publisher --input - --initial-group-id time ...
+```
+
+- `--initial-group-id time` legge una volta l'orologio di sistema all'avvio e parte dal numero di millisecondi trascorsi dall'epoca Unix. È sicuro se l'esecuzione precedente ha pubblicato meno group dei millisecondi trascorsi tra il suo avvio e il riavvio, e l'orologio di sistema non è tornato indietro nel frattempo.
+- `--initial-group-id N` parte dall'intero senza segno `N`, che non deve superare 2^62-1.
+- Il valore predefinito è 0. L'opzione si applica alle track media e al catalogo delle sorgenti live (stdin, SRT e CTE LL-DASH) su ogni draft; viene rifiutata per l'input da file. Sui draft 22 e 23, una migrazione GOAWAY riprende comunque sopra i group inviati dalla sessione precedente. Il backend di pubblicazione moq5 numera da sé i Group ID e rifiuta un valore diverso da zero.
+- Il valore è fisso per il processo. Per l'input stdin e SRT, una riconnessione per `--retry` o per failover tra endpoint all'interno dello stesso processo continua sopra i Group ID inviati dalla sessione fallita invece di ripartire da essa, e l'input stdin riprende dal proprio segmento di inizializzazione. Il backend di pubblicazione moq5 non partecipa a questo meccanismo: ignora lo stato di ripresa, quindi un retry in quel caso riparte dal Group 0 e un input stdin non può essere riprodotto.
+
 ## Pubblicazione tramite moq5
 
 Il backend opzionale [moq5](https://github.com/openmoq/moq5) instrada la pubblicazione batch, stdin live, SRT live e di oggetti live tramite il service tier di moq5. Il service tier gestisce la pubblicazione del catalogo, la validazione CMSF/CMAF, il gating basato sulla domanda dei subscriber, la backpressure limitata e il drain ordinato del trasporto.
@@ -218,7 +320,16 @@ ctest --test-dir build-libmoq --output-on-failure
 
 Il build predefinito mantiene il percorso di trasporto integrato. Consultare [docs/build.md](docs/build.md) per lo stato del backend, il rilevamento delle dipendenze e i dettagli di configurazione.
 
+CAT4MoQ su questo backend richiede `MOQ_SERVICE_AUTH_API_VERSION >= 1` di moq5.
+Usare `-DOPENMOQ_LIBMOQ_SOURCE_DIR=../moq5` con il checkout corrispondente di
+`feature/cat4moq` durante il test della modifica coordinata. Le dipendenze moq5
+più vecchie rifiutano le credenziali configurate prima della connessione. Vedere il
+[design di autenticazione](docs/cat4moq-design.md) per i limiti del backend e i profili di compatibilità.
+
 ## Esempi
+
+Abilitate gli esempi esplicitamente con `cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON`,
+poi compilateli con `cmake --build build`.
 
 | Esempio | Target | Scopo |
 | --- | --- | --- |
@@ -227,6 +338,11 @@ Il build predefinito mantiene il percorso di trasporto integrato. Consultare [do
 | Publisher MSFTS | `openmoq-publisher-msfts-example` | Pubblica oggetti MPEG-2 TS o M2TS allineati ai pacchetti tramite `Publisher::publish_live_objects(...)` |
 
 L'esempio MSFTS segue il draft testuale locale in `examples/msfts-publisher/docs/`, rileva i dati PAT/PMT, seleziona un programma, filtra i PID non correlati ed emette un catalogo MSF versione 1 con `packaging: "m2ts"`.
+
+Questo esempio rileva sezioni PAT/PMT a pacchetto singolo entro i primi 4096
+pacchetti sorgente. Usa un pacing fisso degli oggetti di 10 ms anziché un
+timing derivato dal PCR, pubblica un solo group e dichiara `m2tsRandomAccess: false`; non
+identifica i confini di random access né segue i cambi di programma.
 
 ```bash
 ./build/examples/msfts-publisher/openmoq-publisher-msfts-example \
@@ -252,6 +368,7 @@ Aggiungere `--program NUMBER` per selezionare un programma, `--packets-per-objec
 | Interoperabilità relay | [docs/relay-interop.md](docs/relay-interop.md) |
 | API Publisher C++ | [docs/publisher-api.md](docs/publisher-api.md) |
 | Esempio auth CAT4MOQ | [examples/auth/README.md](examples/auth/README.md) |
+| Profili CAT4MoQ e stato di implementazione | [docs/cat4moq-design.md](docs/cat4moq-design.md), [docs/cat4moq-plan.md](docs/cat4moq-plan.md) |
 | Draft testuale MSFTS | [examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt](examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt) |
 | Mappatura protocollo | [docs/protocol-mapping.md](docs/protocol-mapping.md) |
 | Conformità WebTransport | [docs/webtransport-compliance.md](docs/webtransport-compliance.md) |
@@ -274,6 +391,10 @@ Le guide localizzate dell'API Publisher sono disponibili in [spagnolo](docs/publ
 
 ## Stato Attuale
 
-La CLI principale `openmoq-publisher` accetta i draft 16, 18, 21, 22 e 23; il draft 22 è il valore predefinito. Il client offre solo l'ALPN del draft selezionato. Il draft 18 fornisce il profilo basato sui request stream su cui si basano i draft successivi, il draft 21 lo estende (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS), il draft 22 aggiunge tipi espliciti di LOCATION_FILTER e il draft 23 usa un Length dei messaggi di controllo varint, PAUSED al posto di FORWARD, Error Details in REQUEST_ERROR e i suoi codici specifici di chiusura della sessione; vedere [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md). I draft 21 e 23 sono pubblicati dal backend nativo. Nelle build con moq5 i draft 16, 18 e 22 passano da moq5 e gli altri draft continuano a essere pubblicati dal backend nativo. Il draft 22 tramite moq5 è stato provato solo contro una porta chiusa e con i test unitari; non è stato eseguito contro un relay draft 22. Il testo dei draft 14, 17, 19 e 20 rimane in `docs/` per la cronologia dell'implementazione e la revisione del protocollo, ma queste versioni non sono selezionabili nella CLI principale. L'esempio MSFTS separato mantiene la selezione dei draft 14/16/17/18 per test specifici del draft e accetta anche i draft 21, 22 e 23.
+La CLI principale `openmoq-publisher` accetta i draft 16, 18, 21, 22 e 23; il draft 22 è il valore predefinito. Il draft 18 fornisce il profilo basato sui request stream, il draft 21 lo estende (LOCATION_FILTER, INCLUDE_PROPERTIES, FILL_PARAMETERS). Il draft 22 aggiunge tipi espliciti di LOCATION_FILTER mantenendo la semantica di pubblicazione del draft 21. Il draft 23 mantiene tale semantica con un Length dei messaggi di controllo varint, PAUSED al posto di FORWARD, Error Details in REQUEST_ERROR e i suoi codici specifici di chiusura della sessione; vedere [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md). I draft 21 e 23 sono pubblicati dal backend nativo. Nelle build con moq5 i draft 16, 18 e 22 passano da moq5 e gli altri draft continuano a essere pubblicati dal backend nativo. Il draft 22 tramite moq5 è stato provato solo contro una porta chiusa e con i test unitari; non è stato eseguito contro un relay draft 22. Il testo dei draft 14, 17, 19 e 20 rimane in `docs/` per la cronologia dell'implementazione e la revisione del protocollo, ma queste versioni non sono selezionabili nella CLI principale. L'esempio MSFTS separato mantiene la selezione dei draft 14/16/17/18 per test specifici del draft e accetta anche i draft 21, 22 e 23.
 
 Sia il backend picoquic predefinito sia il backend moq5 opzionale sono sottoposti a test di interoperabilità attivi. Per la copertura dettagliata delle funzionalità, le limitazioni e la roadmap, consultare [docs/status.md](docs/status.md) e [docs/protocol-mapping.md](docs/protocol-mapping.md).
+
+## Attribuzione
+
+Creato originariamente da [Paul Gregoire](https://github.com/mondain) per OpenMOQ

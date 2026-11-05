@@ -39,7 +39,7 @@ target_link_libraries(your_app PRIVATE openmoq_publisher_lib)
 #include "openmoq/publisher/publisher_api.h"
 
 openmoq::publisher::PublisherConfig config;
-config.draft_version = openmoq::publisher::DraftVersion::kDraft14;
+config.draft_version = openmoq::publisher::DraftVersion::kDraft22;
 config.track_namespace = "media";
 config.forward = false;
 config.publish_catalog = false;
@@ -49,9 +49,22 @@ config.split_cmaf_chunks = true;
 config.paced = false;
 config.loop = false;
 config.subscriber_timeout = std::chrono::seconds(30);
+config.await_subscriber_indefinitely = false;
 
 openmoq::publisher::Publisher publisher(config);
 ```
+
+`DraftVersion::kDraft22` がデフォルトです。CLI は draft 16、18、21、22、23 を受け付けます。enum には API と MSFTS の例のために `kDraft14` と `kDraft17` も残されています。
+
+その他の `PublisherConfig` フィールドは、すべてデフォルトでオフまたは空です。
+
+- `preannounce_tracks`: subscriber が存在する前に、`PUBLISH_NAMESPACE` の直後に各 track の `PUBLISH` を送信します (CLI: `--preannounce-tracks`)。
+- `moq_impl_id`: `MOQT_IMPLEMENTATION` Setup Option (`openmoq-publisher/<version>`) を送信します (CLI: `--moq-impl-id`)。
+- `vod`: catalog を live ではなく VOD としてマークします (CLI: `--vod`)。VOD が入力から推定されることはありません。
+- `catalog_republish_interval`: catalog が relay のキャッシュから消えないよう、この間隔で catalog を再公開します。0 の場合は無効です (CLI: `--catalog-republish-interval`)。
+- `drm_systems`: メディア内で見つかった DRM システム向けに、デプロイ固有のフィールド (`la_url`, `cert_url`, `robustness`) を提供する `DrmSystemConfig` エントリのリストです (CLI: `--drm-config`)。
+- `video_alt_group`: live stdin 入力のすべての映像 track にこの `altGroup` を付与します (CLI: `--video-alt-group`)。
+- `libmoq_backend`: libmoq 公開ルートの QUIC スタック (`kAuto`, `kPicoquic`, `kMvfst`, `kMsquic`) です (CLI: `--libmoq-backend`)。
 
 ### 任意: LOC packaging
 
@@ -193,6 +206,8 @@ endpoint.path = "/moq";
 endpoint.path_explicit = true;
 ```
 
+`endpoint.webtransport_allow_missing_reset_stream_at = true` を設定すると、サーバーが `reset_stream_at` transport パラメーターを省略していても WebTransport CONNECT を送信します (CLI: `--webtransport-allow-missing-reset-stream-at`。[WebTransport compliance](webtransport-compliance.md) を参照)。
+
 任意の TLS 制御:
 
 ```cpp
@@ -226,6 +241,8 @@ if (!status.ok) {
 - `publish_file(path, endpoint, tls)`
 - `publish_stream(input, source_name, endpoint, tls)`
 
+ライブ配信をきれいに終了するには、`end_broadcast(EndBroadcastMode::kConvertToVod)` (最終 catalog はすべての track を非 live とマークし、判明している場合は `trackDuration` を追加します) または `end_broadcast(EndBroadcastMode::kTerminate)` (最終 catalog は `isComplete` を true にし、`tracks` 配列を空にします) を呼び出します。その後、session がまだ追跡している request に対して、status `Track Ended` の `PUBLISH_DONE` が送信されます (MSF section 11.3)。アクティブな session がない場合は失敗 status を返し、最終 catalog を書き込むのは `publish_live()` で駆動された session の場合のみです。
+
 ## 9. ライブ入力の公開 (インクリメンタルな stdin/stream)
 
 デフォルトのライブパスは fragmented MP4 を想定しており、これは ffmpeg/CMAF パイプラインに適合します。
@@ -243,6 +260,14 @@ if (!status.ok) {
 ```
 
 `publish_live(...)` は EOF までバッファするのではなく、インクリメンタル解析とライブ公開フローを使います。
+
+ライブ publisher は Group ID を 0 から採番するため、同じ track を再び公開する再起動後のプロセスは、前回の実行と同じ Group ID を再利用します。MoqTransport section 2.5 は、再開する track を、以前に使用したすべての group より大きい値から (たとえば現在時刻から) 開始することを提案しています。そのためには `PublisherConfig::initial_group_id` を設定します。
+
+```cpp
+config.initial_group_id = openmoq::publisher::time_based_initial_group_id();
+```
+
+`time_based_initial_group_id()` は Unix epoch からのミリ秒数を返します。前回の実行が、その開始から再起動までに経過したミリ秒数より少ない group しか公開しておらず、かつシステム時計が巻き戻っていなければ、新しい Group ID は前回の値より大きいままになります。`publish_live(...)` は、すべての draft でライブメディア group と catalog group をこの値から採番します。draft 22 と 23 では、GOAWAY による移行は引き続き前の session が送信した group より上から再開します。失敗したライブ公開を同様に再試行するには、同じ入力に対するすべての `publish_live(ingest, stdin_input, endpoint, tls, endpoint_alpn_overridden, &resume)` の試行に、1 つの `LiveResumeState` を渡します。再試行可能な失敗が起きると、未送信の stdin バイトと次のメディア Group ID および catalog Group ID がそこに記録され、次の試行はそこから再開し、公開が成功すると消去されます。CLI は `--retry` と endpoint failover でこれを行います。デフォルトは 0 です。`kMaxGroupId` (2^62-1) を超える値を指定すると、`Publisher` コンストラクタと `set_config` が例外を投げます。`publish_live_objects(...)` は source が提供する Group ID をそのまま送信し (DASH ingest では `LiveDashIngestConfig::initial_group_id` がそれを設定します)、libmoq backend は Group ID を自身で採番するため 0 以外の値を拒否します。
 
 ## 10. 任意のライブオブジェクトの公開
 
@@ -314,9 +339,11 @@ source.catalog_mode =
 
 **需要ゲーティング (lazy relay)。** libmoq backend が選択されている場合、公開パスはメディアを生成する前に、少なくとも 1 つの下流メディア subscriber を待ちます。lazy relay は、プレイヤーが subscribe したときにのみ SUBSCRIBE を転送します。それまでは何も書き込まれません (batch/objects/stdin は source を消費せず、ライブ SRT は上限内に収まるよう fragment を破棄します)。`PublisherConfig::subscriber_timeout` 以内に subscriber が現れない場合、呼び出しはハングせずに `timed out waiting for media subscriber` で失敗します。
 
+**Subscriber の待機 (`MoqtSession` backend)。** デフォルトでは、`publish_live_objects` は source を読まずに最初のメディア subscriber を待ちます。待機は `PublisherConfig::subscriber_timeout` の経過後に終了し、呼び出しは成功を返します。ただし `PublisherConfig::await_subscriber_indefinitely` が設定されている場合は別です。この設定では、待機を終了させるのは `disconnect()` または session の終了のみで、その間 publisher は source を読み続けます。メディア Object は破棄し、最初の subscriber のために最新の catalog を保持するため、source が滞ることはありません。libmoq backend はこの設定を拒否し、`publish_live` オーバーロード (stdin、SRT) は無視します。publisher は破棄する Object のペーシングを行わないため、ペース付きのファイル source は最初の subscriber が到着する前に終端に達することがあります。`subscriber_timeout` は各 request-stream の読み取りも制限するので、無制限の待機に巨大なタイムアウトはもう必要ありません。期限が適用されるのは最初の subscriber が現れるまでだけです。最後の subscriber が離れると (draft 16 では UNSUBSCRIBE、draft 18 ではキャンセルされた request stream)、publisher はその subscription を終了し、開いている subgroup ストリームを CANCELLED でリセットし、source の Object を読み続けて破棄し、後続の SUBSCRIBE に応答し、source が終了したら戻ります。
+
 ピアがストリームを停止 (STOP_SENDING) した場合、またはパブリッシャーがそのストリームをリセットした場合、トランスポートはそのストリームに対してキューに残っている書き込みを再試行せずに破棄します。これにより、他のストリーム上の制御応答がその書き込みの背後で止まることはありません。どちらの場合も、ピアにはストリームが終了したように見えます。
 
-別 thread から `disconnect()` を呼び出すと、実行中の `publish_live_objects` (またはライブ stdin/SRT) の公開は速やかに停止します。ドライバーループが抜け、endpoint が中断され、呼び出しは成功を返します。stdin の場合、キャンセルは現在のブロッキング read が戻った時点で検知されます。
+別 thread から `disconnect()` を呼び出すと、実行中の公開 (batch、`publish_live_objects`、またはライブ stdin/SRT) は速やかに停止します。ドライバーループが抜け、接続が閉じられ、呼び出しは成功を返します。停止された公開は再試行されず、GOAWAY による移行にも従いません。実際の stdin は POSIX では polling されるため、アイドル状態の入力が停止を遅らせることはありません。それ以外の `std::istream` は、現在のブロッキング read が戻った時点で検知されます。
 
 > **従来の注意:** メディアメタデータを持たない素の `LiveTrack{.track_name = ...}` エントリ (汎用的な "events" 形式のオブジェクト track) は、通常の libmoq 生成 catalog パスでは拒否されます。汎用的な従来型オブジェクト track にはカスタムの `TransportFactory` を注入するか、source が必要な catalog オブジェクトを実際に提供する場合にのみ `LiveCatalogMode::kSourceObject` を使ってください。
 
@@ -330,9 +357,12 @@ fragmented MP4 の `publish_live(...)` API は、引き続きメディア ingest
 - Raw QUIC + draft-16: `moqt-16`
 - Raw QUIC + draft-17: `moqt-17`
 - Raw QUIC + draft-18: `moqt-18`
+- Raw QUIC + draft-21: `moqt-21`
+- Raw QUIC + draft-22: `moqt-22`
+- Raw QUIC + draft-23: `moqt-23`
 - WebTransport: `h3`
 
-WebTransport では、API は `WT-Available-Protocols` を使い、MoQ アプリケーションプロトコルの offer を QUIC ALPN とは別に送信します。draft-16 は `"moqt-16"`、draft-17 は `"moqt-17"`、draft-18 は `"moqt-18"` を offer し、draft-14 は従来のサブプロトコルなしの動作を維持します。引用符は HTTP Structured Fields 構文の一部です。Raw QUIC ALPN は引用符なしの token のままです。
+WebTransport では、API は `WT-Available-Protocols` を使い、MoQ アプリケーションプロトコルの offer を QUIC ALPN とは別に送信します。draft-16 は `"moqt-16"`、draft-17 は `"moqt-17"`、draft-18 は `"moqt-18"` を offer し、draft 21、22、23 はそれぞれ `"moqt-21"`、`"moqt-22"`、`"moqt-23"` を offer し、draft-14 は従来のサブプロトコルなしの動作を維持します。引用符は HTTP Structured Fields 構文の一部です。Raw QUIC ALPN は引用符なしの token のままです。
 
 アプリケーションがすでに endpoint の ALPN を設定しており、それを維持したい場合:
 
@@ -354,6 +384,7 @@ API のすべての公開呼び出しは `TransportStatus` を返します。
 
 - `status.ok == true`: 成功
 - `status.ok == false`: 失敗。`status.message` を確認します
+- `status.failure_kind` は失敗を `kRetryable`、`kEndpointPermanent`、`kFatal`、`kCancelled` のいずれかに分類します。GOAWAY による移行では、`status.migration_uri` と `status.migration_timeout_ms` も設定されます
 
 推奨パターン:
 
@@ -451,7 +482,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.subscriber_timeout = std::chrono::seconds(30);
@@ -573,7 +604,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.paced = true;

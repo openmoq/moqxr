@@ -85,7 +85,7 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --input sample.mp4 \
   --endpoint moqt://relay.example.com:443/moq \
   --namespace media \
-  --draft 18 \
+  --draft 22 \
   --forward 0 \
   --timeout 30 \
   --paced

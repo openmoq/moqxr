@@ -17,8 +17,9 @@
 - 当 picoquic 和 picotls 可用时，通过 Raw QUIC 或 WebTransport 发布。
 - 接受来自 stdin 的直播 fragmented MP4、libsrt 可用时通过 SRT 传输的 MPEG-TS，以及通过 HTTP/1.1 CTE LL-DASH ingest（chunked 或固定长度请求）传输的 CMAF。
 - 使用 `--url` 解析 MSF URL，并使用 `--print-msf-urls` 打印 catalog discovery URL。
+- 通过重复的 `--endpoint` 选项支持按顺序的 relay failover，并通过 `--retry` 配置同一 endpoint 的重试。
 - 提供用于 FFmpeg 生成直播媒体、CAT4MOQ 授权和 MPEG-2 TS/M2TS 打包的 C++ Publisher API 示例。
-- 对于 drafts 16、18 和 22，可选择通过 C11 Media-over-QUIC 库 [moq5](https://github.com/openmoq/moq5) 进行发布。
+- 对于 drafts 16、18 和 22，可选择通过 C11 Media-over-QUIC 库 [moq5](https://github.com/openmoq/moq5) 进行发布。moq5 未实现的 drafts 21 和 23，即使在 moq5 构建中也通过原生后端发布。
 
 ## 快速开始
 
@@ -52,6 +53,31 @@ ctest --test-dir build --output-on-failure
 ./build/openmoq-publisher --input sample.mp4 --emit-dir out/
 ```
 
+CMAF 仍是默认值。添加 `--packaging locmaf` 可选择启用
+[LOCMAF-01](docs/draft-einarsson-moq-locmaf-01.txt)（packaging version `0.3`），
+适用于默认后端上的文件、直播 stdin、SRT 或 CTE LL-DASH 发布。
+publisher 保留 CMAF 初始化数据和编码后的 sample 字节，在
+catalog 中标识 LOCMAF，并输出完整的 header，使晚加入的订阅者和队列丢弃不依赖
+之前的 delta object。文件输入会保留原始 CMAF chunk，包括
+加密和辅助 box；源的限制可使整个 track 保持为
+CMAF。变得不符合条件的直播 track 会失败，而不是改变
+其通告的 packaging。`--stream-per-object`、`--coalesce-cmaf-chunks` 以及
+libmoq 发布后端目前与 LOCMAF 不兼容。
+多路复用的 fragment 必须先解复用（对 FFmpeg 使用 `separate_moof`）。
+
+`--emit-dir` 会将 LOCMAF 媒体写为 `.locmafobj`，与常规的 catalog 和
+初始化 segment 一起输出。若要针对支持 LOCMAF 的 moq-playa
+checkout 进行播放等价性检查，请运行
+`bun scripts/test-locmaf-playa.mjs build/openmoq-publisher ../moq-playa`
+（需要 FFmpeg 和 ffprobe）。参见 [LOCMAF 快速开始](docs/quickstart.md#opt-in-to-locmaf)、
+[C++ API 配置](docs/publisher-api.md#optional-locmaf-packaging)和
+[验证覆盖](docs/testing.md#locmaf-tests)。
+
+LOC-04 发布在原生后端上可通过 `--packaging loc --draft 18`（或 `--draft 21` / `--draft 22` / `--draft 23`）使用。
+它发送单独的 H.264/AAC 帧，并附带 timestamp、timescale 和
+codec 配置属性；CMAF 仍是默认值。范围和限制请参阅
+[LOC 快速开始](docs/quickstart.md#opt-in-to-loc)。
+
 使用默认 draft-22 profile 发布到 relay：
 
 ```bash
@@ -61,11 +87,23 @@ OPENMOQ_PICOQUIC_TRACE=1 ./build/openmoq-publisher \
   --namespace media \
   --draft 22 \
   --forward 0 \
-  --timeout 10 \
+  --timeout 30 \
   --paced
 ```
 
-`--forward 1` 会立即发送 object。`--forward 0` 会等待 relay 转发 subscriber interest。打印的 `connection_id=` 仅确认 transport 和 MOQT setup；它并不确认 namespace 已被接受或存在下游订阅。
+对于文件输入，`--forward 0` 会宣告 namespace，并等待针对 catalog 和 media track 的入站
+`SUBSCRIBE` 请求。无需 `--publish-catalog` 即可获得 catalog；该选项会主动发送 catalog `PUBLISH`，
+并要求 relay 接受它。`--forward 1` 会主动发布 catalog 和 media track，并在 relay 允许转发时发送 object。
+如果 relay 报告 `PUBLISH is not supported`，请使用 `--forward 0` 且不带
+`--publish-catalog`。参见[发布模式与故障排查](docs/relay-interop.md#choose-a-file-publishing-mode)。
+
+打印的 `connection_id=` 仅确认 transport 和 MOQT setup；它并不确认 namespace 已被接受或存在下游订阅。
+
+按优先顺序添加 endpoint，并使用 `--retry N` 在切换前对当前
+endpoint 各重试 `N` 次。例如，`--endpoint primary:4433
+--endpoint backup:4433 --retry 2` 会对主 endpoint 最多尝试三次，
+然后对备用 endpoint 最多尝试三次。失败处理和直播源的详细信息请参阅
+[CLI 快速开始](docs/quickstart.md#endpoint-failover-and-retries)。
 
 在 Windows 上，请将 `./build/openmoq-publisher` 替换为 `build\Release\openmoq-publisher.exe` 或所选 build configuration 对应的路径。
 
@@ -78,6 +116,53 @@ CLI 一次使用一个直播源：
 | Fragmented MP4 | `--live-source stdin --input -` | 标准输入上的 CMAF/fMP4 | 在所有受支持平台上可用 |
 | SRT | `--live-source srt --srt-config FILE` | SRT 上的 MPEG-TS | 需要 libsrt；此路径无法获得 CENC metadata |
 | CTE LL-DASH | `--live-source dash --dash-listen HOST:PORT` | CMAF `POST` 或 `PUT` 请求，chunked 或带 `Content-Length` | listener 目前需要类 Unix 平台 |
+
+### Fragmented MP4 ingest
+
+publisher 从标准输入读取 fragmented MP4。输入必须包含 `ftyp` + `moov` + `moof`/`mdat` fragment，publisher 会输出 MSF/CMSF catalog 和 media object。
+
+```bash
+ffmpeg -hide_banner -stream_loop -1 -re \
+ -i fragmented.mp4 \
+ -map 0:v:0 -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --transport webtransport \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --draft 16 \
+ --publish-catalog \
+ --live-source stdin \
+ --input -
+```
+
+#### 多个视频 rendition
+
+输入中的每个 track 都会发布，并按 `trak` 顺序命名（`vide_1`、`vide_2`、`soun_3`……）。当这些视频 track 是同一画面的多个 rendition 时，`--video-alt-group <N>` 会把它们都放入 MSF alternate group `N`（catalog 中为 `"altGroup":N`，MSF 第 5.2.12 节），使订阅者知道只需选择其中一个。音频 track 不分组，只有单个视频 track 的输入也不会有 `altGroup`。不带该选项时 catalog 不含 `altGroup`，因为 publisher 无法区分 rendition 与例如两个机位。
+
+MSF 要求同一 alternate group 的 track 在时间上对齐，因此请使用相同的帧率和关键帧间隔进行编码，并禁用 scene-cut 关键帧：
+
+```bash
+ffmpeg -hide_banner -re -i input.mp4 \
+ -filter_complex "[0:v]split=2[high][low_in];[low_in]scale=-2:360[low]" \
+ -map "[high]" -map "[low]" -map 0:a:0 \
+ -c:v libx264 -preset veryfast \
+ -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
+ -b:v:0 3000k -b:v:1 800k \
+ -c:a aac -b:a 128k -ar 48000 -ac 2 \
+ -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
+ -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --endpoint https://127.0.0.1:4433/moq \
+ --namespace live/stdin \
+ --publish-catalog \
+ --input - \
+ --video-alt-group 1
+```
+
+该选项适用于原生后端上的直播 stdin 发布。对文件、SRT 和 LL-DASH 输入会被拒绝；LL-DASH ingest 在有两个或更多视频 track 时已自动为它们设置 `altGroup` 1。moq5 后端自行构建 catalog，并拒绝该选项。
 
 ### SRT ingest
 
@@ -119,7 +204,7 @@ ffmpeg -hide_banner -stream_loop -1 -re \
   -i input.mp4 \
   -map 0:v:0 -map 0:a:0 \
   -c:v libx264 -preset veryfast -r 30 -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 \
-  -c:a aac -b:a 160k -ar 48000 -ac 2 \
+  -c:a aac -b:a 128k -ar 48000 -ac 2 \
   -f mpegts "srt://0.0.0.0:9000?mode=listener&pkt_size=1316"
 ```
 
@@ -131,13 +216,13 @@ ffmpeg -hide_banner -stream_loop -1 -re \
   --srt-config /tmp/srt_callers.json \
   --endpoint 127.0.0.1:4443 \
   --transport raw \
-  --namespace live \
+  --namespace live/srt \
   --draft 16 \
   --timeout 120 \
   --forward 0
 ```
 
-唯一支持的 SRT 模式是 `caller`；配置的 host 和 port 必须指向现有 SRT listener。使用 `--forward 1` 可立即进行 relay smoke test，或保留 `--forward 0` 等待 subscriber interest。
+将 `srt.mode` 设为 `caller` 可连接到现有 SRT listener，设为 `listener` 则绑定配置的 host 和 port 并接受传入的 SRT 源。listener 模式对每个配置项接受一个连接，并使用相同的 MPEG-TS ingest pipeline。使用 `--forward 1` 可立即进行 relay smoke test，或保留 `--forward 0` 等待 subscriber interest。
 
 ### CTE LL-DASH ingest
 
@@ -150,7 +235,7 @@ ffmpeg -hide_banner -stream_loop -1 -re \
   --dash-path /ingest \
   --endpoint https://127.0.0.1:4433/moq \
   --transport webtransport \
-  --namespace live \
+  --namespace live/dash \
   --draft 18 \
   --publish-catalog \
   --forward 1 \
@@ -201,6 +286,19 @@ ffmpeg -re \
 
 有关更多详细信息，请参阅 [CLI 快速开始](docs/quickstart.md)、[FFmpeg 示例](docs/ffmpeg.md)和 [SRT 技术说明](docs/srt-ingest-technical-note.md)。
 
+### 重启直播 publisher
+
+每个直播 publisher 进程的 Group ID 都从 0 开始编号。如果进程重启并再次发布相同的 namespace 和 track 名称，其新的 group 会重用上一次运行已发布的 Group ID，导致两个不同的 object 共用同一个 Location。MoqTransport 第 2.5 节建议恢复发布的 publisher 将初始 Group ID 设为大于其之前使用过的所有 group 的值，例如基于当前时间的值。可使用 `--initial-group-id` 实现：
+
+```bash
+./build/openmoq-publisher --input - --initial-group-id time ...
+```
+
+- `--initial-group-id time` 在启动时读取一次系统时钟，并从自 Unix epoch 以来的毫秒数开始。只要上一次运行发布的 group 数少于其启动到重启之间经过的毫秒数，并且系统时钟在此期间没有回拨，这就是安全的。
+- `--initial-group-id N` 从无符号整数 `N` 开始，`N` 不得超过 2^62-1。
+- 默认值为 0。该选项适用于直播源（stdin、SRT 和 CTE LL-DASH）的 media track 和 catalog，对所有 draft 有效；对文件输入会被拒绝。在 drafts 22 和 23 上，GOAWAY 迁移仍会从上一个会话已发送的 group 之上继续。moq5 发布后端自行为 Group ID 编号，并拒绝非零值。
+- 该值在进程内固定。对于 stdin 和 SRT 输入，同一进程内因 `--retry` 或 endpoint failover 而发生的重连，会在失败会话已发送的 Group ID 之上继续，而不是从头开始，stdin 输入则从其 init segment 恢复。moq5 发布后端不参与此机制：它忽略恢复状态，因此在该后端上重试会从 Group 0 重新开始，并且无法重放 stdin 输入。
+
 ## 通过 moq5 发布
 
 可选的 [moq5](https://github.com/openmoq/moq5) backend 通过 moq5 service tier 处理批量、直播 stdin、直播 SRT 和直播 object 发布。service tier 负责 catalog 发布、CMSF/CMAF 验证、基于 subscriber demand 的 gating、有限 backpressure 和有序 transport drain。
@@ -217,7 +315,16 @@ ctest --test-dir build-libmoq --output-on-failure
 
 默认 build 保留内置 transport path。有关 backend 状态、依赖项发现和配置详情，请参阅 [docs/build.md](docs/build.md)。
 
+此 backend 上的 CAT4MoQ 需要 moq5 的 `MOQ_SERVICE_AUTH_API_VERSION >= 1`。
+测试协同变更时，请将 `-DOPENMOQ_LIBMOQ_SOURCE_DIR=../moq5` 与对应的
+`feature/cat4moq` checkout 一起使用。较旧的 moq5
+依赖会在连接前拒绝已配置的凭据。backend 限制和兼容性 profile 请参阅
+[auth 设计](docs/cat4moq-design.md)。
+
 ## 示例
+
+使用 `cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON` 显式启用示例，
+然后用 `cmake --build build` 构建。
 
 | 示例 | Target | 用途 |
 | --- | --- | --- |
@@ -226,6 +333,11 @@ ctest --test-dir build-libmoq --output-on-failure
 | MSFTS publisher | `openmoq-publisher-msfts-example` | 通过 `Publisher::publish_live_objects(...)` 发布按 packet 对齐的 MPEG-2 TS 或 M2TS object |
 
 MSFTS 示例遵循 `examples/msfts-publisher/docs/` 中的本地文本 draft，发现 PAT/PMT 数据，选择一个 program，过滤无关 PID，并输出包含 `packaging: "m2ts"` 的 MSF version 1 catalog。
+
+此示例会在前 4096 个源 packet 内发现单 packet 的 PAT/PMT section。
+它使用固定的 10 ms object 节奏，而非基于 PCR 的
+时序，仅发布一个 group，并声明 `m2tsRandomAccess: false`；它不会
+识别随机访问边界，也不会跟踪 program 变化。
 
 ```bash
 ./build/examples/msfts-publisher/openmoq-publisher-msfts-example \
@@ -251,6 +363,7 @@ MSFTS 示例遵循 `examples/msfts-publisher/docs/` 中的本地文本 draft，�
 | Relay 互操作 | [docs/relay-interop.md](docs/relay-interop.md) |
 | C++ Publisher API | [docs/publisher-api.md](docs/publisher-api.md) |
 | CAT4MOQ auth 示例 | [examples/auth/README.md](examples/auth/README.md) |
+| CAT4MoQ profile 和实现状态 | [docs/cat4moq-design.md](docs/cat4moq-design.md)、[docs/cat4moq-plan.md](docs/cat4moq-plan.md) |
 | MSFTS 文本 draft | [examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt](examples/msfts-publisher/docs/draft-gregoire-moq-msfts.txt) |
 | 协议映射 | [docs/protocol-mapping.md](docs/protocol-mapping.md) |
 | WebTransport 合规性 | [docs/webtransport-compliance.md](docs/webtransport-compliance.md) |
@@ -273,6 +386,10 @@ MSFTS 示例遵循 `examples/msfts-publisher/docs/` 中的本地文本 draft，�
 
 ## 当前状态
 
-主 `openmoq-publisher` CLI 接受 drafts 16、18、21、22 和 23；draft 22 是默认值。客户端只提供所选 draft 的 ALPN。draft 18 提供后续 draft 所基于的 request-stream profile，draft 21 在其基础上扩展（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS），draft 22 增加显式 LOCATION_FILTER 类型，draft 23 使用 varint 控制消息 Length、以 PAUSED 取代 FORWARD、REQUEST_ERROR 的 Error Details 以及其特定的会话终止码；参见 [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md)。drafts 21 和 23 通过原生后端发布。在 moq5 构建中，drafts 16、18 和 22 通过 moq5 发布，其他 draft 仍通过原生后端发布。通过 moq5 发布 draft 22 仅针对已关闭的端口和单元测试进行过测试，尚未针对 draft 22 relay 运行。drafts 14、17、19 和 20 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试，并且也接受 drafts 21、22 和 23。
+主 `openmoq-publisher` CLI 接受 drafts 16、18、21、22 和 23；draft 22 是默认值；draft 18 提供较新的 request-stream profile，draft 21 在其基础上扩展（LOCATION_FILTER、INCLUDE_PROPERTIES、FILL_PARAMETERS）。draft 22 增加显式 LOCATION_FILTER 类型，同时保留 draft-21 的发布语义。draft 23 保留这些语义，并使用 varint 控制消息 Length、以 PAUSED 取代 FORWARD、REQUEST_ERROR 的 Error Details 以及其特定的会话终止码；参见 [docs/draft23-implementation-plan.md](docs/draft23-implementation-plan.md)。drafts 21 和 23 通过原生后端发布。在 moq5 构建中，drafts 16、18 和 22 通过 moq5 发布，其他 draft 仍通过原生后端发布。通过 moq5 发布 draft 22 仅针对已关闭的端口和单元测试进行过测试，尚未针对 draft 22 relay 运行。drafts 14、17、19 和 20 的文本保留在 `docs/` 中，用于实现历史记录和协议审查，但主 CLI 无法选择这些版本。单独的 MSFTS 示例保留 drafts 14/16/17/18 选择，用于针对特定 draft 的测试，并且也接受 drafts 21、22 和 23。
 
 默认 picoquic backend 和可选 moq5 backend 都在进行持续的互操作性测试。有关详细功能覆盖、限制和 roadmap，请参阅 [docs/status.md](docs/status.md) 和 [docs/protocol-mapping.md](docs/protocol-mapping.md)。
+
+## 致谢
+
+最初由 [Paul Gregoire](https://github.com/mondain) 为 OpenMOQ 创建

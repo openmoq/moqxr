@@ -93,7 +93,7 @@ fallback rules, and [testing](testing.md#locmaf-tests) for playback validation.
 ## Opt In to LOC
 
 Select the clear-media subset of [LOC-04](draft-ietf-moq-loc-04.txt) with the
-native draft-18 transport:
+native backend on draft 18 or later (18, 21, 22, or 23):
 
 ```bash
 ./build/openmoq-publisher --input sample.mp4 --packaging loc --draft 18 --dump-plan
@@ -109,8 +109,8 @@ configuration so a retained group can initialize its decoder.
 Initial support is clear H.264 `avc1` and AAC-LC. Unsupported codecs, encrypted
 input, non-identity edit lists, mixed initial progressive samples plus fragments,
 negative presentation timestamps, and in-band AVC configuration changes fail
-explicitly. `--stream-per-object`, `--coalesce-cmaf-chunks`, other transport drafts,
-and the libmoq backend are incompatible with this LOC profile.
+explicitly. `--stream-per-object`, `--coalesce-cmaf-chunks`, drafts earlier than 18 (such as
+`--draft 16`), and the libmoq backend are incompatible with this LOC profile.
 
 The same flags select LOC for live stdin, SRT, and DASH ingest. Live MP4/DASH
 must start with an initialization segment whose sample tables are empty. SRT
@@ -193,8 +193,24 @@ value can fingerprint an endpoint. Add `--moq-impl-id` to send
   --moq-impl-id
 ```
 
-It works with every `--draft`, on native QUIC and WebTransport. There is no API
-setting for it yet.
+It works with every `--draft`, on native QUIC and WebTransport. The API
+equivalent is `PublisherConfig::moq_impl_id`.
+
+## Other Publishing Options
+
+- `--preannounce-tracks` sends a `PUBLISH` for each track immediately after
+  `PUBLISH_NAMESPACE`, before any subscriber exists. It is off by default
+  because some relays are disturbed by an early `PUBLISH`, while others only
+  accept tracks that way and never forward a `SUBSCRIBE`. `--forward 1` already
+  publishes tracks proactively.
+- `--vod` marks the catalog as VOD (`isLive` false, no `generatedAt`). This
+  publisher is live, or simulating live, unless told otherwise; VOD is never
+  inferred from the input.
+- `--catalog-republish-interval <seconds>` republishes the catalog at that
+  interval so it does not fall out of a relay cache. The default 0 disables
+  republication.
+- `--version` (or `-V`) prints the version and commit and exits; `--help` (or
+  `-h`) prints the usage.
 
 ## Endpoint Failover and Retries
 
