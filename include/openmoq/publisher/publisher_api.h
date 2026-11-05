@@ -287,7 +287,8 @@ private:
                               bool connected,
                               const std::string& last_error) const;
     // Whether a publish goes to the libmoq backend: in libmoq builds, with no
-    // injected TransportFactory, for a draft libmoq speaks (16 or 18).
+    // injected TransportFactory, for a draft libmoq speaks (16, 18 or 22; 21
+    // and 23 use the native backend).
     bool routes_to_libmoq() const;
 
     PublisherConfig config_;

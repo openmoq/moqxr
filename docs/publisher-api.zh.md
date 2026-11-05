@@ -39,7 +39,7 @@ target_link_libraries(your_app PRIVATE openmoq_publisher_lib)
 #include "openmoq/publisher/publisher_api.h"
 
 openmoq::publisher::PublisherConfig config;
-config.draft_version = openmoq::publisher::DraftVersion::kDraft14;
+config.draft_version = openmoq::publisher::DraftVersion::kDraft22;
 config.track_namespace = "media";
 config.forward = false;
 config.publish_catalog = false;
@@ -49,9 +49,23 @@ config.split_cmaf_chunks = true;
 config.paced = false;
 config.loop = false;
 config.subscriber_timeout = std::chrono::seconds(30);
+config.await_subscriber_indefinitely = false;
 
 openmoq::publisher::Publisher publisher(config);
 ```
+
+`DraftVersion::kDraft22` 是默认值。CLI 接受 drafts 16、18、21、22 和 23；该枚举还为 API 和
+MSFTS 示例保留了 `kDraft14` 和 `kDraft17`。
+
+其他 `PublisherConfig` 字段，默认均为关闭或为空：
+
+- `preannounce_tracks`：在 `PUBLISH_NAMESPACE` 之后、任何 subscriber 出现之前，为每个 track 发送一个 `PUBLISH`（CLI：`--preannounce-tracks`）。
+- `moq_impl_id`：发送 `MOQT_IMPLEMENTATION` Setup Option（`openmoq-publisher/<version>`）（CLI：`--moq-impl-id`）。
+- `vod`：将 catalog 标记为 VOD 而非直播（CLI：`--vod`）。VOD 绝不会从输入中推断。
+- `catalog_republish_interval`：按此间隔重新发布 catalog，使其不会从 relay 缓存中过期；为零则禁用（CLI：`--catalog-republish-interval`）。
+- `drm_systems`：`DrmSystemConfig` 条目列表，为媒体中发现的 DRM 系统提供部署字段（`la_url`、`cert_url`、`robustness`）（CLI：`--drm-config`）。
+- `video_alt_group`：为直播 stdin 输入的每个视频 track 设置此 `altGroup`（CLI：`--video-alt-group`）。
+- `libmoq_backend`：libmoq 发布路径使用的 QUIC 栈（`kAuto`、`kPicoquic`、`kMvfst`、`kMsquic`）（CLI：`--libmoq-backend`）。
 
 ### 可选 LOC packaging
 
@@ -193,6 +207,11 @@ endpoint.path = "/moq";
 endpoint.path_explicit = true;
 ```
 
+即使服务器省略了 `reset_stream_at` transport parameter，也可以设置
+`endpoint.webtransport_allow_missing_reset_stream_at = true` 来发送 WebTransport CONNECT
+（CLI：`--webtransport-allow-missing-reset-stream-at`；参见
+[WebTransport 合规性](webtransport-compliance.md)）。
+
 可选 TLS 控制：
 
 ```cpp
@@ -226,6 +245,13 @@ if (!status.ok) {
 - `publish_file(path, endpoint, tls)`
 - `publish_stream(input, source_name, endpoint, tls)`
 
+要干净地结束实时广播，请调用 `end_broadcast(EndBroadcastMode::kConvertToVod)`
+（最终 catalog 将每个 track 标记为非直播，并在已知时添加 `trackDuration`）或
+`end_broadcast(EndBroadcastMode::kTerminate)`（最终 catalog 将 `isComplete` 设为 true，
+且 `tracks` 数组为空），随后会为会话仍在跟踪的请求发送状态为 `Track Ended` 的
+`PUBLISH_DONE`（MSF 第 11.3 节）。没有活动会话时它返回失败状态，并且仅在会话通过
+`publish_live()` 驱动时才写入最终 catalog。
+
 ## 9. 实时输入发布（增量 stdin/stream）
 
 默认的实时路径期望输入 fragmented MP4，这与 ffmpeg/CMAF pipeline 相匹配：
@@ -243,6 +269,25 @@ if (!status.ok) {
 ```
 
 `publish_live(...)` 使用增量解析和实时发布流程，而不是一直缓冲到 EOF。
+
+实时 publisher 的 Group ID 从 0 开始编号，因此重启后再次发布相同 track 的进程会重用上一次运行的 Group ID。
+MoqTransport 第 2.5 节建议让恢复的 track 从高于此前使用过的所有 group 的值开始，例如基于当前时间。
+设置 `PublisherConfig::initial_group_id` 即可实现：
+
+```cpp
+config.initial_group_id = openmoq::publisher::time_based_initial_group_id();
+```
+
+`time_based_initial_group_id()` 返回自 Unix epoch 以来的毫秒数。只要上一次运行发布的 group 数少于其启动到重启之间经过的毫秒数，
+并且系统时钟没有回拨，新的 Group ID 就会保持在上一次运行之上。`publish_live(...)` 在所有 draft 上都从该值开始为直播
+media group 和 catalog group 编号；在 drafts 22 和 23 上，GOAWAY 迁移仍会从上一个会话已发送的 group 之上继续。
+若要以同样方式重试失败的实时发布，请在对同一输入的每次
+`publish_live(ingest, stdin_input, endpoint, tls, endpoint_alpn_overridden, &resume)` 尝试中传入同一个 `LiveResumeState`：
+可重试的失败会在其中记录未发送的 stdin 字节以及下一个 media 和 catalog Group ID，下一次尝试从这些位置恢复，
+成功发布后会将其清除。CLI 在 `--retry` 和 endpoint failover 时就是这样做的。默认值为 0。高于 `kMaxGroupId`（2^62-1）的值会使
+`Publisher` 构造函数和 `set_config` 抛出异常。`publish_live_objects(...)`
+发送其数据源提供的 Group ID（DASH ingest 可通过 `LiveDashIngestConfig::initial_group_id` 设置它们），
+而 libmoq 后端会拒绝非零值，因为它自行为 Group ID 编号。
 
 ## 10. 任意实时对象发布
 
@@ -314,7 +359,20 @@ source.catalog_mode =
 
 **需求门控（lazy relay）。** 选择 libmoq 后端时，发布路径会等待至少一个下游媒体 subscriber 出现后才生成媒体——lazy relay 只有在播放器订阅时才会转发 SUBSCRIBE。在此之前不会写入任何内容（batch/objects/stdin 不会消费其 source；实时 SRT 会丢弃 fragment 以保持有界）。如果在 `PublisherConfig::subscriber_timeout` 内没有出现 subscriber，调用会以 `timed out waiting for media subscriber` 失败，而不是一直挂起。
 
-从另一个线程调用 `disconnect()` 会及时停止正在运行的 `publish_live_objects`（或实时 stdin/SRT）发布；驱动循环退出，endpoint 被中断，调用返回成功。对于 stdin，取消会在当前阻塞读取返回后生效。
+**等待 subscriber（`MoqtSession` 后端）。** 默认情况下，`publish_live_objects` 会在不读取其 source 的情况下等待第一个媒体 subscriber。
+等待在 `PublisherConfig::subscriber_timeout` 之后结束，调用返回成功，除非设置了
+`PublisherConfig::await_subscriber_indefinitely`。设置后，只有 `disconnect()` 或会话结束才会终止等待，
+而 publisher 在此期间持续读取 source：它丢弃媒体 Object，并为第一个 subscriber 保留最新的 catalog，
+因此 source 永远不会被阻塞。libmoq 后端会拒绝该设置，`publish_live` 重载（stdin、SRT）则忽略它。
+publisher 不会对其丢弃的 Object 做节奏控制，因此带节奏的文件 source 可能在第一个 subscriber 到来之前就已到达末尾。
+`subscriber_timeout` 同样限定每次 request-stream 读取，因此无限等待不再需要设置一个极大的超时。
+该期限仅在第一个 subscriber 之前适用：当最后一个 subscriber 离开时（draft 16 上为 UNSUBSCRIBE，draft 18 上为被取消的 request stream），
+publisher 会结束该订阅，以 CANCELLED 重置其已打开的 subgroup stream，继续读取并丢弃 source Object，
+应答之后的 SUBSCRIBE，并在 source 结束时返回。
+
+如果对端停止了某个流 (STOP_SENDING)，或发布端已重置该流，传输层会丢弃仍在该流队列中的写入而不是重试，这样其他流上的控制响应就不会被它阻塞。在这两种情况下，对端看到的都是该流已终止。
+
+从另一个线程调用 `disconnect()` 会及时停止正在运行的发布（批处理、`publish_live_objects` 或实时 stdin/SRT）；驱动循环退出，连接被关闭，调用返回成功。已停止的发布不会重试，也不会跟随 GOAWAY 迁移。真实的 stdin 在 POSIX 上会被轮询，因此空闲的输入不会延迟停止；任何其他 `std::istream` 则在其当前阻塞读取返回后才会被观察到。
 
 > **旧版说明：** 没有媒体元数据的裸 `LiveTrack{.track_name = ...}` 条目（通用的 "events" 式对象 track）在常规的 libmoq 生成 catalog 路径上会被拒绝。对于通用的旧版对象 track，请注入自定义 `TransportFactory`；仅当 source 确实提供所需的 catalog 对象时才使用 `LiveCatalogMode::kSourceObject`。
 
@@ -328,9 +386,12 @@ fragmented MP4 `publish_live(...)` API 仍是媒体 ingest 的默认实时发布
 - Raw QUIC + draft-16：`moqt-16`
 - Raw QUIC + draft-17：`moqt-17`
 - Raw QUIC + draft-18：`moqt-18`
+- Raw QUIC + draft-21：`moqt-21`
+- Raw QUIC + draft-22：`moqt-22`
+- Raw QUIC + draft-23：`moqt-23`
 - WebTransport：`h3`
 
-对于 WebTransport，API 会通过 `WT-Available-Protocols` 将 MoQ 应用协议 offer 与 QUIC ALPN 分开发送：draft-16 offer `"moqt-16"`，draft-17 offer `"moqt-17"`，draft-18 offer `"moqt-18"`，draft-14 保留旧的无子协议行为。引号是 HTTP Structured Fields 语法的一部分；Raw QUIC ALPN 仍使用不带引号的 token。
+对于 WebTransport，API 会通过 `WT-Available-Protocols` 将 MoQ 应用协议 offer 与 QUIC ALPN 分开发送：draft-16 offer `"moqt-16"`，draft-17 offer `"moqt-17"`，draft-18 offer `"moqt-18"`，drafts 21、22 和 23 分别 offer `"moqt-21"`、`"moqt-22"` 和 `"moqt-23"`，draft-14 保留旧的无子协议行为。引号是 HTTP Structured Fields 语法的一部分；Raw QUIC ALPN 仍使用不带引号的 token。
 
 如果应用已经设置了 endpoint ALPN，并且希望保留它：
 
@@ -352,6 +413,7 @@ auto status = publisher.publish(prepared, endpoint, tls, endpoint_alpn_overridde
 
 - `status.ok == true`：成功
 - `status.ok == false`：失败，检查 `status.message`
+- `status.failure_kind` 将失败分类为 `kRetryable`、`kEndpointPermanent`、`kFatal` 或 `kCancelled`；GOAWAY 迁移还会设置 `status.migration_uri` 和 `status.migration_timeout_ms`
 
 推荐模式：
 
@@ -393,49 +455,21 @@ std::cout << "bytes=" << stats.bytes_published
           << " groups=" << stats.groups_published << "\n";
 ```
 
-当前字段：
+`PublisherStats` 的字段：
 
-- `publishingLive`：活动会话是否为 live-publish 模式
-- `bytesPublished`：当前或上一会话中已发布的 payload 字节总数
-- `objectsPublished`：当前或上一会话中已发布的对象总数
-- `groupsPublished`：当前或上一会话中已发布的 (track, group) 单元总数
-- `splitCmafChunks`：当前 packaging 模式（`true` = 拆分 chunk，`false` = 合并 chunk）
-- `includeSap`：是否启用 SAP track/object packaging
-- `includeMsfTimeline`：是否启用 MSF media timeline track/object packaging
-- `transport`、`host`、`port`、`path`：当前或上一会话的 endpoint 上下文
-- `connectionId`：最后已知的 transport connection ID
-- `lastError`：最后一个 publisher 级错误，如果有
+- `publishing_live`: 活动会话是否处于实时发布模式
+- `bytes_published`: 当前/最近一次会话中已发布的 payload 总字节数
+- `objects_published`: 当前/最近一次会话中已发布的对象总数
+- `groups_published`: 当前/最近一次会话中已发布的 (track, group) 单元总数
+- `split_cmaf_chunks`: 当前打包模式（`true` = 拆分 chunk，`false` = 合并 chunk）
+- `include_sap`: 是否启用 SAP track/对象打包
+- `include_msf_timeline`: 是否启用 MSF 媒体时间线 track/对象打包
+- `transport`: `TransportKind::kRawQuic` 或 `TransportKind::kWebTransport`
+- `host`, `port`, `path`: 当前/最近一次会话的 endpoint 信息
+- `connection_id`: 最近已知的传输连接 ID
+- `last_error`: 最近一次 publisher 级别的错误（如有）
 
-`stats_json()` 仍可用于现有集成，但已弃用，因为 JSON polling API 会暗示存在运行时 telemetry 支持，而阻塞式 publisher API 并不提供这种支持。
-
-- `transport`：`"raw_quic"` 或 `"webtransport"`
-- `host`：配置的 endpoint host
-- `port`：配置的 endpoint port
-- `path`：配置的 endpoint path
-- `connectionId`：transport connection identifier，可用时存在
-- `lastError`：最后跟踪的错误消息
-
-示例：
-
-```json
-{
-  "active": true,
-  "connected": true,
-  "publishingLive": false,
-  "bytesPublished": 123456,
-  "objectsPublished": 84,
-  "groupsPublished": 42,
-  "splitCmafChunks": true,
-  "includeSap": false,
-  "includeMsfTimeline": false,
-  "transport": "webtransport",
-  "host": "relay.example.com",
-  "port": 443,
-  "path": "/moq",
-  "connectionId": "wt-140735229359104",
-  "lastError": ""
-}
-```
+`stats_json()` 仍可用于现有集成，但已弃用，因为 JSON polling API 暗示存在运行时遥测支持，而阻塞式 publisher API 并不提供。它以单个 JSON 对象返回相同的值，键名为 camelCase（`bytesPublished`、`connectionId` 等），`transport` 为 `"raw_quic"` 或 `"webtransport"`，并额外包含描述会话的 `active` 和 `connected` 两个字段。新代码请使用 `stats()`。
 
 ## 15. 完整示例
 
@@ -449,7 +483,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.subscriber_timeout = std::chrono::seconds(30);
@@ -571,7 +605,7 @@ int main() {
     using namespace openmoq::publisher::transport;
 
     PublisherConfig config;
-    config.draft_version = DraftVersion::kDraft14;
+    config.draft_version = DraftVersion::kDraft22;
     config.track_namespace = "media";
     config.split_cmaf_chunks = true;
     config.paced = true;

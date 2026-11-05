@@ -171,9 +171,11 @@ ctest --test-dir build --output-on-failure \
 
 ## MSFTS Example Tests
 
-Build and run the focused MSFTS Publisher API coverage with:
+Build and run the focused MSFTS Publisher API coverage with (the example and its
+tests are built only when `OPENMOQ_BUILD_EXAMPLES=ON`, which defaults to `OFF`):
 
 ```bash
+cmake -S . -B build -DOPENMOQ_BUILD_EXAMPLES=ON
 cmake --build build --target \
   openmoq-publisher-msfts-example \
   openmoq-publisher-msfts-tests
@@ -217,25 +219,25 @@ Input source notes:
 Use `--dump-plan` to inspect the generated publish plan without touching the network:
 
 ```bash
-./build/openmoq-publisher --input sample.mp4 --draft 14 --dump-plan
+./build/openmoq-publisher --input sample.mp4 --dump-plan
 ```
 
 Include SAP event timeline output explicitly:
 
 ```bash
-./build/openmoq-publisher --input sample.mp4 --draft 14 --sap --dump-plan
+./build/openmoq-publisher --input sample.mp4 --sap --dump-plan
 ```
 
 Include MSF media timeline output explicitly:
 
 ```bash
-./build/openmoq-publisher --input sample.mp4 --draft 14 --msf-timeline --dump-plan
+./build/openmoq-publisher --input sample.mp4 --msf-timeline --dump-plan
 ```
 
 Use stdin when the source is already being produced by another command:
 
 ```bash
-cat sample.mp4 | ./build/openmoq-publisher --input - --draft 14 --dump-plan
+cat sample.mp4 | ./build/openmoq-publisher --input - --dump-plan
 ```
 
 ## CTE DASH Ingest Dry-Run Testing

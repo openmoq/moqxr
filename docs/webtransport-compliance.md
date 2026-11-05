@@ -7,6 +7,7 @@ It is intentionally limited to the draft variants we support today:
 - MoQ Transport draft 16
 - MoQ Transport draft 17
 - MoQ Transport draft 18
+- MoQ Transport drafts 21, 22, and 23 (native backend)
 - WebTransport over HTTP/3 as implemented by picoquic's h3zero, with its
   session requirements checked against draft 16
   ([text](draft-ietf-webtrans-http3-16.txt))
@@ -103,6 +104,7 @@ Current offers in this repo:
 - draft 16: offer `"moqt-16"` only in `WT-Available-Protocols`
 - draft 17: offer `"moqt-17"` only in `WT-Available-Protocols`
 - draft 18: offer `"moqt-18"` only in `WT-Available-Protocols`
+- drafts 21, 22, and 23: offer `"moqt-21"`, `"moqt-22"`, and `"moqt-23"` respectively, only in `WT-Available-Protocols`
 
 Red5's current picoquic/h3zero server path no longer exposes
 `WT-Available-Protocols` to the application on CONNECT accept.  Red5 therefore
@@ -212,7 +214,7 @@ draft-16/draft-18 relay paths. It cannot reach moqx over WebTransport by default
 because moqx omits the `reset_stream_at` transport parameter (see below and
 [openmoq/moqx#752](https://github.com/openmoq/moqx/issues/752)); raw QUIC to
 moqx is unaffected, and `--webtransport-allow-missing-reset-stream-at` lets the
-CONNECT through for interop testing. Draft-17 is selectable and codec-tested, but has less relay
+CONNECT through for interop testing. Draft-17 is codec-tested and available through the API, but is not selectable in the main CLI and has less relay
 coverage. Remaining risk is now concentrated in broader
 coverage rather than initial session establishment:
 
