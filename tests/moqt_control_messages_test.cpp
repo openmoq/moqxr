@@ -3050,6 +3050,116 @@ bool test_draft23_messages() {
     return ok;
 }
 
+std::vector<std::uint8_t> from_hex(std::string_view hex) {
+    std::vector<std::uint8_t> bytes;
+    for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
+        bytes.push_back(static_cast<std::uint8_t>(std::stoi(std::string(hex.substr(i, 2)), nullptr, 16)));
+    }
+    return bytes;
+}
+
+bool test_request_ok_largest_object_decodes() {
+    bool ok = true;
+    // LARGEST_OBJECT (0x09) is a bare Location on drafts 17+; the decoder
+    // used to read its odd type as Length-prefixed and refuse the message.
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22,
+                                     DraftVersion::kDraft23}) {
+        PublishNamespaceOk message;
+        ok &= expect(decode_request_ok(encode_request_ok_message(draft, 93, 6, 1), draft, message),
+                     draft_label(draft) + " REQUEST_OK decodes LARGEST_OBJECT as a Location");
+        ok &= expect(!decode_request_ok(frame(draft, 0x07, {1, 0x09, 6}), draft, message),
+                     draft_label(draft) + " REQUEST_OK rejects a truncated LARGEST_OBJECT");
+    }
+    PublishNamespaceOk draft16;
+    ok &= expect(decode_request_ok(encode_request_ok_message(DraftVersion::kDraft16, 93, 6, 1),
+                                   DraftVersion::kDraft16, draft16),
+                 "draft-16 REQUEST_OK keeps LARGEST_OBJECT as a length-prefixed Key-Value-Pair");
+    return ok;
+}
+
+// Draft-23 wire vectors cross-checked with another draft-23 implementation:
+// each is one framed control message (or stream header) in hex.
+bool test_draft23_wire_vectors() {
+    using openmoq::publisher::transport::GoawayMessage;
+    using openmoq::publisher::transport::decode_goaway_message;
+    using openmoq::publisher::transport::encode_fetch_header;
+    using openmoq::publisher::transport::encode_namespace_notification;
+    bool ok = true;
+    constexpr DraftVersion d23 = DraftVersion::kDraft23;
+    const auto hex_of = [](const std::vector<std::uint8_t>& bytes) {
+        static constexpr char digits[] = "0123456789abcdef";
+        std::string out;
+        for (const std::uint8_t byte : bytes) {
+            out += digits[byte >> 4];
+            out += digits[byte & 0xf];
+        }
+        return out;
+    };
+
+    // Encoders reproduce the vector byte for byte.
+    const std::vector<std::string> suffix{"a"};
+    const std::vector<std::pair<std::string, std::vector<std::uint8_t>>> encoded{
+        {"af001901042f6d6f71041172656c61792e6578616d706c652e636f6d",
+         encode_setup_message({.draft = d23, .transport = TransportKind::kRawQuic,
+                               .authority = "relay.example.com", .path = "/moq"})},
+        {"080401016100", encode_namespace_notification(d23, suffix)},
+        {"1d0f0201046c69766505766964656f0100",
+         encode_track_message({.draft = d23, .track_name = "video", .track_namespace = "live", .request_id = 2,
+                               .track_alias = 1})},
+        {"06080001046c69766500", encode_namespace_message({.draft = d23, .track_namespace = "live"})},
+        {"04050101090307", encode_subscribe_ok_message(d23, 9, 1, 3, 7, true)},
+        {"070401090601", encode_request_ok_message(d23, 3, 6, 1)},
+        {"0b0f02ffffffffffffffffff04646f6e65",
+         encode_publish_done_message(d23, 2, std::numeric_limits<std::uint64_t>::max(), 0x2, "done")},
+        {"055f", encode_fetch_header(d23, 95)},
+        {"300103", encode_subgroup_header(d23, 1, 3, 0, false)},
+    };
+    for (const auto& [expected, bytes] : encoded) {
+        ok &= expect(hex_of(bytes) == expected, "draft-23 vector " + expected + " encodes, got " + hex_of(bytes));
+    }
+
+    // Decoders accept the vector and read the expected fields.
+    ServerSetupMessage setup;
+    ok &= expect(decode_setup_response_message(from_hex("af00050903c11170"), d23, setup) &&
+                     setup.max_control_message_size == 70000,
+                 "draft-23 vector: MAX_CONTROL_MESSAGE_SIZE 70000");
+    ok &= expect(decode_setup_response_message(from_hex("af000406100204"), d23, setup),
+                 "draft-23 vector: SETUP with MAX_FILTER_RANGES and MAX_REQUEST_UPDATES");
+    RequestError error;
+    ok &= expect(decode_request_error(from_hex("05083400000103000000"), d23, error) && error.error_code == 0x34,
+                 "draft-23 vector: REQUEST_ERROR REDIRECT with its detail");
+    ok &= expect(decode_request_error(from_hex("0507330000023e0010"), d23, error) && error.error_code == 0x33,
+                 "draft-23 vector: REQUEST_ERROR with two UNSUPPORTED_PROPERTY details");
+    SubscribeMessage subscribe;
+    ok &= expect(decode_subscribe_message(from_hex("03100901046c69766505766964656f012105"), d23, subscribe) &&
+                     subscribe.request_id == 9 && subscribe.track_name == "video",
+                 "draft-23 vector: SUBSCRIBE with a Next Object filter");
+    ok &= expect(decode_subscribe_message(from_hex("03110901046c69766505766964656f01210103"), d23, subscribe),
+                 "draft-23 vector: SUBSCRIBE with a Relative Start filter");
+    ok &= expect(decode_subscribe_message(from_hex("03170901046c69766505766964656f03210502012101011200"), d23,
+                                          subscribe) &&
+                     subscribe.fill_requested,
+                 "draft-23 vector: SUBSCRIBE with FILL_PARAMETERS and INCLUDE_PROPERTIES");
+    SubscribeTracksMessage tracks;
+    ok &= expect(decode_subscribe_tracks_message(from_hex("510c5d01046c6976650221050102"), d23, tracks) &&
+                     tracks.request_id == 0x5d && tracks.group_order == 2,
+                 "draft-23 vector: SUBSCRIBE_TRACKS with a Next Object filter and Descending order");
+    RequestUpdateMessage update;
+    ok &= expect(decode_request_update_message(from_hex("02045f012300"), d23, update) &&
+                     update.request_id == 0x5f && update.fill_requested,
+                 "draft-23 vector: REQUEST_UPDATE with an empty FILL_PARAMETERS");
+    PublishNamespaceOk request_ok;
+    ok &= expect(decode_request_ok(from_hex("070401090601"), d23, request_ok),
+                 "draft-23 vector: REQUEST_OK with LARGEST_OBJECT {6, 1}");
+    ok &= expect(decode_request_ok(from_hex("07050108c07530"), d23, request_ok),
+                 "draft-23 vector: REQUEST_OK with EXPIRES 30000");
+    GoawayMessage goaway;
+    ok &= expect(decode_goaway_message(from_hex("1003009388"), d23, goaway) && goaway.new_session_uri.empty() &&
+                     goaway.timeout_ms == 5000,
+                 "draft-23 vector: GOAWAY with a 5000 ms timeout");
+    return ok;
+}
+
 int main() {
     bool wire_ok = test_draft22_generic_framing_and_subscribe_range();
     wire_ok &= test_draft22_wire_api_boundaries();
@@ -3086,5 +3196,7 @@ int main() {
     ok &= test_draft23_paused_parameter();
     ok &= test_draft23_fill_parameters();
     ok &= test_draft23_messages();
+    ok &= test_request_ok_largest_object_decodes();
+    ok &= test_draft23_wire_vectors();
     return ok && wire_ok ? 0 : 1;
 }
