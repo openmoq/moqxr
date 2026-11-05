@@ -314,6 +314,8 @@ Questa modalità richiede esattamente una track chiamata `catalog`, almeno una t
 
 **Gating sulla domanda (relay lazy).** Quando è selezionato il backend libmoq, il percorso di pubblicazione attende almeno un subscriber media a valle prima di produrre media: un relay lazy inoltra un SUBSCRIBE solo quando un player si sottoscrive. Fino ad allora non viene scritto nulla (batch/oggetti/stdin non consumano la propria sorgente; SRT live scarta i frammenti per restare limitato). Se nessun subscriber compare entro `PublisherConfig::subscriber_timeout`, la chiamata fallisce con `timed out waiting for media subscriber` invece di bloccarsi.
 
+Se il peer interrompe uno stream (STOP_SENDING) o il publisher lo ha reimpostato (reset), il trasporto scarta qualsiasi scrittura ancora in coda per quello stream invece di ritentarla, in modo che le risposte di controllo sugli altri stream non restino bloccate dietro di essa. Il peer vede lo stream terminato in entrambi i casi.
+
 Chiamare `disconnect()` da un altro thread interrompe tempestivamente una pubblicazione `publish_live_objects` in corso (o stdin/SRT live); il ciclo del driver si interrompe, l'endpoint viene interrotto e la chiamata restituisce successo. Nel caso specifico di stdin, la cancellazione viene osservata non appena la lettura bloccante corrente ritorna.
 
 > **Nota legacy:** le voci `LiveTrack{.track_name = ...}` nude, senza metadati

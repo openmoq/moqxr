@@ -452,6 +452,8 @@ draft 18), the publisher ends that subscription, resets its open subgroup
 streams with CANCELLED, keeps reading and dropping source Objects, answers a
 later SUBSCRIBE, and returns when the source ends.
 
+If the peer stops a stream (STOP_SENDING) or the publisher has reset it, the transport drops any write still queued for that stream instead of retrying it, so control responses on other streams are not held back behind it. The peer sees the stream terminated either way.
+
 Calling `disconnect()` from another thread stops a running publish promptly
 (batch, `publish_live_objects`, or live stdin/SRT); the driver loop breaks, the
 connection is closed, and the call returns success. A stopped publish is not

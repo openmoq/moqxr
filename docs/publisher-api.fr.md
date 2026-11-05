@@ -407,6 +407,8 @@ abandonne des fragments pour rester borné). Si aucun subscriber n'apparaît dan
 `PublisherConfig::subscriber_timeout`, l'appel échoue avec
 `timed out waiting for media subscriber` au lieu de rester bloqué.
 
+Si le pair arrête un flux (STOP_SENDING) ou si le publieur l'a réinitialisé (reset), le transport abandonne toute écriture encore en file pour ce flux au lieu de la réessayer, afin que les réponses de contrôle sur les autres flux ne soient pas bloquées derrière elle. Le pair voit le flux terminé dans les deux cas.
+
 Appeler `disconnect()` depuis un autre thread arrête rapidement une publication
 `publish_live_objects` en cours (ou stdin/SRT live) ; la boucle du driver s'interrompt, l'endpoint est
 interrompu et l'appel renvoie un succès. Pour stdin en particulier, l'annulation est

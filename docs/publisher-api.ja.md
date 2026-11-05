@@ -314,6 +314,8 @@ source.catalog_mode =
 
 **需要ゲーティング (lazy relay)。** libmoq backend が選択されている場合、公開パスはメディアを生成する前に、少なくとも 1 つの下流メディア subscriber を待ちます。lazy relay は、プレイヤーが subscribe したときにのみ SUBSCRIBE を転送します。それまでは何も書き込まれません (batch/objects/stdin は source を消費せず、ライブ SRT は上限内に収まるよう fragment を破棄します)。`PublisherConfig::subscriber_timeout` 以内に subscriber が現れない場合、呼び出しはハングせずに `timed out waiting for media subscriber` で失敗します。
 
+ピアがストリームを停止 (STOP_SENDING) した場合、またはパブリッシャーがそのストリームをリセットした場合、トランスポートはそのストリームに対してキューに残っている書き込みを再試行せずに破棄します。これにより、他のストリーム上の制御応答がその書き込みの背後で止まることはありません。どちらの場合も、ピアにはストリームが終了したように見えます。
+
 別 thread から `disconnect()` を呼び出すと、実行中の `publish_live_objects` (またはライブ stdin/SRT) の公開は速やかに停止します。ドライバーループが抜け、endpoint が中断され、呼び出しは成功を返します。stdin の場合、キャンセルは現在のブロッキング read が戻った時点で検知されます。
 
 > **従来の注意:** メディアメタデータを持たない素の `LiveTrack{.track_name = ...}` エントリ (汎用的な "events" 形式のオブジェクト track) は、通常の libmoq 生成 catalog パスでは拒否されます。汎用的な従来型オブジェクト track にはカスタムの `TransportFactory` を注入するか、source が必要な catalog オブジェクトを実際に提供する場合にのみ `LiveCatalogMode::kSourceObject` を使ってください。

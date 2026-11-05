@@ -314,6 +314,8 @@ source.catalog_mode =
 
 **需求门控（lazy relay）。** 选择 libmoq 后端时，发布路径会等待至少一个下游媒体 subscriber 出现后才生成媒体——lazy relay 只有在播放器订阅时才会转发 SUBSCRIBE。在此之前不会写入任何内容（batch/objects/stdin 不会消费其 source；实时 SRT 会丢弃 fragment 以保持有界）。如果在 `PublisherConfig::subscriber_timeout` 内没有出现 subscriber，调用会以 `timed out waiting for media subscriber` 失败，而不是一直挂起。
 
+如果对端停止了某个流 (STOP_SENDING)，或发布端已重置该流，传输层会丢弃仍在该流队列中的写入而不是重试，这样其他流上的控制响应就不会被它阻塞。在这两种情况下，对端看到的都是该流已终止。
+
 从另一个线程调用 `disconnect()` 会及时停止正在运行的 `publish_live_objects`（或实时 stdin/SRT）发布；驱动循环退出，endpoint 被中断，调用返回成功。对于 stdin，取消会在当前阻塞读取返回后生效。
 
 > **旧版说明：** 没有媒体元数据的裸 `LiveTrack{.track_name = ...}` 条目（通用的 "events" 式对象 track）在常规的 libmoq 生成 catalog 路径上会被拒绝。对于通用的旧版对象 track，请注入自定义 `TransportFactory`；仅当 source 确实提供所需的 catalog 对象时才使用 `LiveCatalogMode::kSourceObject`。

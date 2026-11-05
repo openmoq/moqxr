@@ -427,9 +427,9 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
         if (picoquic_add_to_stream_with_ctx(
                 impl.cnx, write.stream_id, write.bytes.data(), write.bytes.size(), write.fin ? 1 : 0, stream_ctx) != 0) {
             if (picoquic_stream_send_closed(impl.cnx, write.stream_id)) {
-                // The peer stopped the stream or it was reset: picoquic will
-                // never take this write. Drop it rather than hold back every
-                // write queued behind it.
+                // picoquic will never take this write (see
+                // picoquic_stream_send_closed); drop it so the queue moves on.
+                trace("add_to_stream dropped for closed stream " + std::to_string(write.stream_id));
                 writes.pop_front();
                 continue;
             }

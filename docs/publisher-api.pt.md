@@ -416,6 +416,8 @@ consomem sua fonte; SRT ao vivo descarta fragmentos para permanecer limitado).
 Se nenhum subscriber aparecer dentro de `PublisherConfig::subscriber_timeout`,
 a chamada falha com `timed out waiting for media subscriber` em vez de travar.
 
+Se o peer interrompe um stream (STOP_SENDING) ou o publicador o reiniciou (reset), o transporte descarta qualquer escrita ainda na fila para esse stream em vez de tentá-la novamente, para que as respostas de controle em outros streams não fiquem retidas atrás dela. O peer vê o stream encerrado nos dois casos.
+
 Chamar `disconnect()` de outro thread interrompe prontamente uma publicação
 `publish_live_objects` em andamento (ou stdin/SRT ao vivo); o loop do driver é
 encerrado, o endpoint é interrompido e a chamada retorna sucesso. Para stdin

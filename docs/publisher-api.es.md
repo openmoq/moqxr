@@ -314,6 +314,8 @@ Este modo requiere exactamente un track llamado `catalog`, al menos un track que
 
 **Control por demanda (relays lazy).** Cuando se selecciona el backend libmoq, la ruta de publicación espera al menos un subscriber de medios downstream antes de producir medios: un relay lazy reenvía un SUBSCRIBE solo cuando un reproductor se suscribe. Hasta entonces no se escribe nada (batch/objects/stdin no consumen su fuente; SRT en vivo descarta fragmentos para mantenerse acotado). Si no aparece ningún subscriber dentro de `PublisherConfig::subscriber_timeout`, la llamada falla con `timed out waiting for media subscriber` en lugar de quedarse colgada.
 
+Si el peer detiene un stream (STOP_SENDING) o el publicador lo ha reiniciado (reset), el transporte descarta cualquier escritura aún en cola para ese stream en lugar de reintentarla, de modo que las respuestas de control en otros streams no queden retenidas detrás de ella. El peer ve el stream terminado en ambos casos.
+
 Llamar a `disconnect()` desde otro thread detiene rápidamente una publicación `publish_live_objects` en ejecución (o de stdin/SRT en vivo); el bucle del driver se interrumpe, el endpoint se interrumpe y la llamada devuelve éxito. En el caso de stdin, la cancelación se observa una vez que retorna la lectura bloqueante actual.
 
 > **Nota heredada:** las entradas `LiveTrack{.track_name = ...}` simples sin metadatos
