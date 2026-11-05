@@ -206,7 +206,7 @@ CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 Run with moqx as the Catapult/CAT4MOQ issuer command:
 
 ```bash
-CATAPULT_CAT4MOQ_COMMAND='../moqx/build/moqx issue-cat-token --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
+CATAPULT_CAT4MOQ_COMMAND='../moqx/build/default/moqx-issuer --config /tmp/moqx-auth.yaml --auth-service live --auth-key-id cat-dev --auth-actions client_setup,publish_namespace,publish --auth-namespace {namespace} --auth-track {track}' \
 CAT4MOQ_ENDPOINT='https://127.0.0.1:4433/moq-relay' \
 ./examples/auth/run-cat4moq-auth-example.sh
 ```
