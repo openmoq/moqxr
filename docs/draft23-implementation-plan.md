@@ -31,7 +31,8 @@ moqxr only publishes, so only part of the d22 → d23 diff reaches it.
 - **New session close codes** (§12.2): the ones the session can identify without decoder changes.
 
 ### Unchanged for moqxr
-- **FETCH and TRACK_STATUS** are still answered with REQUEST_ERROR NOT_SUPPORTED. That means FETCH_OK's removal, the FETCH stream re-encoding, Gone and End of Group/Track never come into play.
+- **FETCH** is still answered with REQUEST_ERROR NOT_SUPPORTED on draft 23, as on drafts 21 and 22, which cover a late catalog subscriber with the fill. FETCH_OK's removal, the FETCH stream re-encoding, Gone and End of Group/Track therefore never come into play.
+- **TRACK_STATUS** is answered as on drafts 18–22 (see [status.md](status.md)): TRACK_STATUS_OK is a REQUEST_OK with LARGEST_OBJECT once the track has objects and no Track Properties, or DOES_NOT_EXIST for an unknown track. Draft 23 changes nothing in that answer.
 - **The failed fill stream** (FETCH_HEADER, then a reset) is unchanged.
 - **PUBLISH_DONE EXPIRED_AUTH_TOKEN** is unused: moqxr has no token-expiry path.
 

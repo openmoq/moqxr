@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -3160,6 +3161,70 @@ bool test_draft23_wire_vectors() {
     return ok;
 }
 
+// take_decode_fault() reports why the latest decode failed, and protocol_violation()
+// closes with it. Every decoder clears it on entry, so a fault one decoder left
+// behind never names the failure of the next.
+bool test_decoders_clear_a_stale_decode_fault() {
+    using openmoq::publisher::transport::MaxRequestIdMessage;
+    using openmoq::publisher::transport::PublishNamespaceError;
+    using openmoq::publisher::transport::SubscribeUpdateMessage;
+    using openmoq::publisher::transport::clear_decode_fault;
+    using openmoq::publisher::transport::decode_control_message_header;
+    using openmoq::publisher::transport::decode_max_request_id_message;
+    using openmoq::publisher::transport::decode_publish_namespace_error;
+    using openmoq::publisher::transport::decode_publish_namespace_ok;
+    using openmoq::publisher::transport::decode_subscribe_update_message;
+    using openmoq::publisher::transport::decode_track_status_message;
+    using openmoq::publisher::transport::take_decode_fault;
+    bool ok = true;
+    constexpr DraftVersion d23 = DraftVersion::kDraft23;
+    // A namespace with 33 fields fails with INVALID_TRACK_NAMESPACE (0x302).
+    std::vector<std::uint8_t> too_many_fields;
+    append_moqint(too_many_fields, d23, 1);
+    append_moqint(too_many_fields, d23, 33);
+    for (int i = 0; i < 33; ++i) append_string(too_many_fields, d23, "x");
+    append_moqint(too_many_fields, d23, 0);
+    const auto leave_fault = [&] {
+        clear_decode_fault();
+        SubscribeNamespaceMessage message;
+        static_cast<void>(decode_subscribe_namespace_message(frame(d23, 0x50, too_many_fields), d23, message));
+    };
+    leave_fault();
+    ok &= expect(take_decode_fault() == 0x302, "a 33-field namespace records INVALID_TRACK_NAMESPACE");
+
+    // Each decoder below fails on an empty message without a cause of its own.
+    const std::vector<std::uint8_t> empty;
+    const std::vector<std::pair<std::string, std::function<void()>>> decoders{
+        {"decode_publish_ok", [&] { PublishOk m; static_cast<void>(decode_publish_ok(empty, d23, m)); }},
+        {"decode_publish_error", [&] { PublishError m; static_cast<void>(decode_publish_error(empty, d23, m)); }},
+        {"decode_publish_namespace_ok", [&] { PublishNamespaceOk m; static_cast<void>(decode_publish_namespace_ok(empty, m)); }},
+        {"decode_publish_namespace_error",
+         [&] { PublishNamespaceError m; static_cast<void>(decode_publish_namespace_error(empty, m)); }},
+        {"decode_track_status_message",
+         [&] { SubscribeMessage m; static_cast<void>(decode_track_status_message(empty, d23, m)); }},
+        {"decode_max_request_id_message",
+         [&] { MaxRequestIdMessage m; static_cast<void>(decode_max_request_id_message(empty, m)); }},
+        {"decode_subscribe_update_message",
+         [&] { SubscribeUpdateMessage m; static_cast<void>(decode_subscribe_update_message(empty, m)); }},
+        {"decode_control_message_header",
+         [&] {
+             std::uint64_t type = 0;
+             std::size_t offset = 0, length = 0;
+             static_cast<void>(decode_control_message_header(empty, d23, type, offset, length));
+         }},
+        {"decode_setup_response_message",
+         [&] { ServerSetupMessage m; static_cast<void>(decode_setup_response_message(empty, d23, m)); }},
+        {"decode_server_setup_message",
+         [&] { ServerSetupMessage m; static_cast<void>(decode_server_setup_message(empty, m)); }},
+    };
+    for (const auto& [name, decode] : decoders) {
+        leave_fault();
+        decode();
+        ok &= expect(take_decode_fault() == 0, name + " clears a stale decode fault");
+    }
+    return ok;
+}
+
 int main() {
     bool wire_ok = test_draft22_generic_framing_and_subscribe_range();
     wire_ok &= test_draft22_wire_api_boundaries();
@@ -3198,5 +3263,6 @@ int main() {
     ok &= test_draft23_messages();
     ok &= test_request_ok_largest_object_decodes();
     ok &= test_draft23_wire_vectors();
+    ok &= test_decoders_clear_a_stale_decode_fault();
     return ok && wire_ok ? 0 : 1;
 }
