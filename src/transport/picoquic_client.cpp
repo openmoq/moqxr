@@ -352,6 +352,15 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
               " now_ms=" + std::to_string(trace_elapsed_ms(now)));
         const int ret = picoquic_add_to_stream(
             impl.cnx, write.stream_id, write.bytes.data(), write.bytes.size(), write.fin ? 1 : 0);
+        if (ret != 0 && picoquic_stream_send_closed(impl.cnx, write.stream_id)) {
+            // The peer stopped the stream or it was reset: picoquic will
+            // never take this write. Drop it rather than hold back every
+            // write queued behind it.
+            trace("add_to_stream dropped for closed stream " + std::to_string(write.stream_id) +
+                  " queue_age_ms=" + std::to_string(age_ms));
+            writes.pop_front();
+            continue;
+        }
         if (ret != 0) {
             // picoquic rejected the write, most commonly because its per-stream
             // send buffer is full. This is transient back-pressure: defer the

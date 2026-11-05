@@ -812,6 +812,80 @@ int main() {
                          "expected the WebTransport RESET_STREAM code to be mapped back to SESSION_CLOSED 0x03");
         }
 
+        {
+            // A response the session writes to a request stream the peer has
+            // already stopped must not hold back responses on other streams.
+            std::uint64_t stopped_request_stream_id = 0;
+            ok &= expect(drain_client->open_stream(StreamDirection::kBidirectional, stopped_request_stream_id).ok,
+                         "expected peer-stopped WebTransport request stream open to succeed");
+            {
+                std::lock_guard<std::mutex> lock(server.mutex);
+                server.stop_sending_stream_ids.insert(stopped_request_stream_id);
+            }
+            ok &= expect(drain_client->write_stream(stopped_request_stream_id, std::vector<std::uint8_t>{0x03}, false).ok,
+                         "expected the first write on the peer-stopped request stream to succeed");
+            const auto stop_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!drain_client->media_stream_peer_stopped(stopped_request_stream_id) &&
+                   std::chrono::steady_clock::now() < stop_deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            ok &= expect(drain_client->media_stream_peer_stopped(stopped_request_stream_id),
+                         "expected STOP_SENDING on the WebTransport request stream");
+            drain_client->acknowledge_media_stream_peer_stopped(stopped_request_stream_id);
+            ok &= expect(drain_client->write_stream(stopped_request_stream_id, std::vector<std::uint8_t>{0x07}, false).ok,
+                         "expected a write on the peer-stopped request stream to be accepted and dropped");
+
+            std::uint64_t next_request_stream_id = 0;
+            ok &= expect(drain_client->open_stream(StreamDirection::kBidirectional, next_request_stream_id).ok,
+                         "expected the next WebTransport request stream open to succeed");
+            ok &= expect(drain_client->write_stream(next_request_stream_id, std::vector<std::uint8_t>{0x04}, false).ok,
+                         "expected the next WebTransport request stream write to succeed");
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return server.streams_with_data.contains(next_request_stream_id);
+                         }),
+                         "expected a write behind one to a peer-stopped request stream to reach the peer");
+        }
+
+        {
+            // Likewise for a write that reaches picoquic after this side reset
+            // the stream.
+            std::uint64_t reset_request_stream_id = 0;
+            ok &= expect(drain_client->open_stream(StreamDirection::kBidirectional, reset_request_stream_id).ok,
+                         "expected locally reset WebTransport request stream open to succeed");
+            ok &= expect(drain_client->write_stream(reset_request_stream_id, std::vector<std::uint8_t>{0x05}, false).ok,
+                         "expected the first write on the locally reset request stream to succeed");
+            {
+                std::unique_lock<std::mutex> lock(server.mutex);
+                ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                                 return server.streams_with_data.contains(reset_request_stream_id);
+                             }),
+                             "expected the first write on the locally reset request stream to arrive");
+            }
+            ok &= expect(drain_client->reset_stream(reset_request_stream_id, 0x00).ok,
+                         "expected the WebTransport request stream reset to succeed");
+            {
+                std::unique_lock<std::mutex> lock(server.mutex);
+                ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                                 return server.stream_reset_errors.contains(reset_request_stream_id);
+                             }),
+                             "expected the peer to see the WebTransport request stream reset");
+            }
+            ok &= expect(drain_client->write_stream(reset_request_stream_id, std::vector<std::uint8_t>{0x07}, false).ok,
+                         "expected a write on the locally reset request stream to be accepted and dropped");
+
+            std::uint64_t next_request_stream_id = 0;
+            ok &= expect(drain_client->open_stream(StreamDirection::kBidirectional, next_request_stream_id).ok,
+                         "expected the WebTransport request stream after the reset one to open");
+            ok &= expect(drain_client->write_stream(next_request_stream_id, std::vector<std::uint8_t>{0x04}, false).ok,
+                         "expected the WebTransport request stream write after the reset one to succeed");
+            std::unique_lock<std::mutex> lock(server.mutex);
+            ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] {
+                             return server.streams_with_data.contains(next_request_stream_id);
+                         }),
+                         "expected a write behind one to a locally reset request stream to reach the peer");
+        }
+
         constexpr std::size_t kPeerStopStressCount = 24;
         std::vector<std::uint64_t> peer_stop_stress_streams;
         peer_stop_stress_streams.reserve(kPeerStopStressCount);

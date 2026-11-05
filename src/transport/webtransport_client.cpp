@@ -426,6 +426,13 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
         }
         if (picoquic_add_to_stream_with_ctx(
                 impl.cnx, write.stream_id, write.bytes.data(), write.bytes.size(), write.fin ? 1 : 0, stream_ctx) != 0) {
+            if (picoquic_stream_send_closed(impl.cnx, write.stream_id)) {
+                // The peer stopped the stream or it was reset: picoquic will
+                // never take this write. Drop it rather than hold back every
+                // write queued behind it.
+                writes.pop_front();
+                continue;
+            }
             // picoquic's per-stream send buffer is full. This is transient
             // back-pressure, not a fatal error: defer the remaining writes so
             // they stay queued in order until picoquic has drained enough to

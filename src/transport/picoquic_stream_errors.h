@@ -18,4 +18,12 @@ inline std::uint64_t picoquic_remote_stop_error(picoquic_cnx_t* cnx, std::uint64
     return stream != nullptr ? stream->remote_stop_error : 0;
 }
 
+// Whether picoquic refuses all further data on a stream: the stream is gone,
+// the peer sent STOP_SENDING, or a RESET_STREAM is queued or sent for it.
+// picoquic_add_to_stream() fails in each case, and retrying cannot succeed.
+inline bool picoquic_stream_send_closed(picoquic_cnx_t* cnx, std::uint64_t stream_id) {
+    const picoquic_stream_head_t* stream = picoquic_find_stream(cnx, stream_id);
+    return stream == nullptr || stream->stop_sending_received || stream->reset_requested;
+}
+
 }  // namespace openmoq::publisher::transport
