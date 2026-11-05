@@ -4152,6 +4152,188 @@ TransportStatus read_request_stream_message(PublisherTransport& transport,
     }
 }
 
+using LargestObject = std::optional<std::pair<std::size_t, std::size_t>>;
+
+// Drafts 18 and later, section 10.14: TRACK_STATUS is read like a SUBSCRIBE
+// that creates no subscription. A track this session publishes gets
+// TRACK_STATUS_OK (a REQUEST_OK) with the parameters its SUBSCRIBE_OK would
+// carry, which here is LARGEST_OBJECT once the track has objects. Any other
+// track gets DOES_NOT_EXIST. The stream ends with a FIN after the answer.
+// lookup returns nullopt for a track the session does not publish.
+TransportStatus answer_track_status(
+    PublisherTransport& transport,
+    openmoq::publisher::DraftVersion draft,
+    std::uint64_t request_stream_id,
+    std::span<const std::uint8_t> message_bytes,
+    PeerRequestIdValidator& peer_request_ids,
+    std::string_view track_namespace,
+    const std::function<std::optional<LargestObject>(const std::string&)>& lookup) {
+    SubscribeMessage request;
+    if (!decode_track_status_message(message_bytes, draft, request)) {
+        return protocol_violation(transport, "received invalid TRACK_STATUS");
+    }
+    const TransportStatus token_status = authorization_token_status(
+        transport, request.malformed_authorization_token, request.authorization_token_cache_overflow,
+        request.unknown_authorization_token_alias);
+    if (!token_status.ok) return token_status;
+    const TransportStatus id_status = peer_request_ids.validate(transport, request.request_id);
+    if (!id_status.ok) return id_status;
+
+    std::optional<LargestObject> track;
+    if (namespace_matches(request.track_namespace, track_namespace)) {
+        track = lookup(request.track_name);
+    }
+    if (!track.has_value()) {
+        return transport.write_stream(
+            request_stream_id,
+            encode_request_error_message(draft, request.request_id, does_not_exist_request_error_code(draft), 0,
+                                         "track does not exist"),
+            true);
+    }
+    const LargestObject& largest = *track;
+    return transport.write_stream(
+        request_stream_id,
+        largest ? encode_request_ok_message(draft, request.request_id, largest->first, largest->second)
+                : encode_request_ok_message(draft, request.request_id),
+        true);
+}
+
+struct CatalogFetchObject {
+    std::uint64_t group_id = 0;
+    std::uint64_t object_id = 0;
+    std::vector<std::uint8_t> payload;
+};
+
+// Draft 18 section 10.12.2: a Joining FETCH retrieves the objects before a
+// subscription's start so the two are contiguous. Only the catalog is
+// retained for it. A late catalog subscriber gets the catalog object it
+// missed (MSF section 5); every other fetch is declined with NOT_SUPPORTED.
+// joined_track maps a Joining Request ID to the track of a subscription this
+// session accepted, or nullopt for an unknown ID. A subscription that has
+// already completed still counts, since the fetch reaches the publisher after
+// the catalog object has been sent on it.
+TransportStatus answer_catalog_joining_fetch(
+    PublisherTransport& transport,
+    openmoq::publisher::DraftVersion draft,
+    std::uint64_t request_stream_id,
+    std::span<const std::uint8_t> message_bytes,
+    PeerRequestIdValidator& peer_request_ids,
+    const std::function<std::optional<std::string>(std::uint64_t)>& joined_track,
+    const std::function<std::optional<CatalogFetchObject>()>& catalog_object) {
+    FetchMessage fetch;
+    if (!decode_fetch_message(message_bytes, draft, fetch)) {
+        return protocol_violation(transport, "received invalid FETCH");
+    }
+    const TransportStatus token_status = authorization_token_status(
+        transport, fetch.malformed_authorization_token, fetch.authorization_token_cache_overflow,
+        fetch.unknown_authorization_token_alias);
+    if (!token_status.ok) return token_status;
+    const TransportStatus id_status = peer_request_ids.validate(transport, fetch.request_id);
+    if (!id_status.ok) return id_status;
+
+    const auto reject = [&](std::uint64_t code, std::string_view reason) {
+        return transport.write_stream(
+            request_stream_id, encode_request_error_message(draft, fetch.request_id, code, 0, reason), true);
+    };
+    if (fetch.fetch_type == 0x1) {
+        return reject(kRequestErrorNotSupported, "standalone FETCH not supported");
+    }
+    constexpr std::uint64_t kInvalidRange = 0x11;
+    constexpr std::uint64_t kInvalidJoiningRequestId = 0x32;
+    const std::optional<std::string> track = joined_track(fetch.joining_request_id);
+    if (!track.has_value()) {
+        return reject(kInvalidJoiningRequestId, "unknown joining request id");
+    }
+    if (*track != "catalog") {
+        return reject(kRequestErrorNotSupported, "joining FETCH is only served for the catalog");
+    }
+    const std::optional<CatalogFetchObject> object = catalog_object();
+    if (!object.has_value()) {
+        return reject(kInvalidRange, "no objects published");
+    }
+    // Relative: start group = Joining Location.Group - Joining Start; absolute:
+    // Joining Start itself. Either way the range ends at the Joining Location,
+    // the catalog object, so it is served unless the start lies past it.
+    if (fetch.joining_start > object->group_id) {
+        return reject(kInvalidRange, "joining start is past the largest object");
+    }
+
+    std::uint64_t data_stream_id = 0;
+    TransportStatus status = transport.open_stream(StreamDirection::kUnidirectional, data_stream_id);
+    if (!status.ok) return status;
+    std::vector<std::uint8_t> data = encode_fetch_header(draft, fetch.request_id);
+    const std::vector<std::uint8_t> fetch_object =
+        encode_fetch_object(draft, object->group_id, object->object_id, 128, object->payload);
+    data.insert(data.end(), fetch_object.begin(), fetch_object.end());
+    status = transport.write_stream(data_stream_id, data, true);
+    if (!status.ok) return status;
+    return transport.write_stream(
+        request_stream_id,
+        encode_fetch_ok_message(draft, false, static_cast<std::size_t>(object->group_id),
+                                static_cast<std::size_t>(object->object_id) + 1),
+        true);
+}
+
+// Draft 16 section 4: a limited endpoint answers a request it does not
+// support with NOT_SUPPORTED instead of ignoring it. Draft 16 carries FETCH
+// (0x16) and TRACK_STATUS (0xd) on the control stream, with the Request ID
+// right after the length.
+bool is_draft16_unsupported_request(openmoq::publisher::DraftVersion draft, std::uint64_t message_type) {
+    return draft == openmoq::publisher::DraftVersion::kDraft16 && (message_type == 0x16 || message_type == 0x0d);
+}
+
+TransportStatus reject_draft16_unsupported_request(PublisherTransport& transport,
+                                                   std::uint64_t control_stream_id,
+                                                   std::span<const std::uint8_t> message_bytes,
+                                                   PeerRequestIdValidator& peer_request_ids) {
+    constexpr auto draft = openmoq::publisher::DraftVersion::kDraft16;
+    std::size_t offset = 0;
+    std::size_t length = 0;
+    std::uint64_t type = 0;
+    std::uint64_t request_id = 0;
+    if (!decode_control_message_header(message_bytes, draft, type, offset, length) ||
+        !decode_moqint(message_bytes, offset, draft, request_id)) {
+        return protocol_violation(transport, "malformed unsupported request");
+    }
+    const TransportStatus id_status = peer_request_ids.validate(transport, request_id);
+    if (!id_status.ok) return id_status;
+    return transport.write_stream(
+        control_stream_id,
+        encode_request_error_message(draft, request_id, kRequestErrorNotSupported, 0, "request type not supported"),
+        false);
+}
+
+// Drafts 18 and later: routes TRACK_STATUS and FETCH. TRACK_STATUS is
+// answered on every draft; a FETCH is answered on draft 18 (Joining FETCH of
+// the catalog) and declined with NOT_SUPPORTED on the others.
+TransportStatus serve_track_status_or_fetch(
+    PublisherTransport& transport,
+    openmoq::publisher::DraftVersion draft,
+    std::uint64_t request_type,
+    std::uint64_t request_stream_id,
+    std::span<const std::uint8_t> message_bytes,
+    PeerRequestIdValidator& peer_request_ids,
+    std::string_view track_namespace,
+    const std::function<std::optional<LargestObject>(const std::string&)>& lookup,
+    const std::map<std::uint64_t, std::string>& joinable_subscriptions,
+    const std::function<std::optional<CatalogFetchObject>()>& catalog_object) {
+    if (request_type == 0x0d) {
+        return answer_track_status(transport, draft, request_stream_id, message_bytes, peer_request_ids,
+                                   track_namespace, lookup);
+    }
+    if (draft != openmoq::publisher::DraftVersion::kDraft18) {
+        return reject_unsupported_request(transport, draft, request_stream_id, message_bytes, peer_request_ids);
+    }
+    return answer_catalog_joining_fetch(
+        transport, draft, request_stream_id, message_bytes, peer_request_ids,
+        [&](std::uint64_t request_id) -> std::optional<std::string> {
+            const auto it = joinable_subscriptions.find(request_id);
+            if (it == joinable_subscriptions.end()) return std::nullopt;
+            return it->second;
+        },
+        catalog_object);
+}
+
 // Draft 18 §5.1.1: a subscriber terminates a subscription by sending
 // STOP_SENDING on its request stream, and "The Publisher can destroy
 // subscription state as soon as it has received STOP_SENDING". Ends each
@@ -4545,6 +4727,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     std::deque<std::uint64_t> pending_subscription_order;
     std::map<std::uint64_t, ActiveSubscription> active_subscriptions;
     std::set<std::pair<std::vector<std::string>, std::string>> established_subscription_tracks;
+    std::map<std::uint64_t, std::string> joinable_subscriptions;
     std::vector<std::vector<std::string>> established_namespace_prefixes;
     DiscoveryRequests discovery_requests;
     PeerUnidirectionalStreams peer_unidirectional_streams;
@@ -5063,6 +5246,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     }
                     established_subscription_tracks.emplace(
                         subscribe.track_namespace, subscribe.track_name);
+                    joinable_subscriptions.insert_or_assign(subscribe.request_id, subscribe.track_name);
                     open_failed_fill_stream(transport, draft, subscribe.fill_requested, subscribe.request_id,
                                             subscribe.forward, largest.has_value());
                     ActiveSubscription active{
@@ -5184,8 +5368,26 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
 
                 if (is_draft18_or_later(draft) &&
                     (request_type == 0x16 || request_type == 0x0d)) {  // FETCH / TRACK_STATUS
-                    const auto response_status = reject_unsupported_request(
-                        transport, draft, request_stream_id, message_bytes, peer_request_ids);
+                    const auto response_status = serve_track_status_or_fetch(
+                        transport, draft, request_type, request_stream_id, message_bytes, peer_request_ids,
+                        track_namespace,
+                        [&](const std::string& name) -> std::optional<LargestObject> {
+                            if (!tracks_by_name.contains(name)) return std::nullopt;
+                            return subscribe_ok_largest(draft, name,
+                                                        largest_sent ? largest_sent(name) : std::nullopt, false);
+                        },
+                        joinable_subscriptions,
+                        [&]() -> std::optional<CatalogFetchObject> {
+                            const openmoq::publisher::CmsfObject* latest = nullptr;
+                            for (const auto& object : plan.objects) {
+                                if (object.track_name != "catalog") continue;
+                                if (latest == nullptr || object.group_id > latest->group_id) latest = &object;
+                            }
+                            if (latest == nullptr || object_payload(*latest).empty()) return std::nullopt;
+                            const auto payload = object_payload(*latest);
+                            return CatalogFetchObject{latest->group_id, latest->object_id,
+                                                      {payload.begin(), payload.end()}};
+                        });
                     if (!response_status.ok) return response_status;
                     continue;
                 }
@@ -5460,6 +5662,13 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 if (is_draft18_or_later(draft)) {
                     return session_violation(transport, draft, kUnexpectedMessageErrorCode,
                                              "received unknown or unsupported control-stream message");
+                }
+                if (is_draft16_unsupported_request(draft, message_type)) {
+                    const TransportStatus rejected = reject_draft16_unsupported_request(
+                        transport, control_stream_id, message_bytes, peer_request_ids);
+                    if (!rejected.ok) return rejected;
+                    buffer.erase(buffer.begin(), buffer.begin() + message_size);
+                    continue;
                 }
                 // Earlier drafts allow this implementation's legacy skip path.
                 if (trace_enabled()) {
@@ -8501,6 +8710,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     std::map<std::string, std::uint64_t> last_group_id_by_track;
     std::set<std::string> loc_waiting_for_group;
     std::map<std::uint64_t, SubscribeMessage> active_subscriptions;
+    std::map<std::uint64_t, std::string> joinable_subscriptions;
     std::map<std::uint64_t, std::uint64_t> active_subscription_stream_ids;
     std::map<std::uint64_t, std::vector<std::uint8_t>>
         pending_subscription_request_bytes;
@@ -9022,8 +9232,22 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 }
                 if (is_draft18_or_later(draft_version) &&
                     (request_type == 0x16 || request_type == 0x0d)) {
-                    const auto response_status = reject_unsupported_request(
-                        transport_, draft_version, request_stream_id, request_bytes, peer_request_ids);
+                    const auto response_status = serve_track_status_or_fetch(
+                        transport_, draft_version, request_type, request_stream_id, request_bytes, peer_request_ids,
+                        track_namespace_,
+                        [&](const std::string& name) -> std::optional<LargestObject> {
+                            if (!alias_by_track.contains(name)) return std::nullopt;
+                            return subscribe_ok_largest(draft_version, name,
+                                                        live_largest_object(largest_object_by_track, name), false);
+                        },
+                        joinable_subscriptions,
+                        [&]() -> std::optional<CatalogFetchObject> {
+                            std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
+                            if (!last_catalog_object_) return std::nullopt;
+                            const auto& object = *last_catalog_object_;
+                            return CatalogFetchObject{object.group_id, object.object_id,
+                                                      {object.payload.begin(), object.payload.end()}};
+                        });
                     if (!response_status.ok) return {response_status, 0};
                     continue;
                 }
@@ -9092,6 +9316,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 if (!response_status.ok) {
                     return {response_status, 0};
                 }
+                joinable_subscriptions.insert_or_assign(subscribe.request_id, subscribe.track_name);
                 // A draft-22 catalog fill is served by send_catalog() below.
                 open_failed_fill_stream(transport_, draft_version,
                                         subscribe.fill_requested && !serves_catalog_fills(draft_version, subscribe),
@@ -9154,6 +9379,16 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
             std::uint64_t message_type = 0;
             if (!decode_varint(message_bytes, offset, message_type)) {
                 return {TransportStatus::failure("failed to parse control request type"), 0};
+            }
+
+            if (is_draft16_unsupported_request(draft_version, message_type)) {
+                const TransportStatus rejected = reject_draft16_unsupported_request(
+                    transport_, control_stream_id_, message_bytes, peer_request_ids);
+                if (!rejected.ok) return {rejected, 0};
+                pending_control_bytes_.erase(
+                    pending_control_bytes_.begin(),
+                    pending_control_bytes_.begin() + static_cast<std::ptrdiff_t>(message_size));
+                continue;
             }
 
             if ((is_draft18_or_later(draft_version) &&
@@ -10067,6 +10302,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     std::map<std::string, std::uint64_t> last_group_id_by_track;
     std::set<std::string> loc_waiting_for_group;
     std::map<std::uint64_t, SubscribeMessage> active_subscriptions;
+    std::map<std::uint64_t, std::string> joinable_subscriptions;
     std::set<std::pair<std::vector<std::string>, std::string>> established_subscription_tracks;
     std::vector<std::vector<std::string>> established_namespace_prefixes;
     DiscoveryRequests discovery_requests;
@@ -10674,6 +10910,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                         return {write_status, 0};
                     }
                     established_subscription_tracks.insert(subscription_key);
+                    joinable_subscriptions.insert_or_assign(subscribe.request_id, subscribe.track_name);
                     // A draft-22 catalog fill is served by send_catalog() below.
                     open_failed_fill_stream(transport_, draft_version,
                                             subscribe.fill_requested && !serves_catalog_fills(draft_version, subscribe),
@@ -10791,8 +11028,22 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
 
                 if (is_draft18_or_later(draft_version) &&
                     (request_type == 0x16 || request_type == 0x0d)) {
-                    const auto response_status = reject_unsupported_request(
-                        transport_, draft_version, request_stream_id, request_bytes, peer_request_ids);
+                    const auto response_status = serve_track_status_or_fetch(
+                        transport_, draft_version, request_type, request_stream_id, request_bytes, peer_request_ids,
+                        track_namespace_,
+                        [&](const std::string& name) -> std::optional<LargestObject> {
+                            if (!alias_by_track.contains(name)) return std::nullopt;
+                            return subscribe_ok_largest(draft_version, name,
+                                                        live_largest_object(largest_object_by_track, name), false);
+                        },
+                        joinable_subscriptions,
+                        [&]() -> std::optional<CatalogFetchObject> {
+                            std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
+                            if (!last_catalog_object_) return std::nullopt;
+                            const auto& object = *last_catalog_object_;
+                            return CatalogFetchObject{object.group_id, object.object_id,
+                                                      {object.payload.begin(), object.payload.end()}};
+                        });
                     if (!response_status.ok) return {response_status, 0};
                     continue;
                 }
@@ -10929,6 +11180,16 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 message_type != 0x03 && message_type != 0x06 && message_type != 0x50 &&
                 message_type != 0x16 && message_type != 0x1d && message_type != 0x51) {
                 return {session_violation(transport_, draft_version, kUnexpectedMessageErrorCode, "unknown control message"), 0};
+            }
+
+            if (is_draft16_unsupported_request(draft_version, message_type)) {
+                const TransportStatus rejected = reject_draft16_unsupported_request(
+                    transport_, control_stream_id_, message_bytes, peer_request_ids);
+                if (!rejected.ok) return {rejected, 0};
+                pending_control_bytes_.erase(
+                    pending_control_bytes_.begin(),
+                    pending_control_bytes_.begin() + static_cast<std::ptrdiff_t>(message_size));
+                continue;
             }
 
             if ((is_draft18_or_later(draft_version) &&
@@ -11567,6 +11828,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         visit(catalog_resend);
     };
     std::map<std::uint64_t, SubscribeMessage> active_subscriptions;
+    std::map<std::uint64_t, std::string> joinable_subscriptions;
     std::set<std::pair<std::vector<std::string>, std::string>> established_subscription_tracks;
     std::vector<std::vector<std::string>> established_namespace_prefixes;
     DiscoveryRequests discovery_requests;
@@ -11711,6 +11973,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return write_status;
         }
         established_subscription_tracks.insert(subscription_key);
+        joinable_subscriptions.insert_or_assign(subscribe.request_id, subscribe.track_name);
         open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested, subscribe.request_id,
                                 subscribe.forward, largest.has_value());
         SubscribeMessage stored = subscribe;
@@ -12122,8 +12385,22 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
 
                 if (is_draft18_or_later(draft_version) &&
                     (request_type == 0x16 || request_type == 0x0d)) {
-                    const auto response_status = reject_unsupported_request(
-                        transport_, draft_version, request_stream_id, request_bytes, peer_request_ids);
+                    const auto response_status = serve_track_status_or_fetch(
+                        transport_, draft_version, request_type, request_stream_id, request_bytes, peer_request_ids,
+                        track_namespace_,
+                        [&](const std::string& name) -> std::optional<LargestObject> {
+                            if (!alias_by_track.contains(name)) return std::nullopt;
+                            return subscribe_ok_largest(draft_version, name,
+                                                        live_largest_object(largest_object_by_track, name), false);
+                        },
+                        joinable_subscriptions,
+                        [&]() -> std::optional<CatalogFetchObject> {
+                            std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
+                            if (!last_catalog_object_) return std::nullopt;
+                            const auto& object = *last_catalog_object_;
+                            return CatalogFetchObject{object.group_id, object.object_id,
+                                                      {object.payload.begin(), object.payload.end()}};
+                        });
                     if (!response_status.ok) return response_status;
                     continue;
                 }
@@ -12224,6 +12501,16 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 message_type != 0x03 && message_type != 0x06 && message_type != 0x50 &&
                 message_type != 0x16 && message_type != 0x1d && message_type != 0x51) {
                 return session_violation(transport_, draft_version, kUnexpectedMessageErrorCode, "unknown control message");
+            }
+
+            if (is_draft16_unsupported_request(draft_version, message_type)) {
+                const TransportStatus rejected = reject_draft16_unsupported_request(
+                    transport_, control_stream_id_, message_bytes, peer_request_ids);
+                if (!rejected.ok) return rejected;
+                pending_control_bytes_.erase(
+                    pending_control_bytes_.begin(),
+                    pending_control_bytes_.begin() + static_cast<std::ptrdiff_t>(message_size));
+                continue;
             }
 
             if ((is_draft18_or_later(draft_version) &&
