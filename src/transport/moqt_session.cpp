@@ -4081,11 +4081,11 @@ using LargestSentLookup =
 
 // Draft-18+ SUBSCRIBE_OK LARGEST_OBJECT: "If Objects have been published on
 // this Track the Publisher MUST include this parameter" (draft 18 §10.2.11,
-// draft 21 §9.20.18, draft 22 §9.20.17). The batch and publish_live_objects()
-// paths re-send their retained catalog at its existing Location to each new
-// subscriber, so they omit the catalog's Largest Object; otherwise a Next
-// Object filter would exclude that re-send. publish_live() sends a later
-// subscriber a new catalog group instead, so it reports it.
+// draft 21 §9.20.18, draft 22 §9.20.17). The batch path re-sends its retained
+// catalog at its existing Location to each new subscriber, so it omits the
+// catalog's Largest Object; otherwise a Next Object filter would exclude that
+// re-send. publish_live() and publish_live_objects() send a later subscriber
+// a new catalog group instead, so they report it.
 std::optional<std::pair<std::size_t, std::size_t>> subscribe_ok_largest(
     openmoq::publisher::DraftVersion draft,
     const std::string& track_name,
@@ -11733,6 +11733,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
     }
 
+    // The catalog fill and the Joining FETCH serve this broadcast's latest
+    // catalog Object, never one an earlier publish left on this session.
+    {
+        std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
+        last_catalog_object_.reset();
+    }
+
     TransportStatus status = ensure_setup(draft_version);
     if (!status.ok) {
         return status;
@@ -11818,14 +11825,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     const std::uint64_t control_read_stream_id =
         uses_request_streams(draft_version) ? peer_control_stream_id_ : control_stream_id_;
     std::map<std::string, SubgroupSenderState> sender_by_track;
-    // Resends the latest catalog Group to a new catalog subscription.
-    SubgroupSenderState catalog_resend;
     // Visits every sender, for stream events and the final flush.
     const auto live_senders = [&](const auto& visit) {
         for (auto& entry : sender_by_track) {
             visit(entry.second);
         }
-        visit(catalog_resend);
     };
     std::map<std::uint64_t, SubscribeMessage> active_subscriptions;
     std::map<std::uint64_t, std::string> joinable_subscriptions;
@@ -11953,11 +11957,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                            false);
         }
 
-        // The largest Location read from the source, which SUBSCRIBE_OK
-        // reports and the filter resolves against. The catalog keeps
-        // reporting none, so a catalog subscription starts at {0, 0}.
-        const auto seen_it = subscribe.track_name == "catalog" ? largest_object_by_track.end()
-                                                               : largest_object_by_track.find(subscribe.track_name);
+        // The largest Location read from the source, or for the catalog the
+        // largest one sent, which SUBSCRIBE_OK reports and the filter
+        // resolves against.
+        const auto seen_it = largest_object_by_track.find(subscribe.track_name);
         std::optional<std::pair<std::size_t, std::size_t>> largest;
         if (draft_version != DraftVersion::kDraft14 && seen_it != largest_object_by_track.end()) {
             largest = seen_it->second;
@@ -11974,8 +11977,20 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
         established_subscription_tracks.insert(subscription_key);
         joinable_subscriptions.insert_or_assign(subscribe.request_id, subscribe.track_name);
-        open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested, subscribe.request_id,
-                                subscribe.forward, largest.has_value());
+        // A catalog subscriber that comes after the catalog went out still
+        // needs it (MSF section 5). As in publish_live(), a draft-21+ fill
+        // that covers the catalog is served here, and otherwise
+        // send_retained_catalog() sends the catalog in a new Group.
+        bool catalog_filled = false;
+        if (serves_catalog_fills(draft_version, subscribe)) {
+            const TransportStatus fill_status = serve_catalog_fill(draft_version, subscribe, catalog_filled);
+            if (!fill_status.ok) {
+                return fill_status;
+            }
+        } else {
+            open_failed_fill_stream(transport_, draft_version, subscribe.fill_requested, subscribe.request_id,
+                                    subscribe.forward, largest.has_value());
+        }
         SubscribeMessage stored = subscribe;
         if (seen_it != largest_object_by_track.end()) {
             if (subscribe.filter_type == 0x01) {
@@ -11987,7 +12002,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
         }
         active_subscriptions.emplace(subscribe.request_id, std::move(stored));
-        catalog_subscription_unserved = catalog_subscription_unserved || subscribe.track_name == "catalog";
+        catalog_subscription_unserved =
+            catalog_subscription_unserved || (subscribe.track_name == "catalog" && !catalog_filled);
         active_subscription_stream_ids.insert_or_assign(subscribe.request_id, response_stream_id);
         if (subscription_forwards_objects(
                 draft_version, subscribe.forward)) {
@@ -12046,14 +12062,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return TransportStatus::success();
         }
         const auto sender_it = sender_by_track.find(ended.track_name);
-        TransportStatus status = sender_it == sender_by_track.end()
-                                     ? TransportStatus::success()
-                                     : sender_it->second.cancel_all_open_subgroups(transport_, kCancelledErrorCode);
-        if (ended.track_name == "catalog") {
-            const TransportStatus resend_status = catalog_resend.cancel_all_open_subgroups(transport_, kCancelledErrorCode);
-            status = status.ok ? resend_status : status;
-        }
-        return status;
+        return sender_it == sender_by_track.end()
+                   ? TransportStatus::success()
+                   : sender_it->second.cancel_all_open_subgroups(transport_, kCancelledErrorCode);
     };
 
     // Ends each subscription whose request stream the subscriber cancelled,
@@ -12602,6 +12613,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     // Every source catalog Object of the latest catalog Group, for a new
     // catalog subscription.
     std::vector<openmoq::publisher::LiveObject> retained_catalog_group;
+    // Added to each source catalog Group ID: the Groups this publisher
+    // inserted for late catalog subscribers (see send_retained_catalog).
+    std::size_t catalog_group_offset = 0;
     // The source's MSF 11.3 closing catalog, held back until the media
     // tracks are done (see the post-loop flush).
     std::optional<openmoq::publisher::LiveObject> closing_catalog;
@@ -12688,6 +12702,17 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                     static_cast<std::uint64_t>(catalog.group_id),
                                     static_cast<std::uint64_t>(catalog.object_id),
                                     catalog.payload.size());
+            // The catalog's Largest Object is the largest one sent, as in
+            // publish_live(): a subscriber answered before the catalog went
+            // out starts at {0, 0} and gets it at its own Location.
+            note_largest_live_object(largest_object_by_track, "catalog", catalog.group_id, catalog.object_id);
+            std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
+            last_catalog_object_ = openmoq::publisher::CatalogObject{
+                .group_id = static_cast<std::uint64_t>(catalog.group_id),
+                .object_id = static_cast<std::uint64_t>(catalog.object_id),
+                .subgroup_id = catalog.subgroup_id,
+                .payload = std::string(catalog.payload.begin(), catalog.payload.end()),
+            };
         }
         return send_status;
     };
@@ -12717,40 +12742,51 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             if (!send_status.ok) {
                 return send_status;
             }
-        } else if (const bool resend_wanted = std::any_of(
-                       active_subscriptions.begin(), active_subscriptions.end(), [&](const auto& entry) {
-                           if (entry.second.track_name != "catalog") return false;
-                           return std::any_of(retained_catalog_group.begin(), retained_catalog_group.end(),
-                                              [&](const openmoq::publisher::LiveObject& object) {
-                                                  openmoq::publisher::CmsfObject probe;
-                                                  probe.group_id = object.group_id;
-                                                  probe.object_id = object.object_id;
-                                                  return object_matches_filter(probe, entry.second);
-                                              });
-                       });
-                   resend_wanted) {
-            // The track's sender cannot send this catalog Group again: resend
-            // it whole, at its own Locations, on a fresh stream that ends with
-            // its last Object, after resetting an unfinished earlier resend.
-            // The resend is skipped when no catalog subscription's filter
-            // includes the Group (an Absolute Start after it, or an end before
-            // it), because the stream is shared by every catalog subscription.
-            const TransportStatus previous_status =
-                catalog_resend.cancel_all_open_subgroups(transport_, kCancelledErrorCode);
-            if (!previous_status.ok) {
-                return previous_status;
-            }
-            catalog_resend = SubgroupSenderState{};
-            for (std::size_t index = 0; index < retained_catalog_group.size(); ++index) {
-                bool object_published = false;
-                const TransportStatus send_status = send_catalog_object(
-                    catalog_resend, retained_catalog_group[index],
-                    index + 1 == retained_catalog_group.size(), object_published);
-                if (!send_status.ok) {
-                    return send_status;
+        } else {
+            // A subscriber that missed the catalog Group gets it in a new
+            // Group, as in publish_live(). Its SUBSCRIBE_OK reported Largest
+            // Object, so a Largest Object or Next Object filter excludes the
+            // Group's own Locations, and "A publisher MUST NOT send objects
+            // from outside the requested range" (draft 18 section 5.1.2,
+            // draft 22 section 3.3.1). A relay that caches the Group also
+            // forwards a new one. Later source catalog Objects move up with
+            // it. The Group is skipped when no catalog subscription's filter
+            // includes it (an Absolute Start after it, or an end before it),
+            // because the track's streams are shared by every catalog
+            // subscription.
+            const auto largest_sent = live_largest_object(largest_object_by_track, "catalog");
+            const std::size_t group_id =
+                std::max(catalog.group_id, largest_sent ? largest_sent->first : std::size_t{0}) + 1;
+            const bool resend_wanted =
+                std::any_of(active_subscriptions.begin(), active_subscriptions.end(), [&](const auto& entry) {
+                    openmoq::publisher::CmsfObject probe;
+                    probe.group_id = group_id;
+                    return entry.second.track_name == "catalog" && object_matches_filter(probe, entry.second);
+                });
+            if (resend_wanted) {
+                // The earlier Group gets no more Objects: end its streams.
+                const TransportStatus finish_status =
+                    finish_live_group(catalog_sender, effective_delivery_timeouts("catalog"));
+                if (!finish_status.ok) {
+                    return finish_status;
                 }
-                if (!object_published) {
-                    break;
+                catalog_group_offset += group_id - catalog.group_id;
+                retained_source_catalog->group_id = group_id;
+                for (auto& object : retained_catalog_group) {
+                    object.group_id = group_id;
+                }
+                for (std::size_t index = 0; index < retained_catalog_group.size(); ++index) {
+                    const auto& object = retained_catalog_group[index];
+                    bool object_published = false;
+                    const TransportStatus send_status = send_catalog_object(
+                        catalog_sender, object, index + 1 == retained_catalog_group.size() && object.final_in_subgroup,
+                        object_published);
+                    if (!send_status.ok) {
+                        return send_status;
+                    }
+                    if (!object_published) {
+                        break;
+                    }
                 }
             }
         }
@@ -12883,10 +12919,15 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         if (alias_it == alias_by_track.end()) {
             return TransportStatus::failure("live object references unknown track: " + next->track_name);
         }
-        note_largest_live_object(largest_object_by_track,
-                                 next->track_name,
-                                 next->group_id,
-                                 next->object_id);
+        if (next->track_name == "catalog") {
+            // Its Largest Object is noted when it is sent.
+            next->group_id += catalog_group_offset;
+        } else {
+            note_largest_live_object(largest_object_by_track,
+                                     next->track_name,
+                                     next->group_id,
+                                     next->object_id);
+        }
         if (next->ends_broadcast) {
             if (next->track_name != "catalog") {
                 return TransportStatus::failure(
@@ -13117,15 +13158,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                        : status;
         }
     }
-    status = finish_live_group(catalog_resend, effective_delivery_timeouts("catalog"));
-    if (!status.ok) {
-        return stopping() ? finish_after_media_event_dispatch(transport_, live_senders, TransportStatus::success())
-                          : status;
-    }
-    // A catalog resend stream is a catalog track stream too.
     const auto track_stream_count = [&](const std::string& track_name) {
-        return sender_by_track[track_name].stream_count() +
-               (track_name == "catalog" ? catalog_resend.stream_count() : 0);
+        return sender_by_track[track_name].stream_count();
     };
 
     // Sends PUBLISH_DONE on the catalog track or on the media tracks. Returns
