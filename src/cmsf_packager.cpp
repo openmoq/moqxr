@@ -289,7 +289,7 @@ std::vector<std::uint8_t> extract_codec_init_data(const Mp4Box& sample_entry,
     // sample_entry.span.size -- a memory-safety bug and a false-positive
     // hazard. find_child_box_span walks by declared length and clamps to the
     // real buffer.
-    for (const std::string_view type : {"avcC", "hvcC", "esds", "dOps"}) {
+    for (const std::string_view type : {"avcC", "hvcC", "av1C", "esds", "dOps"}) {
         const auto span = find_child_box_span(bytes,
                                               sample_entry.span.offset,
                                               sample_entry.span.size,

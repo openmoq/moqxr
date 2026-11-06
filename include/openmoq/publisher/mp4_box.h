@@ -82,7 +82,7 @@ struct TrackDescription {
     std::string language{};          // ISO-639-2/T, empty when unknown or "und"
     // Present when the sample entry is encv or enca and its sinf parsed.
     std::optional<CencTrackProtection> protection;
-    std::vector<std::uint8_t> codec_private;  // avcC, hvcC, or esds box bytes (including box header)
+    std::vector<std::uint8_t> codec_private;  // avcC, hvcC, av1C, or esds box bytes (including box header)
     std::optional<TrackFragmentDefaults> fragment_defaults = std::nullopt;
 };
 
