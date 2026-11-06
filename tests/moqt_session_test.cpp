@@ -2658,6 +2658,142 @@ bool test_live_stdin_initial_group_id(const EndpointConfig& endpoint, const TlsC
     return ok;
 }
 
+// Draft 18 §10.2.11 and draft 22 §9.20.17: "If Objects have been published on
+// this Track the Publisher MUST include this parameter." publish_live_objects
+// answers a catalog subscriber that comes after the catalog went out the way
+// publish_live does: SUBSCRIBE_OK reports the catalog's Largest Object, a
+// draft-22 fill that covers it is served on a fill fetch stream, a draft-18
+// Joining FETCH (MSF section 5) gets it, and otherwise the catalog goes out
+// again in a new Group, which a Largest Object, Next Group Start, or Next
+// Object filter includes, with or without a Joining FETCH.
+// The first catalog subscriber, answered before any catalog went out, gets no
+// Largest Object and Group 0. A relay re-subscribes this way (field case D7):
+// its first catalog subscription ends, and a new viewer brings a new one.
+bool test_live_objects_catalog_late_subscriber(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    const std::vector<std::uint8_t> catalog_payload = {'C', 'A', 'T'};
+    struct Case {
+        DraftVersion draft;
+        bool fill;
+        bool joining_fetch;
+        std::string_view name;
+        // Draft 18 Filter Type: Largest Object (0x2) or Next Group Start (0x1).
+        std::uint64_t filter = 0x02;
+    };
+    bool ok = true;
+    for (const Case& test_case : {Case{DraftVersion::kDraft18, false, false, "Largest Object filter"},
+                                  Case{DraftVersion::kDraft18, false, false, "Next Group Start filter", 0x01},
+                                  Case{DraftVersion::kDraft18, false, true, "Joining FETCH"},
+                                  Case{DraftVersion::kDraft22, false, false, "Next Object filter"},
+                                  Case{DraftVersion::kDraft22, true, false, "current-group fill"}}) {
+        const DraftVersion draft = test_case.draft;
+        const std::string label =
+            openmoq::publisher::to_string(draft) + " " + std::string(test_case.name) + ": ";
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+        transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, "video", 1, draft));
+        for (const std::uint64_t id : {1, 5, 9, 13}) transport.keep_open_streams.insert(id);
+        bool late_subscribed = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (ends_with(event.bytes, {'V', '1'})) {
+                    // The first catalog subscriber leaves.
+                    current.peer_stopped_media_streams.insert(1);
+                } else if (ends_with(event.bytes, {'V', '2'}) && !late_subscribed) {
+                    late_subscribed = true;
+                    // Draft 22: Next Object, optionally with FILL_PARAMETERS
+                    // {count 1, LOCATION_FILTER Relative StartGroup 1}, which
+                    // fills the current Group (§3.5). Draft 18: Largest Object
+                    // or Next Group Start, without a Joining FETCH unless the
+                    // case adds one.
+                    current.reads[9].push_back(
+                        draft == DraftVersion::kDraft22
+                            ? encode_catalog_subscribe_with_fill(
+                                  draft, 5,
+                                  test_case.fill ? std::optional<std::vector<std::uint8_t>>(
+                                                       std::vector<std::uint8_t>{0x01, 0x21, 0x01, 0x01})
+                                                 : std::nullopt)
+                            : encode_subscribe_message(5, kNamespace, "catalog", 1, draft, 0, 0, 128, 0, 0, 0,
+                                                       test_case.filter));
+                    if (test_case.joining_fetch) {
+                        // Relative Joining FETCH (type 0x2) of subscription 5,
+                        // Joining Start 0: the current catalog Group.
+                        current.reads[13].push_back({0x16, 0x00, 0x05, 7, 0x2, 5, 0, 0});
+                    }
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+            LiveObject{.track_name = "video", .group_id = 4, .payload = {'V', '4'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+        // The last video Group waits for the late catalog subscription.
+        source.next_object = [&]() -> std::optional<LiveObject> {
+            if (object_index >= objects.size() || (object_index >= 4 && !late_subscribed)) return std::nullopt;
+            return objects[object_index++];
+        };
+        source.is_finished = [&]() { return object_index >= objects.size(); };
+        MoqtSession session(transport, std::string(kNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, label + "late catalog subscriber session connects");
+        const TransportStatus status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, label + "late catalog subscriber publish succeeds: " + status.message);
+        ok &= expect(late_subscribed, label + "the late catalog subscription arrives");
+
+        using openmoq::publisher::transport::encode_subscribe_ok_message;
+        ok &= expect(wrote(transport, 1, encode_subscribe_ok_message(draft, 1, 0, 0, 0, false)),
+                     label + "the first catalog SUBSCRIBE_OK omits LARGEST_OBJECT before any catalog is sent");
+        ok &= expect(wrote(transport, 9, encode_subscribe_ok_message(draft, 5, 0, 0, 0, true)),
+                     label + "the late catalog SUBSCRIBE_OK reports LARGEST_OBJECT {0,0}");
+
+        // The fill fetch stream: FETCH_HEADER (0x05) for Request ID 5.
+        const auto fill_it = std::find_if(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+            return (write.stream_id & 0x3ULL) == 0x2ULL && write.bytes.size() > 2 && write.bytes[0] == 0x05 &&
+                   write.bytes[1] == 5;
+        });
+        const auto groups = data_stream_groups(transport, draft);
+        const auto catalog_groups = groups.find(0);
+        const std::vector<std::uint64_t> expected_groups =
+            test_case.fill ? std::vector<std::uint64_t>{0} : std::vector<std::uint64_t>{0, 1};
+        ok &= expect(catalog_groups != groups.end() && catalog_groups->second == expected_groups,
+                     label + (test_case.fill
+                                  ? "a served fill sends no new catalog Group"
+                                  : "the late subscriber gets the catalog in a new Group, after Largest Object"));
+        if (test_case.fill) {
+            ok &= expect(fill_it != transport.writes.end() && fill_it->fin && ends_with(fill_it->bytes, catalog_payload),
+                         label + "the fill fetch stream carries the catalog and ends with a FIN");
+            ok &= expect(fill_it != transport.writes.end() &&
+                             std::none_of(transport.reset_calls.begin(), transport.reset_calls.end(),
+                                          [&](const auto& reset) { return reset.first == fill_it->stream_id; }),
+                         label + "the catalog fill fetch stream is not reset");
+        } else {
+            ok &= expect(fill_it == transport.writes.end(), label + "no fill fetch stream without FILL_PARAMETERS");
+        }
+        if (test_case.joining_fetch) {
+            ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(),
+                                     [](const auto& write) {
+                                         return write.stream_id == 13 && write.fin && message_type(write.bytes) == 0x18;
+                                     }),
+                         label + "the Joining FETCH of the catalog gets FETCH_OK");
+            ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(),
+                                     [&](const auto& write) {
+                                         return (write.stream_id & 0x3ULL) == 0x2ULL && write.fin &&
+                                                message_type(write.bytes) == 0x05 &&
+                                                ends_with(write.bytes, catalog_payload);
+                                     }),
+                         label + "the Joining FETCH sends the catalog on a FETCH_HEADER stream");
+        }
+    }
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -10609,9 +10745,9 @@ int main() {
     }
 
     {
-        // The retained catalog is re-sent to each new subscriber, so a draft-21
-        // catalog SUBSCRIBE_OK omits LARGEST_OBJECT even after the catalog was
-        // sent; otherwise a Next Object filter would drop that re-send.
+        // Draft 21 section 9.20.18: once the catalog was sent, a later catalog
+        // SUBSCRIBE_OK reports its LARGEST_OBJECT {0, 0}. The new subscriber
+        // gets the catalog in a new Group, which its filter includes.
         constexpr DraftVersion draft = DraftVersion::kDraft21;
         MockTransport transport;
         transport.keep_open_streams.insert(1);
@@ -10652,13 +10788,12 @@ int main() {
                 second_ok = write.bytes;
             }
         }
-        bool without_largest = false;
-        for (std::uint64_t alias = 0; alias < 8; ++alias) {
-            without_largest = without_largest ||
-                second_ok == openmoq::publisher::transport::encode_subscribe_ok_message(draft, 95, alias, 0, 0, false);
-        }
-        ok &= expect(second_queued && second_ok.has_value() && without_largest,
-                     "expected a draft-21 catalog SUBSCRIBE_OK to omit LARGEST_OBJECT after the catalog was sent");
+        ok &= expect(second_queued &&
+                         second_ok == openmoq::publisher::transport::encode_subscribe_ok_message(draft, 95, 0, 0, 0, true),
+                     "expected a draft-21 catalog SUBSCRIBE_OK to report LARGEST_OBJECT {0,0} after the catalog was sent");
+        const auto groups = data_stream_groups(transport, draft);
+        ok &= expect(groups.contains(0) && groups.at(0) == std::vector<std::uint64_t>{0, 1},
+                     "expected the later draft-21 catalog subscriber to get the catalog in Group 1");
     }
 
     {
@@ -13309,12 +13444,11 @@ int main() {
 
     // A late catalog subscriber gets the current catalog (field case D7: a
     // relay drops its catalog track when the last subscriber leaves, then
-    // subscribes upstream again). The catalog SUBSCRIBE_OK carries no Largest
-    // Object, so the new subscription starts at {0, 0}, and the latest catalog
-    // Group goes out again at its own Location on a fresh stream. The closing
-    // catalog still follows, in its own Group. In the second case the catalog
-    // SUBSCRIBE comes after the media one: the catalog was never sent, so it
-    // goes out once.
+    // subscribes upstream again). The catalog SUBSCRIBE_OK reports Largest
+    // Object {0, 0}, and the latest catalog goes out again in a new Group, 1,
+    // on a fresh stream. The closing catalog still follows, in its own Group,
+    // moved up to 2. In the last case the catalog SUBSCRIBE comes after the
+    // media one: the catalog was never sent, so it goes out once, in Group 0.
     {
         const DraftVersion draft = DraftVersion::kDraft16;
         const std::vector<std::uint8_t> catalog_payload = {'C', 'A', 'T'};
@@ -13384,13 +13518,14 @@ int main() {
             ok &= expect(status.ok, "expected catalog resubscribe publish to succeed: " + status.message);
             ok &= expect(catalog_resubscribed, "expected the catalog resubscribe case to resubscribe");
             const std::string catalogs = catalog_groups(transport, catalog_payload);
-            ok &= expect(catalogs == " 0 0",
-                         "expected the Group 0 catalog again, on a second stream, for the new subscription; got Groups" +
-                             catalogs);
+            ok &= expect(catalogs == " 0 1",
+                         "expected the catalog again, in Group 1, for the new subscription; got Groups" + catalogs);
             const std::string closings = catalog_groups(transport, closing_payload);
-            ok &= expect(closings == " 1", "expected the closing catalog once, in Group 1; got Groups" + closings);
-            // The catalog track opened three streams: Group 0, its resend, and
-            // the closing Group 1.
+            ok &= expect(closings == " 2", "expected the closing catalog once, in Group 2; got Groups" + closings);
+            ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_subscribe_ok_message(draft, 5, 0, 0, 0, true)),
+                         "expected the new catalog SUBSCRIBE_OK to report LARGEST_OBJECT {0,0}");
+            // The catalog track opened three streams: Group 0, Group 1, and
+            // the closing Group 2.
             ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_publish_done_message(draft, 5, 3)),
                          "expected PUBLISH_DONE for the new catalog subscription to count the three catalog streams");
         }
@@ -13491,6 +13626,10 @@ int main() {
             ok &= expect(catalogs == " 0",
                          "expected a late first catalog SUBSCRIBE to get the catalog once, in Group 0; got Groups" +
                              catalogs);
+            // Read from the source but never sent, the catalog has no Largest
+            // Object yet, so the subscription starts at {0, 0} and includes it.
+            ok &= expect(wrote(transport, 0, openmoq::publisher::transport::encode_subscribe_ok_message(draft, 3, 0, 0, 0, false)),
+                         "expected a late first catalog SUBSCRIBE_OK to omit LARGEST_OBJECT before the catalog is sent");
         }
     }
 
@@ -13690,9 +13829,8 @@ int main() {
 
     // Draft 22 sends each catalog Object as it is read. When the catalog
     // Group's subgroup was reset (its only subscription ended) and a new
-    // catalog subscription got the Group resent, a later delta in that Group
-    // goes out with the Group again, on a fresh stream: the track's own
-    // stream for the subgroup is gone.
+    // catalog subscription got the catalog in a new Group, a later delta in
+    // the source's Group moves up to that new Group and goes out on its stream.
     {
         constexpr DraftVersion draft = DraftVersion::kDraft22;
         MockTransport transport;
@@ -13726,10 +13864,22 @@ int main() {
         ok &= expect(session.connect(endpoint, tls).ok, "expected draft-22 catalog delta connect to succeed");
         status = session.publish_live_objects(source, draft);
         ok &= expect(status.ok, "expected draft-22 catalog delta publish to succeed: " + status.message);
-        ok &= expect(payload_writes(transport, {'D', '1'}) == 1 && payload_writes(transport, {'C', '0'}) == 3,
-                     "expected the draft-22 delta to go out once, with Object 0, after the catalog Group resend; got " +
+        ok &= expect(payload_writes(transport, {'D', '1'}) == 1 && payload_writes(transport, {'C', '0'}) == 2,
+                     "expected the draft-22 delta to go out once, after Object 0 in the new catalog Group; got " +
                          std::to_string(payload_writes(transport, {'D', '1'})) + " deltas and " +
                          std::to_string(payload_writes(transport, {'C', '0'})) + " Objects 0");
+        std::vector<std::uint64_t> c0_streams;
+        std::optional<std::uint64_t> d1_stream;
+        for (const auto& write : transport.writes) {
+            if ((write.stream_id & 0x3U) != 0x2U) continue;
+            if (ends_with(write.bytes, {'C', '0'})) c0_streams.push_back(write.stream_id);
+            if (ends_with(write.bytes, {'D', '1'})) d1_stream = write.stream_id;
+        }
+        ok &= expect(c0_streams.size() == 2 && d1_stream == c0_streams[1],
+                     "expected the draft-22 delta on the new catalog Group's stream");
+        const auto groups = data_stream_groups(transport, draft);
+        ok &= expect(groups.contains(0) && groups.at(0) == std::vector<std::uint64_t>{0, 1},
+                     "expected the draft-22 catalog in Groups 0 and 1 only");
     }
 
     // The subscriber deadline bounds only the wait for the first
@@ -13915,6 +14065,7 @@ int main() {
     ok &= test_live_stdin_catalog_reaches_every_subscriber(endpoint, tls);
     ok &= test_live_stdin_catalog_resume_reports_current_largest(endpoint, tls);
     ok &= test_live_stdin_draft18_subscribe_ok_reports_largest(endpoint, tls);
+    ok &= test_live_objects_catalog_late_subscriber(endpoint, tls);
 
     return ok ? 0 : 1;
 }
