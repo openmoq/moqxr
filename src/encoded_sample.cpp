@@ -530,6 +530,8 @@ std::vector<std::uint8_t> loc_codec_config(const TrackDescription &t) {
         r.end();
         return {r.b.begin(), r.b.end()};
     }
+    if (t.sample_entry_type == "av01")
+        fail("AV1 is not supported by LOC packaging");
     if (boxes[0].type != "esds" || r.get(4))
         fail("invalid AAC configuration");
     Reader es{descriptor(r, 3)};

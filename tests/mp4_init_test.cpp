@@ -12,11 +12,13 @@
 
 namespace {
 
+#include "ffmpeg_av1_init_fixture.inc"
 #include "ffmpeg_avc_init_fixture.inc"
 
 using namespace openmoq::publisher;
 
 static_assert(sizeof(kFfmpegAvcInitData) == kFfmpegAvcInitDataSize);
+static_assert(sizeof(kFfmpegAv1InitData) == kFfmpegAv1InitDataSize);
 
 bool expect(bool condition, const std::string& message) {
     if (!condition) {
@@ -184,6 +186,41 @@ bool test_fragment_frame_rates(std::span<const std::uint8_t> init_segment) {
     return ok;
 }
 
+// True when the bytes are exactly one av1C box: a size/type header followed by the 4-byte
+// AV1CodecConfigurationRecord (marker+version 0x81) and optional configOBUs.
+bool is_av1c_box(const std::vector<std::uint8_t>& bytes) {
+    return bytes.size() >= 12 && read_be32(bytes, 0) == bytes.size() &&
+           std::string(bytes.begin() + 4, bytes.begin() + 8) == "av1C" && bytes[8] == 0x81;
+}
+
+// An independently muxed AV1 init segment: the av01 sample entry carries an av1C box, which the live CMAF
+// catalog must expose as codec initData and use to build the RFC-style AV1 codec string.
+bool test_av1_init_segment() {
+    bool ok = true;
+    const std::span<const std::uint8_t> init_segment(kFfmpegAv1InitData, kFfmpegAv1InitDataSize);
+
+    const auto tracks = extract_tracks(parse_mp4_boxes(init_segment), init_segment);
+    ok &= expect(tracks.size() == 1, "expected one track in the AV1 init segment");
+    if (tracks.size() != 1) {
+        return false;
+    }
+
+    const auto& track = tracks.front();
+    ok &= expect(track.sample_entry_type == "av01", "expected the av01 sample-entry type");
+    ok &= expect(track.codec == "av01.0.00M.08",
+                 "expected the AV1 codec string built from av1C (profile 0, level 0, Main tier, 8-bit)");
+    ok &= expect(is_av1c_box(track.codec_private), "expected the av1C box as the track codec configuration");
+
+    const auto live_catalog = build_live_catalog(tracks, init_segment, true);
+    const std::string catalog_text(live_catalog.catalog_payload.begin(), live_catalog.catalog_payload.end());
+    ok &= expect_contains(catalog_text, "\"codec\":\"av01.0.00M.08\"",
+                          "expected the live catalog to advertise the AV1 codec string");
+    ok &= expect(live_catalog.track_initializations.size() == 1 &&
+                     is_av1c_box(live_catalog.track_initializations.front().codec_payload),
+                 "expected the AV1 codec initData to be the av1C box");
+    return ok;
+}
+
 int main() {
     bool ok = true;
     const std::span<const std::uint8_t> init_segment(kFfmpegAvcInitData, kFfmpegAvcInitDataSize);
@@ -232,6 +269,7 @@ int main() {
                           "expected rejection to identify the missing codec initialization box");
 
     ok &= test_fragment_frame_rates(init_segment);
+    ok &= test_av1_init_segment();
 
     return ok ? 0 : 1;
 }
