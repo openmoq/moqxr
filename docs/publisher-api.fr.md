@@ -84,11 +84,12 @@ config.draft_version = openmoq::publisher::DraftVersion::kDraft18;
 ```
 
 Le backend natif extrait un échantillon H.264/AAC en clair par objet et fournit
-les propriétés LOC-04. Pour des objets déjà encodés, déclarez `LivePackaging::kLoc`,
+les propriétés LOC-05. Pour des objets déjà encodés, déclarez `LivePackaging::kLoc`,
 fournissez les extradata du codec dans `LiveTrack::init_data`, et remplissez
 `LiveObject::properties` avec des entrées `ObjectProperty` typées. Les ID pairs contiennent
 un `uint64_t` ; les ID impairs contiennent des vecteurs d'octets. Fournissez Timestamp (16) et
-un Timescale (8) non nul, et conservez le subgroup zéro. L'appelant est responsable de
+un Timescale (8) non nul, et conservez le subgroup zéro. Codec String (17) est
+facultatif ; s'il est fourni, il doit correspondre à `LiveTrack::codec`. L'appelant est responsable de
 l'exactitude des échantillons et de la configuration ainsi que des frontières de GOP ; commencez
 chaque group vidéo par une image indépendante à l'objet zéro. Le catalog généré porte la
 configuration du codec. Les catalogs fournis par la source et la publication LOC via libmoq

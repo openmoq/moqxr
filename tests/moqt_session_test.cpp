@@ -11947,7 +11947,9 @@ int main() {
         ok &= expect(recovered.size() == 2 && recovered[0].is_video_keyframe && recovered[0].object_id == 0, "LOC SRT queue sequence gap suppresses dependent video until next independent sample");
     }
 
-    for (int invalid = 0; invalid < 4; ++invalid) {
+    for (int invalid = 0; invalid < 6; ++invalid) {
+        // 4: mismatched Codec String; 5: matching optional Codec String.
+        const bool valid = invalid == 0 || invalid == 5;
         MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
         transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
@@ -11962,16 +11964,21 @@ int main() {
             emitted = true;
             auto object_config = config;
             if (invalid == 2) object_config.back() ^= 1;
-            return LiveObject{.track_name = "video", .payload = {0, 0, 0, 2, 0x65, 0x88},
+            LiveObject object{.track_name = "video", .payload = {0, 0, 0, 2, 0x65, 0x88},
                 .properties = {{8, std::uint64_t{1000}}, {16, std::uint64_t{42}},
                                {9, std::vector<std::uint8_t>{static_cast<std::uint8_t>(invalid == 1 ? 0xc0 : 0xe0)}},
                                {13, object_config}}};
+            if (invalid >= 4) {
+                const std::string codec = invalid == 4 ? "avc1.42001f" : "avc1.42001e";
+                object.properties.push_back({17, std::vector<std::uint8_t>(codec.begin(), codec.end())});
+            }
+            return object;
         }};
         MoqtSession session(transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         if (status.ok) status = session.publish_live_objects(source, DraftVersion::kDraft18);
-        ok &= expect(status.ok == (invalid == 0), "LOC arbitrary source validates independent start and matching configuration: " + status.message);
-        ok &= expect(session.publish_stats().objects_published == (invalid == 0 ? 1 : 0), "invalid LOC source never publishes media");
+        ok &= expect(status.ok == valid, "LOC arbitrary source validates independent start, matching configuration, and codec string: " + status.message);
+        ok &= expect(session.publish_stats().objects_published == (valid ? 1 : 0), "invalid LOC source never publishes media");
     }
 
     {

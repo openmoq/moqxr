@@ -1891,9 +1891,11 @@ bool test_object_properties() {
     bool ok = true;
     const std::vector<ObjectProperty> props{{0x10, std::uint64_t{42}}, {8, std::uint64_t{1000}}};
     const std::vector<std::uint8_t> payload{0xaa, 0xbb};
-    ok &= expect(serialize_object_properties(props) == std::vector<std::uint8_t>({8, 0x83, 0xe8, 8, 42}), "sorted LOC-04 golden property block");
+    ok &= expect(serialize_object_properties(props) == std::vector<std::uint8_t>({8, 0x83, 0xe8, 8, 42}), "sorted LOC-05 golden property block");
+    const std::vector<ObjectProperty> codec_props{{0x11, std::vector<std::uint8_t>{'a', 'b'}}, {0x10, std::uint64_t{42}}, {8, std::uint64_t{1000}}};
+    ok &= expect(serialize_object_properties(codec_props) == std::vector<std::uint8_t>({8, 0x83, 0xe8, 8, 42, 1, 2, 'a', 'b'}), "LOC-05 codec string follows timestamp with delta one");
     ok &= expect(encode_subgroup_header(DraftVersion::kDraft18, 0, 0, 0, false, true) == std::vector<std::uint8_t>({0x31, 0, 0}), "PROPERTIES header bit");
-    ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, {}, 0, payload, props) == std::vector<std::uint8_t>({0, 5, 8, 0x83, 0xe8, 8, 42, 2, 0xaa, 0xbb}), "LOC-04 golden object");
+    ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, {}, 0, payload, props) == std::vector<std::uint8_t>({0, 5, 8, 0x83, 0xe8, 8, 42, 2, 0xaa, 0xbb}), "LOC-05 golden object");
     ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, 0, 1, payload, {}, true) == std::vector<std::uint8_t>({0, 0, 2, 0xaa, 0xbb}), "empty properties retain stream framing");
     ok &= expect(encode_subgroup_object(DraftVersion::kDraft18, {}, 0, payload) == std::vector<std::uint8_t>({0, 2, 0xaa, 0xbb}), "default wire unchanged");
     auto stream = encode_subgroup_header(DraftVersion::kDraft18, 0, 0, 0, false, true);

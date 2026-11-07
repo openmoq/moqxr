@@ -37,7 +37,7 @@ constexpr std::string_view kLocmafUnsupported =
     "use the native publisher backend";
 
 constexpr std::string_view kLocUnsupported =
-    "LOC-04 requires object properties and catalog signaling unavailable in the libmoq publisher; "
+    "LOC-05 requires object properties and catalog signaling unavailable in the libmoq publisher; "
     "use the native publisher backend";
 constexpr std::string_view kPropertiesUnsupported =
     "object properties are unsupported by the libmoq publisher; use the native publisher backend";

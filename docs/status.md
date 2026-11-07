@@ -36,18 +36,18 @@ Draft status:
 
 ## LOC Status
 
-The native backend implements the clear H.264/AAC subset of LOC-04 with
+The native backend implements the clear H.264/AAC subset of LOC-05 with
 `--packaging loc --draft 18`. CMAF remains the primary default and LOCMAF keeps
 its separate packaging path. LOC objects carry source presentation timing,
-timescale, frame marking, and codec extradata; video uses GOP groups and audio
-uses one sample per group. Unsupported input and configuration changes fail
-explicitly. The libmoq backend does not publish this LOC profile.
+timescale, frame marking, codec extradata, and the codec string; video uses
+GOP groups and audio uses one sample per group. Unsupported input and
+configuration changes fail explicitly. The libmoq backend does not publish this LOC profile.
 
 Independent offline validation covers 217 encoded samples and decoded-frame
 equivalence, alongside property-wire and live-ingest regressions. Real relay
-forwarding, cached FETCH, and LOC-04 browser playback remain unverified; the
+forwarding, cached FETCH, and LOC-05 browser playback remain unverified; the
 reference Playa LOC decoder still uses LOC-01 IDs. See the
-[quickstart](quickstart.md#opt-in-to-loc) and [tests](testing.md#loc-04-tests).
+[quickstart](quickstart.md#opt-in-to-loc) and [tests](testing.md#loc-05-tests).
 
 ## LOCMAF Status
 

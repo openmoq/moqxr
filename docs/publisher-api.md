@@ -84,11 +84,12 @@ config.draft_version = openmoq::publisher::DraftVersion::kDraft18;
 ```
 
 The native backend extracts one clear H.264/AAC sample per object and supplies
-LOC-04 properties. For already encoded objects, declare `LivePackaging::kLoc`,
+LOC-05 properties. For already encoded objects, declare `LivePackaging::kLoc`,
 provide codec extradata in `LiveTrack::init_data`, and fill
 `LiveObject::properties` with typed `ObjectProperty` entries. Even IDs hold
 `uint64_t`; odd IDs hold byte vectors. Supply Timestamp (16) and nonzero
-Timescale (8), and keep subgroup zero. Callers own sample/config correctness
+Timescale (8), and keep subgroup zero. Codec String (17) is optional; when
+supplied it must match `LiveTrack::codec`. Callers own sample/config correctness
 and GOP boundaries; begin each video group with an independent frame at object
 zero. The generated catalog carries codec configuration. Source-owned catalogs
 and libmoq LOC publishing are rejected. See [constraints](quickstart.md#opt-in-to-loc).

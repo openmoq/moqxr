@@ -356,16 +356,16 @@ int main() {
                       "live track");
     }
 
-    // LOC-04 properties and catalog signaling are unsupported by libmoq.
+    // LOC-05 properties and catalog signaling are unsupported by libmoq.
     {
         const auto rejects_loc = [&](auto operation, const std::string& label) {
             try {
                 operation();
             } catch (const std::invalid_argument& error) {
-                return expect(std::string(error.what()).find("LOC-04") != std::string::npos,
-                              label + " must explain LOC-04 refusal");
+                return expect(std::string(error.what()).find("LOC-05") != std::string::npos,
+                              label + " must explain LOC-05 refusal");
             }
-            return expect(false, label + " must reject unsupported LOC-04");
+            return expect(false, label + " must reject unsupported LOC-05");
         };
         auto track = make_video_track();
         track.packaging = "loc";
@@ -379,8 +379,8 @@ int main() {
                              "live object track translation");
 
         const auto refused = [&](const TransportStatus& status, const std::string& label) {
-            return expect(!status.ok && status.message.find("LOC-04") != std::string::npos,
-                          label + " must refuse LOC-04 before setup");
+            return expect(!status.ok && status.message.find("LOC-05") != std::string::npos,
+                          label + " must refuse LOC-05 before setup");
         };
         PublisherConfig config;
         config.draft_version = static_cast<DraftVersion>(0);  // guarantees no network on regression

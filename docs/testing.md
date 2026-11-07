@@ -67,11 +67,11 @@ cmake --build build-nosmoke
 ctest --test-dir build-nosmoke --output-on-failure
 ```
 
-## LOC-04 Tests
+## LOC-05 Tests
 
 ```bash
 ctest --test-dir build --output-on-failure
-bun scripts/test-loc04.mjs build/openmoq-publisher
+bun scripts/test-loc05.mjs build/openmoq-publisher
 ```
 
 The independent script requires Bun, FFmpeg, and ffprobe. It generates H.264
@@ -89,7 +89,7 @@ translation suite checks explicit rejection of unsupported LOC publishing.
 Existing CMAF/LOCMAF fixture outputs were compared byte-for-byte (excluding only
 catalog generation time), and the offline LOCMAF Playa check still covers 232
 samples. These offline checks do not establish relay forwarding, cached FETCH,
-or browser LOC-04 playback.
+or browser LOC-05 playback.
 
 ## LOCMAF Tests
 

@@ -13017,6 +13017,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                         }
                         config_present = true;
                     }
+                    if (property.id == 0x11) {
+                        const auto& bytes = std::get<std::vector<std::uint8_t>>(property.value);
+                        if (std::string(bytes.begin(), bytes.end()) != metadata->codec) {
+                            throw std::invalid_argument("LOC object codec string differs from announced track");
+                        }
+                    }
                 }
             } catch (const std::exception& error) {
                 return TransportStatus::failure(error.what());

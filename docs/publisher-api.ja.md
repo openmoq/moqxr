@@ -73,7 +73,7 @@ config.media_packaging = openmoq::publisher::MediaPackaging::kLoc;
 config.draft_version = openmoq::publisher::DraftVersion::kDraft18;
 ```
 
-ネイティブ backend は、オブジェクトごとに暗号化されていない H.264/AAC sample を 1 つ抽出し、LOC-04 properties を付与します。すでにエンコード済みのオブジェクトについては、`LivePackaging::kLoc` を宣言し、`LiveTrack::init_data` に codec extradata を指定し、`LiveObject::properties` に型付きの `ObjectProperty` エントリを設定します。偶数 ID は `uint64_t` を、奇数 ID はバイトベクターを保持します。Timestamp (16) と 0 以外の Timescale (8) を指定し、subgroup は 0 のままにします。sample/config の正しさと GOP 境界は呼び出し側の責任です。各映像 group は object 0 の独立フレームから開始してください。生成される catalog が codec 設定を保持します。source 側が所有する catalog と libmoq による LOC publishing は拒否されます。[制約](quickstart.md#opt-in-to-loc) を参照してください。
+ネイティブ backend は、オブジェクトごとに暗号化されていない H.264/AAC sample を 1 つ抽出し、LOC-05 properties を付与します。すでにエンコード済みのオブジェクトについては、`LivePackaging::kLoc` を宣言し、`LiveTrack::init_data` に codec extradata を指定し、`LiveObject::properties` に型付きの `ObjectProperty` エントリを設定します。偶数 ID は `uint64_t` を、奇数 ID はバイトベクターを保持します。Timestamp (16) と 0 以外の Timescale (8) を指定し、subgroup は 0 のままにします。Codec String (17) は任意ですが、指定する場合は `LiveTrack::codec` と一致させてください。sample/config の正しさと GOP 境界は呼び出し側の責任です。各映像 group は object 0 の独立フレームから開始してください。生成される catalog が codec 設定を保持します。source 側が所有する catalog と libmoq による LOC publishing は拒否されます。[制約](quickstart.md#opt-in-to-loc) を参照してください。
 
 ### 任意: LOCMAF packaging
 

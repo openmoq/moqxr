@@ -92,7 +92,7 @@ fallback rules, and [testing](testing.md#locmaf-tests) for playback validation.
 
 ## Opt In to LOC
 
-Select the clear-media subset of [LOC-04](draft-ietf-moq-loc-04.txt) with the
+Select the clear-media subset of [LOC-05](draft-ietf-moq-loc-05.txt) with the
 native backend on draft 18 or later (18, 21, 22, or 23):
 
 ```bash
@@ -129,8 +129,8 @@ block and scheduling metadata; these inspection files are not a standalone LOC
 container and cannot be fed directly to ffprobe.
 
 The reference Playa branch currently implements older LOC-01 property IDs.
-LOCMAF support in a player or relay does not imply LOC-04 playback support. See
-[LOC tests](testing.md#loc-04-tests) for the independent decoder check.
+LOCMAF support in a player or relay does not imply LOC-05 playback support. See
+[LOC tests](testing.md#loc-05-tests) for the independent decoder check.
 
 ## Use Standard Input
 

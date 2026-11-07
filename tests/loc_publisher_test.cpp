@@ -42,12 +42,19 @@ int main() {
             for (const auto& object : prepared.plan.objects) {
                 if (object.kind != CmsfObjectKind::kMedia) continue;
                 ++samples;
-                check(property(object, 8) && property(object, 16), "missing LOC04 timing");
+                check(property(object, 8) && property(object, 16), "missing LOC05 timing");
                 check(!property(object, 2) && !property(object, 4) && !property(object, 6), "legacy LOC IDs escaped");
                 check(!object.owned_payload.empty(), "empty LOC media");
+                const auto media_track = std::find_if(prepared.plan.tracks.begin(), prepared.plan.tracks.end(),
+                    [&](const auto& track) { return track.track_name == object.track_name; });
+                const auto* codec = property(object, 17);
+                check(media_track != prepared.plan.tracks.end() && !media_track->codec.empty() && codec &&
+                      std::get<std::vector<std::uint8_t>>(codec->value) ==
+                          std::vector<std::uint8_t>(media_track->codec.begin(), media_track->codec.end()),
+                      "LOC05 codec string must match catalog codec");
                 if (std::string(name).find("publisher") != std::string::npos) {
                     const auto* marking = property(object, 9);
-                    check(marking && std::holds_alternative<std::vector<std::uint8_t>>(marking->value), "LOC04 marking must be bytes");
+                    check(marking && std::holds_alternative<std::vector<std::uint8_t>>(marking->value), "LOC05 marking must be bytes");
                     check(property(object, 13), "video config absent");
                     check(object.group_id == (samples - 1) / 2 && object.object_id == (samples - 1) % 2, "video GOP ordering");
                 } else {
