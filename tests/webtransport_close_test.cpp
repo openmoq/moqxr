@@ -103,6 +103,11 @@ struct SilentServer {
     h3zero_stream_ctx_t* control_stream_ctx = nullptr;
     bool close_session_sent = false;
     std::optional<std::vector<std::uint8_t>> datagram;
+    // When set, answer the client's first application-stream bytes by opening
+    // a request stream and stopping it before its first bytes are sent, as a
+    // relay does when it gives up a SUBSCRIBE right after sending it.
+    bool early_stop_request = false;
+    std::optional<std::uint64_t> early_stop_stream_id;
     bool datagram_sent = false;
     bool datagram_acked = false;
     picowt_capsule_t received_capsule{};
@@ -191,6 +196,26 @@ int silent_path_callback(picoquic_cnx_t* cnx,
             if (picoquic_queue_datagram_frame(cnx, wire.size(), wire.data()) != 0) {
                 return -1;
             }
+        }
+        if (server->early_stop_request && !server->early_stop_stream_id.has_value() &&
+            stream_ctx != nullptr && stream_ctx != server->control_stream_ctx && length != 0 &&
+            server->control_stream_ctx != nullptr) {
+            const std::uint64_t request_stream_id = picoquic_get_next_local_stream_id(cnx, 0);
+            if (picoquic_mark_active_stream(cnx, request_stream_id, 0, nullptr) != 0 ||
+                picoquic_stop_sending(cnx, request_stream_id, webtransport_code_to_http_code(0x01)) != 0) {
+                return -1;
+            }
+            // WebTransport bidirectional stream header, then a stand-in request and FIN.
+            std::vector<std::uint8_t> wire(16);
+            std::size_t used = picoquic_varint_encode(wire.data(), wire.size(), 0x41);
+            used += picoquic_varint_encode(wire.data() + used, wire.size() - used,
+                                           server->control_stream_ctx->stream_id);
+            wire.resize(used);
+            wire.insert(wire.end(), {0x03, 0x00, 0x00});
+            if (picoquic_add_to_stream(cnx, request_stream_id, wire.data(), wire.size(), 1) != 0) {
+                return -1;
+            }
+            server->early_stop_stream_id = request_stream_id;
         }
         if (server->close_session_code.has_value() && !server->close_session_sent &&
             stream_ctx != nullptr && stream_ctx != server->control_stream_ctx && length != 0 &&
@@ -456,6 +481,67 @@ bool datagram_scenario(std::vector<std::uint8_t> payload, bool valid,
     return ok;
 }
 
+// The relay stops a request stream before its first bytes arrive. h3zero has
+// no stream context for it yet and drops that STOP_SENDING, so the client
+// must record it itself; and the priority it later sets on that stopped
+// stream must not fail the session.
+bool early_stop_scenario() {
+    SilentServer server;
+    server.early_stop_request = true;
+    if (!expect(start_server(server), "expected early-stop WebTransport server to start")) {
+        stop_server(server);
+        return false;
+    }
+    WebTransportClient client;
+    bool ok = expect(client.configure(EndpointConfig{.transport = TransportKind::kWebTransport,
+                                                     .host = "127.0.0.1", .port = server.port,
+                                                     .alpn = "h3", .application_protocol = "moqt-18",
+                                                     .path = "/moq"},
+                                     TlsConfig{.insecure_skip_verify = true}).ok,
+                     "expected early-stop WebTransport configure to succeed");
+    const auto connected = client.connect();
+    ok &= expect(connected.ok, "expected early-stop WebTransport CONNECT: " + connected.message);
+    if (connected.ok) {
+        std::uint64_t stream = 0;
+        ok &= expect(client.open_stream(StreamDirection::kBidirectional, stream).ok,
+                     "expected early-stop trigger stream to open");
+        ok &= expect(client.write_stream(stream, std::vector<std::uint8_t>{0}, false).ok,
+                     "expected early-stop trigger write to succeed");
+        std::optional<std::uint64_t> stopped;
+        {
+            std::unique_lock<std::mutex> lock(server.mutex);
+            server.condition.wait_for(lock, std::chrono::seconds(3),
+                                      [&] { return server.early_stop_stream_id.has_value(); });
+            stopped = server.early_stop_stream_id;
+        }
+        ok &= expect(stopped.has_value(), "expected the server to open and stop a request stream");
+        if (stopped.has_value()) {
+            bool seen = false;
+            for (int attempt = 0; attempt < 300 && !seen; ++attempt) {
+                seen = client.media_stream_peer_stopped(*stopped);
+                if (!seen) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+            ok &= expect(seen, "expected a STOP_SENDING that precedes a request stream's data to be recorded");
+            // The session resets a cancelled request's stream; a priority queued
+            // for it when it was accepted then lands on a stream picoquic closed.
+            ok &= expect(client.reset_stream(*stopped, 0x0).ok,
+                         "expected the stopped request stream to be reset");
+            // Let the reset be acknowledged, so picoquic frees the stream.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            ok &= expect(client.set_reliable_stream_priority(*stopped, 1).ok,
+                         "expected the request stream priority to be queued");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            ok &= expect(client.write_stream(stream, std::vector<std::uint8_t>{1}, false).ok,
+                         "expected a priority on a stopped request stream to leave the session writable");
+        }
+    }
+    ok &= expect(client.close(0).ok, "expected early-stop WebTransport close to finish");
+    stop_server(server);
+    return ok;
+}
+
 // Publisher::disconnect() from another thread, as the CLI does on
 // SIGTERM/SIGINT, while the publish is blocked waiting for the peer. The
 // peer must see the WebTransport session closed and then an application
@@ -521,6 +607,7 @@ int main() {
     bool ok = true;
 
     ok &= disconnect_scenario();
+    ok &= early_stop_scenario();
 
     ok &= datagram_scenario({0xf0, 0x13, 0x2b, 0x3e, 0x2a}, false);
     ok &= datagram_scenario({0xf0, 0x13, 0x2b, 0x3e, 0x2a}, false, "moqt-22", true);

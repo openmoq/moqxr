@@ -405,6 +405,11 @@ int apply_pending_writes(WebTransportClient::Impl& impl) {
 
     for (const auto& [stream_id, priority] : reliable_stream_priorities) {
         if (picoquic_set_stream_priority(impl.cnx, stream_id, priority) != 0) {
+            // A stream the peer stopped, or that is reset or gone, takes no
+            // more data: there is nothing left to prioritize.
+            if (picoquic_stream_send_closed(impl.cnx, stream_id)) {
+                continue;
+            }
             return fail_media_delivery(
                 impl, "failed to set webtransport reliable stream priority", -1);
         }
@@ -951,6 +956,31 @@ void allow_missing_reset_stream_at(picoquic_cnx_t* cnx, WebTransportClient::Impl
     cnx->remote_parameters.is_reset_stream_at_enabled = 1;
 }
 
+// A relay can stop one of its request streams before that stream's first
+// bytes arrive. h3zero has no stream context for it yet and drops the
+// STOP_SENDING, so the session would never learn that the request was
+// cancelled and would keep serving it. Record the stop here instead; the
+// session ends the request once it has read it.
+void note_early_peer_stop(picoquic_cnx_t* cnx, std::uint64_t stream_id) {
+    WebTransportClient::Impl* impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_connection_impl_mutex);
+        const auto it = g_connection_impls.find(cnx);
+        impl = it == g_connection_impls.end() ? nullptr : it->second;
+    }
+    if (impl == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    impl->peer_stopped_media_streams.insert(stream_id);
+    if (const auto code = http_code_to_webtransport_code(picoquic_remote_stop_error(cnx, stream_id))) {
+        impl->peer_stop_errors.insert_or_assign(stream_id, *code);
+    } else {
+        impl->peer_stop_errors.erase(stream_id);
+    }
+    impl->condition.notify_all();
+}
+
 int webtransport_connection_callback(picoquic_cnx_t* cnx,
                                      uint64_t stream_id,
                                      uint8_t* bytes,
@@ -995,6 +1025,11 @@ int webtransport_connection_callback(picoquic_cnx_t* cnx,
                                        .reason = cnx->remote_error_reason != nullptr ? cnx->remote_error_reason : "",
                                    }));
         }
+    }
+    // Bidirectional streams the server opened (low bits 01) are request streams.
+    if (fin_or_event == picoquic_callback_stop_sending && v_stream_ctx == nullptr &&
+        (stream_id & 0x3ULL) == 0x1ULL) {
+        note_early_peer_stop(cnx, stream_id);
     }
     return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event, callback_ctx, v_stream_ctx);
 }
