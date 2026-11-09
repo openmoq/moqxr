@@ -84,10 +84,11 @@ function(openmoq_find_system_picoquic)
             "-DOPENMOQ_USE_SYSTEM_PICOQUIC=OFF.")
     endif()
 
-    # picoquic_internal.h includes "picohash.h" and "picosplay.h" relative to
-    # itself. picosplay.h is part of picoquic's normal install; picohash.h is
+    # picoquic_internal.h includes "picohash.h", "picorbtree.h", and
+    # "picosplay.h" relative to itself. picosplay.h is installed with
+    # picoquic's HTTP headers (BUILD_HTTP=ON); picohash.h and picorbtree.h are
     # private and must have been installed together with picoquic_internal.h.
-    foreach(_companion IN ITEMS picohash.h picosplay.h)
+    foreach(_companion IN ITEMS picohash.h picorbtree.h picosplay.h)
         if(NOT EXISTS "${OPENMOQ_PICOQUIC_INTERNAL_INCLUDE_DIR}/${_companion}")
             message(FATAL_ERROR
                 "OPENMOQ_USE_SYSTEM_PICOQUIC=ON: found picoquic_internal.h in "

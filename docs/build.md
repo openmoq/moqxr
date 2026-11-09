@@ -122,13 +122,13 @@ The installed picoquic package must provide:
   recorded when picoquic was configured (picotls has no install rules of its
   own, so its package stages `include/` and `libpicotls-*.a` by hand and
   picoquic is built with `PTLS_PREFIX` pointing at that prefix).
-- `picoquic_internal.h` and `picohash.h` next to `picoquic.h`. picoquic treats
-  these as private and does not install them, but the Publisher's close-drain
-  logic (`src/transport/picoquic_close_drain.h`) reads connection and stream
-  state through them. They must be copied from the **same source revision** the
-  installed libraries were built from; a header from another revision is a
-  silent ABI mismatch. If the package installs them elsewhere, point
-  `OPENMOQ_PICOQUIC_INTERNAL_INCLUDE_DIR` at that directory.
+- `picoquic_internal.h`, `picohash.h`, and `picorbtree.h` next to `picoquic.h`.
+  picoquic treats these as private and does not install them, but the
+  Publisher's close-drain logic (`src/transport/picoquic_close_drain.h`) reads
+  connection and stream state through them. They must be copied from the
+  **same source revision** the installed libraries were built from; a header
+  from another revision is a silent ABI mismatch. If the package installs them
+  elsewhere, point `OPENMOQ_PICOQUIC_INTERNAL_INCLUDE_DIR` at that directory.
 
 Use `CMAKE_PREFIX_PATH` or `picoquic_DIR` to locate a package outside the
 default search prefixes. Configure output reports the package version and the
