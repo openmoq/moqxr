@@ -11947,8 +11947,10 @@ int main() {
         ok &= expect(recovered.size() == 2 && recovered[0].is_video_keyframe && recovered[0].object_id == 0, "LOC SRT queue sequence gap suppresses dependent video until next independent sample");
     }
 
-    for (int invalid = 0; invalid < 6; ++invalid) {
-        // 4: mismatched Codec String; 5: matching optional Codec String.
+    for (int invalid = 0; invalid < 8; ++invalid) {
+        // 4: mismatched Codec String; 5: matching optional Codec String;
+        // 6: duplicate Codec String; 7: track codec (and matching Codec String)
+        // that is not valid UTF-8.
         const bool valid = invalid == 0 || invalid == 5;
         MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());
@@ -11958,6 +11960,7 @@ int main() {
         LiveTrack track{.track_name = "video", .media_type = openmoq::publisher::LiveMediaType::kVideo,
                         .packaging = openmoq::publisher::LivePackaging::kLoc, .codec = "avc1.42001e", .init_data = config};
         if (invalid == 3) track.media_type = openmoq::publisher::LiveMediaType::kUnset;
+        if (invalid == 7) track.codec = "avc1.42001e\xc0\xae";  // trailing "." as an overlong two-byte form
         bool emitted = false;
         LiveObjectSource source{.tracks = {track}, .next_object = [&]() -> std::optional<LiveObject> {
             if (emitted) return std::nullopt;
@@ -11969,8 +11972,9 @@ int main() {
                                {9, std::vector<std::uint8_t>{static_cast<std::uint8_t>(invalid == 1 ? 0xc0 : 0xe0)}},
                                {13, object_config}}};
             if (invalid >= 4) {
-                const std::string codec = invalid == 4 ? "avc1.42001f" : "avc1.42001e";
+                const std::string codec = invalid == 4 ? "avc1.42001f" : track.codec;
                 object.properties.push_back({17, std::vector<std::uint8_t>(codec.begin(), codec.end())});
+                if (invalid == 6) object.properties.push_back({17, std::vector<std::uint8_t>(codec.begin(), codec.end())});
             }
             return object;
         }};
@@ -11979,6 +11983,8 @@ int main() {
         if (status.ok) status = session.publish_live_objects(source, DraftVersion::kDraft18);
         ok &= expect(status.ok == valid, "LOC arbitrary source validates independent start, matching configuration, and codec string: " + status.message);
         ok &= expect(session.publish_stats().objects_published == (valid ? 1 : 0), "invalid LOC source never publishes media");
+        if (invalid == 6) ok &= expect(status.message.find("duplicate") != std::string::npos, "duplicate LOC codec string rejected as duplicate: " + status.message);
+        if (invalid == 7) ok &= expect(status.message.find("UTF-8") != std::string::npos, "malformed LOC codec string rejected as UTF-8: " + status.message);
     }
 
     {
