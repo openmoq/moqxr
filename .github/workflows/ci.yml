@@ -156,8 +156,9 @@ jobs:
         run: |
           # Mirror what a distribution package provides: picotls and picoquic
           # installed under one prefix, plus picoquic's private
-          # picoquic_internal.h / picohash.h next to picoquic.h (see
-          # docs/build.md, "Build with a System picoquic Package").
+          # picoquic_internal.h, picohash.h, and picorbtree.h next to
+          # picoquic.h (see docs/build.md, "Build with a System picoquic
+          # Package").
           prefix="${GITHUB_WORKSPACE}/.deps/prefix"
           git clone --depth 1 --recurse-submodules https://github.com/h2o/picotls.git .deps/picotls
           cmake -S .deps/picotls -B .deps/picotls/build \
@@ -186,6 +187,7 @@ jobs:
           install -m 0644 \
             .deps/picoquic/picoquic/picoquic_internal.h \
             .deps/picoquic/picoquic/picohash.h \
+            .deps/picoquic/picoquic/picorbtree.h \
             "${prefix}/include/"
           echo "OPENMOQ_DEPS_PREFIX=${prefix}" >> "${GITHUB_ENV}"
 
