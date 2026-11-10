@@ -91,6 +91,13 @@ BatchPublishStats summarize_batch_publish_stats(const PublishPlan& plan) {
     return snapshot;
 }
 
+// A failed connect is retryable, unless the transport found a configuration
+// error that a retry of this endpoint cannot fix.
+transport::FailureKind connect_failure_kind(const transport::TransportStatus& status) {
+    return status.failure_kind == transport::FailureKind::kEndpointPermanent ? transport::FailureKind::kEndpointPermanent
+                                                                            : transport::FailureKind::kRetryable;
+}
+
 transport::FailureKind publish_failure_kind(
     const transport::TransportStatus& status,
     const transport::PublisherTransport& publisher_transport) {
@@ -423,8 +430,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         if (!status.ok) {
             const std::string error = "transport connect failed: " + status.message;
             clear_active_session(active, false, error);
-            return transport::TransportStatus::failure(
-                error, transport::FailureKind::kRetryable);
+            return transport::TransportStatus::failure(error, connect_failure_kind(status));
         }
 
         const PublishPlan materialized = materialize_publish_plan(prepared.plan, prepared.input_bytes);
@@ -649,8 +655,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         if (!status.ok) {
             const std::string error = "transport connect failed: " + status.message;
             clear_active_session(active, false, error);
-            return transport::TransportStatus::failure(
-                error, transport::FailureKind::kRetryable);
+            return transport::TransportStatus::failure(error, connect_failure_kind(status));
         }
 
         transport::LiveIngestOptions session_ingest;
@@ -930,8 +935,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         if (!status.ok) {
             const std::string error = "transport connect failed: " + status.message;
             clear_active_session(active, false, error);
-            return transport::TransportStatus::failure(
-                error, transport::FailureKind::kRetryable);
+            return transport::TransportStatus::failure(error, connect_failure_kind(status));
         }
 
         status = active->session->publish_live_objects(

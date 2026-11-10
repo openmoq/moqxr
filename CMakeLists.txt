@@ -691,6 +691,7 @@ add_library(openmoq_publisher_lib
     src/msf_url.cpp
     src/mp4_box.cpp
     src/publisher_api.cpp
+    src/transport/connect_failure_kind.cpp
     src/transport/libmoq_publisher.cpp
     src/transport/moqt_control_messages.cpp
     src/transport/moqt_session.cpp
@@ -1018,6 +1019,13 @@ if(OPENMOQ_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/transport"
     )
     add_test(NAME openmoq-publisher-peer-close-tests COMMAND openmoq-publisher-peer-close-tests)
+
+    add_executable(openmoq-publisher-connect-failure-kind-tests tests/connect_failure_kind_test.cpp)
+    target_link_libraries(openmoq-publisher-connect-failure-kind-tests PRIVATE openmoq_publisher_lib)
+    target_include_directories(openmoq-publisher-connect-failure-kind-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/transport"
+    )
+    add_test(NAME openmoq-publisher-connect-failure-kind-tests COMMAND openmoq-publisher-connect-failure-kind-tests)
 
     add_executable(openmoq-publisher-api-tests
         tests/publisher_api_test.cpp
