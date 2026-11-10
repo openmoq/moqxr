@@ -1131,6 +1131,18 @@ if(OPENMOQ_BUILD_TESTS)
         )
         add_test(NAME openmoq-publisher-picoquic-close-drain-tests COMMAND openmoq-publisher-picoquic-close-drain-tests)
 
+        add_executable(openmoq-publisher-picoquic-idle-timeout-tests
+            tests/picoquic_idle_timeout_test.cpp
+        )
+        target_link_libraries(openmoq-publisher-picoquic-idle-timeout-tests PRIVATE openmoq_publisher_lib)
+        target_include_directories(openmoq-publisher-picoquic-idle-timeout-tests PRIVATE
+            "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
+        )
+        target_compile_definitions(openmoq-publisher-picoquic-idle-timeout-tests PRIVATE
+            OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
+        )
+        add_test(NAME openmoq-publisher-picoquic-idle-timeout-tests COMMAND openmoq-publisher-picoquic-idle-timeout-tests)
+
         if(OPENMOQ_PICOQUIC_THREAD_CHECK)
             target_compile_definitions(openmoq-publisher-picoquic-datagram-tests
                 PRIVATE PICOQUIC_WITH_THREAD_CHECK)

@@ -278,6 +278,19 @@ std::size_t parse_retry_count(std::string_view value) {
     return static_cast<std::size_t>(retries);
 }
 
+// picoquic uses the idle timeout as the handshake timeout and derives the
+// keepalive from it, so a very small value fails every handshake.
+std::uint32_t parse_quic_idle_timeout(std::string_view value) {
+    constexpr int kMinMs = 1000;
+    constexpr int kMaxMs = 600000;
+    const int timeout = parse_strict_int(value, "--quic-idle-timeout");
+    if (timeout < kMinMs || timeout > kMaxMs) {
+        throw std::runtime_error("--quic-idle-timeout must be between " + std::to_string(kMinMs) + " and " +
+                                 std::to_string(kMaxMs) + " milliseconds");
+    }
+    return static_cast<std::uint32_t>(timeout);
+}
+
 }  // namespace
 
 CliOptions parse_cli_options(int argc, char** argv) {
@@ -500,6 +513,8 @@ CliOptions parse_cli_options(int argc, char** argv) {
             options.tls.insecure_skip_verify = true;
         } else if (argument == "--webtransport-allow-missing-reset-stream-at") {
             options.webtransport_allow_missing_reset_stream_at = true;
+        } else if (argument == "--quic-idle-timeout") {
+            options.quic_idle_timeout_ms = parse_quic_idle_timeout(require_value("--quic-idle-timeout"));
         } else if (argument == "--draft") {
             options.draft_version = parse_draft(require_value("--draft"));
         } else if (argument == "--namespace") {
@@ -747,10 +762,12 @@ CliOptions parse_cli_options(int argc, char** argv) {
         options.endpoint->transport = options.transport;
         options.endpoint->webtransport_allow_missing_reset_stream_at =
             options.webtransport_allow_missing_reset_stream_at;
+        options.endpoint->idle_timeout_ms = options.quic_idle_timeout_ms;
         for (auto& endpoint : options.endpoints) {
             endpoint.transport = options.transport;
             endpoint.webtransport_allow_missing_reset_stream_at =
                 options.webtransport_allow_missing_reset_stream_at;
+            endpoint.idle_timeout_ms = options.quic_idle_timeout_ms;
         }
     }
     if (options.transport == transport::TransportKind::kWebTransport) {
@@ -804,7 +821,7 @@ std::string build_usage(const char* argv0) {
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--moq-impl-id] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--video-alt-group <N>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
-           " [--webtransport-allow-missing-reset-stream-at]"
+           " [--webtransport-allow-missing-reset-stream-at] [--quic-idle-timeout <ms>]"
            " [--retry <count>]"
            " [--auth-profile c4m-01|moqx-compat|red5-cose-compat] [--auth-token-file <path>]"
            " [--auth-setup-token-file <path>] [--auth-action-token-file <path>] [--auth-token-type <uint>]"

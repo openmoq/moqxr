@@ -65,6 +65,14 @@ struct EndpointConfig {
     // reset_stream_at transport parameter. Stream resets then use plain
     // RESET_STREAM, so a reset stream's WebTransport header may not arrive.
     bool webtransport_allow_missing_reset_stream_at = false;
+    // The QUIC idle timeout this client offers, in ms. The connection closes
+    // after this long without a packet from the peer (the lower of the two
+    // peers' values applies), so a lower value notices a relay that vanished
+    // sooner. picoquic also uses it as the handshake timeout, so it bounds
+    // each connection attempt. The keepalive then runs at half of it. 0 keeps
+    // the picoquic default of 30 s and a 5 s keepalive on raw QUIC. A very small
+    // value fails every handshake: the CLI accepts 1000 ms and up.
+    std::uint32_t idle_timeout_ms = 0;
 };
 
 struct TlsConfig {

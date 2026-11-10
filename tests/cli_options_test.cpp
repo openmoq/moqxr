@@ -351,6 +351,27 @@ int main() {
                      "expected the reset_stream_at opt-out to reach every endpoint");
     }
 
+    {
+        const CliOptions options =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--quic-idle-timeout", "4000",
+                   "--endpoint", "primary.example.com:4433", "--endpoint", "backup.example.com:4433"});
+        ok &= expect(options.quic_idle_timeout_ms == 4000 && options.endpoint->idle_timeout_ms == 4000 &&
+                         options.endpoints.size() == 2 && options.endpoints[0].idle_timeout_ms == 4000 &&
+                         options.endpoints[1].idle_timeout_ms == 4000,
+                     "expected --quic-idle-timeout to reach every endpoint");
+        const CliOptions defaults =
+            parse({"openmoq-publisher", "--input", "sample.mp4", "--endpoint", "primary.example.com:4433"});
+        ok &= expect(defaults.endpoint->idle_timeout_ms == 0, "expected the picoquic default without the option");
+    }
+
+    for (const char* bad : {"999", "600001", "0", "-5", "abc"}) {
+        ok &= expect(parse_throws({"openmoq-publisher", "--input", "sample.mp4", "--quic-idle-timeout", bad,
+                                   "--endpoint", "relay.example.com:4433"},
+                                  "--quic-idle-timeout",
+                                  "expected an out-of-range --quic-idle-timeout to be rejected"),
+                     std::string("quic idle timeout bound ") + bad);
+    }
+
     ok &= expect(parse_throws({"openmoq-publisher", "--input", "sample.mp4",
                                "--webtransport-allow-missing-reset-stream-at",
                                "--endpoint", "relay.example.com:4433"},

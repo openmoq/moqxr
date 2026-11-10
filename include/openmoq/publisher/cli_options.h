@@ -64,6 +64,9 @@ struct CliOptions {
     // --webtransport-allow-missing-reset-stream-at; copied into every
     // endpoint (EndpointConfig::webtransport_allow_missing_reset_stream_at).
     bool webtransport_allow_missing_reset_stream_at = false;
+    // --quic-idle-timeout, in ms; copied into every endpoint
+    // (EndpointConfig::idle_timeout_ms). 0 keeps the picoquic default.
+    std::uint32_t quic_idle_timeout_ms = 0;
     bool forward = false;
     bool publish_catalog = false;
     bool include_sap = false;

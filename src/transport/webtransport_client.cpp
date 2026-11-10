@@ -1160,6 +1160,9 @@ TransportStatus WebTransportClient::connect() {
     if (!verify_peer) {
         picoquic_set_null_verifier(impl_->quic);
     }
+    if (endpoint_->idle_timeout_ms > 0) {
+        picoquic_set_default_idle_timeout(impl_->quic, endpoint_->idle_timeout_ms);
+    }
 
     impl_->cnx = picoquic_create_cnx(impl_->quic, picoquic_null_connection_id, picoquic_null_connection_id,
                                      reinterpret_cast<struct sockaddr*>(&impl_->server_address), current_time, 0,
