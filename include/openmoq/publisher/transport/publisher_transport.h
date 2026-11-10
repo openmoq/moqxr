@@ -68,8 +68,9 @@ struct EndpointConfig {
     // The QUIC idle timeout this client offers, in ms. The connection closes
     // after this long without a packet from the peer (the lower of the two
     // peers' values applies), so a lower value notices a relay that vanished
-    // sooner. The keepalive then runs at half of it. 0 keeps the picoquic
-    // default of 30 s and a 5 s keepalive on raw QUIC.
+    // sooner. picoquic also uses it as the handshake timeout, so it bounds
+    // each connection attempt. The keepalive then runs at half of it. 0 keeps
+    // the picoquic default of 30 s and a 5 s keepalive on raw QUIC.
     std::uint32_t idle_timeout_ms = 0;
 };
 
