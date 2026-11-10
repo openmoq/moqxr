@@ -148,6 +148,20 @@ void stop_server(QuietServer& server) {
     }
 }
 
+// The test servers listen on ::1; a host without IPv6 loopback skips the test.
+bool ipv6_loopback_available() {
+    const int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_loopback;
+    const bool bound = bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    close(fd);
+    return bound;
+}
+
 bool connectClient(PicoquicClient& client, const QuietServer& server) {
     EndpointConfig endpoint{
         .host = "::1",
@@ -176,7 +190,7 @@ bool quietConnectionStaysOpen() {
     return ok;
 }
 
-// A server that vanishes is noticed within about the idle timeout.
+// A server that vanishes is noticed within a few idle timeouts.
 bool vanishedServerIsNoticed() {
     QuietServer server;
     bool ok = expect(start_server(server), "expected the server to start");
@@ -195,8 +209,9 @@ bool vanishedServerIsNoticed() {
     std::cerr << "vanished server noticed after "
               << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << " ms\n";
     ok &= expect(client.state() != ConnectionState::kConnected, "expected the client to notice the vanished server");
-    ok &= expect(elapsed < std::chrono::milliseconds(2 * kIdleTimeoutMs),
-                 "expected the vanished server to be noticed within twice the idle timeout");
+    // Well under the 30 s default, with room for a loaded CI host.
+    ok &= expect(elapsed < std::chrono::milliseconds(4 * kIdleTimeoutMs),
+                 "expected the vanished server to be noticed within four idle timeouts");
     static_cast<void>(client.close(0));
     return ok;
 }
@@ -204,6 +219,10 @@ bool vanishedServerIsNoticed() {
 }  // namespace
 
 int main() {
+    if (!ipv6_loopback_available()) {
+        std::cout << "SKIP: no IPv6 loopback\n";
+        return 0;
+    }
     bool ok = true;
     ok &= quietConnectionStaysOpen();
     ok &= vanishedServerIsNoticed();

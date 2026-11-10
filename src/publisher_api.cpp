@@ -333,6 +333,10 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
             return transport::TransportStatus::failure(
                 "--webtransport-allow-missing-reset-stream-at is not supported by the libmoq publishing backend");
         }
+        if (endpoint.idle_timeout_ms != 0) {
+            return transport::TransportStatus::failure(
+                "--quic-idle-timeout is not supported by the libmoq publishing backend");
+        }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             stop_requested_ = false;
