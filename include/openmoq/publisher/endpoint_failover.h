@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
@@ -48,7 +49,12 @@ private:
     void retain(LiveObject object);
     bool is_video_track(const std::string& track_name) const;
 
+    void apply_track_change(const LiveObject& change);
+
     LiveObjectSource source_;
+    // The tracks live now: source_.tracks with the source's track changes
+    // applied, which is what a new attempt starts from.
+    std::vector<LiveTrack> tracks_;
     std::size_t max_buffered_objects_ = 1;
     std::size_t attempt_count_ = 0;
     std::optional<LiveObject> retained_catalog_;

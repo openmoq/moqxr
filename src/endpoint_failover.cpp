@@ -1,5 +1,6 @@
 #include "openmoq/publisher/endpoint_failover.h"
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -18,6 +19,7 @@ void emit(const EndpointFailoverEventSink& sink, EndpointFailoverEvent event) {
 ReplayableLiveObjectSource::ReplayableLiveObjectSource(
     LiveObjectSource source, std::size_t max_buffered_objects)
     : source_(std::move(source)),
+      tracks_(source_.tracks),
       max_buffered_objects_(max_buffered_objects == 0 ? 1 : max_buffered_objects) {}
 
 void ReplayableLiveObjectSource::begin_attempt() {
@@ -38,14 +40,18 @@ void ReplayableLiveObjectSource::begin_attempt() {
         }
     }
     for (auto it = replay_begin; it != retained_.end(); ++it) {
-        replay_.push_back(*it);
+        // A track the source ended is not in the new attempt's track list.
+        if (std::any_of(tracks_.begin(), tracks_.end(),
+                        [&](const LiveTrack& track) { return track.track_name == it->track_name; })) {
+            replay_.push_back(*it);
+        }
     }
     retained_.clear();
 }
 
 LiveObjectSource ReplayableLiveObjectSource::source() {
     return LiveObjectSource{
-        .tracks = source_.tracks,
+        .tracks = tracks_,
         .next_object = [this]() { return next_object(); },
         .is_finished = [this]() {
             return replay_.empty() &&
@@ -73,7 +79,10 @@ std::optional<LiveObject> ReplayableLiveObjectSource::next_object() {
     if (!object.has_value()) {
         return std::nullopt;
     }
-    if (object->track_name == "catalog") {
+    if (object->adds_track.has_value() || object->ends_track) {
+        // A change carries no media: the track list holds it for a new attempt.
+        apply_track_change(*object);
+    } else if (object->track_name == "catalog") {
         retained_catalog_ = *object;
     } else {
         retain(*object);
@@ -88,8 +97,18 @@ void ReplayableLiveObjectSource::retain(LiveObject object) {
     }
 }
 
+void ReplayableLiveObjectSource::apply_track_change(const LiveObject& change) {
+    if (change.adds_track.has_value()) {
+        tracks_.push_back(*change.adds_track);
+        return;
+    }
+    tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
+                                 [&](const LiveTrack& track) { return track.track_name == change.track_name; }),
+                  tracks_.end());
+}
+
 bool ReplayableLiveObjectSource::is_video_track(const std::string& track_name) const {
-    for (const auto& track : source_.tracks) {
+    for (const auto& track : tracks_) {
         if (track.track_name == track_name) {
             return track.media_type == LiveMediaType::kVideo;
         }

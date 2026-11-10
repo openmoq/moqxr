@@ -10954,6 +10954,137 @@ int main() {
     }
 
     {
+        // A source ends a track and adds another while the session continues
+        // (draft 22: one request stream per subscription).
+        constexpr DraftVersion draft = DraftVersion::kDraft22;
+        MockTransport transport;
+        transport.keep_open_streams.insert(1);
+        transport.keep_open_streams.insert(5);
+        transport.keep_open_streams.insert(9);
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(91, kTestTrackNamespace, "catalog", 1, draft));
+        transport.reads[5].push_back(encode_subscribe_message(95, kTestTrackNamespace, "video", 1, draft));
+        std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C', '0'}},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "audio", .adds_track = LiveTrack{.track_name = "audio"}},
+            LiveObject{.track_name = "catalog", .group_id = 1, .payload = {'C', '1'}},
+            LiveObject{.track_name = "video", .ends_track = true},
+            LiveObject{.track_name = "audio", .group_id = 1, .payload = {'A', '1'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}},
+            .next_object = [&]() -> std::optional<LiveObject> {
+                if (object_index >= objects.size()) {
+                    return std::nullopt;
+                }
+                if (objects[object_index].adds_track.has_value()) {
+                    // A subscriber that read the catalog update asks for the new track.
+                    transport.reads[9].push_back(encode_subscribe_message(99, kTestTrackNamespace, "audio", 1, draft));
+                }
+                return objects[object_index++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected track change connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected a publish with track changes to succeed: " + status.message);
+
+        bool audio_accepted = false;
+        std::size_t video_done = 0;
+        const auto expected_video_done =
+            openmoq::publisher::transport::encode_publish_done_message(draft, 95, 2);
+        for (const auto& write : transport.writes) {
+            audio_accepted = audio_accepted || (write.stream_id == 9 && message_type(write.bytes) == 0x04);
+            video_done += (write.stream_id == 5 && write.bytes == expected_video_done) ? 1 : 0;
+        }
+        ok &= expect(audio_accepted, "expected the SUBSCRIBE for the added track to succeed");
+        ok &= expect(video_done == 1, "expected the ended track to receive exactly one PUBLISH_DONE");
+        ok &= expect(session.publish_stats().objects_published == 5,
+                     "expected both catalogs and the media of both tracks to publish, got " +
+                         std::to_string(session.publish_stats().objects_published));
+    }
+
+    {
+        // Track changes the publisher refuses.
+        constexpr DraftVersion draft = DraftVersion::kDraft16;
+        struct Case {
+            const char* name;
+            std::vector<LiveObject> changes;
+            LiveCatalogMode mode;
+            const char* fragment;
+        };
+        const std::vector<Case> cases = {
+            {"duplicate add",
+             {LiveObject{.track_name = "video", .adds_track = LiveTrack{.track_name = "video"}}},
+             LiveCatalogMode::kSourceObject, "already used"},
+            {"mismatched name",
+             {LiveObject{.track_name = "audio", .adds_track = LiveTrack{.track_name = "other"}}},
+             LiveCatalogMode::kSourceObject, "does not match"},
+            {"add and end together",
+             {LiveObject{.track_name = "audio", .adds_track = LiveTrack{.track_name = "audio"}, .ends_track = true}},
+             LiveCatalogMode::kSourceObject, "cannot add and end"},
+            {"end of an unknown track",
+             {LiveObject{.track_name = "audio", .ends_track = true}},
+             LiveCatalogMode::kSourceObject, "ends unknown track"},
+            {"end of the catalog",
+             {LiveObject{.track_name = "catalog", .ends_track = true}},
+             LiveCatalogMode::kSourceObject, "catalog track cannot"},
+            {"object after the end",
+             {LiveObject{.track_name = "video", .ends_track = true},
+              LiveObject{.track_name = "video", .group_id = 3, .payload = {'V'}}},
+             LiveCatalogMode::kSourceObject, "ended track"},
+            {"second end",
+             {LiveObject{.track_name = "video", .ends_track = true},
+              LiveObject{.track_name = "video", .ends_track = true}},
+             LiveCatalogMode::kSourceObject, "already ended"},
+            {"re-add of an ended name",
+             {LiveObject{.track_name = "video", .ends_track = true},
+              LiveObject{.track_name = "video", .adds_track = LiveTrack{.track_name = "video"}}},
+             LiveCatalogMode::kSourceObject, "already used"},
+            {"generated catalog",
+             {LiveObject{.track_name = "audio", .adds_track = LiveTrack{.track_name = "audio"}}},
+             LiveCatalogMode::kGenerated, "source-owned catalog"},
+        };
+        for (const auto& test_case : cases) {
+            MockTransport transport;
+            transport.keep_open_streams.insert(0);
+            queue_draft16_scheduling_prefix(transport);
+            std::vector<std::uint8_t> subscriptions =
+                encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft);
+            append_bytes(subscriptions, encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+            transport.reads[0].push_back(std::move(subscriptions));
+            std::vector<LiveObject> objects = {
+                LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C'}},
+                LiveObject{.track_name = "video", .group_id = 1, .payload = {'V'}},
+            };
+            objects.insert(objects.end(), test_case.changes.begin(), test_case.changes.end());
+            std::size_t object_index = 0;
+            LiveObjectSource source{
+                .tracks = {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}},
+                .next_object = [&]() -> std::optional<LiveObject> {
+                    if (object_index >= objects.size()) {
+                        return std::nullopt;
+                    }
+                    return objects[object_index++];
+                },
+                .catalog_mode = test_case.mode,
+            };
+            MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                                std::chrono::seconds(1));
+            ok &= expect(session.connect(endpoint, tls).ok, "expected track change refusal connect to succeed");
+            status = session.publish_live_objects(source, draft);
+            ok &= expect(!status.ok && status.message.find(test_case.fragment) != std::string::npos,
+                         std::string("expected the publish to refuse: ") + test_case.name + " (got: " +
+                             status.message + ")");
+        }
+    }
+
+    {
         // ends_broadcast is only meaningful on the catalog track.
         constexpr DraftVersion draft = DraftVersion::kDraft22;
         MockTransport transport;

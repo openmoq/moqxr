@@ -78,6 +78,20 @@ struct LiveObject {
     // catalog track. This follows MSF 11.3; a receiver must still deliver a
     // track until its PUBLISH_DONE, because the streams can arrive in any order.
     bool ends_broadcast = false;
+    // A track change in the middle of a publish, for a source that owns its
+    // catalog (LiveCatalogMode::kSourceObject). The Object only carries the
+    // change: it has no payload and is not sent.
+    //
+    // adds_track: the publisher starts publishing this track, named by
+    // track_name. Return it before the catalog Object that announces the
+    // track: a subscriber can SUBSCRIBE as soon as it has the catalog. A name
+    // is used once per publish, an ended track's name included.
+    std::optional<LiveTrack> adds_track{};
+    // ends_track: the publisher finishes the track named by track_name and
+    // sends PUBLISH_DONE (Track Ended) for it. Return it after the catalog
+    // Object that removes the track. An Object for the track after this fails
+    // the publish.
+    bool ends_track = false;
 };
 
 struct LiveObjectSource {

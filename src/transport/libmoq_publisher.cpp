@@ -1958,6 +1958,10 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
         if (!object.properties.empty()) {
             return live_teardown(live, sender, ep, std::string(kPropertiesUnsupported));
         }
+        if (object.adds_track.has_value() || object.ends_track) {
+            return live_teardown(live, sender, ep,
+                                 "adding or ending a track is not supported by the libmoq publishing backend");
+        }
         const auto hit = handles.find(object.track_name);
         if (hit == handles.end()) {
             return live_teardown(live, sender, ep,
