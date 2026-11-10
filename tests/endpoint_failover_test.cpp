@@ -1,5 +1,6 @@
 #include "openmoq/publisher/endpoint_failover.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <limits>
@@ -187,6 +188,64 @@ int main() {
                      "expected publication to resume from the paused underlying source");
         ok &= expect(replayable.buffered_objects() <= 4,
                      "expected the live replay buffer to remain bounded");
+    }
+
+    
+
+    {
+        // A new attempt starts from the tracks live then: an added track is
+        // there, an ended one is not, and the change Objects are not replayed.
+        std::vector<LiveObject> input = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C'}},
+            LiveObject{.track_name = "video", .group_id = 1, .object_id = 0, .payload = {'V'}},
+            LiveObject{.track_name = "audio", .adds_track = LiveTrack{.track_name = "audio"}},
+            LiveObject{.track_name = "audio", .group_id = 1, .payload = {'A'}},
+            LiveObject{.track_name = "video", .ends_track = true},
+        };
+        std::size_t next = 0;
+        LiveObjectSource source{
+            .tracks = {
+                LiveTrack{.track_name = "catalog"},
+                LiveTrack{.track_name = "video", .media_type = LiveMediaType::kVideo},
+            },
+            .next_object = [&input, &next]() -> std::optional<LiveObject> {
+                if (next == input.size()) {
+                    return std::nullopt;
+                }
+                return input[next++];
+            },
+            .catalog_mode = LiveCatalogMode::kSourceObject,
+        };
+        ReplayableLiveObjectSource replayable(std::move(source), 8);
+
+        replayable.begin_attempt();
+        auto first_attempt = replayable.source();
+        ok &= expect(first_attempt.tracks.size() == 2, "expected the first attempt to start with the declared tracks");
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            static_cast<void>(first_attempt.next_object());
+        }
+
+        replayable.begin_attempt();
+        auto second_attempt = replayable.source();
+        const auto has_track = [&](const char* name) {
+            return std::any_of(second_attempt.tracks.begin(), second_attempt.tracks.end(),
+                               [&](const LiveTrack& track) { return track.track_name == name; });
+        };
+        ok &= expect(second_attempt.tracks.size() == 2 && has_track("catalog") && has_track("audio") &&
+                         !has_track("video"),
+                     "expected a new attempt to start with the added track and without the ended one");
+        std::vector<LiveObject> replayed;
+        while (auto object = second_attempt.next_object()) {
+            replayed.push_back(std::move(*object));
+        }
+        ok &= expect(std::none_of(replayed.begin(), replayed.end(),
+                                  [](const LiveObject& object) {
+                                      return object.adds_track.has_value() || object.ends_track ||
+                                             object.track_name == "video";
+                                  }),
+                     "expected neither track changes nor the ended track's Objects to be replayed");
+        ok &= expect(replayed.size() == 2 && replayed[0].track_name == "catalog" && replayed[1].track_name == "audio",
+                     "expected the catalog and the added track's Objects to be replayed");
     }
 
     return ok ? 0 : 1;

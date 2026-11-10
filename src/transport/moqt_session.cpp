@@ -11775,6 +11775,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     }
 
     std::map<std::string, std::uint64_t> alias_by_track;
+    // Tracks the source ended (LiveObject::ends_track): their names and
+    // aliases are not reused.
+    std::set<std::string> ended_tracks;
     std::uint64_t next_alias = 0;
     for (const auto& track : source.tracks) {
         if (track.track_name.empty()) {
@@ -11798,27 +11801,32 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     // State in the reply cannot be read, so the request would be made and its
     // answer discarded. Callers whose relay needs it set
     // PublisherConfig::preannounce_tracks (CLI: --preannounce-tracks).
+    std::uint64_t next_preannounce_request_id = 2;
+    const auto preannounce_track = [&](const std::string& track_name, std::uint64_t alias) -> TransportStatus {
+        const auto track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track_name);
+        TrackMessage track_message{
+            .draft = draft_version,
+            .track_name = track_name,
+            .track_namespace = track_namespace_,
+            .request_id = next_preannounce_request_id,
+            .track_alias = alias,
+            .largest_group_id = 0,
+            .largest_object_id = 0,
+            .content_exists = true,
+            .authorization_token = track_auth.token,
+            .dpop_proof = track_auth.proof,
+        };
+        const TransportStatus write_status =
+            transport_.write_stream(control_stream_id_, encode_track_message(track_message), false);
+        next_preannounce_request_id += 2;
+        return write_status;
+    };
     if (!uses_request_streams(draft_version) && preannounce_tracks_) {
-        std::uint64_t request_id = 2;
         for (const auto& [track_name, alias] : alias_by_track) {
-            const auto track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track_name);
-            TrackMessage track_message{
-                .draft = draft_version,
-                .track_name = track_name,
-                .track_namespace = track_namespace_,
-                .request_id = request_id,
-                .track_alias = alias,
-                .largest_group_id = 0,
-                .largest_object_id = 0,
-                .content_exists = true,
-                .authorization_token = track_auth.token,
-                .dpop_proof = track_auth.proof,
-            };
-            status = transport_.write_stream(control_stream_id_, encode_track_message(track_message), false);
+            status = preannounce_track(track_name, alias);
             if (!status.ok) {
                 return status;
             }
-            request_id += 2;
         }
     }
 
@@ -11851,52 +11859,66 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     LargestObjectByTrack largest_object_by_track;
     std::uint64_t next_publish_request_id = 2;
 
+    // PUBLISH for one track on a request-stream draft.
+    auto publish_one_track = [&](const std::string& track_name,
+                                 std::uint64_t alias,
+                                 std::optional<std::uint64_t> subscribe_tracks_request_id) -> TransportStatus {
+        const auto track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track_name);
+        TrackMessage track_message{
+            .draft = draft_version,
+            .track_name = track_name,
+            .track_namespace = track_namespace_,
+            .request_id = next_publish_request_id,
+            .track_alias = alias,
+            .largest_group_id = 0,
+            .largest_object_id = 0,
+            .content_exists = true,
+            .authorization_token = track_auth.token,
+            .dpop_proof = track_auth.proof,
+            .subscribe_tracks_request_id = subscribe_tracks_request_id,
+        };
+        PublishOk publish_ok;
+        std::uint64_t stream_id = 0;
+        TransportStatus publish_status =
+            send_request_stream_and_wait(transport_,
+                                         draft_version,
+                                         encode_track_message(track_message),
+                                         true,
+                                         &publish_ok,
+                                         &stream_id,
+                                         &pending_publish_request_bytes[next_publish_request_id]);
+        if (!publish_status.ok) {
+            return publish_status;
+        }
+        published_track_delivery_timeouts.insert_or_assign(track_name, publish_ok.delivery_timeouts);
+        SubscribeMessage settings;
+        settings.request_id = next_publish_request_id;
+        settings.track_name = track_name;
+        apply_publish_ok_settings(publish_ok, settings);
+        published_track_settings.insert_or_assign(track_name, settings);
+        published_track_request_ids.insert_or_assign(track_name, next_publish_request_id);
+        publish_stream_id_by_request_id_.insert_or_assign(next_publish_request_id, stream_id);
+        if (publish_ok.forward != 0) {
+            subscribed_tracks.insert(track_name);
+        }
+        next_publish_request_id += 2;
+        return TransportStatus::success();
+    };
+
+    // The SUBSCRIBE_TRACKS request the tracks were published for, which a
+    // track added later is published for as well.
+    std::optional<std::uint64_t> published_for_subscribe_tracks;
     auto publish_tracks = [&](std::optional<std::uint64_t> subscribe_tracks_request_id = std::nullopt)
         -> TransportStatus {
         if (!uses_request_streams(draft_version) || !published_track_request_ids.empty()) {
             return TransportStatus::success();
         }
+        published_for_subscribe_tracks = subscribe_tracks_request_id;
         for (const auto& [track_name, alias] : alias_by_track) {
-            const auto track_auth = action_authorization(draft_version, cat4moq::Action::kPublish, track_name);
-            TrackMessage track_message{
-                .draft = draft_version,
-                .track_name = track_name,
-                .track_namespace = track_namespace_,
-                .request_id = next_publish_request_id,
-                .track_alias = alias,
-                .largest_group_id = 0,
-                .largest_object_id = 0,
-                .content_exists = true,
-                .authorization_token = track_auth.token,
-                .dpop_proof = track_auth.proof,
-                .subscribe_tracks_request_id = subscribe_tracks_request_id,
-            };
-            PublishOk publish_ok;
-            std::uint64_t stream_id = 0;
-            TransportStatus publish_status =
-                send_request_stream_and_wait(transport_,
-                                             draft_version,
-                                             encode_track_message(track_message),
-                                             true,
-                                             &publish_ok,
-                                             &stream_id,
-                                             &pending_publish_request_bytes[next_publish_request_id]);
+            const TransportStatus publish_status = publish_one_track(track_name, alias, subscribe_tracks_request_id);
             if (!publish_status.ok) {
                 return publish_status;
             }
-            published_track_delivery_timeouts.insert_or_assign(
-                track_name, publish_ok.delivery_timeouts);
-            SubscribeMessage settings;
-            settings.request_id = next_publish_request_id;
-            settings.track_name = track_name;
-            apply_publish_ok_settings(publish_ok, settings);
-            published_track_settings.insert_or_assign(track_name, settings);
-            published_track_request_ids.insert_or_assign(track_name, next_publish_request_id);
-            publish_stream_id_by_request_id_.insert_or_assign(next_publish_request_id, stream_id);
-            if (publish_ok.forward != 0) {
-                subscribed_tracks.insert(track_name);
-            }
-            next_publish_request_id += 2;
         }
         return TransportStatus::success();
     };
@@ -12663,6 +12685,91 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             return serve_while_blocked();
         });
     };
+    // Applies a track change from the source (see LiveObject::adds_track).
+    const auto apply_track_change = [&](const openmoq::publisher::LiveObject& change) -> TransportStatus {
+        const std::string& name = change.track_name;
+        if (source.catalog_mode != openmoq::publisher::LiveCatalogMode::kSourceObject) {
+            return TransportStatus::failure("adding or ending a track requires a source-owned catalog");
+        }
+        if (name == "catalog") {
+            return TransportStatus::failure("the catalog track cannot be added or ended");
+        }
+        if (change.adds_track.has_value() && change.ends_track) {
+            return TransportStatus::failure("a live object cannot add and end a track: " + name);
+        }
+        if (change.adds_track.has_value()) {
+            const auto& track = *change.adds_track;
+            if (name.empty() || track.track_name != name) {
+                return TransportStatus::failure("added track name does not match its live object: " + name);
+            }
+            if (track.packaging == openmoq::publisher::LivePackaging::kLoc ||
+                track.packaging == openmoq::publisher::LivePackaging::kLocmaf) {
+                return TransportStatus::failure("LOC/LOCMAF cannot transform a source-owned catalog");
+            }
+            if (alias_by_track.contains(name) || ended_tracks.contains(name)) {
+                return TransportStatus::failure("live object adds a track name already used: " + name);
+            }
+            const std::uint64_t alias = next_alias++;
+            alias_by_track.emplace(name, alias);
+            if (!uses_request_streams(draft_version)) {
+                return preannounce_tracks_ ? preannounce_track(name, alias) : TransportStatus::success();
+            }
+            // Before the first publish_tracks() the loop over alias_by_track
+            // covers this track.
+            return published_track_request_ids.empty() ? TransportStatus::success()
+                                                       : publish_one_track(name, alias, published_for_subscribe_tracks);
+        }
+
+        if (!alias_by_track.contains(name)) {
+            return TransportStatus::failure(ended_tracks.contains(name)
+                                                ? "live object ends a track already ended: " + name
+                                                : "live object ends unknown track: " + name);
+        }
+        const auto sender_it = sender_by_track.find(name);
+        if (sender_it != sender_by_track.end()) {
+            const TransportStatus finish_status = finish_live_group(sender_it->second, effective_delivery_timeouts(name));
+            if (!finish_status.ok) {
+                return finish_status;
+            }
+        }
+        const std::uint64_t stream_count = sender_it != sender_by_track.end() ? sender_it->second.stream_count() : 0;
+        for (auto it = active_subscriptions.begin(); it != active_subscriptions.end();) {
+            if (it->second.track_name != name) {
+                ++it;
+                continue;
+            }
+            const std::uint64_t request_id = it->first;
+            const auto stream_it = active_subscription_stream_ids.find(request_id);
+            const std::uint64_t response_stream_id =
+                uses_request_streams(draft_version) && stream_it != active_subscription_stream_ids.end()
+                    ? stream_it->second
+                    : control_stream_id_;
+            const TransportStatus done_status = transport_.write_stream(
+                response_stream_id, encode_publish_done_message(draft_version, request_id, stream_count), false);
+            if (!done_status.ok) {
+                return done_status;
+            }
+            active_subscription_stream_ids.erase(request_id);
+            joinable_subscriptions.erase(request_id);
+            it = active_subscriptions.erase(it);
+        }
+        const auto published_it = published_track_request_ids.find(name);
+        if (published_it != published_track_request_ids.end() &&
+            !terminated_publish_request_ids.contains(published_it->second)) {
+            const TransportStatus done_status = write_publish_done_for_request(
+                transport_, draft_version, control_stream_id_, publish_stream_id_by_request_id_,
+                published_it->second, stream_count);
+            if (!done_status.ok) {
+                return done_status;
+            }
+            publish_stream_id_by_request_id_.erase(published_it->second);
+            terminated_publish_request_ids.insert(published_it->second);
+        }
+        subscribed_tracks.erase(name);
+        alias_by_track.erase(name);
+        ended_tracks.insert(name);
+        return TransportStatus::success();
+    };
     // Sends one source catalog Object on the given sender.
     const auto send_catalog_object = [&](SubgroupSenderState& sender,
                                          const openmoq::publisher::LiveObject& catalog,
@@ -12915,9 +13022,21 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             awaiting_source_catalog = false;
         }
+        if (next->adds_track.has_value() || next->ends_track) {
+            status = apply_track_change(*next);
+            if (!status.ok) {
+                if (interrupted()) {
+                    break;
+                }
+                return status;
+            }
+            continue;
+        }
         const auto alias_it = alias_by_track.find(next->track_name);
         if (alias_it == alias_by_track.end()) {
-            return TransportStatus::failure("live object references unknown track: " + next->track_name);
+            return TransportStatus::failure(ended_tracks.contains(next->track_name)
+                                                ? "live object for an ended track: " + next->track_name
+                                                : "live object references unknown track: " + next->track_name);
         }
         if (next->track_name == "catalog") {
             // Its Largest Object is noted when it is sent.
