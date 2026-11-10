@@ -932,7 +932,7 @@ TransportStatus PicoquicClient::connect() {
         if (result != nullptr) {
             freeaddrinfo(result);
         }
-        return TransportStatus::failure("failed to resolve picoquic server address",
+        return TransportStatus::failure(std::string("failed to resolve picoquic server address: ") + gai_strerror(lookup),
                                         resolve_failure_kind(lookup == EAI_NONAME));
     }
 

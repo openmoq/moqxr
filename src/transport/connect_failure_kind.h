@@ -19,8 +19,14 @@ inline FailureKind resolve_failure_kind(bool host_not_found) {
 }
 
 // The QUIC errors of a connection that closed before its handshake ended.
+// certificate_expired also reports a certificate that is not yet valid, as
+// on a host whose clock is not set yet: that can heal, so it is retryable.
 inline FailureKind handshake_failure_kind(std::uint64_t local_error, std::uint64_t remote_error) {
     constexpr std::uint64_t kNoApplicationProtocol = 0x0100 + 120;   // TLS alert 120 (RFC 9001, section 4.8)
+    constexpr std::uint64_t kCertificateExpired = 0x0100 + 45;
+    if (local_error == kCertificateExpired) {
+        return FailureKind::kRetryable;
+    }
     if (tlsverify::is_certificate_verification_error(local_error) ||
         tlsverify::is_certificate_verification_error(remote_error) || remote_error == kNoApplicationProtocol) {
         return FailureKind::kEndpointPermanent;
