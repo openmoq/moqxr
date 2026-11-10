@@ -670,7 +670,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
 
     if (options.media_packaging == MediaPackaging::kLoc) {
         if (!is_draft18_or_later(options.draft_version)) {
-            throw std::runtime_error("LOC-04 requires --draft 18 or later");
+            throw std::runtime_error("LOC-05 requires --draft 18 or later");
         }
         if (options.stream_per_object || !options.split_cmaf_chunks) {
             throw std::runtime_error("LOC requires one sample per object and a stream per GOP");

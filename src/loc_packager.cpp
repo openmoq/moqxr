@@ -21,6 +21,7 @@ std::uint64_t microseconds(std::uint64_t ticks, std::uint32_t timescale) {
 LocTrackEncoder::LocTrackEncoder(const TrackDescription& track)
     : track_(track), config_(loc_codec_config(track)) {
     if (track.timescale == 0) throw std::runtime_error("LOC requires a nonzero timescale");
+    if (track.codec.empty()) throw std::runtime_error("LOC requires a codec string");
     track_.packaging = "loc";
 }
 
@@ -75,9 +76,11 @@ std::vector<MediaFragment> LocTrackEncoder::encode(std::span<const EncodedSample
                                {16, static_cast<std::uint64_t>(sample.presentation_time)}};
         // One complete frame per object: S/E set, I only for independent frames.
         if (video) fragment.properties.push_back({9, std::vector<std::uint8_t>{static_cast<std::uint8_t>(sample.independent ? 0xe0 : 0xc0)}});
-        // Repeating extradata keeps retained objects self-describing without
-        // requiring a cache to rewrite an existing object or fetch prior state.
+        // Repeating extradata and the codec string keeps retained objects
+        // self-describing without requiring a cache to rewrite an existing
+        // object or fetch prior state.
         fragment.properties.push_back({video ? 13U : 15U, config_});
+        fragment.properties.push_back({17, std::vector<std::uint8_t>(track_.codec.begin(), track_.codec.end())});
         static_cast<void>(serialize_object_properties(fragment.properties));
         output.push_back(std::move(fragment));
         if (object_ == std::numeric_limits<std::size_t>::max()) throw std::runtime_error("LOC object ID overflow");
@@ -87,7 +90,7 @@ std::vector<MediaFragment> LocTrackEncoder::encode(std::span<const EncodedSample
 }
 
 PublishPlan prepare_loc_plan(const ParsedMp4& parsed, const PublisherConfig& config) {
-    if (!is_draft18_or_later(config.draft_version)) throw std::runtime_error("LOC-04 requires draft 18 or later");
+    if (!is_draft18_or_later(config.draft_version)) throw std::runtime_error("LOC-05 requires draft 18 or later");
     const auto samples = read_encoded_samples(parsed);
     SegmentedMp4 segmented;
     segmented.tracks = parsed.tracks;

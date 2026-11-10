@@ -1276,12 +1276,12 @@ int main() {
                      loc.media_packaging != openmoq::publisher::MediaPackaging::kLocmaf,
                      "LOC must select its own packaging profile");
     } catch (const std::exception& error) {
-        ok &= expect(false, std::string("LOC-04 CLI should be accepted: ") + error.what());
+        ok &= expect(false, std::string("LOC-05 CLI should be accepted: ") + error.what());
     }
     try {
         parse({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "21"});
     } catch (const std::exception& error) {
-        ok &= expect(false, std::string("LOC-04 CLI should accept draft 21: ") + error.what());
+        ok &= expect(false, std::string("LOC-05 CLI should accept draft 21: ") + error.what());
     }
     ok &= expect(parse_throws({"publisher", "--input", "sample.mp4", "--packaging", "loc", "--draft", "16"},
                               "draft 18", "LOC must reject explicit draft16"), "LOC draft gate");

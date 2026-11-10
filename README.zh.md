@@ -73,7 +73,7 @@ checkout 进行播放等价性检查，请运行
 [C++ API 配置](docs/publisher-api.md#optional-locmaf-packaging)和
 [验证覆盖](docs/testing.md#locmaf-tests)。
 
-LOC-04 发布在原生后端上可通过 `--packaging loc --draft 18`（或 `--draft 21` / `--draft 22` / `--draft 23`）使用。
+LOC-05 发布在原生后端上可通过 `--packaging loc --draft 18`（或 `--draft 21` / `--draft 22` / `--draft 23`）使用。
 它发送单独的 H.264/AAC 帧，并附带 timestamp、timescale 和
 codec 配置属性；CMAF 仍是默认值。范围和限制请参阅
 [LOC 快速开始](docs/quickstart.md#opt-in-to-loc)。

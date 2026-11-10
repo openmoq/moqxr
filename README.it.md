@@ -73,7 +73,7 @@ con un checkout di moq-playa con supporto LOCMAF, eseguite
 la [configurazione dell'API C++](docs/publisher-api.md#optional-locmaf-packaging) e la
 [copertura di validazione](docs/testing.md#locmaf-tests).
 
-La pubblicazione LOC-04 è disponibile con `--packaging loc --draft 18` (oppure `--draft 21` / `--draft 22` / `--draft 23`) sul backend
+La pubblicazione LOC-05 è disponibile con `--packaging loc --draft 18` (oppure `--draft 21` / `--draft 22` / `--draft 23`) sul backend
 nativo. Invia singoli frame H.264/AAC con proprietà di timestamp, timescale e
 configurazione del codec; CMAF resta il valore predefinito. Vedere l'
 [avvio rapido LOC](docs/quickstart.md#opt-in-to-loc) per ambito e vincoli.

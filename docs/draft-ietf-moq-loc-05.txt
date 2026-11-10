@@ -5,13 +5,13 @@
 Media Over QUIC                                                M. Zanaty
 Internet-Draft                                             S. Nandakumar
 Intended status: Standards Track                                   Cisco
-Expires: 21 January 2027                                     P. Thatcher
+Expires: 6 May 2027                                          P. Thatcher
                                                                Microsoft
-                                                            20 July 2026
+                                                         2 November 2026
 
 
                       Low Overhead Media Container
-                         draft-ietf-moq-loc-04
+                         draft-ietf-moq-loc-05
 
 Abstract
 
@@ -53,9 +53,9 @@ Status of This Memo
 
 
 
-Zanaty, et al.           Expires 21 January 2027                [Page 1]
+Zanaty, et al.             Expires 6 May 2027                   [Page 1]
 
-Internet-Draft               media-container                   July 2026
+Internet-Draft               media-container               November 2026
 
 
    Internet-Drafts are draft documents valid for a maximum of six months
@@ -63,7 +63,7 @@ Internet-Draft               media-container                   July 2026
    time.  It is inappropriate to use Internet-Drafts as reference
    material or to cite them other than as "work in progress."
 
-   This Internet-Draft will expire on 21 January 2027.
+   This Internet-Draft will expire on 6 May 2027.
 
 Copyright Notice
 
@@ -94,13 +94,13 @@ Table of Contents
      2.3.  LOC Properties  . . . . . . . . . . . . . . . . . . . . .   6
        2.3.1.  Common Properties . . . . . . . . . . . . . . . . . .   7
        2.3.2.  Video Properties  . . . . . . . . . . . . . . . . . .   8
-       2.3.3.  Audio Properties  . . . . . . . . . . . . . . . . . .   8
+       2.3.3.  Audio Properties  . . . . . . . . . . . . . . . . . .   9
    3.  Payload Encryption  . . . . . . . . . . . . . . . . . . . . .   9
      3.1.  Secure Objects Integration  . . . . . . . . . . . . . . .   9
-       3.1.1.  Key Identification  . . . . . . . . . . . . . . . . .   9
+       3.1.1.  Key Identification  . . . . . . . . . . . . . . . . .  10
        3.1.2.  Immutable Properties  . . . . . . . . . . . . . . . .  10
        3.1.3.  Private Properties for Sensitive Metadata . . . . . .  10
-       3.1.4.  Cipher Suite Requirements . . . . . . . . . . . . . .  10
+       3.1.4.  Cipher Suite Requirements . . . . . . . . . . . . . .  11
        3.1.5.  AAD Construction  . . . . . . . . . . . . . . . . . .  11
    4.  Examples  . . . . . . . . . . . . . . . . . . . . . . . . . .  11
      4.1.  Application with one audio track  . . . . . . . . . . . .  12
@@ -109,25 +109,25 @@ Table of Contents
 
 
 
-Zanaty, et al.           Expires 21 January 2027                [Page 2]
+Zanaty, et al.             Expires 6 May 2027                   [Page 2]
 
-Internet-Draft               media-container                   July 2026
+Internet-Draft               media-container               November 2026
 
 
      4.3.  Application with single video track with temporal
            layers  . . . . . . . . . . . . . . . . . . . . . . . . .  13
-     4.4.  Application with mutiple dependent video tracks . . . . .  13
+     4.4.  Application with mutiple dependent video tracks . . . . .  14
      4.5.  Application with mutiple dependent video tracks with dyadic
-           framerate levels. . . . . . . . . . . . . . . . . . . . .  14
+           framerate levels. . . . . . . . . . . . . . . . . . . . .  15
      4.6.  Application with multiple simulcast qualities video
            tracks  . . . . . . . . . . . . . . . . . . . . . . . . .  15
    5.  Security and Privacy Considerations . . . . . . . . . . . . .  16
      5.1.  Protecting Sensitive Metadata . . . . . . . . . . . . . .  16
-     5.2.  Immutable Property Considerations . . . . . . . . . . . .  16
+     5.2.  Immutable Property Considerations . . . . . . . . . . . .  17
      5.3.  Relay Trust Model . . . . . . . . . . . . . . . . . . . .  17
      5.4.  Deletion Detection  . . . . . . . . . . . . . . . . . . .  17
    6.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .  17
-     6.1.  MOQ Properties Registry . . . . . . . . . . . . . . . . .  17
+     6.1.  MOQ Properties Registry . . . . . . . . . . . . . . . . .  18
    7.  References  . . . . . . . . . . . . . . . . . . . . . . . . .  18
      7.1.  Normative References  . . . . . . . . . . . . . . . . . .  18
      7.2.  Informative References  . . . . . . . . . . . . . . . . .  19
@@ -165,9 +165,9 @@ Internet-Draft               media-container                   July 2026
 
 
 
-Zanaty, et al.           Expires 21 January 2027                [Page 3]
+Zanaty, et al.             Expires 6 May 2027                   [Page 3]
 
-Internet-Draft               media-container                   July 2026
+Internet-Draft               media-container               November 2026
 
 
    This specification can also be used by applications outside the
@@ -221,9 +221,9 @@ Internet-Draft               media-container                   July 2026
 
 
 
-Zanaty, et al.           Expires 21 January 2027                [Page 4]
+Zanaty, et al.             Expires 6 May 2027                   [Page 4]
 
-Internet-Draft               media-container                   July 2026
+Internet-Draft               media-container               November 2026
 
 
 2.1.  Video Payload Format
@@ -277,9 +277,9 @@ Internet-Draft               media-container                   July 2026
 
 
 
-Zanaty, et al.           Expires 21 January 2027                [Page 5]
+Zanaty, et al.             Expires 6 May 2027                   [Page 5]
 
-Internet-Draft               media-container                   July 2026
+Internet-Draft               media-container               November 2026
 
 
 2.2.  MOQ Object Mapping
@@ -333,9 +333,9 @@ Internet-Draft               media-container                   July 2026
 
 
 
-Zanaty, et al.           Expires 21 January 2027                [Page 6]
+Zanaty, et al.             Expires 6 May 2027                   [Page 6]
 
-Internet-Draft               media-container                   July 2026
+Internet-Draft               media-container               November 2026
 
 
    Other specifications can define other metadata as LOC Public and
@@ -389,9 +389,9 @@ Internet-Draft               media-container                   July 2026
 
 
 
-Zanaty, et al.           Expires 21 January 2027                [Page 7]
+Zanaty, et al.             Expires 6 May 2027                   [Page 7]
 
-Internet-Draft               media-container                   July 2026
+Internet-Draft               media-container               November 2026
 
 
    *  ID: 0x08
@@ -399,6 +399,20 @@ Internet-Draft               media-container                   July 2026
    *  Length: Omitted (ID is even)
 
    *  Value: vi64 (1-9 bytes)
+
+2.3.1.3.  Codec String
+
+   *  Name: Codec String
+
+   *  Description: Codec string in UTF-8 as defined by the WebCodecs
+      Codec Registry which maps to the codec property (in UTF-16) in the
+      WebCodecs AudioDecoderConfig or VideoDecoderConfig.
+
+   *  ID: 0x11
+
+   *  Length: Varies
+
+   *  Value: Varies
 
 2.3.2.  Video Properties
 
@@ -428,6 +442,14 @@ Internet-Draft               media-container                   July 2026
 
    *  ID: 0x09
 
+
+
+
+Zanaty, et al.             Expires 6 May 2027                   [Page 8]
+
+Internet-Draft               media-container               November 2026
+
+
    *  Length: Varies (1-4 bytes)
 
    *  Value: Varies
@@ -442,13 +464,6 @@ Internet-Draft               media-container                   July 2026
       corresponding codec specification, which maps to the WebCodecs
       AudioDecoderConfig description property in the
       EncodedAudioChunkMetadata.
-
-
-
-Zanaty, et al.           Expires 21 January 2027                [Page 8]
-
-Internet-Draft               media-container                   July 2026
-
 
    *  ID: 0x0F
 
@@ -484,6 +499,13 @@ Internet-Draft               media-container                   July 2026
    encryption of MOQT objects.  When using Secure Objects with LOC, the
    following considerations apply:
 
+
+
+Zanaty, et al.             Expires 6 May 2027                   [Page 9]
+
+Internet-Draft               media-container               November 2026
+
+
 3.1.1.  Key Identification
 
    The Secure Object Key ID property (type 0x2 in [SecureObjects]) MUST
@@ -491,20 +513,6 @@ Internet-Draft               media-container                   July 2026
    used for encryption.  This property is authenticated but not
    encrypted, allowing relays to forward objects without decryption
    while ensuring subscribers can identify the correct decryption key.
-
-
-
-
-
-
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027                [Page 9]
-
-Internet-Draft               media-container                   July 2026
-
 
 3.1.2.  Immutable Properties
 
@@ -547,20 +555,19 @@ Internet-Draft               media-container                   July 2026
    This approach allows sensitive metadata to remain confidential from
    relays while still being available to authorized end subscribers.
 
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 10]
+
+Internet-Draft               media-container               November 2026
+
+
 3.1.4.  Cipher Suite Requirements
 
    Implementations using LOC with Secure Objects MUST support the
    AES_128_GCM_SHA256_128 cipher suite (0x0004).  Other cipher suites
    defined in [SecureObjects] MAY be used based on application
    requirements for authentication tag size versus bandwidth overhead.
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 10]
-
-Internet-Draft               media-container                   July 2026
-
 
 3.1.5.  AAD Construction
 
@@ -594,6 +601,23 @@ Internet-Draft               media-container                   July 2026
    application data to the MOQT object model and underlying QUIC
    transport.
 
+
+
+
+
+
+
+
+
+
+
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 11]
+
+Internet-Draft               media-container               November 2026
+
+
    +------------------------------+
    |     Media Application        |
    |    Audio, Video Frames       |
@@ -610,13 +634,6 @@ Internet-Draft               media-container                   July 2026
    |             QUIC             |
    |        Streams, Datagrams    |
    +------------------------------+
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 11]
-
-Internet-Draft               media-container                   July 2026
-
 
 4.1.  Application with one audio track
 
@@ -646,6 +663,17 @@ Internet-Draft               media-container                   July 2026
    An example is shown below for an H.264 video track with 1280x720p
    resolution and 30 fps frame rate at 1 Mbps bitrate.
 
+
+
+
+
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 12]
+
+Internet-Draft               media-container               November 2026
+
+
    codec: "avc3.42E01E"
    bitrate: 1000000
    framerate: 30
@@ -664,15 +692,6 @@ Internet-Draft               media-container                   July 2026
 
    When mapping to QUIC for sending, one unidirectional QUIC stream is
    setup to deliver all the encoded video chunks within a MOQT group.
-
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 12]
-
-Internet-Draft               media-container                   July 2026
-
 
    When decoding at the 'End Consumer', the objects from each of the
    QUIC streams are fed in the GroupID then ObjectID order to the
@@ -703,6 +722,14 @@ Internet-Draft               media-container                   July 2026
    group.  The first encoded video frame, MOQT Object with ObjectID 0,
    shall be the Indepedent (IDR) frame and the rest of the encoded video
    frames corresponds to dependent (delta) frames, organized in the
+
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 13]
+
+Internet-Draft               media-container               November 2026
+
+
    decode order.  When mapping to QUIC for sending, one unidirectional
    QUIC stream is used per SubGroup, thus resulting in 2 QUIC streams
    per MOQT group.
@@ -716,19 +743,6 @@ Internet-Draft               media-container                   July 2026
 
    An example is shown below for an H.264 video track with 2 spatial
    qualities at 360p and 720p each at 30 fps
-
-
-
-
-
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 13]
-
-Internet-Draft               media-container                   July 2026
-
 
    Video Track 1
    codec: "avc3.42E01E"
@@ -761,30 +775,23 @@ Internet-Draft               media-container                   July 2026
    Track 2 Group 5 Object 1
    ....
 
+
+
+
+
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 14]
+
+Internet-Draft               media-container               November 2026
+
+
 4.5.  Application with mutiple dependent video tracks with dyadic
       framerate levels.
 
    An example is shown below for an H.264 video track with 2 spatial
    qualities at 360p and 720p, however, the framerate between tracks
    vary dyadically.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 14]
-
-Internet-Draft               media-container                   July 2026
-
 
    Video Track 1
    codec: "avc3.42E01E"
@@ -821,6 +828,20 @@ Internet-Draft               media-container                   July 2026
    An example is shown below for an H.264 video track with 2 simulcast
    spatial qualities at 360p and 720p each at 30 fps.
 
+
+
+
+
+
+
+
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 15]
+
+Internet-Draft               media-container               November 2026
+
+
    Video Track 1
    codec: "avc3.42E01E"
    bitrate: 500000
@@ -834,13 +855,6 @@ Internet-Draft               media-container                   July 2026
    framerate: 30
    width: 1280
    height: 720
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 15]
-
-Internet-Draft               media-container                   July 2026
-
 
    When ready for publishing, the mapping to the MOQT object model and
    to underlying QUIC, follows the same procedures as described in
@@ -877,6 +891,13 @@ Internet-Draft               media-container                   July 2026
 
    *  Immutable properties are authenticated but visible to relays
 
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 16]
+
+Internet-Draft               media-container               November 2026
+
+
    *  Media switches that need metadata access require appropriate key
       material
 
@@ -889,14 +910,6 @@ Internet-Draft               media-container                   July 2026
    carefully consider which properties require:
 
    *  Confidentiality (use Private properties)
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 16]
-
-Internet-Draft               media-container                   July 2026
-
 
    *  Integrity without confidentiality (use Immutable properties)
 
@@ -933,26 +946,18 @@ Internet-Draft               media-container                   July 2026
 
 6.  IANA Considerations
 
+
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 17]
+
+Internet-Draft               media-container               November 2026
+
+
 6.1.  MOQ Properties Registry
 
    This document registers the following entries in the MOQ Properties
    registry established by [MoQTransport]:
-
-
-
-
-
-
-
-
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 17]
-
-Internet-Draft               media-container                   July 2026
-
 
      +======+=====================+===============+=================+
      | Type | Name                | Scope         | Specification   |
@@ -969,6 +974,8 @@ Internet-Draft               media-container                   July 2026
      +------+---------------------+---------------+-----------------+
      | 0x0F | AUDIO_CONFIG        | Track, Object | Section 2.3.3.1 |
      +------+---------------------+---------------+-----------------+
+     | 0x11 | CODEC_STRING        | Track, Object | Section 2.3.1.3 |
+     +------+---------------------+---------------+-----------------+
 
                                  Table 1
 
@@ -979,9 +986,9 @@ Internet-Draft               media-container                   July 2026
    [MoQTransport]
               Nandakumar, S., Vasiliev, V., Swett, I., and A. Frindell,
               "Media over QUIC Transport", Work in Progress, Internet-
-              Draft, draft-ietf-moq-transport-19, 6 July 2026,
+              Draft, draft-ietf-moq-transport-23, 2 November 2026,
               <https://datatracker.ietf.org/doc/html/draft-ietf-moq-
-              transport-19>.
+              transport-23>.
 
    [WebCodecs]
               "WebCodecs", July 2023,
@@ -996,19 +1003,16 @@ Internet-Draft               media-container                   July 2026
               DOI 10.17487/RFC2119, March 1997,
               <https://www.rfc-editor.org/rfc/rfc2119>.
 
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 18]
+
+Internet-Draft               media-container               November 2026
+
+
    [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
               2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
               May 2017, <https://www.rfc-editor.org/rfc/rfc8174>.
-
-
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 18]
-
-Internet-Draft               media-container                   July 2026
-
 
    [RFC9626]  Zanaty, M., Berger, E., and S. Nandakumar, "Video Frame
               Marking RTP Header Extension", RFC 9626,
@@ -1054,16 +1058,17 @@ Authors' Addresses
    Email: mzanaty@cisco.com
 
 
+
+
+
+Zanaty, et al.             Expires 6 May 2027                  [Page 19]
+
+Internet-Draft               media-container               November 2026
+
+
    Suhas Nandakumar
    Cisco
    Email: snandaku@cisco.com
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 19]
-
-Internet-Draft               media-container                   July 2026
 
 
    Peter Thatcher
@@ -1112,9 +1117,4 @@ Internet-Draft               media-container                   July 2026
 
 
 
-
-
-
-
-
-Zanaty, et al.           Expires 21 January 2027               [Page 20]
+Zanaty, et al.             Expires 6 May 2027                  [Page 20]

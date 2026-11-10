@@ -36,7 +36,7 @@ This document records the draft-14 and draft-16 mappings and the LOC mapping. Th
 ## LOC packaging
 
 `--packaging loc --draft 18` maps the clear H.264/AAC subset of
-[LOC-04](draft-ietf-moq-loc-04.txt) onto draft-18 subgroup properties. This does
+[LOC-05](draft-ietf-moq-loc-05.txt) onto draft-18 subgroup properties. This does
 not enable MOQT-19. CMAF remains the default.
 
 - One encoded sample per object, with no MP4 box headers in the payload.
@@ -45,6 +45,14 @@ not enable MOQT-19. CMAF remains the default.
   independently decodable IDRs also set I. Other marking bits remain zero.
 - Video config `0x0D` carries avcC record bytes; audio config `0x0F` carries
   AudioSpecificConfig bytes. Configuration is repeated on every generated object.
+- Codec String `0x11` carries the catalog's UTF-8 WebCodecs codec string and is
+  repeated alongside the configuration. Track-scope properties are not sent.
+  Tradeoff: each object grows by the string plus two bytes of ID and length,
+  about 11 bytes for `mp4a.40.2` (roughly 4 kbps for 48 kHz AAC) and 13 for
+  `avc1.42001e`. Audio already uses one object per group, so emitting only at
+  group starts would save nothing there; for video it would save about 13 bytes
+  per dependent frame, but objects cached or fetched mid-group would no
+  longer carry the codec string.
 - Video uses one subgroup (zero) per GOP; audio uses one frame per group.
 - Property IDs are sorted and delta-encoded using draft-18 vi64; value type
   follows the absolute ID parity. A property-bearing stream retains that framing

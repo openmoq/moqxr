@@ -49,33 +49,39 @@ CMAF remains the primary default; LOCMAF remains a separate opt-in format.
 
 ### Draft baseline and compatibility
 
-Use the checked-in [LOC-04 text](draft-ietf-moq-loc-04.txt), published July 20,
-2026. IETF Datatracker reported revision `04` as current on September 18,
-2026. Download source:
-<https://www.ietf.org/archive/id/draft-ietf-moq-loc-04.txt>.
-SHA-256: `fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47`.
+Use the checked-in [LOC-05 text](draft-ietf-moq-loc-05.txt), published
+November 2, 2026. Download source:
+<https://www.ietf.org/archive/id/draft-ietf-moq-loc-05.txt>.
+SHA-256: `e75ba67b545a863d59473ab279683e3fcd61650bf2e19875c00f6a302271fbf3`.
 Use [MSF-01](draft-ietf-moq-msf-01.txt) section 4.1 for catalog signaling and
-sample/group mapping. LOC-04 references MOQT-19; the initial implementation
-binds its clear-media subset to the existing draft-18 property framing,
-with explicit wire tests, rather than imply new MOQT-19 support.
+sample/group mapping. LOC-05 references MOQT-23; the implementation binds its
+clear-media subset to the draft-18 property framing, with explicit wire tests,
+rather than tie the LOC revision to a transport draft.
+
+LOC-05 differs from LOC-04 only by adding the optional Codec String property
+(`0x11`, Track and Object scope); payload format, the existing property IDs,
+and encryption rules are unchanged. Because MOQT receivers ignore unknown
+properties, LOC-05 output remains readable by LOC-04 consumers, so there is
+no LOC revision switch.
 
 LOC is encoded audio/video frames plus MOQT properties, not a compressed
 CMAF chunk. Each encoded sample becomes one object; MP4 box headers are not
 part of its media payload. The catalog must say `packaging: "loc"` and must
 not include `locmafVersion`. Do not invent a `locVersion` catalog field.
 
-LOC-04 sections 2.3 and 6.1 define:
+LOC-05 sections 2.3 and 6.1 define:
 
 | Property | ID | Value |
 | --- | --- | --- |
 | Timestamp | `0x10` | vi64 integer |
 | Timescale | `0x08` | vi64 integer |
+| Codec string | `0x11` | UTF-8 WebCodecs codec string bytes |
 | Video frame marking | `0x09` | Length-prefixed RFC 9626 bytes |
 | Audio level | `0x0C` | vi64 integer containing RFC 6464 bits |
 | Video config | `0x0D` | Codec extradata bytes |
 | Audio config | `0x0F` | Codec extradata bytes |
 
-Timescale must accompany media-relative timestamps; without it, LOC-04
+Timescale must accompany media-relative timestamps; without it, LOC
 interprets timestamps as Unix-epoch microseconds. Preserve presentation time
 for metadata and decode order for object ordering. Do not substitute decode
 time for presentation time on B-frames or label relative time as wall-clock.
@@ -83,25 +89,25 @@ time for presentation time on B-frames or label relative time as wall-clock.
 Current reference limitations, verified from local sources:
 
 - Playa `2d58206`, `packages/loc/src/property-map.ts`, resolves LOC-01 IDs
-  `0x02`, `0x04`, and `0x06`; it is not a LOC-04 semantic oracle. Its transport
+  `0x02`, `0x04`, and `0x06`; it is not a LOC-05 semantic oracle. Its transport
   property-block codec is a useful independent framing reference.
 - red5-moq-relay `852f9fa`, `org/red5/io/moq/loc/model`, has the same older
   timestamp/frame-marking/audio-level IDs. Opaque property forwarding may
   still work, but must be proved through cached delivery and FETCH.
-- The local moq5 `media/loc/src/loc.c` implements LOC-01. Keep libmoq LOC-04
+- The local moq5 `media/loc/src/loc.c` implements LOC-01. Keep libmoq LOC-05
   publishing gated until its profile is implemented and verified.
 - The user's publisher is available at `../moq-rs/moq-pub` rather than
   `../moq-pub`; its media catalog currently selects CMAF. Use it as a baseline
-  publisher reference, not as proof of LOC-04 compatibility.
+  publisher reference, not as proof of LOC-05 compatibility.
 
-### LOC-04 implementation scope
+### LOC-05 implementation scope
 
 Add explicit `--packaging loc` / `MediaPackaging::kLoc`. Start with clear
 H.264 and AAC using the native draft-18 session, then add other codecs only
 with verified WebCodecs payload/config mappings. Preserve both existing
 packaging modes and their default wire bytes. Reject LOC on unsupported
 transport/backend combinations before publication; never silently send the
-old LOC-01 property IDs under the LOC-04 implementation.
+old LOC-01 property IDs under the LOC-05 implementation.
 
 Cover batch MP4, live stdin, SRT, DASH, and caller-supplied encoded samples
 through the same sample-to-object mapping. For the first implementation use
@@ -116,9 +122,18 @@ Audio level is optional and must be omitted unless actually supplied or
 measured. Keep codec configuration available at random-access entry points
 so cached groups and late joins can initialize a decoder.
 
+Codec String travels with the codec configuration on every object, taken from
+the same `TrackDescription::codec` that the catalog publishes so the two
+cannot diverge. Audio already uses one object per group, so restricting it to
+group starts would save nothing there and only about 13 bytes on dependent
+video frames. Track-scope properties are deferred: no track-property path
+exists yet, LOC-05 does not require them, and the catalog already carries the
+codec string per track. On the explicit object API, Codec String is optional
+but must match `LiveTrack::codec` when supplied.
+
 ### Initial behavior contract
 
-- `--packaging loc --draft 18` selects LOC-04. Omitted packaging still means
+- `--packaging loc --draft 18` selects LOC-05. Omitted packaging still means
   CMAF. `--packaging locmaf` keeps its existing behavior. Reject LOC with
   draft 16 or libmoq before opening a publishing session. Do not infer LOC
   revision from the transport draft or retry using legacy LOC property IDs.
@@ -149,7 +164,7 @@ so cached groups and late joins can initialize a decoder.
   Never retain a dropped dependency chain and resume video on a delta frame.
 - Reject `--coalesce-cmaf-chunks` and `--stream-per-object` for this initial
   GOP-stream profile. One video subgroup per GOP is an implementation
-  choice, not a LOC-04 prohibition on layered subgroups.
+  choice, not a LOC-05 prohibition on layered subgroups.
 - Emit `*_media.loc` containing the elementary sample and matching
   `*_properties.json` sidecars containing IDs, typed values, and complete
   encoded property-block hex. Integer values in JSON are decimal strings
@@ -169,7 +184,7 @@ Unchanged no-property obj:  00 02 aa bb
 The wire test must decode the resulting stream with an independent parser
 and assert both properties and unchanged payload. Add odd-ID Config and
 Frame Marking vectors separately; the LOC-01 integer frame-marking encoding
-must never be emitted as LOC-04.
+must never be emitted as LOC-05.
 
 ### Implementation map
 
@@ -187,13 +202,13 @@ must never be emitted as LOC-04.
   publishing, live sample conversion, and whole-group queue recovery.
   `live_srt_ingest.cpp` retains source PES PTS/DTS independently of existing
   CMAF timing; the LOC converter uses those clocks and decode lookahead.
-- `scripts/test-loc04.mjs`: independent property decoding and FFmpeg decoded-frame
-  equivalence. It uses LOC-04 IDs directly and does not depend on Playa's LOC-01
+- `scripts/test-loc05.mjs`: independent property decoding and FFmpeg decoded-frame
+  equivalence. It uses LOC-05 IDs directly and does not depend on Playa's LOC-01
   semantic decoder.
 
 The acceptance gates below retain the original implementation contract.
-Offline validation is recorded in [testing](testing.md#loc-04-tests); real
-relay forwarding, cached FETCH, and LOC-04 browser playback remain separate
+Offline validation is recorded in [testing](testing.md#loc-05-tests); real
+relay forwarding, cached FETCH, and LOC-05 browser playback remain separate
 interoperability gates, not conclusions from a successful build.
 
 ### Delivery milestones and acceptance gates
@@ -205,18 +220,18 @@ interoperability gates, not conclusions from a successful build.
    valid LOC catalogs, one object per sample, and matching inspection
    sidecars. Decode reconstructed samples independently and compare packet
    payload hashes, presentation timing, A/V offset, and frame hashes with
-   the source. Compare duration at the sample-extraction boundary; LOC-04
+   the source. Compare duration at the sample-extraction boundary; LOC-05
    defines no duration property, so do not invent one on the wire. Include B-frames and multiple samples per chunk.
 3. **Live publishing:** stdin, SRT, DASH, and explicit sample-source tests
    prove catalog/config ordering, bounded queues, whole-object drops,
    keyframe recovery, stable object identity on replay, and clean rejection
    of encrypted or unsupported input. A configuration failure must not
    publish a LOC catalog followed by CMAF payloads.
-4. **LOC-04 interoperability:** a receiver understands IDs `0x08`, `0x09`,
-   `0x0C`, `0x0D`, `0x0F`, and `0x10` with their correct types. Verify real
+4. **LOC-05 interoperability:** a receiver understands IDs `0x08`, `0x09`,
+   `0x0C`, `0x0D`, `0x0F`, `0x10`, and `0x11` with their correct types. Verify real
    relay delivery, late join at a GOP boundary, and relay-served FETCH with
    exact payload/property equality. Record publisher, relay, receiver, and
-   transport revisions. Until Playa is upgraded, use an independent LOC-04
+   transport revisions. Until Playa is upgraded, use an independent LOC-05
    test receiver and report Playa playback as unverified.
 5. **Regression and handoff:** full CTest suite, LOCMAF vectors and Playa
    reconstruction, CLI/API negative cases, parser sanitizer checks, and
@@ -231,7 +246,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure \
   -R 'openmoq-publisher-(encoded-sample|loc-publisher|control-message|transport|live-dash|msf-catalog|cli)-tests'
 ctest --test-dir build --output-on-failure
-bun scripts/test-loc04.mjs build/openmoq-publisher
+bun scripts/test-loc05.mjs build/openmoq-publisher
 bun scripts/test-locmaf-playa.mjs build/openmoq-publisher ../moq-playa
 ```
 
@@ -240,7 +255,7 @@ Register the new test executables in `CMakeLists.txt`. Run the full existing
 suite and LOCMAF golden/Playa checks before calling the LOC addition ready;
 CMAF and LOCMAF byte-output comparisons are explicit compatibility gates.
 Network setup alone is not delivery proof, and successful old-LOC playback
-is not LOC-04 validation.
+is not LOC-05 validation.
 
 ## Catalog Metadata
 

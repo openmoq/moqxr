@@ -7418,6 +7418,40 @@ private:
     std::function<TransportStatus()>& sender_;
 };
 
+// Strict RFC 3629 check: rejects overlong forms, surrogates, and code points
+// above U+10FFFF. LOC Codec String is defined as UTF-8.
+bool is_valid_utf8(std::string_view text) {
+    const auto byte = [&text](std::size_t index) { return static_cast<std::uint8_t>(text[index]); };
+    for (std::size_t i = 0; i < text.size();) {
+        const std::uint8_t lead = byte(i);
+        std::size_t length = 0;
+        std::uint8_t min_second = 0x80;
+        std::uint8_t max_second = 0xbf;
+        if (lead < 0x80) {
+            ++i;
+            continue;
+        } else if (lead >= 0xc2 && lead <= 0xdf) {
+            length = 2;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            length = 3;
+            if (lead == 0xe0) min_second = 0xa0;
+            if (lead == 0xed) max_second = 0x9f;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            length = 4;
+            if (lead == 0xf0) min_second = 0x90;
+            if (lead == 0xf4) max_second = 0x8f;
+        } else {
+            return false;
+        }
+        if (text.size() - i < length || byte(i + 1) < min_second || byte(i + 1) > max_second) return false;
+        for (std::size_t k = 2; k < length; ++k) {
+            if ((byte(i + k) & 0xc0) != 0x80) return false;
+        }
+        i += length;
+    }
+    return true;
+}
+
 }  // namespace
 
 namespace priority_scheduler_internal {
@@ -11712,6 +11746,11 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 (audio && (!track.codec.starts_with("mp4a.40.") || track.init_data.size() < 2))) {
                 return TransportStatus::failure("LOC requires explicit AVC or AAC media type and decoder configuration");
             }
+            // An object's Codec String must equal this value, so checking it
+            // here also covers every 0x11 property and the catalog codec field.
+            if (!is_valid_utf8(track.codec)) {
+                return TransportStatus::failure("LOC codec string must be valid UTF-8");
+            }
         }
     }
 
@@ -13135,6 +13174,14 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                             throw std::invalid_argument("LOC object configuration differs from announced track");
                         }
                         config_present = true;
+                    }
+                    if (property.id == 0x11) {
+                        // serialize_object_properties above already rejected a duplicate 0x11,
+                        // and the track codec was checked as UTF-8 at declaration.
+                        const auto& bytes = std::get<std::vector<std::uint8_t>>(property.value);
+                        if (std::string(bytes.begin(), bytes.end()) != metadata->codec) {
+                            throw std::invalid_argument("LOC object codec string differs from announced track");
+                        }
                     }
                 }
             } catch (const std::exception& error) {

@@ -74,7 +74,7 @@ config.media_packaging = openmoq::publisher::MediaPackaging::kLoc;
 config.draft_version = openmoq::publisher::DraftVersion::kDraft18;
 ```
 
-原生后端会为每个对象提取一个未加密的 H.264/AAC sample，并提供 LOC-04 属性。对于已经编码的对象，请声明 `LivePackaging::kLoc`，在 `LiveTrack::init_data` 中提供 codec extradata，并用类型化的 `ObjectProperty` 条目填充 `LiveObject::properties`。偶数 ID 保存 `uint64_t`；奇数 ID 保存字节向量。需提供 Timestamp (16) 和非零的 Timescale (8)，并保持 subgroup 为零。调用方负责 sample/config 的正确性以及 GOP 边界；每个视频 group 必须以 object 零处的独立帧开始。生成的 catalog 携带 codec 配置。由 source 提供的 catalog 和 libmoq LOC 发布会被拒绝。参见[约束](quickstart.md#opt-in-to-loc)。
+原生后端会为每个对象提取一个未加密的 H.264/AAC sample，并提供 LOC-05 属性。对于已经编码的对象，请声明 `LivePackaging::kLoc`，在 `LiveTrack::init_data` 中提供 codec extradata，并用类型化的 `ObjectProperty` 条目填充 `LiveObject::properties`。偶数 ID 保存 `uint64_t`；奇数 ID 保存字节向量。需提供 Timestamp (16) 和非零的 Timescale (8)，并保持 subgroup 为零。Codec String (17) 为可选项；如提供，必须与 `LiveTrack::codec` 一致。调用方负责 sample/config 的正确性以及 GOP 边界；每个视频 group 必须以 object 零处的独立帧开始。生成的 catalog 携带 codec 配置。由 source 提供的 catalog 和 libmoq LOC 发布会被拒绝。参见[约束](quickstart.md#opt-in-to-loc)。
 
 ### 可选 LOCMAF packaging
 

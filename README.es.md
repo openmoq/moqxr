@@ -73,7 +73,7 @@ con soporte LOCMAF, ejecute
 la [configuración de la API de C++](docs/publisher-api.md#optional-locmaf-packaging) y la
 [cobertura de validación](docs/testing.md#locmaf-tests).
 
-La publicación LOC-04 está disponible con `--packaging loc --draft 18` (o `--draft 21` / `--draft 22` / `--draft 23`) en el backend
+La publicación LOC-05 está disponible con `--packaging loc --draft 18` (o `--draft 21` / `--draft 22` / `--draft 23`) en el backend
 nativo. Envía fotogramas H.264/AAC individuales con propiedades de timestamp, timescale y
 configuración de codec; CMAF sigue siendo el valor predeterminado. Consulte el
 [inicio rápido de LOC](docs/quickstart.md#opt-in-to-loc) para conocer el alcance y las restricciones.

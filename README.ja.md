@@ -69,7 +69,7 @@ LOCMAF 対応の moq-playa checkout に対する再生の同等性チェック�
 [C++ API 設定](docs/publisher-api.md#optional-locmaf-packaging)、
 [検証範囲](docs/testing.md#locmaf-tests) を参照してください。
 
-LOC-04 の公開は、native backend 上で `--packaging loc --draft 18`（または `--draft 21` / `--draft 22` / `--draft 23`）により利用できます。
+LOC-05 の公開は、native backend 上で `--packaging loc --draft 18`（または `--draft 21` / `--draft 22` / `--draft 23`）により利用できます。
 タイムスタンプ、timescale、codec 設定の各 property を付けて H.264/AAC のフレームを個別に送信します。CMAF が引き続きデフォルトです。
 範囲と制約については [LOC quickstart](docs/quickstart.md#opt-in-to-loc) を参照してください。
 

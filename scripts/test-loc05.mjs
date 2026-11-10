@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Independent LOC-04 inspection/decoder validation. Requires FFmpeg/libx264,
+// Independent LOC-05 inspection/decoder validation. Requires FFmpeg/libx264,
 // ffprobe and Node or Bun. This tests emitted artifacts, not network delivery.
-// Usage: node scripts/test-loc04.mjs <publisher> [--keep]
+// Usage: node scripts/test-loc05.mjs <publisher> [--keep]
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -10,11 +10,11 @@ import { join, resolve } from 'node:path';
 
 const [publisherArg, option] = process.argv.slice(2);
 if (!publisherArg || (option && option !== '--keep') || process.argv.length > 4) {
-    console.error('Usage: node scripts/test-loc04.mjs <publisher> [--keep]');
+    console.error('Usage: node scripts/test-loc05.mjs <publisher> [--keep]');
     process.exit(2);
 }
 const publisher = resolve(publisherArg);
-const work = await mkdtemp(join(tmpdir(), 'moqxr-loc04-'));
+const work = await mkdtemp(join(tmpdir(), 'moqxr-loc05-'));
 function run(command, args) {
     const result = spawnSync(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     if (result.error || result.status !== 0)
@@ -127,6 +127,7 @@ try {
             const values = new Map(decoded.map(p => [p.id, p.value === undefined ? Buffer.from(p.hex, 'hex') : BigInt(p.value)]));
             assert.equal(values.get('8'), denominator, 'LOC timescale');
             assert.equal(values.get('16'), BigInt(sample.pts), 'LOC presentation timestamp');
+            assert.equal(values.get('17')?.toString('utf8'), entry.codec, 'LOC codec string matches catalog');
             assert.equal(BigInt(sidecar.decodeTimeUs), BigInt(sample.dts) * 1000000n / denominator, 'inspection DTS');
             assert.equal(BigInt(sidecar.durationUs), BigInt(sample.duration) * 1000000n / denominator, 'inspection duration');
             const video = stream.codec_type === 'video';
@@ -150,7 +151,7 @@ try {
         await writeFile(rebuilt, Buffer.concat(reconstructed));
         assert.deepEqual(frameHashes(rebuilt, '0:0'), frameHashes(source, `0:${stream.index}`), `${entry.name}: decoded frames`);
     }
-    console.log(`LOC-04 PASS: ${total} samples; independent VI64 properties, exact payload/PTS/config, B-frame ordering, and FFmpeg decoded frames.`);
+    console.log(`LOC-05 PASS: ${total} samples; independent VI64 properties, exact payload/PTS/config, B-frame ordering, and FFmpeg decoded frames.`);
     console.log('Inspection-artifact validation only; no network receiver interoperability claim.');
 } finally {
     if (option === '--keep') console.log(`Artifacts: ${work}`);
