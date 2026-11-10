@@ -40,6 +40,8 @@ int main() {
     ok &= expect(handshake_failure_kind(0x0a, 0) == FailureKind::kRetryable, "a QUIC protocol error is retryable");
     ok &= expect(handshake_failure_kind(alert(45), 0) == FailureKind::kRetryable,
                  "an expired or not yet valid certificate is retryable: the clock may not be set yet");
+    ok &= expect(handshake_failure_kind(0, alert(48)) == FailureKind::kRetryable,
+                 "a server rejecting the client certificate is not a server configuration error");
     ok &= expect(handshake_failure_kind(0, alert(40)) == FailureKind::kRetryable,
                  "another TLS alert from the server is retryable");
     if (ok) {

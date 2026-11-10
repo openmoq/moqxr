@@ -691,6 +691,7 @@ add_library(openmoq_publisher_lib
     src/msf_url.cpp
     src/mp4_box.cpp
     src/publisher_api.cpp
+    src/transport/connect_failure_kind.cpp
     src/transport/libmoq_publisher.cpp
     src/transport/moqt_control_messages.cpp
     src/transport/moqt_session.cpp

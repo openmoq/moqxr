@@ -924,16 +924,7 @@ TransportStatus PicoquicClient::connect() {
     int is_name = 0;
     if (picoquic_get_server_address(endpoint_->host.c_str(), endpoint_->port, &impl_->server_address, &is_name) != 0) {
         state_ = ConnectionState::kFailed;
-        // picoquic does not say why the lookup failed: ask the resolver again.
-        addrinfo hints{};
-        hints.ai_socktype = SOCK_DGRAM;
-        addrinfo* result = nullptr;
-        const int lookup = getaddrinfo(endpoint_->host.c_str(), nullptr, &hints, &result);
-        if (result != nullptr) {
-            freeaddrinfo(result);
-        }
-        return TransportStatus::failure(std::string("failed to resolve picoquic server address: ") + gai_strerror(lookup),
-                                        resolve_failure_kind(lookup == EAI_NONAME));
+        return resolve_failure_status("picoquic", endpoint_->host);
     }
 
     const bool verify_peer = !(tls_.has_value() && tls_->insecure_skip_verify);

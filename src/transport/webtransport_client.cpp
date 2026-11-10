@@ -33,6 +33,7 @@
 #include <h3zero_common.h>
 #include <pico_webtransport.h>
 
+#include "connect_failure_kind.h"
 #include "tls_verification.h"
 #include "peer_close.h"
 #include "picoquic_stream_errors.h"
@@ -1123,7 +1124,7 @@ TransportStatus WebTransportClient::connect() {
     int is_name = 0;
     if (picoquic_get_server_address(endpoint_->host.c_str(), endpoint_->port, &impl_->server_address, &is_name) != 0) {
         state_ = ConnectionState::kFailed;
-        return TransportStatus::failure("failed to resolve webtransport server address");
+        return resolve_failure_status("webtransport", endpoint_->host);
     }
 
     const bool verify_peer = !(tls_.has_value() && tls_->insecure_skip_verify);
@@ -1288,7 +1289,11 @@ TransportStatus WebTransportClient::connect() {
         }
         if (impl_->failed || impl_->disconnected || impl_->loop_exited || !impl_->connected) {
             state_ = ConnectionState::kFailed;
-            return TransportStatus::failure(impl_->last_error.empty() ? "webtransport startup failed" : impl_->last_error);
+            // A close before the session was ready is a handshake failure: see
+            // connect_failure_kind.h.
+            return TransportStatus::failure(
+                impl_->last_error.empty() ? "webtransport startup failed" : impl_->last_error,
+                handshake_failure_kind(impl_->quic_local_error, impl_->quic_remote_error));
         }
     }
 
