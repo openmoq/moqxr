@@ -29,6 +29,7 @@
 #include <picoquic_utils.h>
 #include <picosocks.h>
 
+#include "connect_failure_kind.h"
 #include "peer_close.h"
 #include "picoquic_stream_errors.h"
 #include "tls_verification.h"
@@ -116,6 +117,8 @@ struct PicoquicClient::Impl {
     // picoquic_get_logging_cnxid may only run on the loop thread afterwards.
     std::string connection_id_hex;
     std::string last_error;
+    // What a failed connect() reports: see connect_failure_kind.h.
+    FailureKind failure_kind = FailureKind::kRetryable;
     // Set when the relay, not this client, closed the connection: its MOQT
     // termination code and reason, reported in place of a generic close.
     std::string peer_close_message;
@@ -675,6 +678,7 @@ int client_callback(picoquic_cnx_t* cnx,
             impl->timed_out_media_streams.clear();
             if (!impl->connected) {
                 impl->failed = true;
+                impl->failure_kind = handshake_failure_kind(local_error, remote_error);
                 impl->last_error = "connection closed before reaching ready state";
                 if (local_error != 0) {
                     impl->last_error += "; local: " + tlsverify::describe_quic_error(local_error);
@@ -920,7 +924,16 @@ TransportStatus PicoquicClient::connect() {
     int is_name = 0;
     if (picoquic_get_server_address(endpoint_->host.c_str(), endpoint_->port, &impl_->server_address, &is_name) != 0) {
         state_ = ConnectionState::kFailed;
-        return TransportStatus::failure("failed to resolve picoquic server address");
+        // picoquic does not say why the lookup failed: ask the resolver again.
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_DGRAM;
+        addrinfo* result = nullptr;
+        const int lookup = getaddrinfo(endpoint_->host.c_str(), nullptr, &hints, &result);
+        if (result != nullptr) {
+            freeaddrinfo(result);
+        }
+        return TransportStatus::failure("failed to resolve picoquic server address",
+                                        resolve_failure_kind(lookup == EAI_NONAME));
     }
 
     const bool verify_peer = !(tls_.has_value() && tls_->insecure_skip_verify);
@@ -1069,7 +1082,8 @@ TransportStatus PicoquicClient::connect() {
         }
 
         state_ = ConnectionState::kFailed;
-        return TransportStatus::failure(impl_->last_error.empty() ? "picoquic handshake failed" : impl_->last_error);
+        return TransportStatus::failure(impl_->last_error.empty() ? "picoquic handshake failed" : impl_->last_error,
+                                        impl_->failure_kind);
     }
 #endif
 }
