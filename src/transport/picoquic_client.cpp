@@ -963,6 +963,9 @@ TransportStatus PicoquicClient::connect() {
     if (!verify_peer) {
         picoquic_set_null_verifier(impl_->quic);
     }
+    if (endpoint_->idle_timeout_ms > 0) {
+        picoquic_set_default_idle_timeout(impl_->quic, endpoint_->idle_timeout_ms);
+    }
 
     // RFC 9221 negotiation is mandatory even for stream-only MOQT publishers.
     if (picoquic_set_default_tp_value(impl_->quic, picoquic_tp_max_datagram_frame_size,
@@ -1008,9 +1011,10 @@ TransportStatus PicoquicClient::connect() {
     //
     // The interval must be comfortably below the negotiated idle timeout. Five
     // seconds is far enough inside any commonly negotiated value to be safe, and
-    // the traffic is one PING frame, so the cost is negligible.
+    // the traffic is one PING frame, so the cost is negligible. A configured idle
+    // timeout can be shorter, so picoquic then derives the interval from it (0).
     constexpr std::uint64_t kKeepAliveIntervalUs = 5'000'000;
-    picoquic_enable_keep_alive(impl_->cnx, kKeepAliveIntervalUs);
+    picoquic_enable_keep_alive(impl_->cnx, endpoint_->idle_timeout_ms > 0 ? 0 : kKeepAliveIntervalUs);
 
     if (picoquic_start_client_cnx(impl_->cnx) != 0) {
         picoquic_free(impl_->quic);
