@@ -25,6 +25,9 @@ namespace openmoq::publisher {
 namespace {
 
 void validate_packaging(const PublisherConfig& config) {
+    if (config.publisher_priorities && !is_draft18_or_later(config.draft_version)) {
+        throw std::runtime_error("publisher priorities require draft 18 or later");
+    }
     if (config.media_packaging == MediaPackaging::kLoc) {
         if (!is_draft18_or_later(config.draft_version)) throw std::runtime_error("LOC-05 requires draft 18 or later");
         if (!config.split_cmaf_chunks || config.live_stream_per_object) throw std::runtime_error("LOC requires one sample per object and a stream per GOP");
@@ -209,6 +212,9 @@ constexpr const char* kLibmoqInitialGroupIdUnsupported =
 // reach the published catalog.
 constexpr const char* kLibmoqVideoAltGroupUnsupported =
     "video_alt_group is not supported by the libmoq publishing backend";
+// libmoq sends its own PUBLISH and SUBSCRIBE_OK and schedules its own streams.
+constexpr const char* kLibmoqPublisherPrioritiesUnsupported =
+    "publisher priorities are not supported by the libmoq publishing backend";
 #endif
 
 void validate_initial_group_id(const PublisherConfig& config) {
@@ -343,6 +349,9 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
     // injected-factory callers, drafts libmoq does not speak, and builds
     // without libmoq.
     if (routes_to_libmoq()) {
+        if (config_.publisher_priorities) {
+            return transport::TransportStatus::failure(kLibmoqPublisherPrioritiesUnsupported);
+        }
         if (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf ||
             std::any_of(prepared.plan.tracks.begin(), prepared.plan.tracks.end(),
                         [](const auto& track) { return track.packaging == "loc" || track.packaging == "locmaf"; })) {
@@ -437,6 +446,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
         active->session->set_msf_version(config_.msf_version);
+        active->session->set_publisher_priorities(config_.publisher_priorities);
 
         if (!set_active_session(active, resolved_endpoint, false)) {
             return transport::TransportStatus::success();
@@ -522,6 +532,9 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
                                                    bool endpoint_alpn_overridden,
                                                    LiveResumeState* resume) const {
 #ifdef OPENMOQ_ENABLE_LIBMOQ_PUBLISHER
+    if (routes_to_libmoq() && (ingest.use_stdin || !ingest.srt_callers.empty()) && config_.publisher_priorities) {
+        return transport::TransportStatus::failure(kLibmoqPublisherPrioritiesUnsupported);
+    }
     if (routes_to_libmoq() && (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf)) {
         return transport::TransportStatus::failure("LOC/LOCMAF is not supported by the libmoq publishing backend");
     }
@@ -661,6 +674,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
         active->session->set_msf_version(config_.msf_version);
+        active->session->set_publisher_priorities(config_.publisher_priorities);
         active->session->set_initial_group_id(config_.initial_group_id);
         active->session->set_video_alt_group(config_.video_alt_group);
 
@@ -823,6 +837,9 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         if (config_.initial_group_id != 0) {
             return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
         }
+        if (config_.publisher_priorities) {
+            return transport::TransportStatus::failure(kLibmoqPublisherPrioritiesUnsupported);
+        }
         if (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf ||
             std::any_of(source.tracks.begin(), source.tracks.end(),
                         [](const auto& track) { return track.packaging == LivePackaging::kLoc || track.packaging == LivePackaging::kLocmaf; })) {
@@ -944,6 +961,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
         active->session->set_msf_version(config_.msf_version);
+        active->session->set_publisher_priorities(config_.publisher_priorities);
 
         if (!set_active_session(active, resolved_endpoint, true)) {
             return transport::TransportStatus::success();

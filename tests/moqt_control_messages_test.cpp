@@ -2560,6 +2560,51 @@ bool test_draft21_request_update_filter_errors() {
     return ok;
 }
 
+bool test_default_publisher_priority_track_property() {
+    bool ok = true;
+    // DEFAULT_PUBLISHER_PRIORITY (0x0E) is the only Track Property, so its Delta
+    // Type is 0x0E; an even type carries a bare vi64 (64 is one byte, 128 two).
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22,
+                                     DraftVersion::kDraft23}) {
+        TrackMessage publish{.draft = draft, .track_name = "t", .track_namespace = "n", .request_id = 2,
+                             .track_alias = 3};
+        const auto unset = encode_track_message(publish);
+        ok &= expect(unset == frame(draft, 0x1d, {2, 1, 1, 'n', 1, 't', 3, 0}),
+                     draft_label(draft) + " PUBLISH without a priority keeps its bytes");
+        publish.default_publisher_priority = 64;
+        ok &= expect(encode_track_message(publish) == frame(draft, 0x1d, {2, 1, 1, 'n', 1, 't', 3, 0, 0x0e, 0x40}),
+                     draft_label(draft) + " PUBLISH carries DEFAULT_PUBLISHER_PRIORITY 64 as its Track Properties");
+        publish.default_publisher_priority = 128;
+        const auto encoded_128 = encode_track_message(publish);
+        ok &= expect(encoded_128.size() == unset.size() + 3 &&
+                         std::vector<std::uint8_t>(encoded_128.end() - 3, encoded_128.end()) ==
+                             std::vector<std::uint8_t>({0x0e, 0x80, 0x80}),
+                     draft_label(draft) + " PUBLISH encodes priority 128 as a two-byte vi64");
+
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, 64) ==
+                         frame(draft, 0x04, {0x01, 0x01, 0x09, 0x03, 0x07, 0x0e, 0x40}),
+                     draft_label(draft) + " SUBSCRIBE_OK puts DEFAULT_PUBLISHER_PRIORITY after LARGEST_OBJECT");
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 0, 0, false, 0) ==
+                         frame(draft, 0x04, {0x01, 0x00, 0x0e, 0x00}),
+                     draft_label(draft) + " SUBSCRIBE_OK carries DEFAULT_PUBLISHER_PRIORITY 0");
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, std::nullopt) ==
+                         encode_subscribe_ok_message(draft, 9, 1, 3, 7, true),
+                     draft_label(draft) + " SUBSCRIBE_OK without a priority keeps its bytes");
+    }
+    // Drafts before 18 have no Track Properties here; the field is ignored.
+    for (const DraftVersion draft : {DraftVersion::kDraft14, DraftVersion::kDraft16}) {
+        TrackMessage publish{.draft = draft, .track_name = "t", .track_namespace = "n", .request_id = 2,
+                             .track_alias = 3};
+        const auto unset = encode_track_message(publish);
+        publish.default_publisher_priority = 64;
+        ok &= expect(encode_track_message(publish) == unset, draft_label(draft) + " PUBLISH ignores the priority");
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, 64) ==
+                         encode_subscribe_ok_message(draft, 9, 1, 3, 7, true),
+                     draft_label(draft) + " SUBSCRIBE_OK ignores the priority");
+    }
+    return ok;
+}
+
 bool test_largest_object_parameter_is_a_bare_location() {
     bool ok = true;
     // LARGEST_OBJECT (0x09) is "a Location" (draft-18 10.2.11, draft-21 9.20.18): two vi64s
@@ -3233,6 +3278,7 @@ int main() {
     bool ok = true;
     ok &= test_publisher_datagrams();
     ok &= test_largest_object_parameter_is_a_bare_location();
+    ok &= test_default_publisher_priority_track_property();
     ok &= test_draft21_request_update_filter_errors();
     ok &= test_draft21_subscribe_tracks_rejects_range_filters();
     ok &= test_parameter_length_wrap_is_rejected();

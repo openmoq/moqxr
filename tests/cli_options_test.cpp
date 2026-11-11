@@ -653,6 +653,67 @@ int main() {
     ok &= expect(build_usage("prog").find("[--initial-group-id <N|time>]") != std::string::npos,
                  "expected usage to list --initial-group-id");
 
+    // --publisher-priority: opt-in DEFAULT_PUBLISHER_PRIORITY per kind of track.
+    {
+        using openmoq::publisher::PublisherPriorities;
+        const CliOptions unset = parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443",
+                                        "--draft", "22"});
+        ok &= expect(!unset.publisher_priorities.has_value(), "expected no publisher priorities by default");
+        const CliOptions set = parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443",
+                                      "--draft", "22", "--publisher-priority", "audio=64,video=128,catalog=0"});
+        ok &= expect(set.publisher_priorities ==
+                         PublisherPriorities{.audio = 64, .video = 128, .catalog = 0, .other = 128},
+                     "expected --publisher-priority to set the named kinds and leave other at 128");
+        const CliOptions one = parse({"openmoq-publisher", "--input", "sample.mp4", "--endpoint", "localhost:4443",
+                                      "--draft", "18", "--publisher-priority", "other=255"});
+        ok &= expect(one.publisher_priorities == PublisherPriorities{.other = 255},
+                     "expected --publisher-priority with one kind on draft 18 and file input");
+        for (const char* draft : {"21", "23"}) {
+            ok &= expect(parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443", "--draft", draft,
+                                "--publisher-priority", "audio=1"})
+                             .publisher_priorities.has_value(),
+                         std::string("expected --publisher-priority on draft ") + draft);
+        }
+    }
+    for (const std::string value : {"", "audio", "audio=", "audio=256", "audio=-1", "audio=1x", "audio= 1",
+                                    "speech=1", "audio=1,audio=2", "audio=1,", ",audio=1", "audio=1;video=2"}) {
+        ok &= parse_throws({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443", "--draft", "22",
+                            "--publisher-priority", value},
+                           "--publisher-priority",
+                           "expected --publisher-priority \"" + value + "\" to be rejected");
+    }
+    ok &= parse_throws({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443", "--draft", "16",
+                        "--publisher-priority", "audio=64"},
+                       "--publisher-priority requires --draft 18 or later",
+                       "expected --publisher-priority to be rejected on draft 16");
+    ok &= parse_throws({"openmoq-publisher", "--input", "sample.mp4", "--draft", "22", "--publisher-priority",
+                        "audio=64"},
+                       "--publisher-priority requires --endpoint",
+                       "expected --publisher-priority to be rejected without an endpoint");
+    ok &= expect(build_usage("prog").find("[--publisher-priority audio=N,video=N,catalog=N,other=N]") !=
+                     std::string::npos,
+                 "expected usage to list --publisher-priority");
+    {
+        using openmoq::publisher::TrackKind;
+        using openmoq::publisher::TrackPublisherPriorities;
+        const TrackPublisherPriorities off;
+        ok &= expect(!off.signalled("video").has_value() && off.effective("video") == 128,
+                     "expected unconfigured track priorities to signal nothing and schedule at 128");
+        TrackPublisherPriorities on(openmoq::publisher::PublisherPriorities{.audio = 64, .video = 128, .catalog = 32,
+                                                                            .other = 200});
+        on.assign("v", TrackKind::kVideo);
+        on.assign("a", openmoq::publisher::track_kind("a", "soun"));
+        on.assign("v", TrackKind::kAudio);
+        ok &= expect(on.signalled("v") == 128 && on.signalled("a") == 64,
+                     "expected a track's first assignment to stick for the session");
+        ok &= expect(on.signalled("catalog") == 32 && on.signalled("timeline") == 200,
+                     "expected unassigned tracks to resolve by name: the catalog, or other");
+        ok &= expect(openmoq::publisher::track_kind("catalog", "vide") == TrackKind::kCatalog &&
+                         openmoq::publisher::track_kind("x", "vide") == TrackKind::kVideo &&
+                         openmoq::publisher::track_kind("x", "meta") == TrackKind::kOther,
+                     "expected track kinds from the catalog name and handler type");
+    }
+
     // --video-alt-group (MSF section 5.2.12).
     {
         const CliOptions options = parse({"openmoq-publisher", "--input", "-", "--endpoint", "localhost:4443"});

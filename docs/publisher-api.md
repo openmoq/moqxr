@@ -73,6 +73,10 @@ Other `PublisherConfig` fields, all off or empty by default:
   (CLI: `--drm-config`).
 - `video_alt_group`: give every video track of live stdin input this `altGroup`
   (CLI: `--video-alt-group`).
+- `publisher_priorities`: a `PublisherPriorities` value (`audio`, `video`,
+  `catalog`, `other`, each 0-255, default 128) sent as each track's
+  `DEFAULT_PUBLISHER_PRIORITY` on draft 18 and later; unset sends nothing
+  (CLI: `--publisher-priority`). See the README section "Track priorities".
 - `libmoq_backend`: QUIC stack for the libmoq publish route (`kAuto`, `kPicoquic`,
   `kMvfst`, `kMsquic`) (CLI: `--libmoq-backend`).
 
