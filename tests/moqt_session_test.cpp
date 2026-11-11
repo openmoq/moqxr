@@ -2681,14 +2681,20 @@ bool test_live_objects_catalog_late_subscriber(const EndpointConfig& endpoint, c
         std::uint64_t filter = 0x02;
     };
     bool ok = true;
+    // Run each case without and with publisher priorities (catalog 32, other
+    // 200; the bare "video" LiveTrack has no media type, so it counts as other):
+    // each value reaches its SUBSCRIBE_OK, and the catalog's its FETCH objects.
+    for (const bool prioritized : {false, true})
     for (const Case& test_case : {Case{DraftVersion::kDraft18, false, false, "Largest Object filter"},
                                   Case{DraftVersion::kDraft18, false, false, "Next Group Start filter", 0x01},
                                   Case{DraftVersion::kDraft18, false, true, "Joining FETCH"},
                                   Case{DraftVersion::kDraft22, false, false, "Next Object filter"},
                                   Case{DraftVersion::kDraft22, true, false, "current-group fill"}}) {
         const DraftVersion draft = test_case.draft;
-        const std::string label =
-            openmoq::publisher::to_string(draft) + " " + std::string(test_case.name) + ": ";
+        const std::string label = openmoq::publisher::to_string(draft) + " " + std::string(test_case.name) +
+                                  (prioritized ? " with priorities" : "") + ": ";
+        const std::optional<std::uint8_t> catalog_priority =
+            prioritized ? std::optional<std::uint8_t>(32) : std::nullopt;
         MockTransport transport;
         transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
@@ -2742,16 +2748,33 @@ bool test_live_objects_catalog_late_subscriber(const EndpointConfig& endpoint, c
         };
         source.is_finished = [&]() { return object_index >= objects.size(); };
         MoqtSession session(transport, std::string(kNamespace), false, false, false, std::chrono::seconds(1));
+        if (prioritized) {
+            session.set_publisher_priorities(openmoq::publisher::PublisherPriorities{.catalog = 32, .other = 200});
+        }
         ok &= expect(session.connect(endpoint, tls).ok, label + "late catalog subscriber session connects");
         const TransportStatus status = session.publish_live_objects(source, draft);
         ok &= expect(status.ok, label + "late catalog subscriber publish succeeds: " + status.message);
         ok &= expect(late_subscribed, label + "the late catalog subscription arrives");
 
         using openmoq::publisher::transport::encode_subscribe_ok_message;
-        ok &= expect(wrote(transport, 1, encode_subscribe_ok_message(draft, 1, 0, 0, 0, false)),
+        ok &= expect(wrote(transport, 1, encode_subscribe_ok_message(draft, 1, 0, 0, 0, false, catalog_priority)),
                      label + "the first catalog SUBSCRIBE_OK omits LARGEST_OBJECT before any catalog is sent");
-        ok &= expect(wrote(transport, 9, encode_subscribe_ok_message(draft, 5, 0, 0, 0, true)),
+        ok &= expect(wrote(transport, 9, encode_subscribe_ok_message(draft, 5, 0, 0, 0, true, catalog_priority)),
                      label + "the late catalog SUBSCRIBE_OK reports LARGEST_OBJECT {0,0}");
+        // Video SUBSCRIBE_OK on stream 5 ends with DEFAULT_PUBLISHER_PRIORITY
+        // 200 (two-byte vi64 0x80 0xc8) only with priorities.
+        ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(),
+                                 [&](const auto& write) {
+                                     return write.stream_id == 5 && message_type(write.bytes) == 0x04 &&
+                                            ends_with(write.bytes, {0x0e, 0x80, 0xc8}) == prioritized;
+                                 }),
+                     label + "the untyped video track's SUBSCRIBE_OK carries other's 200 only with priorities");
+        // A FETCH object is Flags, Group, Object, Publisher Priority, Length,
+        // Payload; this payload's Length is one byte.
+        const auto fetch_priority_is = [&](const auto& write) {
+            return write.bytes.size() > catalog_payload.size() + 2 &&
+                   write.bytes[write.bytes.size() - catalog_payload.size() - 2] == catalog_priority.value_or(128);
+        };
 
         // The fill fetch stream: FETCH_HEADER (0x05) for Request ID 5.
         const auto fill_it = std::find_if(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
@@ -2769,6 +2792,8 @@ bool test_live_objects_catalog_late_subscriber(const EndpointConfig& endpoint, c
         if (test_case.fill) {
             ok &= expect(fill_it != transport.writes.end() && fill_it->fin && ends_with(fill_it->bytes, catalog_payload),
                          label + "the fill fetch stream carries the catalog and ends with a FIN");
+            ok &= expect(fill_it != transport.writes.end() && fetch_priority_is(*fill_it),
+                         label + "the catalog fill object carries the catalog's publisher priority");
             ok &= expect(fill_it != transport.writes.end() &&
                              std::none_of(transport.reset_calls.begin(), transport.reset_calls.end(),
                                           [&](const auto& reset) { return reset.first == fill_it->stream_id; }),
@@ -2786,15 +2811,253 @@ bool test_live_objects_catalog_late_subscriber(const EndpointConfig& endpoint, c
                                      [&](const auto& write) {
                                          return (write.stream_id & 0x3ULL) == 0x2ULL && write.fin &&
                                                 message_type(write.bytes) == 0x05 &&
-                                                ends_with(write.bytes, catalog_payload);
+                                                ends_with(write.bytes, catalog_payload) && fetch_priority_is(write);
                                      }),
-                         label + "the Joining FETCH sends the catalog on a FETCH_HEADER stream");
+                         label + "the Joining FETCH sends the catalog, at its publisher priority, on a FETCH_HEADER stream");
         }
     }
     return ok;
 }
 
 }  // namespace
+
+// Live stdin (CMAF from an FFmpeg-style init: vide_1, soun_2, vide_3, vide_4)
+// answering a relay's SUBSCRIBEs: each SUBSCRIBE_OK carries its track's
+// DEFAULT_PUBLISHER_PRIORITY only when priorities are set. Draft 23 is left to
+// the PUBLISH test above: encode_subscribe_message does not build its SUBSCRIBE.
+bool test_publisher_priorities_live_stdin(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    bool ok = true;
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft22}) {
+        for (const bool prioritized : {false, true}) {
+            const std::string label = openmoq::publisher::to_string(draft) +
+                                      (prioritized ? " stdin with priorities: " : " stdin without priorities: ");
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+            transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, "soun_2", 1, draft));
+            transport.reads[9].push_back(encode_subscribe_message(5, kNamespace, "vide_1", 1, draft));
+            for (const std::uint64_t id : {1, 5, 9}) transport.keep_open_streams.insert(id);
+            MoqtSession session(transport, std::string(kNamespace), false, false, false, std::chrono::seconds(1));
+            if (prioritized) {
+                session.set_publisher_priorities(
+                    openmoq::publisher::PublisherPriorities{.audio = 64, .video = 128, .catalog = 32});
+            }
+            ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+            const auto bytes = concat({make_live_abr_init_mp4(), make_live_track_fragment(1, 0, true, {'V', '1', 'V', '1'}),
+                                       make_live_track_fragment(2, 0, true, {'A', '1', 'A', '1'})});
+            std::istringstream input(std::string(bytes.begin(), bytes.end()));
+            const auto status = session.publish_live(input, draft, true);
+            ok &= expect(status.ok, label + "live publish succeeds: " + status.message);
+            const auto subscribe_ok_ends_with = [&](std::uint64_t stream_id, const std::vector<std::uint8_t>& tail) {
+                return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                    return write.stream_id == stream_id && message_type(write.bytes) == 0x04 && ends_with(write.bytes, tail);
+                });
+            };
+            const auto subscribe_ok_sent = [&](std::uint64_t stream_id) {
+                return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                    return write.stream_id == stream_id && message_type(write.bytes) == 0x04;
+                });
+            };
+            for (const std::uint64_t id : {1, 5, 9}) {
+                ok &= expect(subscribe_ok_sent(id), label + "SUBSCRIBE_OK sent on stream " + std::to_string(id));
+            }
+            ok &= expect(subscribe_ok_ends_with(1, {0x0e, 0x20}) == prioritized,
+                         label + "catalog SUBSCRIBE_OK carries 32 only with priorities");
+            ok &= expect(subscribe_ok_ends_with(5, {0x0e, 0x40}) == prioritized,
+                         label + "audio SUBSCRIBE_OK carries 64 only with priorities");
+            ok &= expect(subscribe_ok_ends_with(9, {0x0e, 0x80, 0x80}) == prioritized,
+                         label + "video SUBSCRIBE_OK carries 128 only with priorities");
+        }
+    }
+    // Forward mode on draft 23: the publisher PUBLISHes every media track, each
+    // PUBLISH carrying its kind's value.
+    for (const bool prioritized : {false, true}) {
+        constexpr DraftVersion draft = DraftVersion::kDraft23;
+        const std::string label = prioritized ? "draft-23 stdin PUBLISH with priorities: "
+                                              : "draft-23 stdin PUBLISH without priorities: ";
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        for (std::uint64_t i = 0; i < 5; ++i) {
+            transport.reads[4 + 4 * i].push_back(encode_publish_ok_message(draft, 2 + 2 * i, 1));
+        }
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        if (prioritized) {
+            session.set_publisher_priorities(openmoq::publisher::PublisherPriorities{.audio = 64, .video = 128, .catalog = 32});
+        }
+        ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+        const auto bytes = concat({make_live_abr_init_mp4(), make_live_track_fragment(1, 0, true, {'V', '1', 'V', '1'}),
+                                   make_live_track_fragment(2, 0, true, {'A', '1', 'A', '1'})});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, label + "live publish succeeds: " + status.message);
+        const auto publish_ends_with = [&](std::string_view track, const std::vector<std::uint8_t>& tail) {
+            const std::string name = std::string(1, static_cast<char>(track.size())) + std::string(track);
+            return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                const std::string text(write.bytes.begin(), write.bytes.end());
+                return message_type(write.bytes) == 0x1d && text.find(name) != std::string::npos &&
+                       ends_with(write.bytes, tail);
+            });
+        };
+        // This path PUBLISHes the media tracks only; the catalog goes out on a
+        // relay's SUBSCRIBE (covered above).
+        ok &= expect(!publish_ends_with("catalog", {}), label + "the catalog is not PUBLISHed on this path");
+        ok &= expect(publish_ends_with("soun_2", {0x0e, 0x40}) == prioritized,
+                     label + "audio PUBLISH carries 64 only with priorities");
+        for (const char* video : {"vide_1", "vide_3", "vide_4"}) {
+            ok &= expect(publish_ends_with(video, {0x0e, 0x80, 0x80}) == prioritized,
+                         label + video + " PUBLISH carries 128 only with priorities");
+        }
+    }
+    return ok;
+}
+
+// Publishes catalog, audio and video through publish_live_objects with a
+// source-owned catalog, so every byte written is deterministic.
+struct PriorityScenarioCapture {
+    TransportStatus status;
+    std::vector<MockTransport::WriteEvent> writes;
+    std::vector<MockTransport::ObjectWriteEvent> object_writes;
+};
+
+PriorityScenarioCapture run_priority_scenario(DraftVersion draft,
+                                              std::optional<openmoq::publisher::PublisherPriorities> priorities,
+                                              const EndpointConfig& endpoint,
+                                              const TlsConfig& tls) {
+    MockTransport transport;
+    transport.reads[3].push_back(draft == DraftVersion::kDraft18
+                                     ? encode_draft18_setup_response()
+                                     : encode_server_setup_message({.draft = draft, .max_request_id = 16}));
+    transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+    transport.reads[4].push_back(encode_publish_ok_message(draft, 2, 1));
+    transport.reads[8].push_back(encode_publish_ok_message(draft, 4, 1));
+    transport.reads[12].push_back(encode_publish_ok_message(draft, 6, 1));
+    std::vector<LiveObject> objects = {
+        LiveObject{.track_name = "catalog", .group_id = 0, .subgroup_id = 0, .object_id = 0, .payload = {'{', '}'}},
+        LiveObject{.track_name = "audio", .group_id = 1, .subgroup_id = 0, .object_id = 0, .payload = {'A'}},
+        LiveObject{.track_name = "video", .group_id = 1, .subgroup_id = 0, .object_id = 0, .payload = {'V'}},
+    };
+    std::size_t next = 0;
+    LiveObjectSource source{
+        .tracks = {LiveTrack{.track_name = "catalog"},
+                   LiveTrack{.track_name = "audio", .media_type = openmoq::publisher::LiveMediaType::kAudio},
+                   LiveTrack{.track_name = "video", .media_type = openmoq::publisher::LiveMediaType::kVideo}},
+        .next_object = [&]() -> std::optional<LiveObject> {
+            if (next >= objects.size()) return std::nullopt;
+            return objects[next++];
+        },
+        .catalog_mode = LiveCatalogMode::kSourceObject,
+    };
+    MoqtSession session(transport, "interop", true, true, false, std::chrono::seconds(1));
+    if (priorities) session.set_publisher_priorities(priorities);
+    PriorityScenarioCapture capture;
+    capture.status = session.connect(endpoint, tls);
+    if (capture.status.ok) capture.status = session.publish_live_objects(source, draft);
+    capture.writes = transport.writes;
+    capture.object_writes = transport.object_write_attempts;
+    return capture;
+}
+
+std::uint64_t priority_scenario_digest(const PriorityScenarioCapture& capture) {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](std::uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            hash = (hash ^ ((value >> (8 * i)) & 0xff)) * 0x100000001b3ULL;
+        }
+    };
+    for (const auto& write : capture.writes) {
+        mix(write.stream_id);
+        mix(write.fin);
+        mix(write.bytes.size());
+        for (const auto byte : write.bytes) mix(byte);
+    }
+    for (const auto& write : capture.object_writes) {
+        mix(write.stream_id);
+        mix(write.fin);
+        mix(write.options.transport_priority);
+        mix(write.bytes.size());
+        for (const auto byte : write.bytes) mix(byte);
+    }
+    return hash;
+}
+
+bool test_publisher_priorities_live_objects(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    bool ok = true;
+    const auto publish_of = [](const PriorityScenarioCapture& capture, std::string_view track) {
+        for (const auto& write : capture.writes) {
+            if ((write.stream_id & 0x3ULL) != 0 || write.stream_id == 0 || message_type(write.bytes) != 0x1d) continue;
+            const std::string bytes(write.bytes.begin(), write.bytes.end());
+            if (bytes.find(std::string(1, static_cast<char>(track.size())) + std::string(track)) != std::string::npos) {
+                return std::optional<std::vector<std::uint8_t>>(write.bytes);
+            }
+        }
+        return std::optional<std::vector<std::uint8_t>>();
+    };
+    const auto ends_with = [](const std::optional<std::vector<std::uint8_t>>& bytes,
+                              const std::vector<std::uint8_t>& suffix) {
+        return bytes && bytes->size() >= suffix.size() &&
+               std::equal(suffix.begin(), suffix.end(), bytes->end() - static_cast<std::ptrdiff_t>(suffix.size()));
+    };
+    const auto priority_of = [](const PriorityScenarioCapture& capture, std::uint8_t payload) {
+        for (const auto& write : capture.object_writes) {
+            if (!write.bytes.empty() && write.bytes.back() == payload) {
+                return std::optional<std::uint8_t>(write.options.transport_priority);
+            }
+        }
+        return std::optional<std::uint8_t>();
+    };
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
+        const std::string label = openmoq::publisher::to_string(draft);
+        const auto off = run_priority_scenario(draft, std::nullopt, endpoint, tls);
+        ok &= expect(off.status.ok, label + " priority scenario publishes with priorities off: " + off.status.message);
+        for (const char* track : {"catalog", "audio", "video"}) {
+            const auto publish = publish_of(off, track);
+            ok &= expect(publish.has_value(), label + " sends a PUBLISH for " + track);
+            ok &= expect(!ends_with(publish, {0x0e, 0x20}) && !ends_with(publish, {0x0e, 0x40}) &&
+                             !ends_with(publish, {0x0e, 0x80, 0x80}),
+                         label + " PUBLISH carries no DEFAULT_PUBLISHER_PRIORITY when priorities are off");
+        }
+        ok &= expect(priority_of(off, '}') && priority_of(off, '}') == priority_of(off, 'A') &&
+                         priority_of(off, 'A') == priority_of(off, 'V'),
+                     label + " schedules catalog, audio and video alike when priorities are off");
+
+        const auto on = run_priority_scenario(
+            draft, openmoq::publisher::PublisherPriorities{.audio = 64, .video = 128, .catalog = 32}, endpoint, tls);
+        ok &= expect(on.status.ok, label + " priority scenario publishes with priorities on: " + on.status.message);
+        ok &= expect(ends_with(publish_of(on, "catalog"), {0x0e, 0x20}),
+                     label + " catalog PUBLISH carries DEFAULT_PUBLISHER_PRIORITY 32");
+        ok &= expect(ends_with(publish_of(on, "audio"), {0x0e, 0x40}),
+                     label + " audio PUBLISH carries DEFAULT_PUBLISHER_PRIORITY 64");
+        ok &= expect(ends_with(publish_of(on, "video"), {0x0e, 0x80, 0x80}),
+                     label + " video PUBLISH carries DEFAULT_PUBLISHER_PRIORITY 128");
+        const auto catalog = priority_of(on, '}');
+        const auto audio = priority_of(on, 'A');
+        const auto video = priority_of(on, 'V');
+        // The uplink maps (subscriber, publisher) onto one byte of QUIC stream
+        // priority, about 259 tuple values per class, so the publisher byte moves
+        // a stream by at most one class: 32, 64 and 128 share a class at
+        // subscriber priority 128. The extremes 0 and 255 show the value arrives.
+        ok &= expect(catalog && audio && video && *catalog == *audio && *audio == *video,
+                     label + " publisher priorities 32, 64 and 128 share an uplink class");
+        const auto extremes = run_priority_scenario(
+            draft, openmoq::publisher::PublisherPriorities{.audio = 0, .video = 255, .catalog = 0}, endpoint, tls);
+        ok &= expect(priority_of(extremes, 'A') && priority_of(extremes, 'V') &&
+                         *priority_of(extremes, 'A') < *priority_of(extremes, 'V') &&
+                         priority_of(extremes, '}') == priority_of(extremes, 'A'),
+                     label + " uplink schedules audio and catalog at 0 before video at 255");
+        ok &= expect(priority_of(on, 'V') == priority_of(off, 'V'),
+                     label + " schedules video at 128 exactly as with priorities off");
+        // Object bytes do not change: subgroup headers keep the default-priority form.
+        bool same_objects = on.object_writes.size() == off.object_writes.size();
+        for (std::size_t i = 0; same_objects && i < on.object_writes.size(); ++i) {
+            same_objects = on.object_writes[i].bytes == off.object_writes[i].bytes;
+        }
+        ok &= expect(same_objects, label + " object and subgroup header bytes are unchanged by priorities");
+    }
+    return ok;
+}
 
 int main() {
     bool ok = true;
@@ -13041,6 +13304,8 @@ int main() {
     ok &= test_publish_request_stream_stop_sending_ends_subscription(endpoint, tls);
     ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
     ok &= test_live_stdin_video_alt_group(endpoint, tls);
+    ok &= test_publisher_priorities_live_objects(endpoint, tls);
+    ok &= test_publisher_priorities_live_stdin(endpoint, tls);
     ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
     ok &= test_live_stdin_resubscribe_after_stop_sending(endpoint, tls);
     ok &= test_live_stdin_stop_sending_cancels_subgroups(endpoint, tls);

@@ -10,6 +10,7 @@
 #include "openmoq/publisher/drm_config.h"
 #include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/moq_draft.h"
+#include "openmoq/publisher/publisher_priority.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
 namespace openmoq::publisher {
@@ -101,6 +102,9 @@ struct CliOptions {
     // --video-alt-group <N>; see PublisherConfig::video_alt_group. Live stdin
     // only.
     std::optional<std::uint32_t> video_alt_group;
+    // --publisher-priority audio=N,video=N,catalog=N,other=N; see
+    // PublisherConfig::publisher_priorities.
+    std::optional<PublisherPriorities> publisher_priorities;
     // Parsed eagerly by parse_cli_options so a malformed --drm-config file is
     // reported before publishing begins, rather than publishing with partial
     // DRM configuration.
