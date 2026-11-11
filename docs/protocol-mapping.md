@@ -418,8 +418,11 @@ build directions.
   The publisher's `track_namespace` is a flat string that the transport layer
   splits on `/`, so such an element cannot survive the round-trip. Refusing
   is preferred over silently producing a namespace with the wrong arity.
-- **`c4m` is parsed but not consumed.** Nothing on the publish path uses a
-  CAT token.
+- **`c4m` supplies authorization credentials.** The CLI decodes the MSF URL's
+  token into both setup and action credentials. It conflicts with credential
+  file flags, and `--print-msf-urls` omits it. Treat a URL containing `c4m` as
+  a credential; see [authorization options](quickstart.md#cat4moq-authorization)
+  for encoding and backend constraints.
 - **The `--url` track name configures nothing.** The publisher's catalog
   track name is the literal `"catalog"`, hardcoded in `src/cmsf_packager.cpp`.
 - **Range parameters are parsed but not acted on.** A publisher does not

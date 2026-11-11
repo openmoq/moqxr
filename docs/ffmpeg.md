@@ -133,4 +133,16 @@ Segment names that carry a file extension are grouped by their directory instead
 
 For relay smoke testing, use `--forward 1` so objects are forwarded immediately. Use `--forward 0` when the relay should wait for subscriber interest before media delivery. In that mode, `connection_id=` confirms transport and MOQT setup only; it does not mean the relay accepted the namespace or forwarded a subscription. Draft-16 subscriptions arrive on the control stream, while draft-17/18 subscriptions arrive on bidirectional request streams and are acknowledged with `SUBSCRIBE_OK` on the same stream. Use `--timeout` to bound the initial wait and `OPENMOQ_PICOQUIC_TRACE=1` to inspect relay control traffic.
 
-When publishing a file with `--input <file>` through a relay on draft 18 or later, a relay with no subscriber yet answers `PUBLISH_OK` with `forward=0`. The publisher then waits, bounded by `--timeout`, for the relay to send a `REQUEST_UPDATE` with `forward=1` on that track's PUBLISH request stream, and sends objects once it arrives. Tracks still at `forward=0` are skipped, with one log line per track rather than one per object. A track that flips to `forward=1` after the first pass misses the objects already skipped for it unless `--loop` is used, which picks it up on the next cycle. If no update arrives before the timeout, the publisher falls back to waiting for a downstream SUBSCRIBE, so the total wait can be up to twice `--timeout`. On draft 16, forward updates for file input arrive as control-stream SUBSCRIBE_UPDATE and are not yet handled.
+For file input using proactive `PUBLISH` on the native backend, a relay may
+answer `PUBLISH_OK` with `forward=0` until a subscriber arrives. The publisher
+waits for a `REQUEST_UPDATE` enabling forwarding: on the track's PUBLISH
+request stream for draft 18 and later, or on the control stream naming the
+PUBLISH request ID for draft 16. Both paths are handled. Tracks still at
+`forward=0` are skipped, with one log line per track rather than per object.
+
+A non-looping publish replays a track enabled after its first pass from the
+start of the plan; `--loop` picks it up on the next cycle. The wait is bounded
+by `--timeout`, with a fresh deadline after replaying newly enabled tracks.
+Tracks still disabled afterward fall back to waiting for a downstream
+`SUBSCRIBE`, with another subscriber timeout. Thus `--timeout` is not a total
+wall-clock limit. See [relay behavior](relay-interop.md#behavior-notes).

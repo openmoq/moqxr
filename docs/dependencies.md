@@ -28,8 +28,8 @@ dependencies are required when it is enabled:
 
 | Dependency | How it is supplied | Purpose |
 | --- | --- | --- |
-| [picoquic](https://github.com/private-octopus/picoquic) | Managed `master` checkout, `OPENMOQ_PICOQUIC_SOURCE_DIR`, or an installed package with `OPENMOQ_USE_SYSTEM_PICOQUIC=ON` | QUIC, HTTP/3, and WebTransport transport |
-| [picotls](https://github.com/h2o/picotls) | Managed `master` checkout with submodules, or `OPENMOQ_PICOTLS_SOURCE_DIR`; supplied by the installed picoquic when `OPENMOQ_USE_SYSTEM_PICOQUIC=ON` | TLS implementation used by picoquic |
+| [picoquic](https://github.com/private-octopus/picoquic) | Managed `master` checkout (moq5's pinned revision and patches when managed libmoq is selected), `OPENMOQ_PICOQUIC_SOURCE_DIR`, or an installed package with `OPENMOQ_USE_SYSTEM_PICOQUIC=ON` | QUIC, HTTP/3, and WebTransport transport |
+| [picotls](https://github.com/h2o/picotls) | Managed `master` checkout with submodules (moq5's pinned revision and patches when managed libmoq is selected), or `OPENMOQ_PICOTLS_SOURCE_DIR`; supplied by the installed picoquic when `OPENMOQ_USE_SYSTEM_PICOQUIC=ON` | TLS implementation used by picoquic |
 | OpenSSL development headers and libraries | System installation selected by CMake | Required by the picoquic build's default OpenSSL backend |
 | pkg-config | System installation | Required while configuring picotls; on Windows, CI uses `pkgconfiglite` |
 | Platform thread library | Located by CMake's `Threads` package | Required by picoquic |
@@ -92,6 +92,12 @@ When `OPENMOQ_ENABLE_PICOQUIC=ON`, libmoq reuses the picoquic, picotls,
 OpenSSL, and thread dependencies already configured by moqxr and builds its raw
 QUIC and picoquic WebTransport adapters. When picoquic is disabled, libmoq's
 core and service tiers build without those adapters.
+
+When moq5 itself is managed, CMake reads the picoquic and picotls revisions
+from its `scripts/setup_picoquic_deps.sh` and applies its corresponding patch
+series to managed transport sources. Local picoquic/picotls overrides must
+already be compatible: CMake does not patch them. A local moq5 override does
+not select the managed pins; see [managed dependencies](build.md#managed-pico-dependencies).
 
 Setting `OPENMOQ_LIBMOQ_SOURCE_DIR` configures and links that local libmoq tree
 even when `OPENMOQ_USE_LIBMOQ_PUBLISHER=OFF`. This validates the integration

@@ -158,6 +158,7 @@ ffmpeg -hide_banner -re -i input.mp4 \
  -c:a aac -b:a 128k -ar 48000 -ac 2 \
  -movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof \
  -f mp4 pipe:1 | ./build/openmoq-publisher \
+ --transport webtransport \
  --endpoint https://127.0.0.1:4433/moq \
  --namespace live/stdin \
  --publish-catalog \

@@ -483,10 +483,13 @@ requires a credential to bind to. See `examples/auth/README.md` for the proof
 format and how to obtain the thumbprint the issuer needs. Every explicitly configured failover endpoint receives the same
 configured credentials, so all endpoints must be intended credential recipients.
 
-Authorization applies to file, stdin, SRT, and DASH publishing. The legacy
-MoqtSession backend carries the credentials; the current managed libmoq backend
-rejects configured authorization before connecting because its public API cannot
-carry it.
+Authorization applies to file, stdin, SRT, and DASH publishing on the native
+MoqtSession backend. The libmoq backend carries credentials on drafts 16 and 18
+when moq5 provides `MOQ_SERVICE_AUTH_API_VERSION >= 1`; older dependencies and
+libmoq draft 22 reject configured authorization before connecting. Drafts 21
+and 23 use the native backend even in libmoq builds. See the
+[CAT4MoQ design](cat4moq-design.md#backend-and-interoperability-boundaries)
+for backend and validation limits.
 
 ### Auth example
 

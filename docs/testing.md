@@ -59,7 +59,9 @@ Publish-plan numbering notes:
 - MSF media timeline tracks are disabled by default; add `--msf-timeline` when you want a `timeline` metadata track and object
 - SAP event timeline tracks are disabled by default; add `--sap` when you want catalog and metadata objects for `*_sap` tracks
 
-If you want the packaging and transport tests without the CLI target, use the secondary build tree:
+To run the same build and tests in a separate directory, use the secondary
+build tree below. It still builds the CLI; `OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS`
+controls the optional network smoke tests, not the CLI target.
 
 ```bash
 cmake -S . -B build-nosmoke -DOPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=OFF

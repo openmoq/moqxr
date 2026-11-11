@@ -55,7 +55,14 @@ By default, CMake owns dependency checkouts under `<build>/_deps` and follows:
 - canonical `h2o/picotls` `master`, including its recorded submodules
 - `openmoq/moq5` `main` when `OPENMOQ_USE_LIBMOQ_PUBLISHER=ON`
 
-The first configure downloads the current branch heads. Later configures use a
+When managed moq5 is selected, CMake instead builds picoquic and picotls at the
+revisions pinned in moq5's `scripts/setup_picoquic_deps.sh` and applies its
+`patches/picoquic` and `patches/picotls` series when present. This supplies the
+APIs required by moq5's adapters. Explicit picoquic/picotls source overrides
+are not patched or updated; callers must supply compatible trees themselves.
+An `OPENMOQ_LIBMOQ_SOURCE_DIR` override does not select these managed pins.
+
+The first configure downloads the selected branches or pinned revisions. Later configures use a
 successful-check timestamp in that build directory and contact upstream again
 after 24 hours. If a required initial download or scheduled refresh cannot
 reach upstream, configure fails instead of silently accepting a stale branch.
@@ -263,8 +270,9 @@ GitHub Actions publishes release archives for Linux, macOS, and Windows:
 - pushing a `v*` tag builds release artifacts and attaches them to the matching GitHub Release
 - running the `Release Builds` workflow manually uploads the same archives as workflow artifacts
 - manual runs can also publish a GitHub Release when you provide a `release_tag` such as `v0.1.0`
-- CI and release use the managed dependency flow, so each clean job resolves
-  picoquic `master` and canonical picotls `master` during configure
+- CI and release use the managed dependency flow. Native-backend jobs resolve
+  picoquic `master` and canonical picotls `master` during configure; managed
+  libmoq jobs use moq5's pinned revisions and patch series instead
 - Linux and macOS archives are `.tar.gz` and contain `openmoq-publisher`, `libopenmoq_publisher.a`, `include/`, `docs/`, `README.md`, and `LICENSE`
 - Windows archives are `.zip` and contain `openmoq-publisher.exe`, `openmoq_publisher.lib`, `include/`, `docs/`, `README.md`, and `LICENSE`
 
