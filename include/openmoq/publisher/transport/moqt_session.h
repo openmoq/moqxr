@@ -5,6 +5,7 @@
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/msf_catalog.h"
+#include "openmoq/publisher/publisher_priority.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -188,8 +189,15 @@ public:
     // independent sources, not alternates of one another.
     void set_video_alt_group(std::optional<std::uint32_t> alt_group) { video_alt_group_ = alt_group; }
 
+    // See PublisherConfig::publisher_priorities. nullopt (the default) sends
+    // no DEFAULT_PUBLISHER_PRIORITY and schedules every track at 128.
+    void set_publisher_priorities(std::optional<openmoq::publisher::PublisherPriorities> priorities) {
+        track_priorities_ = openmoq::publisher::TrackPublisherPriorities(priorities);
+    }
+
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
+    openmoq::publisher::TrackPublisherPriorities track_priorities_;
     void reset_publish_stats();
     TransportStatus apply_live_group_floors(std::uint64_t resume_group_floor,
                                             std::uint64_t resume_catalog_group_floor);

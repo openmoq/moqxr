@@ -569,6 +569,12 @@ CliOptions parse_cli_options(int argc, char** argv) {
             initial_group_id_set = true;
         } else if (argument == "--video-alt-group") {
             options.video_alt_group = parse_video_alt_group(require_value("--video-alt-group"));
+        } else if (argument == "--publisher-priority") {
+            try {
+                options.publisher_priorities = parse_publisher_priorities(require_value("--publisher-priority"));
+            } catch (const std::invalid_argument& error) {
+                throw std::runtime_error(error.what());
+            }
         } else if (argument == "--drm-config") {
             // Parsed eagerly, not stored as a path: a malformed DRM config
             // must fail before publishing starts rather than publish with
@@ -666,6 +672,15 @@ CliOptions parse_cli_options(int argc, char** argv) {
         (options.stream_per_object || !options.split_cmaf_chunks)) {
         throw std::runtime_error("LOCMAF requires one chunk per object and one subgroup per group; "
                                  "--stream-per-object and --coalesce-cmaf-chunks are incompatible");
+    }
+
+    if (options.publisher_priorities) {
+        if (!is_draft18_or_later(options.draft_version)) {
+            throw std::runtime_error("--publisher-priority requires --draft 18 or later");
+        }
+        if (!options.endpoint.has_value()) {
+            throw std::runtime_error("--publisher-priority requires --endpoint");
+        }
     }
 
     if (options.media_packaging == MediaPackaging::kLoc) {
@@ -820,6 +835,7 @@ std::string build_usage(const char* argv0) {
            " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22|23] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--moq-impl-id] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
            " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--video-alt-group <N>] [--drm-config <path>]"
+           " [--publisher-priority audio=N,video=N,catalog=N,other=N]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--webtransport-allow-missing-reset-stream-at] [--quic-idle-timeout <ms>]"
            " [--retry <count>]"

@@ -356,6 +356,27 @@ int main() {
                       "live track");
     }
 
+    // Publisher priorities need PUBLISH and SUBSCRIBE_OK Track Properties that
+    // libmoq does not send, so every libmoq publish route refuses them.
+    {
+        const auto refused = [&](const TransportStatus& status, const std::string& label) {
+            return expect(!status.ok && status.message.find("publisher priorities") != std::string::npos,
+                          label + " must refuse publisher priorities before setup");
+        };
+        PublisherConfig config;
+        config.draft_version = static_cast<DraftVersion>(0);  // guarantees no network on regression
+        config.publisher_priorities = openmoq::publisher::PublisherPriorities{.audio = 64};
+        EndpointConfig endpoint;
+        LibmoqPublishStats stats;
+        ok &= refused(publish_plan_via_libmoq({}, config, endpoint, {}, stats), "batch priorities");
+        std::istringstream input;
+        ok &= refused(publish_live_stdin_via_libmoq(input, config, endpoint, {}, stats, nullptr),
+                      "stdin priorities");
+        ok &= refused(publish_live_srt_via_libmoq({}, config, endpoint, {}, stats, nullptr), "SRT priorities");
+        ok &= refused(publish_live_objects_via_libmoq({}, config, endpoint, {}, stats, nullptr),
+                      "live priorities");
+    }
+
     // LOC-05 properties and catalog signaling are unsupported by libmoq.
     {
         const auto rejects_loc = [&](auto operation, const std::string& label) {

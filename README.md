@@ -304,6 +304,20 @@ Each live publisher process numbers its Group IDs from 0. If the process restart
 - The default is 0. The option applies to the media tracks and the catalog of the live sources (stdin, SRT, and CTE LL-DASH) on every draft; it is rejected for file input. On drafts 22 and 23, a GOAWAY migration still resumes above the groups the previous session sent. The moq5 publishing backend numbers Group IDs itself and rejects a non-zero value.
 - The value is fixed for the process. For stdin and SRT input, a `--retry` or endpoint failover reconnect inside the same process continues above the Group IDs the failed session sent instead of starting again from it, and stdin input resumes from its init segment. The moq5 publishing backend does not take part in this: it ignores the resume state, so a retry there restarts from Group 0 and a stdin input cannot be replayed.
 
+### Track priorities
+
+By default every track has the MOQT default Publisher Priority, 128, and moqxr sends no priority signal. To let a relay serve some tracks first, set a priority per kind of track; lower is more urgent:
+
+```bash
+./build/openmoq-publisher --input - --draft 22 --publisher-priority audio=64,video=128,catalog=64 ...
+```
+
+- The kinds are `audio`, `video`, `catalog`, and `other` (tracks that are none of these, such as timeline or event tracks). A kind not named stays 128.
+- Each track's value goes out as the `DEFAULT_PUBLISHER_PRIORITY` Track Property (0x0E) in its `PUBLISH` and `SUBSCRIBE_OK`, and its subgroups inherit it, so the subgroup headers keep their default-priority form. Catalog FETCH objects carry the catalog's value.
+- A track's priority is fixed for the session, so it never changes within a subgroup.
+- The publisher also schedules its own streams with these values. That scheduling maps subscriber and publisher priority onto one byte of QUIC stream priority, where the publisher priority moves a stream by at most one step, so on the publisher's own connection the effect is small.
+- Requires `--draft 18` or later and `--endpoint`. The libmoq backend refuses it. With `publish_live_objects`, a track's kind comes from `LiveTrack::media_type`; a track without one counts as `other`.
+
 ## Publishing via moq5
 
 The opt-in [moq5](https://github.com/openmoq/moq5) backend routes batch, live stdin, live SRT, and live-object publishing through moq5's service tier. The service tier handles catalog publication, CMSF/CMAF validation, subscriber-demand gating, bounded backpressure, and graceful transport draining.

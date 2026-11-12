@@ -36,6 +36,10 @@ constexpr std::string_view kLocmafUnsupported =
     "LOCMAF requires locmafVersion catalog signaling unavailable in the libmoq publisher; "
     "use the native publisher backend";
 
+// libmoq sends its own PUBLISH and SUBSCRIBE_OK and schedules its own streams,
+// so DEFAULT_PUBLISHER_PRIORITY would never be sent.
+constexpr std::string_view kPublisherPrioritiesUnsupported =
+    "publisher priorities are not supported by the libmoq publisher; use the native publisher backend";
 constexpr std::string_view kLocUnsupported =
     "LOC-05 requires object properties and catalog signaling unavailable in the libmoq publisher; "
     "use the native publisher backend";
@@ -1198,6 +1202,9 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
     LibmoqAuthorization authorization;
     const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
     if (!authorization_status.ok) return authorization_status;
+    if (config.publisher_priorities) {
+        return TransportStatus::failure(kPublisherPrioritiesUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc || has_loc_tracks(materialized_plan)) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1398,6 +1405,9 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
     LibmoqAuthorization authorization;
     const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
     if (!authorization_status.ok) return authorization_status;
+    if (config.publisher_priorities) {
+        return TransportStatus::failure(kPublisherPrioritiesUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1627,6 +1637,9 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
     LibmoqAuthorization authorization;
     const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
     if (!authorization_status.ok) return authorization_status;
+    if (config.publisher_priorities) {
+        return TransportStatus::failure(kPublisherPrioritiesUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc) {
         return TransportStatus::failure(kLocUnsupported);
     }
@@ -1855,6 +1868,9 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
     LibmoqAuthorization authorization;
     const auto authorization_status = authorization.prepare(config.authorization, config.draft_version);
     if (!authorization_status.ok) return authorization_status;
+    if (config.publisher_priorities) {
+        return TransportStatus::failure(kPublisherPrioritiesUnsupported);
+    }
     if (config.media_packaging == MediaPackaging::kLoc ||
         std::any_of(source.tracks.begin(), source.tracks.end(), [](const LiveTrack& track) {
             return track.packaging == LivePackaging::kLoc;

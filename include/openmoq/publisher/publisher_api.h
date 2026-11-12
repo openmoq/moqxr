@@ -16,6 +16,7 @@
 #include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
+#include "openmoq/publisher/publisher_priority.h"
 #include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/msf_catalog.h"
@@ -119,6 +120,10 @@ struct PublisherConfig {
     // tracks, SRT input, publish_live_objects(), and the batch publish() path
     // do not use this field; the libmoq backend refuses it.
     std::optional<std::uint32_t> video_alt_group;
+    // Opt-in publisher priority per kind of track (see publisher_priority.h).
+    // Unset, the default, sends no DEFAULT_PUBLISHER_PRIORITY and leaves every
+    // track at 128. Requires draft 18 or later; the libmoq backend refuses it.
+    std::optional<PublisherPriorities> publisher_priorities;
     // Bounds the wait for the first subscriber, and each read of a request
     // message on a request stream.
     std::chrono::seconds subscriber_timeout = std::chrono::seconds(30);
