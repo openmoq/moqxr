@@ -1,8 +1,11 @@
 // TLS server-certificate verification tests for the picoquic transport.
 //
-// These tests spin up loopback picoquic servers using the test certificates
-// shipped with the picoquic source tree (all issued by "picotls test ca",
-// certs/test-ca.crt) and exercise the PicoquicClient verification behaviour:
+// These tests spin up loopback picoquic servers using the test PKI in
+// tests/certs (all issued by "openmoq test ca", tests/certs/test-ca.crt; see
+// tests/certs/generate.sh) and exercise the PicoquicClient verification
+// behaviour. The leaves name their hosts in subjectAltName: OpenSSL 4 no
+// longer matches host names against the subject CN, so picoquic's own
+// CN-only test certificates fail verified handshakes there. Scenarios:
 //
 //   1. verified handshake against the RSA test certificate succeeds
 //   2. insecure (null-verifier) handshake against an Ed25519 certificate fails
@@ -45,7 +48,7 @@ using openmoq::publisher::transport::PicoquicClient;
 using openmoq::publisher::transport::TlsConfig;
 using openmoq::publisher::transport::TransportStatus;
 
-constexpr const char* kPicoquicSourceDir = OPENMOQ_PICOQUIC_SOURCE_DIR;
+constexpr const char* kTestCertsDir = OPENMOQ_TEST_CERTS_DIR;
 constexpr const char* kTestAlpn = "moq-00";
 
 bool trace_enabled() {
@@ -259,16 +262,16 @@ struct ServerScenario {
 int main() {
     bool ok = true;
 
-    const std::string certs_dir = std::string(kPicoquicSourceDir) + "/certs";
+    const std::string certs_dir = kTestCertsDir;
     const std::string test_ca = certs_dir + "/test-ca.crt";
-    const std::string rsa_cert = certs_dir + "/cert.pem";           // CN=test.example.com
-    const std::string rsa_key = certs_dir + "/key.pem";
-    const std::string ed_cert = certs_dir + "/ed25519/cert.pem";    // CN=ed25519.test.example.com
+    const std::string rsa_cert = certs_dir + "/rsa/cert.pem";         // DNS:test.example.com
+    const std::string rsa_key = certs_dir + "/rsa/key.pem";
+    const std::string ed_cert = certs_dir + "/ed25519/cert.pem";      // DNS:ed25519.test.example.com
     const std::string ed_key = certs_dir + "/ed25519/key.pem";
-    const std::string p384_cert = certs_dir + "/secp384r1/cert.pem";  // CN=secp384r1.test.example.com
+    const std::string p384_cert = certs_dir + "/secp384r1/cert.pem";  // DNS:secp384r1.test.example.com
     const std::string p384_key = certs_dir + "/secp384r1/key.pem";
 
-    std::cerr << "tls verify test start (picoquic certs at " << certs_dir << ")" << std::endl;
+    std::cerr << "tls verify test start (certs at " << certs_dir << ")" << std::endl;
 
     // ---- Servers -----------------------------------------------------------
     ServerScenario rsa_server;
