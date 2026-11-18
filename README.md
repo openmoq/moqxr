@@ -74,8 +74,8 @@ checkout with LOCMAF support, run
 [validation coverage](docs/testing.md#locmaf-tests).
 
 LOC-05 publishing is available with `--packaging loc --draft 18` (or `--draft 21` / `--draft 22` / `--draft 23`) on the native
-backend. It sends individual H.264/AAC frames with timestamp, timescale, and
-codec configuration properties; CMAF remains the default. See the
+backend. It sends individual H.264, HEVC, AV1, VP9, AAC-LC or Opus frames with timestamp,
+timescale, and codec configuration properties; CMAF remains the default. See the
 [LOC quickstart](docs/quickstart.md#opt-in-to-loc) for scope and constraints.
 
 Publish to a relay with the default draft-22 profile:
