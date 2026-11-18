@@ -763,13 +763,18 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
 
     for (const auto& registered : tracks_) {
         const TrackDescription& track = registered.description;
-        MsfTrack msf_track = make_msf_track(track, /*is_live=*/true);
+        MsfTrack msf_track = make_msf_track(track, /*is_live=*/true, std::nullopt, 0, msf_version_);
         if (video_track_count > 1 && track.handler_type == "vide") {
             msf_track.alt_group = 1;
         }
 
         if (!registered.init_data_base64.empty()) {
-            attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);
+            if (track.packaging == "loc") {
+                attach_loc_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64,
+                                     track.handler_type == "vide");
+            } else {
+                attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);
+            }
         }
 
         // Same shared enforcement the batch and live paths use; see

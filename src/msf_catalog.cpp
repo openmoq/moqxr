@@ -237,6 +237,32 @@ void validate_track(const MsfTrack& track, MsfVersion version) {
     } else if (track.locmaf_version.has_value()) {
         throw std::runtime_error("locmafVersion is forbidden outside locmaf packaging" + where);
     }
+    // MSF-02 Table 6: fields required per (packaging, role) pair. eventtimeline's eventType
+    // is checked below for both versions.
+    if (version == MsfVersion::k02 && track.packaging == "loc" && track.role.has_value()) {
+        const std::string& role = *track.role;
+        const auto need = [&](bool present, const char* field) {
+            if (!present) {
+                throw std::runtime_error(std::string("MSF-02 catalog requires ") + field + " for loc " + role + " tracks" + where);
+            }
+        };
+        if (role == "video" || role == "audio" || role == "audiodescription" || role == "signlanguage") {
+            need(track.codec.has_value(), "codec");
+        }
+        if (role == "video" || role == "audio") {
+            need(track.bitrate.has_value(), "bitrate");
+        }
+        if (role == "video" || role == "signlanguage") {
+            need(track.framerate.has_value(), "framerate");
+        }
+        if (role == "audio" || role == "audiodescription") {
+            need(track.samplerate.has_value(), "samplerate");
+            need(track.channel_config.has_value(), "channelConfig");
+        }
+        if (role == "audiodescription") {
+            need(track.lang.has_value(), "lang");
+        }
+    }
     // Section 5.2.22: bitrate MUST be specified for audio and video tracks.
     if (is_media_role(track) && !track.bitrate.has_value()) {
         throw std::runtime_error("MSF catalog requires bitrate for audio and video tracks" + where);
@@ -844,10 +870,19 @@ bool bitrate_is_estimated(const TrackDescription& track,
     return track.max_bitrate == 0 && !(configured.has_value() && *configured != 0) && computed == 0;
 }
 
+double resolve_framerate(const TrackDescription& track) {
+    return track.frame_rate > 0.0 ? track.frame_rate : 30.0;
+}
+
+bool framerate_is_estimated(const TrackDescription& track) {
+    return track.handler_type == "vide" && !(track.frame_rate > 0.0);
+}
+
 MsfTrack make_msf_track(const TrackDescription& track,
                         bool is_live,
                         std::optional<std::uint64_t> configured_bitrate,
-                        std::uint64_t computed_bitrate) {
+                        std::uint64_t computed_bitrate,
+                        MsfVersion msf_version) {
     MsfTrack out;
     out.name = track.track_name;
     out.packaging = track.packaging;
@@ -906,6 +941,12 @@ MsfTrack make_msf_track(const TrackDescription& track,
         }
         if (track.frame_rate > 0.0) {
             out.framerate = track.frame_rate;
+        } else if (msf_version == MsfVersion::k02 && track.packaging == "loc") {
+            // MSF-02 Table 6 requires framerate for loc video.
+            out.framerate = resolve_framerate(track);
+            std::cerr << "[msf-catalog] warning: track \"" << track.track_name
+                      << "\" has no measured frame rate; advertising estimated "
+                      << *out.framerate << " fps" << std::endl;
         }
         const std::uint64_t bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
         out.bitrate = bitrate;
@@ -934,6 +975,25 @@ void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view tra
         .id = std::move(init_id),
         .type = "inline",
         .data = std::move(base64_data),
+    });
+}
+
+void attach_loc_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name,
+                          std::string base64_config, bool video) {
+    if (base64_config.empty()) {
+        return;
+    }
+    if (msf_version_from_string(catalog.version) != MsfVersion::k02) {
+        attach_init_data(catalog, track, track_name, std::move(base64_config));
+        return;
+    }
+    std::string init_id(track_name);
+    init_id += "-init";
+    track.init_ref = init_id;
+    catalog.init_data_list.push_back(MsfInitData{
+        .id = std::move(init_id),
+        .type = "object-property",
+        .data = video ? "0x0D" : "0x0F",
     });
 }
 

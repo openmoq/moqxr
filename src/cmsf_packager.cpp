@@ -537,7 +537,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
         if (track.track_name == "catalog") {
             continue;
         }
-        MsfTrack msf_track = make_msf_track(track, /*is_live=*/!vod);
+        MsfTrack msf_track = make_msf_track(track, /*is_live=*/!vod, std::nullopt, 0, msf_version);
 
         // CMSF section 3.5.2: maxObjSapStartingType is the maximum SAP type
         // across every fragment of the track; maxGrpSapStartingType is the
@@ -565,7 +565,11 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
         const auto init_it = init_data_by_track.find(track.track_name);
         // LOC codecs with no description (VP9) have no init data to attach.
         if (init_it != init_data_by_track.end() && !init_it->second.empty()) {
-            attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
+            if (track.packaging == "loc") {
+                attach_loc_init_data(msf_catalog, msf_track, track.track_name, init_it->second, track.handler_type == "vide");
+            } else {
+                attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
+            }
         }
 
         // The CMSF 4.1.2 refusal and attachment live in one place
@@ -832,7 +836,7 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
         tracks.begin(), tracks.end(), [](const TrackDescription& track) { return track.handler_type == "vide"; });
 
     for (const auto& track : tracks) {
-        MsfTrack msf_track = make_msf_track(track, is_live);
+        MsfTrack msf_track = make_msf_track(track, is_live, std::nullopt, 0, msf_version);
         if (video_alt_group && video_track_count > 1 && track.handler_type == "vide") {
             msf_track.alt_group = *video_alt_group;
         }
@@ -840,7 +844,11 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
         const auto init_it = init_data_by_track.find(track.track_name);
         // LOC codecs with no description (VP9) have no init data to attach.
         if (init_it != init_data_by_track.end() && !init_it->second.empty()) {
-            attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
+            if (track.packaging == "loc") {
+                attach_loc_init_data(msf_catalog, msf_track, track.track_name, init_it->second, track.handler_type == "vide");
+            } else {
+                attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
+            }
         }
 
         // Same shared enforcement the batch path uses; see

@@ -1583,5 +1583,104 @@ int main() {
         }
     }
 
+    // MSF-02 Table 6: fields required per (packaging, role) pair, and LOC init data entries.
+    {
+        const auto loc_track = [](const std::string& role) {
+            MsfTrack track;
+            track.name = role;
+            track.packaging = "loc";
+            track.role = role;
+            track.is_live = true;
+            track.codec = role == "video" ? "avc1.640028" : "opus";
+            track.bitrate = 1000000;
+            if (role == "video" || role == "signlanguage") track.framerate = 30.0;
+            if (role == "audio" || role == "audiodescription") {
+                track.samplerate = 48000;
+                track.channel_config = "2";
+            }
+            if (role == "audiodescription") track.lang = "en";
+            return track;
+        };
+        const auto catalog_with = [](MsfVersion version, const MsfTrack& track) {
+            MsfCatalog catalog;
+            catalog.version = std::string(msf_version_string(version));
+            catalog.tracks = {track};
+            return catalog;
+        };
+        for (const std::string role : {"video", "audio", "audiodescription", "signlanguage"}) {
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k02, loc_track(role)), "expected a complete loc " + role + " track to serialize");
+        }
+        const auto without = [&](const std::string& role, auto reset, const std::string& field) {
+            auto track = loc_track(role);
+            reset(track);
+            ok &= throws_runtime_error(catalog_with(MsfVersion::k02, track),
+                                       "expected a loc " + role + " track without " + field + " to be refused under 02");
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k01, track),
+                                     "expected a loc " + role + " track without " + field + " to stay accepted under 01 or fail only on 01 rules");
+        };
+        // Under 01 a loc video track without framerate is accepted; audio without codec is accepted too.
+        without("video", [](MsfTrack& t) { t.codec.reset(); }, "codec");
+        without("video", [](MsfTrack& t) { t.framerate.reset(); }, "framerate");
+        without("audiodescription", [](MsfTrack& t) { t.lang.reset(); }, "lang");
+        without("audiodescription", [](MsfTrack& t) { t.samplerate.reset(); }, "samplerate");
+        without("signlanguage", [](MsfTrack& t) { t.framerate.reset(); }, "framerate");
+        {
+            auto track = loc_track("audio");
+            track.channel_config.reset();
+            ok &= throws_runtime_error(catalog_with(MsfVersion::k02, track), "expected loc audio without channelConfig to be refused");
+        }
+        {
+            MsfTrack track;
+            track.name = "events";
+            track.packaging = "eventtimeline";
+            track.is_live = true;
+            ok &= throws_runtime_error(catalog_with(MsfVersion::k02, track), "expected eventtimeline without eventType to be refused");
+            track.event_type = "com.example.sap";
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k02, track), "expected eventtimeline with eventType to serialize");
+        }
+        // CMAF carries no Table 6 row: a cmaf video track needs only what it needed before.
+        {
+            MsfTrack track = loc_track("video");
+            track.packaging = "cmaf";
+            track.framerate.reset();
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k02, track), "expected Table 6 to leave cmaf tracks alone");
+        }
+
+        // Frame rate resolution mirrors resolve_bitrate: measured, else a flagged estimate.
+        {
+            TrackDescription measured;
+            measured.handler_type = "vide";
+            measured.frame_rate = 25.0;
+            TrackDescription unknown = measured;
+            unknown.frame_rate = 0.0;
+            ok &= expect(resolve_framerate(measured) == 25.0 && !framerate_is_estimated(measured),
+                         "expected a measured frame rate to be used as is");
+            ok &= expect(resolve_framerate(unknown) == 30.0 && framerate_is_estimated(unknown),
+                         "expected an unknown frame rate to resolve to the flagged 30 fps estimate");
+        }
+
+        // attach_loc_init_data: object-property entries under 02, inline under 01, nothing without a config.
+        {
+            auto catalog = catalog_with(MsfVersion::k02, loc_track("video"));
+            attach_loc_init_data(catalog, catalog.tracks[0], "video", "AAAA", true);
+            ok &= expect(catalog.tracks[0].init_ref == "video-init" && catalog.init_data_list.size() == 1 &&
+                             catalog.init_data_list[0].type == "object-property" && catalog.init_data_list[0].data == "0x0D",
+                         "expected a video object-property entry naming VIDEO_CONFIG");
+            auto audio = catalog_with(MsfVersion::k02, loc_track("audio"));
+            attach_loc_init_data(audio, audio.tracks[0], "audio", "AAAA", false);
+            ok &= expect(audio.init_data_list.size() == 1 && audio.init_data_list[0].data == "0x0F",
+                         "expected an audio object-property entry naming AUDIO_CONFIG");
+            auto none = catalog_with(MsfVersion::k02, loc_track("video"));
+            attach_loc_init_data(none, none.tracks[0], "video", "", true);
+            ok &= expect(!none.tracks[0].init_ref.has_value() && none.init_data_list.empty(),
+                         "expected no init data entry for a codec without a description");
+            auto old = catalog_with(MsfVersion::k01, loc_track("video"));
+            attach_loc_init_data(old, old.tracks[0], "video", "AAAA", true);
+            ok &= expect(old.init_data_list.size() == 1 && old.init_data_list[0].type == "inline" &&
+                             old.init_data_list[0].data == "AAAA",
+                         "expected MSF-01 to keep inline LOC init data");
+        }
+    }
+
     return ok ? 0 : 1;
 }

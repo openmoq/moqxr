@@ -159,7 +159,23 @@ bool bitrate_is_estimated(const TrackDescription& track,
 MsfTrack make_msf_track(const TrackDescription& track,
                         bool is_live,
                         std::optional<std::uint64_t> configured_bitrate = std::nullopt,
-                        std::uint64_t computed_bitrate = 0);
+                        std::uint64_t computed_bitrate = 0,
+                        MsfVersion msf_version = MsfVersion::k02);
+
+// Frame rate for a video track: the measured value, else a 30 fps estimate so a
+// MSF-02 LOC video track (Table 6 requires framerate) can still be published
+// from a live source that never measured one. framerate_is_estimated tells callers
+// to warn the operator, as bitrate_is_estimated does.
+double resolve_framerate(const TrackDescription& track);
+bool framerate_is_estimated(const TrackDescription& track);
+
+// Attach LOC decoder configuration. MSF-01 carries it inline (Base64). MSF-02
+// publishes an "object-property" entry naming VIDEO_CONFIG (0x0D) or AUDIO_CONFIG
+// (0x0F), because LOC objects repeat the configuration in that property
+// (section 12.2). An empty config (a codec with no description, such as VP9)
+// attaches nothing.
+void attach_loc_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name,
+                          std::string base64_config, bool video);
 
 // Attach a Base64-encoded init segment to a track: sets track.init_ref and
 // appends the matching MsfInitData entry to the catalog's initDataList,
