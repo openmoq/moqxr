@@ -73,6 +73,9 @@ checkout with LOCMAF support, run
 [C++ API configuration](docs/publisher-api.md#optional-locmaf-packaging), and
 [validation coverage](docs/testing.md#locmaf-tests).
 
+Catalogs follow `draft-ietf-moq-msf-02` by default; `--msf-version 01` keeps the earlier
+`draft-ietf-moq-msf-01` form (see [protocol-mapping](docs/protocol-mapping.md#msf-catalog)).
+
 LOC-05 publishing is available with `--packaging loc --draft 18` (or `--draft 21` / `--draft 22` / `--draft 23`) on the native
 backend. It sends individual H.264, HEVC, AV1, VP9, AAC-LC or Opus frames with timestamp,
 timescale, and codec configuration properties; CMAF remains the default. See the

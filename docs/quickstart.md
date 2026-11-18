@@ -539,6 +539,9 @@ config, token generation, relay connection, and focused-test workflow.
 
 - default output includes the `catalog` object plus media objects
 - `--msf-timeline` additionally creates a `timeline` media timeline track and metadata object
+- `--msf-version 01|02` selects the catalog draft: `02` (default) writes a `draft-ietf-moq-msf-02` catalog
+  (`"version":"draft-02"`) and `01` the earlier `"version":"1"` form; see
+  [protocol-mapping](protocol-mapping.md#msf-catalog) for the differences
 - `--sap` additionally creates `*_sap` metadata tracks and objects
 - default packaging emits lower-latency split MOQT objects per group when chunk/sample boundaries are available
 - `--coalesce-cmaf-chunks` restores one media object per group for CMAF; it is rejected with LOCMAF
