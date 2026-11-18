@@ -1,4 +1,5 @@
 #include "openmoq/publisher/encoded_sample.h"
+#include "../src/loc_packager.h"
 #include <algorithm>
 #include <functional>
 #include <iostream>
@@ -325,6 +326,53 @@ void vp9_fixture() {
     for (std::size_t i = 0; i < samples.size(); ++i)
         check(samples[i].independent == (i % 4 == 0), "VP9 keyframes follow the 4-frame GOP");
 }
+void new_codec_guarantees() {
+    const char *fixtures_to_check[] = {"tests/fixtures/loc-hevc-fragmented.mp4", "tests/fixtures/loc-av1-fragmented.mp4",
+                                       "tests/fixtures/loc-vp9-fragmented.mp4", "tests/fixtures/loc-opus.mp4"};
+    for (const char *path : fixtures_to_check) {
+        const auto track = parse_mp4_file(path).tracks.front();
+        auto encrypted = track;
+        encrypted.protection = CencTrackProtection{};
+        rejects([&] { loc_codec_config(encrypted); });
+        auto wrapped = track;
+        wrapped.sample_entry_type = track.handler_type == "vide" ? "encv" : "enca";
+        rejects([&] { loc_codec_config(wrapped); });
+        auto unsupported = track;
+        unsupported.sample_entry_type = "vvc1";
+        try {
+            loc_codec_config(unsupported);
+            throw std::runtime_error("vvc1 accepted");
+        } catch (const std::runtime_error &error) {
+            check(std::string(error.what()).find("unsupported codec/sample description") != std::string::npos,
+                  "unsupported entries fail with a clear message");
+        }
+    }
+}
+// After a dropped keyframe, a delta frame must never start a group, whatever the codec.
+void late_join_per_codec() {
+    for (const char *path : {"tests/fixtures/loc-bframes-fragmented.mp4", "tests/fixtures/loc-hevc-fragmented.mp4",
+                             "tests/fixtures/loc-av1-fragmented.mp4", "tests/fixtures/loc-vp9-fragmented.mp4"}) {
+        const auto parsed = parse_mp4_file(path);
+        const auto samples = read_encoded_samples(parsed);
+        const auto &track = parsed.tracks.front();
+        const auto independent = std::find_if(samples.begin(), samples.end(), [](const auto &s) { return s.independent; });
+        const auto dependent = std::find_if(samples.begin(), samples.end(), [](const auto &s) { return !s.independent; });
+        check(independent != samples.end() && dependent != samples.end(), "fixture has both frame kinds");
+        LocTrackEncoder encoder(track);
+        auto key = *independent;
+        check(encoder.encode(std::span<const EncodedSample>(&key, 1)).size() == 1, "initial keyframe publishes");
+        // A gap in the decode timeline drops the dependency chain.
+        auto delta = *dependent;
+        delta.decode_time = key.decode_time + 2 * key.duration;
+        delta.presentation_time = static_cast<std::int64_t>(delta.decode_time);
+        check(encoder.encode(std::span<const EncodedSample>(&delta, 1)).empty(), "delta frame after a gap is dropped");
+        auto resumed = key;
+        resumed.decode_time = delta.decode_time + delta.duration;
+        resumed.presentation_time = static_cast<std::int64_t>(resumed.decode_time);
+        const auto out = encoder.encode(std::span<const EncodedSample>(&resumed, 1));
+        check(out.size() == 1 && out.front().group_id == 1 && out.front().object_id == 0, "recovery starts a new group");
+    }
+}
 int main() {
     try {
         init_validation();
@@ -338,6 +386,8 @@ int main() {
         opus_fixture();
         av1_fixture();
         vp9_fixture();
+        new_codec_guarantees();
+        late_join_per_codec();
         std::cout << "Encoded sample tests passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

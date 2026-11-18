@@ -83,8 +83,8 @@ config.media_packaging = openmoq::publisher::MediaPackaging::kLoc;
 config.draft_version = openmoq::publisher::DraftVersion::kDraft18;
 ```
 
-The native backend extracts one clear H.264/AAC sample per object and supplies
-LOC-05 properties. For already encoded objects, declare `LivePackaging::kLoc`,
+The native backend extracts one clear sample (H.264, HEVC, AV1, VP9, AAC-LC or
+Opus) per object and supplies LOC-05 properties. For already encoded objects, declare `LivePackaging::kLoc`,
 provide codec extradata in `LiveTrack::init_data`, and fill
 `LiveObject::properties` with typed `ObjectProperty` entries. Even IDs hold
 `uint64_t`; odd IDs hold byte vectors. Supply Timestamp (16) and nonzero
