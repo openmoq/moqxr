@@ -77,19 +77,64 @@ function frameHashes(file, selector) {
     return run('ffmpeg', ['-v', 'error', '-xerror', '-i', file, '-map', selector, '-f', 'framemd5', '-'])
         .split('\n').filter(line => line && !line.startsWith('#')).map(line => line.split(',').slice(4).join(',').trim());
 }
-try {
-    const source = join(work, 'source.mp4');
+// One validation case per codec pairing. `codecArgs` are the FFmpeg encoder
+// options; `prefixes` are the catalog codec string prefixes expected per media type.
+const CASES = [
+    {
+        label: 'h264-aac',
+        codecArgs: ['-c:v', 'libx264', '-threads', '1', '-preset', 'fast', '-g', '25', '-keyint_min', '25',
+            '-sc_threshold', '0', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k'],
+        prefixes: { video: 'avc1.', audio: 'mp4a.40.' },
+    },
+    {
+        label: 'hevc-aac',
+        codecArgs: ['-c:v', 'libx265', '-x265-params', 'keyint=25:min-keyint=25:bframes=2:scenecut=0:log-level=error',
+            '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1', '-c:a', 'aac', '-b:a', '96k'],
+        prefixes: { video: 'hvc1.', audio: 'mp4a.40.' },
+    },
+    {
+        label: 'h264-opus',
+        codecArgs: ['-c:v', 'libx264', '-threads', '1', '-preset', 'fast', '-g', '25', '-keyint_min', '25',
+            '-sc_threshold', '0', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'libopus', '-b:a', '64k', '-ac', '2'],
+        prefixes: { video: 'avc1.', audio: 'opus' },
+    },
+    {
+        label: 'av1-aac',
+        codecArgs: ['-c:v', 'libsvtav1', '-g', '25', '-pix_fmt', 'yuv420p', '-svtav1-params', 'keyint=25:irefresh-type=2',
+            '-c:a', 'aac', '-b:a', '96k'],
+        prefixes: { video: 'av01.', audio: 'mp4a.40.' },
+        reordered: false, // AV1 hides reordering in show_existing_frame temporal units
+    },
+    {
+        label: 'vp9',
+        codecArgs: ['-c:v', 'libvpx-vp9', '-g', '25', '-deadline', 'realtime', '-cpu-used', '8', '-auto-alt-ref', '0',
+            '-lag-in-frames', '0', '-pix_fmt', 'yuv420p', '-an'],
+        prefixes: { video: 'vp09.' },
+        reordered: false,
+        noVideoConfig: true, // the WebCodecs VP9 registration defines no description
+        initFromSource: true, // CMAF packaging does not support VP9; the single-track source moov is the decoder init
+    },
+];
+async function validate({ label, codecArgs, prefixes, reordered = true, noVideoConfig = false, initFromSource = false }) {
+    const source = join(work, `${label}-source.mp4`);
     run('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25',
-        '-f', 'lavfi', '-i', 'sine=frequency=997:sample_rate=48000', '-t', '3',
-        '-c:v', 'libx264', '-threads', '1', '-preset', 'fast', '-g', '25', '-keyint_min', '25',
-        '-sc_threshold', '0', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k',
+        '-f', 'lavfi', '-i', 'sine=frequency=997:sample_rate=48000', '-t', '3', ...codecArgs,
         '-movflags', '+frag_keyframe+empty_moov+default_base_moof+separate_moof', source]);
     const probe = JSON.parse(run('ffprobe', ['-v', 'error', '-show_streams', '-show_packets', '-show_data', '-of', 'json', source]));
-    assert.ok(probe.packets.some(p => p.pts !== p.dts), 'fixture must exercise reordered B-frame PTS');
-    const loc = join(work, 'loc');
-    const cmaf = join(work, 'cmaf');
+    // Some muxers leave packet durations unset (ffprobe prints N/A); derive them from DTS deltas.
+    for (const stream of probe.streams) {
+        const packets = probe.packets.filter(p => p.stream_index === stream.index);
+        packets.forEach((packet, index) => {
+            if (packet.duration !== undefined) return;
+            const next = packets[index + 1];
+            packet.duration = next ? next.dts - packet.dts : packets[index - 1].duration ?? packets[index - 1].dts - packets[index - 2].dts;
+        });
+    }
+    if (reordered) assert.ok(probe.packets.some(p => p.pts !== p.dts), 'fixture must exercise reordered B-frame PTS');
+    const loc = join(work, `${label}-loc`);
+    const cmaf = join(work, `${label}-cmaf`);
     run(publisher, ['--input', source, '--draft', '18', '--packaging', 'loc', '--emit-dir', loc]);
-    run(publisher, ['--input', source, '--draft', '18', '--packaging', 'cmaf', '--emit-dir', cmaf]);
+    if (!initFromSource) run(publisher, ['--input', source, '--draft', '18', '--packaging', 'cmaf', '--emit-dir', cmaf]);
     const catalog = JSON.parse(await readFile(join(loc, 'catalog.json'), 'utf8'));
     const files = await readdir(loc);
     assert.ok(!files.some(file => /_(?:media|probe|init)\.mp4$/.test(file)), 'LOC artifacts must not masquerade as MP4');
@@ -97,24 +142,32 @@ try {
         const match = /^(.*)_g(\d+)_o(\d+)_media\.loc$/.exec(file);
         return match ? [{ file, track: match[1], group: BigInt(match[2]), object: BigInt(match[3]) }] : [];
     });
-    assert.equal(new Set(objects.map(o => o.track)).size, 2, 'expected audio and video media');
+    assert.equal(new Set(objects.map(o => o.track)).size, probe.streams.length, 'expected one LOC track per source stream');
     let total = 0;
     for (const stream of probe.streams) {
         const entry = catalog.tracks.find(t => t.role === stream.codec_type);
         assert.ok(entry, `missing ${stream.codec_type} catalog track`);
         assert.equal(entry.packaging, 'loc');
+        assert.ok(entry.codec.startsWith(prefixes[stream.codec_type]), `${label}: catalog codec ${entry.codec}`);
         assert.equal(entry.locmafVersion, undefined);
+        const noConfig = noVideoConfig && stream.codec_type === 'video';
         const extradata = hexDump(stream.extradata);
-        assert.ok(extradata.length, 'fixture codec extradata missing');
-        const initEntry = catalog.initDataList.find(i => i.id === entry.initRef);
-        assert.deepEqual(Buffer.from(initEntry.data, 'base64'), extradata, 'LOC catalog must carry codec extradata');
+        if (noConfig) {
+            assert.equal(entry.initRef, undefined, `${label}: a codec without a description has no catalog init data`);
+        } else {
+            assert.ok(extradata.length, 'fixture codec extradata missing');
+            const initEntry = catalog.initDataList.find(i => i.id === entry.initRef);
+            assert.deepEqual(Buffer.from(initEntry.data, 'base64'), extradata, 'LOC catalog must carry codec extradata');
+        }
         const samples = probe.packets.filter(p => p.stream_index === stream.index);
         const ordered = objects.filter(o => o.track === entry.name).sort((a, b) =>
             a.group !== b.group ? (a.group < b.group ? -1 : 1) : a.object < b.object ? -1 : a.object > b.object ? 1 : 0);
         assert.equal(ordered.length, samples.length, `${entry.name}: one LOC object per source sample`);
         const [numerator, denominator] = stream.time_base.split('/').map(BigInt);
         assert.equal(numerator, 1n);
-        const reconstructed = [await readFile(join(cmaf, `${entry.name}_init.mp4`))];
+        const sourceBytes = await readFile(source);
+        const firstFragment = sourceBytes.indexOf(Buffer.from('moof')) - 4;
+        const reconstructed = [initFromSource ? sourceBytes.subarray(0, firstFragment) : await readFile(join(cmaf, `${entry.name}_init.mp4`))];
         let previousGroup = -1n;
         for (let i = 0; i < ordered.length; ++i) {
             const object = ordered[i];
@@ -132,7 +185,8 @@ try {
             assert.equal(BigInt(sidecar.durationUs), BigInt(sample.duration) * 1000000n / denominator, 'inspection duration');
             const video = stream.codec_type === 'video';
             const config = values.get(video ? '13' : '15');
-            if (config || (video ? sample.flags.includes('K') : object.group !== previousGroup))
+            if (noConfig) assert.equal(config, undefined, `${label}: no config property for a codec without a description`);
+            else if (config || (video ? sample.flags.includes('K') : object.group !== previousGroup))
                 assert.deepEqual(config, extradata, 'random-access codec configuration');
             if (video) {
                 const marking = values.get('9');
@@ -147,11 +201,16 @@ try {
             reconstructed.push(fragment(Number.parseInt(stream.id), i + 1, sample, values.get('16'), payload));
             ++total;
         }
-        const rebuilt = join(work, `${entry.name}-reconstructed.mp4`);
+        const rebuilt = join(work, `${label}-${entry.name}-reconstructed.mp4`);
         await writeFile(rebuilt, Buffer.concat(reconstructed));
         assert.deepEqual(frameHashes(rebuilt, '0:0'), frameHashes(source, `0:${stream.index}`), `${entry.name}: decoded frames`);
     }
-    console.log(`LOC-05 PASS: ${total} samples; independent VI64 properties, exact payload/PTS/config, B-frame ordering, and FFmpeg decoded frames.`);
+    return total;
+}
+try {
+    let total = 0;
+    for (const testCase of CASES) total += await validate(testCase);
+    console.log(`LOC-05 PASS: ${total} samples over ${CASES.map(c => c.label).join(', ')}; independent VI64 properties, exact payload/PTS/config, B-frame ordering, and FFmpeg decoded frames.`);
     console.log('Inspection-artifact validation only; no network receiver interoperability claim.');
 } finally {
     if (option === '--keep') console.log(`Artifacts: ${work}`);

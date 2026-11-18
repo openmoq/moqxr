@@ -79,7 +79,8 @@ std::vector<MediaFragment> LocTrackEncoder::encode(std::span<const EncodedSample
         // Repeating extradata and the codec string keeps retained objects
         // self-describing without requiring a cache to rewrite an existing
         // object or fetch prior state.
-        fragment.properties.push_back({video ? 13U : 15U, config_});
+        // Codecs without a defined description (VP9) carry no config property.
+        if (!config_.empty()) fragment.properties.push_back({video ? 13U : 15U, config_});
         fragment.properties.push_back({17, std::vector<std::uint8_t>(track_.codec.begin(), track_.codec.end())});
         static_cast<void>(serialize_object_properties(fragment.properties));
         output.push_back(std::move(fragment));

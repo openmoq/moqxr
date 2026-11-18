@@ -104,7 +104,8 @@ Current reference limitations, verified from local sources:
 
 Add explicit `--packaging loc` / `MediaPackaging::kLoc`. Start with clear
 H.264 and AAC using the native draft-18 session, then add other codecs only
-with verified WebCodecs payload/config mappings. Preserve both existing
+with verified WebCodecs payload/config mappings. HEVC, Opus, AV1 and VP9 follow
+through the codec profile table below. Preserve both existing
 packaging modes and their default wire bytes. Reject LOC on unsupported
 transport/backend combinations before publication; never silently send the
 old LOC-01 property IDs under the LOC-05 implementation.
@@ -130,6 +131,27 @@ video frames. Track-scope properties are deferred: no track-property path
 exists yet, LOC-05 does not require them, and the catalog already carries the
 codec string per track. On the explicit object API, Codec String is optional
 but must match `LiveTrack::codec` when supplied.
+
+### Codec profiles
+
+`LocCodecProfile` (`include/openmoq/publisher/loc_codec_profile.h`) owns
+everything codec specific: sample entry recognition, decoder configuration
+validation and extraction, bitstream keyframe detection, and the explicit
+object API gate. Frame marking and group starts use the bitstream result, never
+the container sync flag alone.
+
+| Codec | Sample entries | Video/Audio Config | Keyframe from | Notes |
+| --- | --- | --- | --- | --- |
+| H.264 | `avc1` | `avcC` record | IDR NAL | In-band parameter sets rejected unless SRT strips identical copies |
+| HEVC | `hvc1`, `hev1` | `hvcC` record, needs VPS, SPS and PPS | IRAP types 16-21 with first_slice flag | Same in-band handling as H.264; `nuh_layer_id` above 0 rejected |
+| AV1 | `av01` | `av1C` record | First frame header, KEY_FRAME and not show_existing_frame | Exactly one shown frame per sample; spatial layers rejected, temporal sublayers allowed; in-band sequence header must agree on profile and still-picture bits (FFmpeg's av1C copy is not byte-identical) |
+| VP9 | `vp09` | none | First frame's `frame_type` | WebCodecs VP9 registration: "The description is not used for this codec." No `0x0D`, no catalog init data; codec string `vp09.PP.LL.DD` from `vpcC` |
+| AAC-LC | `mp4a` | AudioSpecificConfig | always | |
+| Opus | `Opus`, `opus` | OpusHead built from `dOps` (big endian to little endian) | always | Codec string `opus` |
+
+SRT (MPEG-TS) supports H.264, HEVC and AAC-LC only: MPEG-TS has no standard
+mapping for AV1, VP9 or Opus, so those streams are never published and a LOC
+session with no supported track fails with a message naming the supported codecs.
 
 ### Initial behavior contract
 
@@ -195,6 +217,8 @@ must never be emitted as LOC-05.
   progressive and fragmented timing. Mixed initial samples plus fragments fail
   explicitly. In-band AVC parameter sets and layered NALs are rejected, except
   the SRT adapter can strip byte-identical copies of advertised SPS/PPS.
+- `loc_codec_profile.cpp` and `loc_codec_{avc,hevc,av1,vp9,aac,opus}.cpp`: the codec
+  profile registry and one profile per codec (see Codec profiles above).
 - `loc_packager.cpp`: sample-to-object mapping, GOP recovery, source PTS,
   configuration replay, and batch plan preparation.
 - `cmsf_packager.cpp`: LOC catalog initialization and inspection files.
@@ -216,7 +240,7 @@ interoperability gates, not conclusions from a successful build.
 1. **Wire foundation:** property model and draft-18 serialization tests pass;
    existing CMAF and LOCMAF wire vectors remain identical. No CLI LOC mode
    is exposed before a complete sample-to-object path exists.
-2. **Batch publishing:** progressive and fragmented H.264/AAC inputs produce
+2. **Batch publishing:** progressive and fragmented H.264, HEVC, AV1, VP9, AAC and Opus inputs produce
    valid LOC catalogs, one object per sample, and matching inspection
    sidecars. Decode reconstructed samples independently and compare packet
    payload hashes, presentation timing, A/V offset, and frame hashes with

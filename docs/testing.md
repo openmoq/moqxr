@@ -76,13 +76,22 @@ ctest --test-dir build --output-on-failure
 bun scripts/test-loc05.mjs build/openmoq-publisher
 ```
 
-The independent script requires Bun, FFmpeg, and ffprobe. It generates H.264
-with B-frames and AAC, verifies exact sample bytes and presentation timestamps,
-decodes draft-18 vi64 property blocks independently, reconstructs MP4 for decoder
-input, and compares decoded frame hashes. It validates 217 samples in its current
-fixture. Source DTS/durations are checked against inspection metadata before
+The independent script requires Bun, FFmpeg (libx264, libx265, libopus, libsvtav1,
+libvpx-vp9) and ffprobe. It runs one case per codec pairing: H.264/AAC, HEVC/AAC,
+H.264/Opus, AV1/AAC, and video-only VP9. Each case verifies exact sample bytes and
+presentation timestamps, that the Video/Audio Config property equals the extradata
+ffprobe reports (OpusHead for Opus, none for VP9), that the Codec String matches
+the catalog, decodes draft-18 vi64 property blocks independently, reconstructs MP4
+for decoder input, and compares decoded frame hashes. It validates 952 samples
+across the five cases. VP9 is reconstructed from its source init segment because
+CMAF packaging does not support VP9. Source DTS/durations are checked against inspection metadata before
 reconstruction; LOC itself does not carry a standalone DTS/duration property.
 
+CTest also covers the per-codec profiles (`openmoq-publisher-loc-codec-profile-tests`:
+decoder configuration validation, bitstream keyframe detection, multi-picture and
+layered rejection, explicit object API gates) with generated HEVC, Opus, AV1 and VP9
+fixtures (`tests/fixtures/generated.txt` records the FFmpeg commands), late-join
+recovery per video codec, and rejection of encrypted or unsupported entries.
 CTest covers sample extraction and malformed input, LOC catalogs and grouping,
 property framing, session propagation, and live queue recovery. SRT tests check
 original PES timing, malformed clocks, AAC configuration changes, and decode

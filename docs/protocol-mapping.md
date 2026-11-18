@@ -35,7 +35,7 @@ This document records the draft-14 and draft-16 mappings and the LOC mapping. Th
 
 ## LOC packaging
 
-`--packaging loc --draft 18` maps the clear H.264/AAC subset of
+`--packaging loc --draft 18` maps the clear H.264, HEVC, AV1, VP9, AAC-LC and Opus subset of
 [LOC-05](draft-ietf-moq-loc-05.txt) onto draft-18 subgroup properties. This does
 not enable MOQT-19. CMAF remains the default.
 

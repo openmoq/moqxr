@@ -1,4 +1,5 @@
 #include "openmoq/publisher/encoded_sample.h"
+#include "../src/loc_packager.h"
 #include <algorithm>
 #include <functional>
 #include <iostream>
@@ -252,6 +253,126 @@ void fixtures() {
     check(config.size() >= 2 && config[0] == 0x11 && config[1] == 0x88, "AAC AudioSpecificConfig");
 }
 } // namespace
+void hevc_bitstream_independence() {
+    TrackDescription t;
+    t.track_id = 1;
+    t.track_name = "video";
+    t.handler_type = "vide";
+    t.sample_entry_type = "hvc1";
+    t.codec = "hvc1.1.6.L120.B0";
+    t.timescale = 1000;
+    Bytes hvcc = {1, 1, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8, 0, 0, 0x0B, 3};
+    for (const std::uint8_t type : {32, 33, 34}) {
+        hvcc.insert(hvcc.end(), {static_cast<std::uint8_t>(0x80 | type), 0, 1, 0, 3,
+                                 static_cast<std::uint8_t>(type << 1), 1, 0xAA});
+    }
+    t.codec_private = box("hvcC", hvcc);
+    t.fragment_defaults = TrackFragmentDefaults{10, 7, 0x02000000}; // Every sample is flagged as a sync sample.
+    const std::vector<TrackDescription> tracks{t};
+    auto moof = fragment_box(0x01000801, 0, 0);
+    // Four-byte length, then IDR_W_RADL and TRAIL_R slices that both start a picture.
+    auto mdat = box("mdat", {0, 0, 0, 3, 0x26, 0x01, 0x80, 0, 0, 0, 3, 0x02, 0x01, 0x80});
+    const auto data_offset = static_cast<std::uint32_t>(moof.size() + 8);
+    for (int n = 0; n < 4; ++n)
+        moof[moof.size() - 12 + n] = data_offset >> (24 - 8 * n);
+    const auto s = read_fragment_samples(moof, mdat, tracks);
+    check(s.size() == 2, "two HEVC samples");
+    check(s[0].independent, "IDR sample is independent");
+    check(!s[1].independent, "TRAIL_R flagged sync by the container is still not independent");
+}
+void hevc_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-hevc-fragmented.mp4");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() == 8, "HEVC fixture has eight samples");
+    for (std::size_t i = 0; i < samples.size(); ++i)
+        check(samples[i].independent == (i == 0 || i == 4), "HEVC keyframes follow the 4-frame GOP");
+    check(samples[1].presentation_time > samples[2].presentation_time, "B-frame presentation order is preserved");
+    check(loc_codec_config(parsed.tracks.front()).size() > 23, "hvcC payload is exposed as Video Config");
+}
+void opus_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-opus.mp4");
+    check(parsed.tracks.size() == 1 && parsed.tracks.front().codec == "opus", "Opus fixture has one opus track");
+    const auto &track = parsed.tracks.front();
+    check(track.codec_private.size() > 8 && std::string(track.codec_private.begin() + 4, track.codec_private.begin() + 8) == "dOps",
+          "dOps is captured as codec private data");
+    // OpusHead as FFmpeg derives it from the same file (ffprobe extradata).
+    const Bytes expected = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0};
+    check(loc_codec_config(track) == expected, "Audio Config is the OpusHead");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() >= 40, "Opus fixture has one sample per 20 ms packet");
+    check(samples.front().duration == 960, "Opus packets are 20 ms at 48 kHz");
+    for (const auto &sample : samples) // The final packet is trimmed by the encoder.
+        check(sample.independent && !sample.bytes.empty() && sample.duration > 0 && sample.duration <= 960,
+              "Opus samples are independent packets of at most 20 ms");
+}
+void av1_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-av1-fragmented.mp4");
+    check(parsed.tracks.size() == 1 && parsed.tracks.front().sample_entry_type == "av01", "AV1 fixture has one av01 track");
+    const auto config = loc_codec_config(parsed.tracks.front());
+    check(config.size() > 4 && config[0] == 0x81, "av1C payload is exposed as Video Config");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() == 12, "AV1 fixture has twelve temporal units");
+    for (std::size_t i = 0; i < samples.size(); ++i)
+        check(samples[i].independent == (i % 4 == 0), "AV1 keyframes follow the 4-frame GOP");
+    check(samples[2].bytes.size() <= 8, "show_existing_frame temporal units are tiny and still published");
+}
+void vp9_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-vp9-fragmented.mp4");
+    check(parsed.tracks.size() == 1 && parsed.tracks.front().sample_entry_type == "vp09", "VP9 fixture has one vp09 track");
+    check(parsed.tracks.front().codec == "vp09.00.10.08", "VP9 codec string is built from vpcC (profile 0, level 1.0, 8-bit)");
+    check(loc_codec_config(parsed.tracks.front()).empty(), "VP9 has no Video Config");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() == 12, "VP9 fixture has twelve frames");
+    for (std::size_t i = 0; i < samples.size(); ++i)
+        check(samples[i].independent == (i % 4 == 0), "VP9 keyframes follow the 4-frame GOP");
+}
+void new_codec_guarantees() {
+    const char *fixtures_to_check[] = {"tests/fixtures/loc-hevc-fragmented.mp4", "tests/fixtures/loc-av1-fragmented.mp4",
+                                       "tests/fixtures/loc-vp9-fragmented.mp4", "tests/fixtures/loc-opus.mp4"};
+    for (const char *path : fixtures_to_check) {
+        const auto track = parse_mp4_file(path).tracks.front();
+        auto encrypted = track;
+        encrypted.protection = CencTrackProtection{};
+        rejects([&] { loc_codec_config(encrypted); });
+        auto wrapped = track;
+        wrapped.sample_entry_type = track.handler_type == "vide" ? "encv" : "enca";
+        rejects([&] { loc_codec_config(wrapped); });
+        auto unsupported = track;
+        unsupported.sample_entry_type = "vvc1";
+        try {
+            loc_codec_config(unsupported);
+            throw std::runtime_error("vvc1 accepted");
+        } catch (const std::runtime_error &error) {
+            check(std::string(error.what()).find("unsupported codec/sample description") != std::string::npos,
+                  "unsupported entries fail with a clear message");
+        }
+    }
+}
+// After a dropped keyframe, a delta frame must never start a group, whatever the codec.
+void late_join_per_codec() {
+    for (const char *path : {"tests/fixtures/loc-bframes-fragmented.mp4", "tests/fixtures/loc-hevc-fragmented.mp4",
+                             "tests/fixtures/loc-av1-fragmented.mp4", "tests/fixtures/loc-vp9-fragmented.mp4"}) {
+        const auto parsed = parse_mp4_file(path);
+        const auto samples = read_encoded_samples(parsed);
+        const auto &track = parsed.tracks.front();
+        const auto independent = std::find_if(samples.begin(), samples.end(), [](const auto &s) { return s.independent; });
+        const auto dependent = std::find_if(samples.begin(), samples.end(), [](const auto &s) { return !s.independent; });
+        check(independent != samples.end() && dependent != samples.end(), "fixture has both frame kinds");
+        LocTrackEncoder encoder(track);
+        auto key = *independent;
+        check(encoder.encode(std::span<const EncodedSample>(&key, 1)).size() == 1, "initial keyframe publishes");
+        // A gap in the decode timeline drops the dependency chain.
+        auto delta = *dependent;
+        delta.decode_time = key.decode_time + 2 * key.duration;
+        delta.presentation_time = static_cast<std::int64_t>(delta.decode_time);
+        check(encoder.encode(std::span<const EncodedSample>(&delta, 1)).empty(), "delta frame after a gap is dropped");
+        auto resumed = key;
+        resumed.decode_time = delta.decode_time + delta.duration;
+        resumed.presentation_time = static_cast<std::int64_t>(resumed.decode_time);
+        const auto out = encoder.encode(std::span<const EncodedSample>(&resumed, 1));
+        check(out.size() == 1 && out.front().group_id == 1 && out.front().object_id == 0, "recovery starts a new group");
+    }
+}
 int main() {
     try {
         init_validation();
@@ -260,6 +381,13 @@ int main() {
         absolute_offsets();
         fixtures();
         bframes();
+        hevc_bitstream_independence();
+        hevc_fixture();
+        opus_fixture();
+        av1_fixture();
+        vp9_fixture();
+        new_codec_guarantees();
+        late_join_per_codec();
         std::cout << "Encoded sample tests passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

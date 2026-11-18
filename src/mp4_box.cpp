@@ -515,6 +515,23 @@ std::string av1_codec_string(const Mp4Box& sample_entry, std::span<const std::ui
     return out.str();
 }
 
+std::string vp9_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
+    const auto vpcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
+                                          kVisualSampleEntryChildOffset, "vpcC");
+    // vpcC is an 8-byte box header, then a FullBox (version 1, flags) holding
+    //   profile(8) level(8) bitDepth(4) chroma(3) fullRange(1) ...
+    // VP9-ISOBMFF short form: vp09.<profile>.<level>.<bitDepth>, two digits each.
+    if (!vpcc.has_value() || vpcc->offset + 8 + 7 > bytes.size() || bytes[vpcc->offset + 8] != 1) {
+        return "vp09";
+    }
+    const std::size_t record_offset = vpcc->offset + 8;
+    std::ostringstream out;
+    out << "vp09." << std::setfill('0') << std::setw(2) << static_cast<unsigned int>(bytes[record_offset + 4]) << '.'
+        << std::setw(2) << static_cast<unsigned int>(bytes[record_offset + 5]) << '.' << std::setw(2)
+        << static_cast<unsigned int>(bytes[record_offset + 6] >> 4U);
+    return out.str();
+}
+
 std::string mpeg4_audio_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
     const auto esds = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
                                           kAudioSampleEntryChildOffset, "esds");
@@ -573,6 +590,9 @@ std::string codec_string_from_sample_entry(const Mp4Box& sample_entry, std::span
     }
     if (sample_entry.type == "av01") {
         return av1_codec_string(sample_entry, bytes);
+    }
+    if (sample_entry.type == "vp09") {
+        return vp9_codec_string(sample_entry, bytes);
     }
     if (sample_entry.type == "mp4a") {
         return mpeg4_audio_codec_string(sample_entry, bytes);
@@ -866,7 +886,7 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         // as the wrong value (0) for every encrypted audio track, since
         // validate_track makes those fields MUST-present.
         if ((effective_type == "avc1" || effective_type == "avc3" || effective_type == "hvc1" ||
-             effective_type == "hev1") &&
+             effective_type == "hev1" || effective_type == "vp09") &&
             sample_entry.payload.offset + 28 <= bytes.size()) {
             width = read_be16(bytes, sample_entry.payload.offset + 24);
             height = read_be16(bytes, sample_entry.payload.offset + 26);
@@ -910,7 +930,9 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         std::vector<std::uint8_t> codec_private;
         const std::string_view config_type = effective_type == "avc1" || effective_type == "avc3" ? "avcC" :
             effective_type == "hvc1" || effective_type == "hev1" ? "hvcC" :
-            effective_type == "av01" ? "av1C" : "esds";
+            effective_type == "av01" ? "av1C" :
+            effective_type == "vp09" ? "vpcC" :
+            effective_type == "Opus" || effective_type == "opus" ? "dOps" : "esds";
         if (const auto config = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
                                                     sample_entry_child_offset, config_type)) {
             const auto config_bytes = slice_bytes(bytes, *config);

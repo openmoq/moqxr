@@ -106,9 +106,23 @@ Presentation timestamps retain their source timescale, including B-frame
 reordering; transmission follows decode order. Every object repeats codec
 configuration so a retained group can initialize its decoder.
 
-Initial support is clear H.264 `avc1` and AAC-LC. Unsupported codecs, encrypted
+Supported clear codecs, each with the Codec String taken from the catalog and
+a decoder configuration carried as Video Config or Audio Config:
+
+| Codec | Sample entry | Codec String | Config property |
+| --- | --- | --- | --- |
+| H.264 | `avc1` | `avc1.` | `avcC` record |
+| HEVC | `hvc1`, `hev1` | `hvc1.`, `hev1.` | `hvcC` record |
+| AV1 | `av01` | `av01.` | `av1C` record |
+| VP9 | `vp09` | `vp09.` | none (WebCodecs defines no description) |
+| AAC-LC | `mp4a` | `mp4a.40.` | AudioSpecificConfig |
+| Opus | `Opus`, `opus` | `opus` | OpusHead |
+
+Frame marking and group starts come from the video bitstream, not the container
+sync flag. Unsupported codecs, encrypted
 input, non-identity edit lists, mixed initial progressive samples plus fragments,
-negative presentation timestamps, and in-band AVC configuration changes fail
+negative presentation timestamps, in-band configuration changes, layered or
+multi-picture samples fail
 explicitly. `--stream-per-object`, `--coalesce-cmaf-chunks`, drafts earlier than 18 (such as
 `--draft 16`), and the libmoq backend are incompatible with this LOC profile.
 
@@ -116,8 +130,10 @@ The same flags select LOC for live stdin, SRT, and DASH ingest. Live MP4/DASH
 must start with an initialization segment whose sample tables are empty. SRT
 preserves its original 90 kHz PTS/DTS, including A/V offsets; matching repeated
 SPS/PPS are stripped from its converted samples, while changed parameters fail.
-SRT requires one AVC access unit per PES and one AAC raw data block per ADTS
-frame; AAC configuration changes and detected multi-picture AVC samples fail.
+SRT carries H.264, HEVC and AAC-LC only (MPEG-TS has no standard mapping for
+AV1, VP9 or Opus, so those streams are not published); it requires one AVC or
+HEVC access unit per PES and one AAC raw data block per ADTS frame. AAC
+configuration changes and detected multi-picture samples fail.
 Video uses one-sample lookahead to determine decode duration. At shutdown, the
 last sample reuses the last measured decode interval for scheduling; a lone
 sample with no measured interval fails. Missing or regressing PES clocks fail

@@ -3,6 +3,7 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_srt_ingest.h"
 #include "openmoq/publisher/locmaf_encoder.h"
+#include "openmoq/publisher/loc_codec_profile.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
 #include "openmoq/publisher/version.h"
@@ -8390,6 +8391,13 @@ TransportStatus encode_live_fragment(openmoq::publisher::MediaFragment& fragment
 }  // namespace
 
 namespace live_srt_internal {
+std::string no_srt_tracks_message(MediaPackaging packaging) {
+    if (packaging == MediaPackaging::kLoc) {
+        return "no supported live tracks available from SRT source; LOC over SRT supports H.264 or HEVC video "
+               "and AAC audio in MPEG-TS";
+    }
+    return "no live tracks available from SRT source";
+}
 std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
     std::span<const openmoq::publisher::MediaFragment> fragments,
     const std::vector<openmoq::publisher::TrackDescription>& tracks) {
@@ -8539,7 +8547,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     if (tracks.empty()) {
         stop_requested = true;
         srt_manager.join();
-        return TransportStatus::failure("no live tracks available from SRT source");
+        return TransportStatus::failure(live_srt_internal::no_srt_tracks_message(media_packaging_));
     }
 
     const std::vector<std::uint8_t> synthetic_init =
@@ -11737,14 +11745,14 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
         for (const auto& track : source.tracks) {
             if (track.track_name == "catalog") continue;
-            if (track.packaging != openmoq::publisher::LivePackaging::kLoc || track.codec.empty() || track.init_data.empty()) {
+            if (track.packaging != openmoq::publisher::LivePackaging::kLoc || track.codec.empty()) {
                 return TransportStatus::failure("LOC object sources require LOC packaging and codec configuration");
             }
             const bool video = track.media_type == openmoq::publisher::LiveMediaType::kVideo;
             const bool audio = track.media_type == openmoq::publisher::LiveMediaType::kAudio;
-            if ((!video && !audio) || (video && (!track.codec.starts_with("avc1.") || track.init_data.size() < 7 || track.init_data[0] != 1)) ||
-                (audio && (!track.codec.starts_with("mp4a.40.") || track.init_data.size() < 2))) {
-                return TransportStatus::failure("LOC requires explicit AVC or AAC media type and decoder configuration");
+            const auto* profile = (video || audio) ? openmoq::publisher::find_loc_profile_for_codec(track.codec, video) : nullptr;
+            if (profile == nullptr || !profile->accepts_live_track(track.codec, track.init_data, video)) {
+                return TransportStatus::failure("LOC requires an explicit audio or video media type with a supported codec (H.264, HEVC, AV1, VP9, AAC or Opus) and matching decoder configuration");
             }
             // An object's Codec String must equal this value, so checking it
             // here also covers every 0x11 property and the catalog codec field.
@@ -13188,7 +13196,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 return TransportStatus::failure(error.what());
             }
             if (!timestamp || !timescale) return TransportStatus::failure("LOC objects require Timestamp and nonzero Timescale");
-            if (next->object_id == 0 && ((!config_present) || (video && !independent))) {
+            // Codecs without a description (VP9) announce no init data and carry no config property.
+            if (next->object_id == 0 && ((!config_present && !metadata->init_data.empty()) || (video && !independent))) {
                 return TransportStatus::failure("LOC group start requires matching configuration and independent video frame marking");
             }
             next->final_in_subgroup = false;

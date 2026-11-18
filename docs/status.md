@@ -36,14 +36,18 @@ Draft status:
 
 ## LOC Status
 
-The native backend implements the clear H.264/AAC subset of LOC-05 with
-`--packaging loc --draft 18`. CMAF remains the primary default and LOCMAF keeps
+The native backend implements the clear H.264, HEVC, AV1, VP9, AAC-LC and Opus
+subset of LOC-05 with `--packaging loc --draft 18`. Each codec is a profile
+(sample entry, decoder configuration, bitstream keyframe detection); VP9 carries
+no Video Config because the WebCodecs registration defines no description, and
+SRT supports H.264, HEVC and AAC only. CMAF remains the primary default and LOCMAF keeps
 its separate packaging path. LOC objects carry source presentation timing,
 timescale, frame marking, codec extradata, and the codec string; video uses
 GOP groups and audio uses one sample per group. Unsupported input and
 configuration changes fail explicitly. The libmoq backend does not publish this LOC profile.
 
-Independent offline validation covers 217 encoded samples and decoded-frame
+Independent offline validation covers 952 encoded samples over five codec
+pairings (H.264/AAC, HEVC/AAC, H.264/Opus, AV1/AAC, VP9) with decoded-frame
 equivalence, alongside property-wire and live-ingest regressions. Real relay
 forwarding, cached FETCH, and LOC-05 browser playback remain unverified; the
 reference Playa LOC decoder still uses LOC-01 IDs. See the
