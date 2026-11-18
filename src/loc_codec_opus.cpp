@@ -18,6 +18,16 @@ void put_le32(std::vector<std::uint8_t> &out, std::uint64_t v) {
     put_le16(out, v >> 16);
 }
 
+// RFC 7845 section 5.1.1 channel mapping rules for families 1 and 255.
+bool valid_channel_mapping(unsigned family, unsigned channels, unsigned streams, unsigned coupled,
+                           std::span<const std::uint8_t> mapping) {
+    if (channels == 0 || (family == 1 && channels > 8) || streams == 0 || coupled > streams ||
+        streams + coupled > 255 || mapping.size() != channels)
+        return false;
+    return std::all_of(mapping.begin(), mapping.end(),
+                       [&](std::uint8_t entry) { return entry == 255 || entry < streams + coupled; });
+}
+
 // ISO dOps (big endian, RFC 7845 fields) to the OpusHead identification header
 // (little endian) that WebCodecs expects as the decoder description.
 std::vector<std::uint8_t> opus_head_from_dops(std::span<const std::uint8_t> dops) {
@@ -40,11 +50,20 @@ std::vector<std::uint8_t> opus_head_from_dops(std::span<const std::uint8_t> dops
     if (family == 0) {
         if (channels > 2)
             fail("Opus mapping family 0 allows at most two channels");
-    } else {
-        head.push_back(static_cast<std::uint8_t>(r.get(1)));
-        head.push_back(static_cast<std::uint8_t>(r.get(1)));
+    } else if (family == 1 || family == 255) {
+        const auto streams = r.get(1);
+        const auto coupled = r.get(1);
+        std::vector<std::uint8_t> mapping;
         for (std::uint64_t i = 0; i < channels; ++i)
-            head.push_back(static_cast<std::uint8_t>(r.get(1)));
+            mapping.push_back(static_cast<std::uint8_t>(r.get(1)));
+        if (!valid_channel_mapping(static_cast<unsigned>(family), static_cast<unsigned>(channels),
+                                   static_cast<unsigned>(streams), static_cast<unsigned>(coupled), mapping))
+            fail("invalid Opus channel mapping");
+        head.push_back(static_cast<std::uint8_t>(streams));
+        head.push_back(static_cast<std::uint8_t>(coupled));
+        head.insert(head.end(), mapping.begin(), mapping.end());
+    } else {
+        fail("unsupported Opus channel mapping family");
     }
     r.end();
     return head;
@@ -55,8 +74,13 @@ bool valid_opus_head(std::span<const std::uint8_t> head) {
     if (head.size() < kOpusHeadFixedSize || !std::equal(head.begin(), head.begin() + 8, kMagic) || head[8] != 1 ||
         head[9] == 0)
         return false;
-    const std::size_t expected = head[18] == 0 ? kOpusHeadFixedSize : kOpusHeadFixedSize + 2 + head[9];
-    return head.size() == expected && (head[18] != 0 || head[9] <= 2);
+    const unsigned channels = head[9], family = head[18];
+    if (family == 0)
+        return head.size() == kOpusHeadFixedSize && channels <= 2;
+    if (family != 1 && family != 255)
+        return false;
+    return head.size() == kOpusHeadFixedSize + 2 + channels &&
+           valid_channel_mapping(family, channels, head[19], head[20], head.subspan(21));
 }
 
 class OpusLocProfile final : public LocCodecProfile {

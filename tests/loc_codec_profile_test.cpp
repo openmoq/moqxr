@@ -265,6 +265,37 @@ void opus_rejects_malformed_dops() {
     const auto trailing_track = opus_track(trailing);
     rejects([&] { find_loc_profile(trailing_track)->extract_config(trailing_track); });
 }
+void opus_validates_channel_mapping() {
+    auto track_for = [](std::uint8_t channels, std::uint8_t family, std::uint8_t streams, std::uint8_t coupled,
+                        const Bytes &mapping) {
+        Bytes tail = {streams, coupled};
+        append(tail, mapping);
+        return opus_track(dops(channels, 312, 48000, 0, family, tail));
+    };
+    auto accepted = [&](const TrackDescription &t) {
+        try {
+            find_loc_profile(t)->extract_config(t);
+            return true;
+        } catch (const std::runtime_error &) {
+            return false;
+        }
+    };
+    check(accepted(track_for(6, 1, 4, 2, {0, 4, 1, 2, 3, 5})), "valid 5.1 mapping");
+    check(accepted(track_for(3, 255, 3, 0, {0, 1, 2})), "valid family 255 mapping");
+    check(accepted(track_for(2, 1, 1, 1, {0, 255})), "255 marks a silent channel");
+    check(!accepted(track_for(6, 1, 0, 3, {9, 9, 9, 9, 9, 9})), "zero streams and out of range entries");
+    check(!accepted(track_for(2, 1, 1, 2, {0, 1})), "coupled streams exceed streams");
+    check(!accepted(track_for(2, 1, 1, 1, {0, 2})), "mapping entry beyond streams plus coupled");
+    check(!accepted(track_for(12, 1, 12, 0, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})), "family 1 allows at most 8 channels");
+    check(!accepted(track_for(4, 2, 4, 0, {0, 1, 2, 3})), "ambisonics families are not supported");
+    // The explicit object API validates the same table inside an OpusHead.
+    const auto good = track_for(6, 1, 4, 2, {0, 4, 1, 2, 3, 5});
+    auto head = find_loc_profile(good)->extract_config(good);
+    const auto *opus = find_loc_profile_for_codec("opus", false);
+    check(opus->accepts_live_track("opus", head, false), "valid OpusHead accepted");
+    head.back() = 9; // mapping entry beyond streams plus coupled
+    check(!opus->accepts_live_track("opus", head, false), "OpusHead with an out of range mapping rejected");
+}
 void opus_sample_is_always_independent() {
     const auto t = opus_track(dops(2, 312, 48000, 0, 0));
     const auto *p = find_loc_profile(t);
@@ -487,6 +518,7 @@ int main() {
         opus_dops_converts_to_opushead_family0();
         opus_dops_converts_family1_with_mapping_table();
         opus_rejects_malformed_dops();
+        opus_validates_channel_mapping();
         opus_sample_is_always_independent();
         opus_accepts_live_track_requires_codec_opus_and_opushead();
         av1_extract_config_returns_av1c_payload();

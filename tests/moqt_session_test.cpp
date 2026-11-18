@@ -12202,6 +12202,8 @@ int main() {
         status = session.connect(endpoint, tls);
         if (status.ok) status = session.publish_live_objects(source, DraftVersion::kDraft18);
         ok &= expect(status.ok == (variant == 0), "LOC VP9 source needs no codec configuration: " + status.message);
+        if (variant != 0) ok &= expect(status.message.find("HEVC") != std::string::npos && status.message.find("AVC or AAC") == std::string::npos,
+                                       "LOC source rejection names every supported codec: " + status.message);
         ok &= expect(session.publish_stats().objects_published == (variant == 0 ? 1 : 0), "invalid VP9 source never publishes media");
     }
 

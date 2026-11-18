@@ -11752,7 +11752,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             const bool audio = track.media_type == openmoq::publisher::LiveMediaType::kAudio;
             const auto* profile = (video || audio) ? openmoq::publisher::find_loc_profile_for_codec(track.codec, video) : nullptr;
             if (profile == nullptr || !profile->accepts_live_track(track.codec, track.init_data, video)) {
-                return TransportStatus::failure("LOC requires explicit AVC or AAC media type and decoder configuration");
+                return TransportStatus::failure("LOC requires an explicit audio or video media type with a supported codec (H.264, HEVC, AV1, VP9, AAC or Opus) and matching decoder configuration");
             }
             // An object's Codec String must equal this value, so checking it
             // here also covers every 0x11 property and the catalog codec field.
