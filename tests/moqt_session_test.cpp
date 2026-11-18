@@ -12177,6 +12177,34 @@ int main() {
         if (invalid == 7) ok &= expect(status.message.find("UTF-8") != std::string::npos, "malformed LOC codec string rejected as UTF-8: " + status.message);
     }
 
+    for (int variant = 0; variant < 3; ++variant) {
+        // VP9 has no codec description: the track carries no init data and objects carry no Video Config.
+        // 1: the track declares init data; 2: an object carries a Video Config anyway.
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+        transport.reads[4].push_back(encode_publish_ok_message(DraftVersion::kDraft18, 2, 1));
+        LiveTrack track{.track_name = "video", .media_type = openmoq::publisher::LiveMediaType::kVideo,
+                        .packaging = openmoq::publisher::LivePackaging::kLoc, .codec = "vp09.00.10.08"};
+        if (variant == 1) track.init_data = {1, 2, 3};
+        bool emitted = false;
+        LiveObjectSource source{.tracks = {track}, .next_object = [&]() -> std::optional<LiveObject> {
+            if (emitted) return std::nullopt;
+            emitted = true;
+            LiveObject object{.track_name = "video", .payload = {0x82, 0x49, 0x83},
+                .properties = {{8, std::uint64_t{1000}}, {16, std::uint64_t{42}}, {9, std::vector<std::uint8_t>{0xe0}}}};
+            if (variant == 2) object.properties.push_back({13, std::vector<std::uint8_t>{1, 2, 3}});
+            const std::string codec = "vp09.00.10.08";
+            object.properties.push_back({17, std::vector<std::uint8_t>(codec.begin(), codec.end())});
+            return object;
+        }};
+        MoqtSession session(transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
+        status = session.connect(endpoint, tls);
+        if (status.ok) status = session.publish_live_objects(source, DraftVersion::kDraft18);
+        ok &= expect(status.ok == (variant == 0), "LOC VP9 source needs no codec configuration: " + status.message);
+        ok &= expect(session.publish_stats().objects_published == (variant == 0 ? 1 : 0), "invalid VP9 source never publishes media");
+    }
+
     {
         MockTransport transport;
         transport.reads[3].push_back(encode_draft18_setup_response());

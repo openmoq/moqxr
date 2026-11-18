@@ -315,6 +315,16 @@ void av1_fixture() {
         check(samples[i].independent == (i % 4 == 0), "AV1 keyframes follow the 4-frame GOP");
     check(samples[2].bytes.size() <= 8, "show_existing_frame temporal units are tiny and still published");
 }
+void vp9_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-vp9-fragmented.mp4");
+    check(parsed.tracks.size() == 1 && parsed.tracks.front().sample_entry_type == "vp09", "VP9 fixture has one vp09 track");
+    check(parsed.tracks.front().codec == "vp09.00.10.08", "VP9 codec string is built from vpcC (profile 0, level 1.0, 8-bit)");
+    check(loc_codec_config(parsed.tracks.front()).empty(), "VP9 has no Video Config");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() == 12, "VP9 fixture has twelve frames");
+    for (std::size_t i = 0; i < samples.size(); ++i)
+        check(samples[i].independent == (i % 4 == 0), "VP9 keyframes follow the 4-frame GOP");
+}
 int main() {
     try {
         init_validation();
@@ -327,6 +337,7 @@ int main() {
         hevc_fixture();
         opus_fixture();
         av1_fixture();
+        vp9_fixture();
         std::cout << "Encoded sample tests passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

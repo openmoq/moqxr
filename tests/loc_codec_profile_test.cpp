@@ -399,6 +399,71 @@ void av1_accepts_live_track_requires_av01_prefix() {
     check(!av1->accepts_live_track("av01.0.04M.08", Bytes{1, 66, 0, 10, 252, 225, 0, 1, 0x67}, true), "avcC bytes are not an av1C");
     check(find_loc_profile_for_codec("av01.0.04M.08", false) == nullptr, "av01 on an audio track");
 }
+
+// ---- VP9 ----
+// vpcC payload: version 1, flags 0, profile, level, bitDepth/chroma/range, colour fields, no init data.
+Bytes vpcc_payload(std::uint8_t profile = 0, std::uint8_t level = 10, std::uint8_t depth_chroma = 0x82) {
+    return {1, 0, 0, 0, profile, level, depth_chroma, 2, 2, 2, 0, 0};
+}
+TrackDescription vp9_track(Bytes payload = vpcc_payload()) {
+    TrackDescription t;
+    t.handler_type = "vide";
+    t.sample_entry_type = "vp09";
+    t.codec = "vp09.00.10.08";
+    t.timescale = 1000;
+    t.codec_private = box("vpcC", std::move(payload));
+    return t;
+}
+LocSampleCheck vp9_check(const Bytes &sample) {
+    const auto t = vp9_track();
+    return find_loc_profile(t)->check_sample(t, sample, false);
+}
+void vp9_has_no_video_config() {
+    const auto t = vp9_track();
+    const auto *p = find_loc_profile(t);
+    check(p != nullptr, "vp09 video has a profile");
+    check(!p->has_config(), "WebCodecs defines no description for VP9");
+    check(p->extract_config(t).empty(), "no Video Config bytes");
+}
+void vp9_validate_vpcc_rejects_bad_config() {
+    auto bad_version = vpcc_payload();
+    bad_version[0] = 0;
+    auto with_init_data = vpcc_payload();
+    with_init_data[11] = 1;
+    with_init_data.push_back(0xAA);
+    auto truncated = vpcc_payload();
+    truncated.pop_back();
+    auto trailing = vpcc_payload();
+    trailing.push_back(0);
+    for (const auto &payload : {bad_version, with_init_data, truncated, trailing}) {
+        const auto t = vp9_track(payload);
+        rejects([&] { find_loc_profile(t)->extract_config(t); });
+    }
+}
+void vp9_key_frame_is_independent() {
+    check(vp9_check(Bytes{0x82, 0x49, 0x83}).independent, "profile 0 key frame");
+    check(vp9_check(Bytes{0x90, 0x00}).independent, "profile 2 key frame");
+}
+void vp9_inter_frame_is_not_independent() {
+    check(!vp9_check(Bytes{0x86, 0x00}).independent, "profile 0 inter frame");
+}
+void vp9_show_existing_frame_is_not_independent() {
+    check(!vp9_check(Bytes{0x88, 0x00}).independent, "show_existing_frame");
+}
+void vp9_profile3_reserved_bit_handled() {
+    check(vp9_check(Bytes{0xB0, 0x00}).independent, "profile 3 key frame skips the reserved bit");
+    check(!vp9_check(Bytes{0xB2, 0x00}).independent, "profile 3 inter frame");
+}
+void vp9_rejects_bad_frames() {
+    rejects([&] { vp9_check(Bytes{}); });
+    rejects([&] { vp9_check(Bytes{0x42, 0x00}); }); // frame_marker is not 2
+}
+void vp9_accepts_live_track_requires_vp09_prefix_without_init_data() {
+    const auto *vp9 = find_loc_profile_for_codec("vp09.00.10.08", true);
+    check(vp9 != nullptr && vp9->accepts_live_track("vp09.00.10.08", Bytes{}, true), "vp9 accepted without init data");
+    check(!vp9->accepts_live_track("vp09.00.10.08", Bytes{1, 2, 3}, true), "init data is not defined for VP9");
+    check(find_loc_profile_for_codec("vp09.00.10.08", false) == nullptr, "vp09 on an audio track");
+}
 } // namespace
 int main() {
     try {
@@ -436,6 +501,14 @@ int main() {
         av1_checks_inband_sequence_header_against_av1c();
         av1_rejects_layers_tile_lists_and_malformed_obus();
         av1_accepts_live_track_requires_av01_prefix();
+        vp9_has_no_video_config();
+        vp9_validate_vpcc_rejects_bad_config();
+        vp9_key_frame_is_independent();
+        vp9_inter_frame_is_not_independent();
+        vp9_show_existing_frame_is_not_independent();
+        vp9_profile3_reserved_bit_handled();
+        vp9_rejects_bad_frames();
+        vp9_accepts_live_track_requires_vp09_prefix_without_init_data();
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

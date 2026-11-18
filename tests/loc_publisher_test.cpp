@@ -136,6 +136,32 @@ int main() {
             }
             check(objects == 12, "AV1 fixture publishes every temporal unit");
         }
+        {
+            // VP9: no Video Config (WebCodecs defines no description), Codec String and marking still carried.
+            std::istringstream input(fixture("loc-vp9-fragmented.mp4"));
+            auto prepared = Publisher(config).prepare_stream(input, "loc-vp9-fragmented.mp4");
+            std::size_t objects = 0;
+            for (const auto& object : prepared.plan.objects) {
+                if (object.kind != CmsfObjectKind::kMedia) continue;
+                ++objects;
+                check(!property(object, 13), "VP9 objects must not carry a Video Config");
+                const auto* codec = property(object, 17);
+                check(codec && std::get<std::vector<std::uint8_t>>(codec->value) ==
+                          std::vector<std::uint8_t>({'v', 'p', '0', '9', '.', '0', '0', '.', '1', '0', '.', '0', '8'}),
+                      "VP9 Codec String");
+                const auto* marking = property(object, 9);
+                check(marking && std::get<std::vector<std::uint8_t>>(marking->value) ==
+                          std::vector<std::uint8_t>{static_cast<std::uint8_t>((objects - 1) % 4 == 0 ? 0xe0 : 0xc0)},
+                      "VP9 frame marking follows bitstream keyframes");
+                check(object.group_id == (objects - 1) / 4 && object.object_id == (objects - 1) % 4, "VP9 GOP grouping");
+            }
+            check(objects == 12, "VP9 fixture publishes every frame");
+            const auto catalog = std::find_if(prepared.plan.objects.begin(), prepared.plan.objects.end(),
+                [](const auto& object) { return object.track_name == "catalog"; });
+            const std::string json(catalog->owned_payload.begin(), catalog->owned_payload.end());
+            check(json.find("\"codec\":\"vp09.00.10.08\"") != std::string::npos && json.find("initRef") == std::string::npos,
+                  "VP9 catalog carries the codec string and no init data");
+        }
         // A missing decode interval invalidates dependent video until a new IDR.
         std::istringstream video_input(fixture("locmaf-publisher.mp4"));
         auto parsed = parse_mp4_stream(video_input, "video");

@@ -25,3 +25,6 @@ ffmpeg -v error -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -ac 2 -c:a
 
 LOC AV1 fixture (FFmpeg libsvtav1, 128x128, 12 frames at 4 fps, GOP 4, random-access prediction structure so some packets are 3-byte show_existing_frame temporal units, no edit list):
 ffmpeg -v error -f lavfi -i testsrc2=size=128x128:rate=4 -t 3 -c:v libsvtav1 -g 4 -pix_fmt yuv420p -svtav1-params "keyint=4:irefresh-type=2" -an -use_editlist 0 -movflags +frag_keyframe+empty_moov+default_base_moof tests/fixtures/loc-av1-fragmented.mp4
+
+LOC VP9 fixture (FFmpeg libvpx-vp9, 128x128, 12 frames at 4 fps, GOP 4, no hidden alt-ref frames, no edit list):
+ffmpeg -v error -f lavfi -i testsrc2=size=128x128:rate=4 -t 3 -c:v libvpx-vp9 -g 4 -auto-alt-ref 0 -lag-in-frames 0 -deadline good -cpu-used 5 -pix_fmt yuv420p -an -use_editlist 0 -movflags +frag_keyframe+empty_moov+default_base_moof tests/fixtures/loc-vp9-fragmented.mp4

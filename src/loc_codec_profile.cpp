@@ -8,10 +8,11 @@ const LocCodecProfile &aac_loc_profile();
 const LocCodecProfile &hevc_loc_profile();
 const LocCodecProfile &opus_loc_profile();
 const LocCodecProfile &av1_loc_profile();
+const LocCodecProfile &vp9_loc_profile();
 
 namespace {
-std::array<const LocCodecProfile *, 5> profiles() {
-    return {&avc_loc_profile(), &aac_loc_profile(), &hevc_loc_profile(), &opus_loc_profile(), &av1_loc_profile()};
+std::array<const LocCodecProfile *, 6> profiles() {
+    return {&avc_loc_profile(), &aac_loc_profile(), &hevc_loc_profile(), &opus_loc_profile(), &av1_loc_profile(), &vp9_loc_profile()};
 }
 } // namespace
 

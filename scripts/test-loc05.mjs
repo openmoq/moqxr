@@ -105,18 +105,36 @@ const CASES = [
         prefixes: { video: 'av01.', audio: 'mp4a.40.' },
         reordered: false, // AV1 hides reordering in show_existing_frame temporal units
     },
+    {
+        label: 'vp9',
+        codecArgs: ['-c:v', 'libvpx-vp9', '-g', '25', '-deadline', 'realtime', '-cpu-used', '8', '-auto-alt-ref', '0',
+            '-lag-in-frames', '0', '-pix_fmt', 'yuv420p', '-an'],
+        prefixes: { video: 'vp09.' },
+        reordered: false,
+        noVideoConfig: true, // the WebCodecs VP9 registration defines no description
+        initFromSource: true, // CMAF packaging does not support VP9; the single-track source moov is the decoder init
+    },
 ];
-async function validate({ label, codecArgs, prefixes, reordered = true }) {
+async function validate({ label, codecArgs, prefixes, reordered = true, noVideoConfig = false, initFromSource = false }) {
     const source = join(work, `${label}-source.mp4`);
     run('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25',
         '-f', 'lavfi', '-i', 'sine=frequency=997:sample_rate=48000', '-t', '3', ...codecArgs,
         '-movflags', '+frag_keyframe+empty_moov+default_base_moof+separate_moof', source]);
     const probe = JSON.parse(run('ffprobe', ['-v', 'error', '-show_streams', '-show_packets', '-show_data', '-of', 'json', source]));
+    // Some muxers leave packet durations unset (ffprobe prints N/A); derive them from DTS deltas.
+    for (const stream of probe.streams) {
+        const packets = probe.packets.filter(p => p.stream_index === stream.index);
+        packets.forEach((packet, index) => {
+            if (packet.duration !== undefined) return;
+            const next = packets[index + 1];
+            packet.duration = next ? next.dts - packet.dts : packets[index - 1].duration ?? packets[index - 1].dts - packets[index - 2].dts;
+        });
+    }
     if (reordered) assert.ok(probe.packets.some(p => p.pts !== p.dts), 'fixture must exercise reordered B-frame PTS');
     const loc = join(work, `${label}-loc`);
     const cmaf = join(work, `${label}-cmaf`);
     run(publisher, ['--input', source, '--draft', '18', '--packaging', 'loc', '--emit-dir', loc]);
-    run(publisher, ['--input', source, '--draft', '18', '--packaging', 'cmaf', '--emit-dir', cmaf]);
+    if (!initFromSource) run(publisher, ['--input', source, '--draft', '18', '--packaging', 'cmaf', '--emit-dir', cmaf]);
     const catalog = JSON.parse(await readFile(join(loc, 'catalog.json'), 'utf8'));
     const files = await readdir(loc);
     assert.ok(!files.some(file => /_(?:media|probe|init)\.mp4$/.test(file)), 'LOC artifacts must not masquerade as MP4');
@@ -124,7 +142,7 @@ async function validate({ label, codecArgs, prefixes, reordered = true }) {
         const match = /^(.*)_g(\d+)_o(\d+)_media\.loc$/.exec(file);
         return match ? [{ file, track: match[1], group: BigInt(match[2]), object: BigInt(match[3]) }] : [];
     });
-    assert.equal(new Set(objects.map(o => o.track)).size, 2, 'expected audio and video media');
+    assert.equal(new Set(objects.map(o => o.track)).size, probe.streams.length, 'expected one LOC track per source stream');
     let total = 0;
     for (const stream of probe.streams) {
         const entry = catalog.tracks.find(t => t.role === stream.codec_type);
@@ -132,17 +150,24 @@ async function validate({ label, codecArgs, prefixes, reordered = true }) {
         assert.equal(entry.packaging, 'loc');
         assert.ok(entry.codec.startsWith(prefixes[stream.codec_type]), `${label}: catalog codec ${entry.codec}`);
         assert.equal(entry.locmafVersion, undefined);
+        const noConfig = noVideoConfig && stream.codec_type === 'video';
         const extradata = hexDump(stream.extradata);
-        assert.ok(extradata.length, 'fixture codec extradata missing');
-        const initEntry = catalog.initDataList.find(i => i.id === entry.initRef);
-        assert.deepEqual(Buffer.from(initEntry.data, 'base64'), extradata, 'LOC catalog must carry codec extradata');
+        if (noConfig) {
+            assert.equal(entry.initRef, undefined, `${label}: a codec without a description has no catalog init data`);
+        } else {
+            assert.ok(extradata.length, 'fixture codec extradata missing');
+            const initEntry = catalog.initDataList.find(i => i.id === entry.initRef);
+            assert.deepEqual(Buffer.from(initEntry.data, 'base64'), extradata, 'LOC catalog must carry codec extradata');
+        }
         const samples = probe.packets.filter(p => p.stream_index === stream.index);
         const ordered = objects.filter(o => o.track === entry.name).sort((a, b) =>
             a.group !== b.group ? (a.group < b.group ? -1 : 1) : a.object < b.object ? -1 : a.object > b.object ? 1 : 0);
         assert.equal(ordered.length, samples.length, `${entry.name}: one LOC object per source sample`);
         const [numerator, denominator] = stream.time_base.split('/').map(BigInt);
         assert.equal(numerator, 1n);
-        const reconstructed = [await readFile(join(cmaf, `${entry.name}_init.mp4`))];
+        const sourceBytes = await readFile(source);
+        const firstFragment = sourceBytes.indexOf(Buffer.from('moof')) - 4;
+        const reconstructed = [initFromSource ? sourceBytes.subarray(0, firstFragment) : await readFile(join(cmaf, `${entry.name}_init.mp4`))];
         let previousGroup = -1n;
         for (let i = 0; i < ordered.length; ++i) {
             const object = ordered[i];
@@ -160,7 +185,8 @@ async function validate({ label, codecArgs, prefixes, reordered = true }) {
             assert.equal(BigInt(sidecar.durationUs), BigInt(sample.duration) * 1000000n / denominator, 'inspection duration');
             const video = stream.codec_type === 'video';
             const config = values.get(video ? '13' : '15');
-            if (config || (video ? sample.flags.includes('K') : object.group !== previousGroup))
+            if (noConfig) assert.equal(config, undefined, `${label}: no config property for a codec without a description`);
+            else if (config || (video ? sample.flags.includes('K') : object.group !== previousGroup))
                 assert.deepEqual(config, extradata, 'random-access codec configuration');
             if (video) {
                 const marking = values.get('9');

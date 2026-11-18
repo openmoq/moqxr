@@ -11745,7 +11745,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         }
         for (const auto& track : source.tracks) {
             if (track.track_name == "catalog") continue;
-            if (track.packaging != openmoq::publisher::LivePackaging::kLoc || track.codec.empty() || track.init_data.empty()) {
+            if (track.packaging != openmoq::publisher::LivePackaging::kLoc || track.codec.empty()) {
                 return TransportStatus::failure("LOC object sources require LOC packaging and codec configuration");
             }
             const bool video = track.media_type == openmoq::publisher::LiveMediaType::kVideo;
@@ -13196,7 +13196,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                 return TransportStatus::failure(error.what());
             }
             if (!timestamp || !timescale) return TransportStatus::failure("LOC objects require Timestamp and nonzero Timescale");
-            if (next->object_id == 0 && ((!config_present) || (video && !independent))) {
+            // Codecs without a description (VP9) announce no init data and carry no config property.
+            if (next->object_id == 0 && ((!config_present && !metadata->init_data.empty()) || (video && !independent))) {
                 return TransportStatus::failure("LOC group start requires matching configuration and independent video frame marking");
             }
             next->final_in_subgroup = false;

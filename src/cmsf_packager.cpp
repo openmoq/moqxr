@@ -560,7 +560,8 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
         }
 
         const auto init_it = init_data_by_track.find(track.track_name);
-        if (init_it != init_data_by_track.end()) {
+        // LOC codecs with no description (VP9) have no init data to attach.
+        if (init_it != init_data_by_track.end() && !init_it->second.empty()) {
             attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
@@ -831,7 +832,8 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
         }
 
         const auto init_it = init_data_by_track.find(track.track_name);
-        if (init_it != init_data_by_track.end()) {
+        // LOC codecs with no description (VP9) have no init data to attach.
+        if (init_it != init_data_by_track.end() && !init_it->second.empty()) {
             attach_init_data(msf_catalog, msf_track, track.track_name, init_it->second);
         }
 
