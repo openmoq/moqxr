@@ -86,6 +86,16 @@ struct MsfTrack {
     std::optional<std::uint64_t> track_duration_ms;    // 5.2.35
     std::optional<std::string> event_type;             // 5.2.5, eventtimeline only
 
+    // MSF-02 only (catalog version "draft-02"); serialization refuses them under "1".
+    std::optional<std::string> packaging_metadata;     // 5.2.5, "key=value;key=value"
+    std::optional<std::uint64_t> accessible_window_time_ms;  // 5.2.45
+    std::optional<std::uint64_t> keyframe_spacing;     // 5.2.46, objects per keyframe interval
+    std::optional<std::string> connection_uri;         // 5.2.37, JSON "connectionURI"
+    std::optional<std::string> parent_name;            // 5.2.34, names the target of a delta "update"
+    std::optional<std::string> parent_namespace;       // 5.2.35
+    // renderGroup numbers that `depends` references next to track names (5.2.15).
+    std::vector<std::uint32_t> depends_render_groups;
+
     // CMSF section 3.5.2.
     std::optional<std::uint32_t> max_grp_sap_starting_type;
     std::optional<std::uint32_t> max_obj_sap_starting_type;

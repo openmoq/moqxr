@@ -1435,5 +1435,153 @@ int main() {
         ok &= expect_contains(serialize_catalog(two), "\"version\":\"draft-02\"", "expected the draft-02 version string on the wire");
     }
 
+    // MSF-02 field model and validation (docs/draft-ietf-moq-msf-02.txt). Every MSF-02 rule is
+    // gated on the catalog version so "1" catalogs keep their behaviour.
+    {
+        const auto catalog_for = [](MsfVersion version) {
+            MsfCatalog catalog;
+            catalog.version = std::string(msf_version_string(version));
+            MsfTrack video;
+            video.name = "video";
+            video.packaging = "cmaf";
+            video.role = "video";
+            video.is_live = true;
+            video.render_group = 1;
+            video.codec = "avc1.640028";
+            video.bitrate = 1000000;
+            MsfTrack audio;
+            audio.name = "audio";
+            audio.packaging = "cmaf";
+            audio.role = "audio";
+            audio.is_live = true;
+            audio.render_group = 1;
+            audio.codec = "mp4a.40.2";
+            audio.bitrate = 128000;
+            audio.samplerate = 48000;
+            audio.channel_config = "2";
+            catalog.tracks = {video, audio};
+            return catalog;
+        };
+        const auto with_namespace = [&](MsfVersion version, const std::string& name_space) {
+            auto catalog = catalog_for(version);
+            catalog.tracks.front().name_space = name_space;
+            return catalog;
+        };
+        std::string many(32, 'a');
+        std::string thirty_two = "a";
+        for (int i = 1; i < 32; ++i) thirty_two += "/a";
+        const std::string thirty_three = thirty_two + "/a";
+        for (const std::string bad : {std::string(), std::string("/a"), std::string("a/"), std::string("a//b"), thirty_three}) {
+            ok &= throws_runtime_error(with_namespace(MsfVersion::k02, bad), "expected namespace \"" + bad + "\" to be refused under 02");
+        }
+        for (const std::string good : {std::string("a"), std::string("a/b"), thirty_two}) {
+            ok &= serializes_cleanly(with_namespace(MsfVersion::k02, good), "expected namespace \"" + good + "\" to be accepted under 02");
+        }
+        ok &= serializes_cleanly(with_namespace(MsfVersion::k01, "a//b"), "expected the 01 namespace rules to be unchanged");
+
+        // Full Track Name uniqueness: same name in different namespaces is fine.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            catalog.tracks[0].name = "same";
+            catalog.tracks[1].name = "same";
+            catalog.tracks[0].name_space = "a";
+            catalog.tracks[1].name_space = "b";
+            catalog.tracks[1].role = "video";
+            catalog.tracks[1].samplerate.reset();
+            catalog.tracks[1].channel_config.reset();
+            ok &= serializes_cleanly(catalog, "expected one name in two namespaces to be accepted");
+            catalog.tracks[1].name_space = "a";
+            ok &= throws_runtime_error(catalog, "expected a duplicate Full Track Name to be refused");
+        }
+
+        // depends: names and renderGroups must resolve; both kinds serialize in one array.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            MsfTrack timeline;
+            timeline.name = "timeline";
+            timeline.packaging = "mediatimeline";
+            timeline.is_live = true;
+            timeline.depends = {"video"};
+            timeline.depends_render_groups = {1};
+            catalog.tracks.push_back(timeline);
+            ok &= expect_contains(serialize_catalog(catalog), "\"depends\":[\"video\",1]",
+                                  "expected depends to carry track names and renderGroups together");
+            catalog.tracks.back().depends = {"nope"};
+            ok &= throws_runtime_error(catalog, "expected a depends name that resolves to no track to be refused");
+            catalog.tracks.back().depends = {"video"};
+            catalog.tracks.back().depends_render_groups = {9};
+            ok &= throws_runtime_error(catalog, "expected a depends renderGroup that resolves to no track to be refused");
+            auto old = catalog_for(MsfVersion::k01);
+            old.tracks.push_back(timeline);
+            ok &= throws_runtime_error(old, "expected a numeric depends entry to be refused under 01");
+            old.tracks.back().depends_render_groups.clear();
+            old.tracks.back().depends = {"unresolved"};
+            ok &= serializes_cleanly(old, "expected an unresolved depends name to stay accepted under 01");
+        }
+
+        // New 02 track fields, in the order write_track emits them.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            auto& track = catalog.tracks.front();
+            track.packaging_metadata = "streamMapping=group";
+            track.accessible_window_time_ms = 30000;
+            track.keyframe_spacing = 30;
+            track.connection_uri = "moqt://relay.example/x";
+            const std::string json = serialize_catalog(catalog);
+            ok &= expect_contains(json, "\"packagingMetadata\":\"streamMapping=group\"", "expected packagingMetadata");
+            ok &= expect_contains(json, "\"accessibleWindowTime\":30000", "expected accessibleWindowTime");
+            ok &= expect_contains(json, "\"keyframeSpacing\":30", "expected keyframeSpacing");
+            ok &= expect_contains(json, "\"connectionURI\":\"moqt://relay.example/x\"", "expected connectionURI");
+            ok &= expect(json.find("packagingMetadata") < json.find("accessibleWindowTime") &&
+                             json.find("accessibleWindowTime") < json.find("keyframeSpacing"),
+                         "expected packagingMetadata, accessibleWindowTime, keyframeSpacing in that order");
+            for (const auto mutate : {+[](MsfTrack& t) { t.packaging_metadata = "a=b"; },
+                                      +[](MsfTrack& t) { t.accessible_window_time_ms = 1; },
+                                      +[](MsfTrack& t) { t.keyframe_spacing = 1; },
+                                      +[](MsfTrack& t) { t.connection_uri = "x"; },
+                                      +[](MsfTrack& t) { t.parent_name = "p"; }}) {
+                auto old = catalog_for(MsfVersion::k01);
+                mutate(old.tracks.front());
+                ok &= throws_runtime_error(old, "expected an MSF-02 track field to be refused under 01");
+            }
+        }
+
+        // Custom field names may not collide with spec fields; the 02 additions are reserved only under 02.
+        {
+            for (const std::string name : {"keyframeSpacing", "packagingMetadata", "accessibleWindowTime", "connectionURI",
+                                           "parentName", "parentNamespace", "token"}) {
+                auto catalog = catalog_for(MsfVersion::k02);
+                catalog.tracks.front().custom_fields[name] = "1";
+                ok &= throws_runtime_error(catalog, "expected custom field " + name + " to collide under 02");
+            }
+            auto old = catalog_for(MsfVersion::k01);
+            old.tracks.front().custom_fields["keyframeSpacing"] = "1";
+            ok &= serializes_cleanly(old, "expected the 02-only names to stay available as custom fields under 01");
+            auto legacy = catalog_for(MsfVersion::k02);
+            legacy.tracks.front().custom_fields["connectionUri"] = "\"x\"";
+            ok &= throws_runtime_error(legacy, "expected the old connectionUri spelling to stay reserved");
+        }
+
+        // initDataList types.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            catalog.tracks.front().init_ref = "video-init";
+            catalog.init_data_list = {MsfInitData{.id = "video-init", .type = "object-property", .data = "0x0D"}};
+            ok &= expect_contains(serialize_catalog(catalog), "\"type\":\"object-property\"", "expected object-property init data");
+            catalog.init_data_list[0].type = "track-property";
+            ok &= serializes_cleanly(catalog, "expected track-property init data to be accepted under 02");
+            for (const std::string bad_data : {std::string("0D"), std::string("0x"), std::string("0xZZ"), std::string("")}) {
+                catalog.init_data_list[0].data = bad_data;
+                ok &= throws_runtime_error(catalog, "expected property init data \"" + bad_data + "\" to be refused");
+            }
+            catalog.init_data_list[0] = MsfInitData{.id = "video-init", .type = "weird", .data = "AAAA"};
+            ok &= throws_runtime_error(catalog, "expected an unknown init data type to be refused");
+            auto old = catalog_for(MsfVersion::k01);
+            old.tracks.front().init_ref = "video-init";
+            old.init_data_list = {MsfInitData{.id = "video-init", .type = "object-property", .data = "0x0D"}};
+            ok &= throws_runtime_error(old, "expected property init data types to be refused under 01");
+        }
+    }
+
     return ok ? 0 : 1;
 }
