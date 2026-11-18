@@ -8391,6 +8391,13 @@ TransportStatus encode_live_fragment(openmoq::publisher::MediaFragment& fragment
 }  // namespace
 
 namespace live_srt_internal {
+std::string no_srt_tracks_message(MediaPackaging packaging) {
+    if (packaging == MediaPackaging::kLoc) {
+        return "no supported live tracks available from SRT source; LOC over SRT supports H.264 or HEVC video "
+               "and AAC audio in MPEG-TS";
+    }
+    return "no live tracks available from SRT source";
+}
 std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
     std::span<const openmoq::publisher::MediaFragment> fragments,
     const std::vector<openmoq::publisher::TrackDescription>& tracks) {
@@ -8540,7 +8547,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     if (tracks.empty()) {
         stop_requested = true;
         srt_manager.join();
-        return TransportStatus::failure("no live tracks available from SRT source");
+        return TransportStatus::failure(live_srt_internal::no_srt_tracks_message(media_packaging_));
     }
 
     const std::vector<std::uint8_t> synthetic_init =

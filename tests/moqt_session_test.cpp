@@ -56,6 +56,8 @@ std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
     std::span<const openmoq::publisher::MediaFragment> fragments,
     const std::vector<openmoq::publisher::TrackDescription>& tracks);
 
+std::string no_srt_tracks_message(MediaPackaging packaging);
+
 TransportStatus exercise_live_srt_publish_flow_for_testing(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
@@ -12076,6 +12078,63 @@ int main() {
         const std::vector<MediaFragment> gap{make_fragment(90000, 90000, 0, true), make_fragment(96000, 96000, 2, false), make_fragment(99000, 99000, 3, true), make_fragment(102000, 102000, 4, false)};
         const auto recovered = encode_loc_fragments_for_testing(gap, {track});
         ok &= expect(recovered.size() == 2 && recovered[0].is_video_keyframe && recovered[0].object_id == 0, "LOC SRT queue sequence gap suppresses dependent video until next independent sample");
+    }
+
+    {
+        // HEVC over SRT: the converter strips only parameter sets that match the announced hvcC.
+        using openmoq::publisher::MediaFragment;
+        using openmoq::publisher::SourceSampleTiming;
+        using openmoq::publisher::transport::live_srt_internal::encode_loc_fragments_for_testing;
+        using openmoq::publisher::transport::live_srt_internal::no_srt_tracks_message;
+        const std::vector<std::uint8_t> vps{0x40, 0x01, 0xAA}, sps{0x42, 0x01, 0xBB}, pps{0x44, 0x01, 0xCC};
+        TrackDescription track{.track_id = 1, .handler_type = "vide", .codec = "hvc1.1.6.L120.B0", .sample_entry_type = "hvc1", .track_name = "video"};
+        track.timescale = 90000;
+        std::vector<std::uint8_t> hvcc{1, 1, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8, 0, 0, 0x0B, 3};
+        for (const auto& [type, unit] : {std::pair{32, vps}, std::pair{33, sps}, std::pair{34, pps}}) {
+            hvcc.insert(hvcc.end(), {static_cast<std::uint8_t>(0x80 | type), 0, 1, 0, static_cast<std::uint8_t>(unit.size())});
+            hvcc.insert(hvcc.end(), unit.begin(), unit.end());
+        }
+        track.codec_private = make_box("hvcC", hvcc);
+        auto be32 = [](std::uint32_t value) { std::vector<std::uint8_t> bytes; append_be32(bytes, value); return bytes; };
+        auto full_box = [&](std::string_view type, std::uint8_t version, std::uint32_t flags, std::vector<std::uint8_t> payload) {
+            auto prefix = be32((static_cast<std::uint32_t>(version) << 24) | flags);
+            return make_box(type, concat({prefix, payload}));
+        };
+        auto length_prefixed = [&](const std::vector<std::vector<std::uint8_t>>& nals) {
+            std::vector<std::uint8_t> bytes;
+            for (const auto& unit : nals) { append_be32(bytes, static_cast<std::uint32_t>(unit.size())); bytes.insert(bytes.end(), unit.begin(), unit.end()); }
+            return bytes;
+        };
+        auto make_fragment = [&](std::uint64_t dts, std::uint64_t sequence, const std::vector<std::vector<std::uint8_t>>& nals, bool independent) {
+            const auto sample = length_prefixed(nals);
+            const auto tfhd = full_box("tfhd", 0, 0x020038, concat({be32(1), be32(3000), be32(static_cast<std::uint32_t>(sample.size())), be32(independent ? 0x02000000 : 0x01010000)}));
+            const auto tfdt = full_box("tfdt", 0, 0, be32(0));
+            auto trun = full_box("trun", 0, 1, concat({be32(1), be32(0)}));
+            auto moof = make_box("moof", make_box("traf", concat({tfhd, tfdt, trun})));
+            trun = full_box("trun", 0, 1, concat({be32(1), be32(static_cast<std::uint32_t>(moof.size() + 8))}));
+            moof = make_box("moof", make_box("traf", concat({tfhd, tfdt, trun})));
+            MediaFragment fragment;
+            fragment.track_name = "video";
+            fragment.payload.owned_bytes = concat({moof, make_box("mdat", sample)});
+            fragment.source_timing = SourceSampleTiming{dts, static_cast<std::int64_t>(dts), 0, 90000, sequence};
+            return fragment;
+        };
+        const std::vector<std::uint8_t> idr{0x26, 0x01, 0x80}, trail{0x02, 0x01, 0x80};
+        const std::vector<MediaFragment> matching{make_fragment(90000, 0, {vps, sps, pps, idr}, true), make_fragment(93000, 1, {trail}, false)};
+        const auto encoded = encode_loc_fragments_for_testing(matching, {track});
+        ok &= expect(encoded.size() == 2 && encoded[0].payload.owned_bytes == length_prefixed({idr}) && encoded[0].is_video_keyframe && !encoded[1].is_video_keyframe,
+                     "LOC SRT HEVC strips matching in-band parameter sets and detects keyframes from the bitstream");
+        bool changed_rejected = false;
+        try {
+            const std::vector<std::uint8_t> other_sps{0x42, 0x01, 0xEE};
+            const std::vector<MediaFragment> changed{make_fragment(90000, 0, {vps, other_sps, pps, idr}, true)};
+            static_cast<void>(encode_loc_fragments_for_testing(changed, {track}));
+        } catch (const std::runtime_error&) { changed_rejected = true; }
+        ok &= expect(changed_rejected, "LOC SRT HEVC rejects parameter sets that differ from the announced hvcC");
+        ok &= expect(no_srt_tracks_message(MediaPackaging::kLoc).find("H.264") != std::string::npos &&
+                     no_srt_tracks_message(MediaPackaging::kLoc).find("HEVC") != std::string::npos &&
+                     no_srt_tracks_message(MediaPackaging::kCmaf) == "no live tracks available from SRT source",
+                     "LOC SRT names the supported codecs when no supported track is found");
     }
 
     for (int invalid = 0; invalid < 8; ++invalid) {
