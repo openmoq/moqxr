@@ -304,6 +304,17 @@ void opus_fixture() {
         check(sample.independent && !sample.bytes.empty() && sample.duration > 0 && sample.duration <= 960,
               "Opus samples are independent packets of at most 20 ms");
 }
+void av1_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-av1-fragmented.mp4");
+    check(parsed.tracks.size() == 1 && parsed.tracks.front().sample_entry_type == "av01", "AV1 fixture has one av01 track");
+    const auto config = loc_codec_config(parsed.tracks.front());
+    check(config.size() > 4 && config[0] == 0x81, "av1C payload is exposed as Video Config");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() == 12, "AV1 fixture has twelve temporal units");
+    for (std::size_t i = 0; i < samples.size(); ++i)
+        check(samples[i].independent == (i % 4 == 0), "AV1 keyframes follow the 4-frame GOP");
+    check(samples[2].bytes.size() <= 8, "show_existing_frame temporal units are tiny and still published");
+}
 int main() {
     try {
         init_validation();
@@ -315,6 +326,7 @@ int main() {
         hevc_bitstream_independence();
         hevc_fixture();
         opus_fixture();
+        av1_fixture();
         std::cout << "Encoded sample tests passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

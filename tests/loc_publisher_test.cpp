@@ -115,6 +115,27 @@ int main() {
             }
             check(objects >= 40, "Opus fixture publishes every packet");
         }
+        {
+            // AV1: av1C Video Config, "av01." Codec String, bitstream-derived frame marking.
+            std::istringstream input(fixture("loc-av1-fragmented.mp4"));
+            auto prepared = Publisher(config).prepare_stream(input, "loc-av1-fragmented.mp4");
+            std::size_t objects = 0;
+            for (const auto& object : prepared.plan.objects) {
+                if (object.kind != CmsfObjectKind::kMedia) continue;
+                ++objects;
+                const auto* video_config = property(object, 13);
+                check(video_config && std::get<std::vector<std::uint8_t>>(video_config->value)[0] == 0x81, "AV1 Video Config must be the av1C payload");
+                const auto* codec = property(object, 17);
+                const auto& codec_bytes = std::get<std::vector<std::uint8_t>>(codec->value);
+                check(codec && std::string(codec_bytes.begin(), codec_bytes.begin() + 5) == "av01.", "AV1 Codec String");
+                const auto* marking = property(object, 9);
+                check(marking && std::get<std::vector<std::uint8_t>>(marking->value) ==
+                          std::vector<std::uint8_t>{static_cast<std::uint8_t>((objects - 1) % 4 == 0 ? 0xe0 : 0xc0)},
+                      "AV1 frame marking follows bitstream keyframes");
+                check(object.group_id == (objects - 1) / 4 && object.object_id == (objects - 1) % 4, "AV1 GOP grouping");
+            }
+            check(objects == 12, "AV1 fixture publishes every temporal unit");
+        }
         // A missing decode interval invalidates dependent video until a new IDR.
         std::istringstream video_input(fixture("locmaf-publisher.mp4"));
         auto parsed = parse_mp4_stream(video_input, "video");

@@ -283,6 +283,122 @@ void opus_accepts_live_track_requires_codec_opus_and_opushead() {
     check(!opus->accepts_live_track("opus", bad_magic, false), "wrong magic rejected");
     check(!opus->accepts_live_track("opus", Bytes(head.begin(), head.end() - 1), false), "truncated OpusHead rejected");
 }
+
+// ---- AV1 ----
+Bytes leb128(std::size_t v) {
+    Bytes b;
+    do {
+        std::uint8_t byte = v & 0x7f;
+        v >>= 7;
+        if (v)
+            byte |= 0x80;
+        b.push_back(byte);
+    } while (v);
+    return b;
+}
+// One OBU in the low-overhead format (has_size_field = 1).
+Bytes obu(std::uint8_t type, const Bytes &payload, int extension = -1) {
+    Bytes b = {static_cast<std::uint8_t>((type << 3) | (extension >= 0 ? 4 : 0) | 2)};
+    if (extension >= 0)
+        b.push_back(static_cast<std::uint8_t>(extension));
+    append(b, leb128(payload.size()));
+    append(b, payload);
+    return b;
+}
+Bytes cat(std::initializer_list<Bytes> parts) {
+    Bytes b;
+    for (const auto &p : parts)
+        append(b, p);
+    return b;
+}
+const Bytes kSeqPayload = {0x00, 0x00, 0x00, 0x00};   // seq_profile 0, reduced_still_picture_header 0
+const Bytes kReducedSeqPayload = {0x08, 0x00, 0x00, 0x00}; // reduced_still_picture_header 1
+Bytes av1c_record(const Bytes &config_obus) { return cat({Bytes{0x81, 0x00, 0x0C, 0x00}, config_obus}); }
+TrackDescription av1_track(Bytes record = av1c_record(obu(1, kSeqPayload))) {
+    TrackDescription t;
+    t.handler_type = "vide";
+    t.sample_entry_type = "av01";
+    t.codec = "av01.0.04M.08";
+    t.timescale = 1000;
+    t.codec_private = box("av1C", std::move(record));
+    return t;
+}
+const Bytes kTd = obu(2, {});
+const Bytes kKeyFrame = obu(6, {0x10, 0xAA});    // show_existing 0, KEY_FRAME, show_frame 1
+const Bytes kInterFrame = obu(6, {0x30, 0xAA});  // INTER_FRAME, show_frame 1
+const Bytes kHiddenFrame = obu(6, {0x20, 0xAA}); // INTER_FRAME, show_frame 0
+const Bytes kShowExisting = obu(3, {0x80});      // show_existing_frame 1
+LocSampleCheck av1_check(const Bytes &sample, bool strip = false, const TrackDescription &t = av1_track()) {
+    return find_loc_profile(t)->check_sample(t, sample, strip);
+}
+void av1_extract_config_returns_av1c_payload() {
+    const auto record = av1c_record(obu(1, kSeqPayload));
+    const auto t = av1_track(record);
+    check(find_loc_profile(t) != nullptr, "av01 video has a profile");
+    check(find_loc_profile(t)->extract_config(t) == record, "Video Config is the av1C payload");
+    const auto empty_config = av1_track(av1c_record({}));
+    check(find_loc_profile(empty_config)->extract_config(empty_config) == av1c_record({}),
+          "av1C without configOBUs is valid");
+}
+void av1_rejects_bad_config() {
+    for (const Bytes &record : {Bytes{0x01, 0x00, 0x0C, 0x00}, Bytes{0x82, 0x00, 0x0C, 0x00}, Bytes{0x81, 0x00, 0x0C, 0x20},
+                                Bytes{0x81, 0x00, 0x0C}, av1c_record(Bytes{0x0A, 0x05, 0x00})}) {
+        const auto t = av1_track(record);
+        rejects([&] { find_loc_profile(t)->extract_config(t); });
+    }
+    const auto unsized = av1_track(av1c_record(Bytes{0x08, 0x00})); // OBU_SEQUENCE_HEADER without a size field
+    rejects([&] { find_loc_profile(unsized)->extract_config(unsized); });
+}
+void av1_key_frame_temporal_unit_is_independent() {
+    check(av1_check(cat({kTd, kKeyFrame})).independent, "key frame is independent");
+    check(av1_check(cat({kTd, obu(1, kSeqPayload), kKeyFrame})).independent, "identical in-band sequence header is accepted");
+}
+void av1_inter_frame_is_not_independent() {
+    check(!av1_check(cat({kTd, kInterFrame})).independent, "inter frame is not independent");
+    check(!av1_check(cat({kTd, obu(6, {0x50, 0xAA})})).independent, "intra-only frame is not independent");
+}
+void av1_show_existing_frame_is_not_independent() {
+    check(!av1_check(cat({kTd, kShowExisting})).independent, "show_existing_frame is not independent");
+}
+void av1_hidden_plus_shown_frame_is_one_temporal_unit() {
+    const auto check_result = av1_check(cat({kTd, kHiddenFrame, kShowExisting}));
+    check(!check_result.independent, "hidden inter frame followed by a shown frame");
+}
+void av1_reduced_still_picture_header_is_independent() {
+    const auto t = av1_track(av1c_record(obu(1, kReducedSeqPayload)));
+    check(av1_check(cat({kTd, obu(6, {0x00, 0xAA})}), false, t).independent, "reduced still picture header is always a key frame");
+}
+void av1_rejects_two_shown_frames_in_one_sample() {
+    rejects([&] { av1_check(cat({kTd, kKeyFrame, kInterFrame})); });
+    rejects([&] { av1_check(cat({kTd, kHiddenFrame})); }); // no shown frame
+    rejects([&] { av1_check(cat({kTd})); });               // no frame at all
+}
+void av1_rejects_multiple_temporal_units() {
+    rejects([&] { av1_check(cat({kTd, kKeyFrame, kTd, kInterFrame})); });
+}
+void av1_checks_inband_sequence_header_against_av1c() {
+    // FFmpeg's av1C sequence header differs from the in-band copy in trailing bits, so only
+    // seq_profile, still_picture and reduced_still_picture_header must agree.
+    check(av1_check(cat({kTd, obu(1, Bytes{0x00, 0x00, 0x00, 0x01}), kKeyFrame})).independent,
+          "in-band sequence header with the same profile is accepted");
+    rejects([&] { av1_check(cat({kTd, obu(1, Bytes{0x20, 0x00, 0x00, 0x00}), kKeyFrame})); }); // seq_profile 1
+    rejects([&] { av1_check(cat({kTd, obu(1, Bytes{0x08, 0x00, 0x00, 0x00}), kKeyFrame})); }); // reduced header
+    rejects([&] { av1_check(cat({kTd, obu(1, {}), kKeyFrame})); });                             // empty
+}
+void av1_rejects_layers_tile_lists_and_malformed_obus() {
+    rejects([&] { av1_check(cat({kTd, obu(6, {0x10, 0xAA}, 0x08)})); }); // spatial_id 1
+    check(av1_check(cat({kTd, obu(6, {0x10, 0xAA}, 0x20)})).independent, "temporal sublayers stay in one subgroup");
+    rejects([&] { av1_check(cat({kTd, obu(8, {0x00}), kKeyFrame})); });  // OBU_TILE_LIST
+    rejects([&] { av1_check(cat({kTd, kKeyFrame, Bytes{0x32, 0x09, 0x00}})); }); // size beyond the sample
+    rejects([&] { av1_check(cat({kTd, Bytes{0x30, 0x10}})); });          // frame OBU without a size field
+}
+void av1_accepts_live_track_requires_av01_prefix() {
+    const auto record = av1c_record(obu(1, kSeqPayload));
+    const auto *av1 = find_loc_profile_for_codec("av01.0.04M.08", true);
+    check(av1 != nullptr && av1->accepts_live_track("av01.0.04M.08", record, true), "av1 accepted");
+    check(!av1->accepts_live_track("av01.0.04M.08", Bytes{1, 66, 0, 10, 252, 225, 0, 1, 0x67}, true), "avcC bytes are not an av1C");
+    check(find_loc_profile_for_codec("av01.0.04M.08", false) == nullptr, "av01 on an audio track");
+}
 } // namespace
 int main() {
     try {
@@ -308,6 +424,18 @@ int main() {
         opus_rejects_malformed_dops();
         opus_sample_is_always_independent();
         opus_accepts_live_track_requires_codec_opus_and_opushead();
+        av1_extract_config_returns_av1c_payload();
+        av1_rejects_bad_config();
+        av1_key_frame_temporal_unit_is_independent();
+        av1_inter_frame_is_not_independent();
+        av1_show_existing_frame_is_not_independent();
+        av1_hidden_plus_shown_frame_is_one_temporal_unit();
+        av1_reduced_still_picture_header_is_independent();
+        av1_rejects_two_shown_frames_in_one_sample();
+        av1_rejects_multiple_temporal_units();
+        av1_checks_inband_sequence_header_against_av1c();
+        av1_rejects_layers_tile_lists_and_malformed_obus();
+        av1_accepts_live_track_requires_av01_prefix();
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

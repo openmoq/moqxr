@@ -98,14 +98,21 @@ const CASES = [
             '-sc_threshold', '0', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'libopus', '-b:a', '64k', '-ac', '2'],
         prefixes: { video: 'avc1.', audio: 'opus' },
     },
+    {
+        label: 'av1-aac',
+        codecArgs: ['-c:v', 'libsvtav1', '-g', '25', '-pix_fmt', 'yuv420p', '-svtav1-params', 'keyint=25:irefresh-type=2',
+            '-c:a', 'aac', '-b:a', '96k'],
+        prefixes: { video: 'av01.', audio: 'mp4a.40.' },
+        reordered: false, // AV1 hides reordering in show_existing_frame temporal units
+    },
 ];
-async function validate({ label, codecArgs, prefixes }) {
+async function validate({ label, codecArgs, prefixes, reordered = true }) {
     const source = join(work, `${label}-source.mp4`);
     run('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25',
         '-f', 'lavfi', '-i', 'sine=frequency=997:sample_rate=48000', '-t', '3', ...codecArgs,
         '-movflags', '+frag_keyframe+empty_moov+default_base_moof+separate_moof', source]);
     const probe = JSON.parse(run('ffprobe', ['-v', 'error', '-show_streams', '-show_packets', '-show_data', '-of', 'json', source]));
-    assert.ok(probe.packets.some(p => p.pts !== p.dts), 'fixture must exercise reordered B-frame PTS');
+    if (reordered) assert.ok(probe.packets.some(p => p.pts !== p.dts), 'fixture must exercise reordered B-frame PTS');
     const loc = join(work, `${label}-loc`);
     const cmaf = join(work, `${label}-cmaf`);
     run(publisher, ['--input', source, '--draft', '18', '--packaging', 'loc', '--emit-dir', loc]);
