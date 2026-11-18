@@ -67,6 +67,33 @@ int main() {
                 if (track.handler_type == "vide" || track.handler_type == "soun") check(track.packaging == "loc", "media mislabeled");
             }
         }
+        {
+            // HEVC publishes through the same sample-to-object mapping with an hvcC Video Config.
+            std::istringstream input(fixture("loc-hevc-fragmented.mp4"));
+            auto prepared = Publisher(config).prepare_stream(input, "loc-hevc-fragmented.mp4");
+            std::istringstream parse_input(fixture("loc-hevc-fragmented.mp4"));
+            const auto hevc_parsed = parse_mp4_stream(parse_input, "hevc");
+            const auto hevc_config = loc_codec_config(hevc_parsed.tracks.front());
+            std::size_t objects = 0;
+            for (const auto& object : prepared.plan.objects) {
+                if (object.kind != CmsfObjectKind::kMedia) continue;
+                ++objects;
+                const auto* video_config = property(object, 13);
+                check(video_config && std::get<std::vector<std::uint8_t>>(video_config->value) == hevc_config,
+                      "HEVC Video Config must be the hvcC payload");
+                const auto* codec = property(object, 17);
+                check(codec && std::get<std::vector<std::uint8_t>>(codec->value).size() > 5 &&
+                          std::get<std::vector<std::uint8_t>>(codec->value)[0] == 'h',
+                      "HEVC codec string missing");
+                const auto* marking = property(object, 9);
+                const bool keyframe = (objects - 1) % 4 == 0;
+                check(marking && std::get<std::vector<std::uint8_t>>(marking->value) ==
+                          std::vector<std::uint8_t>{static_cast<std::uint8_t>(keyframe ? 0xe0 : 0xc0)},
+                      "HEVC frame marking follows bitstream keyframes");
+                check(object.group_id == (objects - 1) / 4 && object.object_id == (objects - 1) % 4, "HEVC GOP grouping");
+            }
+            check(objects == 8, "HEVC fixture publishes every sample");
+        }
         // A missing decode interval invalidates dependent video until a new IDR.
         std::istringstream video_input(fixture("locmaf-publisher.mp4"));
         auto parsed = parse_mp4_stream(video_input, "video");

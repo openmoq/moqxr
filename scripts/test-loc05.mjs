@@ -77,17 +77,31 @@ function frameHashes(file, selector) {
     return run('ffmpeg', ['-v', 'error', '-xerror', '-i', file, '-map', selector, '-f', 'framemd5', '-'])
         .split('\n').filter(line => line && !line.startsWith('#')).map(line => line.split(',').slice(4).join(',').trim());
 }
-try {
-    const source = join(work, 'source.mp4');
+// One validation case per codec pairing. `codecArgs` are the FFmpeg encoder
+// options; `prefixes` are the catalog codec string prefixes expected per media type.
+const CASES = [
+    {
+        label: 'h264-aac',
+        codecArgs: ['-c:v', 'libx264', '-threads', '1', '-preset', 'fast', '-g', '25', '-keyint_min', '25',
+            '-sc_threshold', '0', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k'],
+        prefixes: { video: 'avc1.', audio: 'mp4a.40.' },
+    },
+    {
+        label: 'hevc-aac',
+        codecArgs: ['-c:v', 'libx265', '-x265-params', 'keyint=25:min-keyint=25:bframes=2:scenecut=0:log-level=error',
+            '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1', '-c:a', 'aac', '-b:a', '96k'],
+        prefixes: { video: 'hvc1.', audio: 'mp4a.40.' },
+    },
+];
+async function validate({ label, codecArgs, prefixes }) {
+    const source = join(work, `${label}-source.mp4`);
     run('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25',
-        '-f', 'lavfi', '-i', 'sine=frequency=997:sample_rate=48000', '-t', '3',
-        '-c:v', 'libx264', '-threads', '1', '-preset', 'fast', '-g', '25', '-keyint_min', '25',
-        '-sc_threshold', '0', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k',
+        '-f', 'lavfi', '-i', 'sine=frequency=997:sample_rate=48000', '-t', '3', ...codecArgs,
         '-movflags', '+frag_keyframe+empty_moov+default_base_moof+separate_moof', source]);
     const probe = JSON.parse(run('ffprobe', ['-v', 'error', '-show_streams', '-show_packets', '-show_data', '-of', 'json', source]));
     assert.ok(probe.packets.some(p => p.pts !== p.dts), 'fixture must exercise reordered B-frame PTS');
-    const loc = join(work, 'loc');
-    const cmaf = join(work, 'cmaf');
+    const loc = join(work, `${label}-loc`);
+    const cmaf = join(work, `${label}-cmaf`);
     run(publisher, ['--input', source, '--draft', '18', '--packaging', 'loc', '--emit-dir', loc]);
     run(publisher, ['--input', source, '--draft', '18', '--packaging', 'cmaf', '--emit-dir', cmaf]);
     const catalog = JSON.parse(await readFile(join(loc, 'catalog.json'), 'utf8'));
@@ -103,6 +117,7 @@ try {
         const entry = catalog.tracks.find(t => t.role === stream.codec_type);
         assert.ok(entry, `missing ${stream.codec_type} catalog track`);
         assert.equal(entry.packaging, 'loc');
+        assert.ok(entry.codec.startsWith(prefixes[stream.codec_type]), `${label}: catalog codec ${entry.codec}`);
         assert.equal(entry.locmafVersion, undefined);
         const extradata = hexDump(stream.extradata);
         assert.ok(extradata.length, 'fixture codec extradata missing');
@@ -147,11 +162,16 @@ try {
             reconstructed.push(fragment(Number.parseInt(stream.id), i + 1, sample, values.get('16'), payload));
             ++total;
         }
-        const rebuilt = join(work, `${entry.name}-reconstructed.mp4`);
+        const rebuilt = join(work, `${label}-${entry.name}-reconstructed.mp4`);
         await writeFile(rebuilt, Buffer.concat(reconstructed));
         assert.deepEqual(frameHashes(rebuilt, '0:0'), frameHashes(source, `0:${stream.index}`), `${entry.name}: decoded frames`);
     }
-    console.log(`LOC-05 PASS: ${total} samples; independent VI64 properties, exact payload/PTS/config, B-frame ordering, and FFmpeg decoded frames.`);
+    return total;
+}
+try {
+    let total = 0;
+    for (const testCase of CASES) total += await validate(testCase);
+    console.log(`LOC-05 PASS: ${total} samples over ${CASES.map(c => c.label).join(', ')}; independent VI64 properties, exact payload/PTS/config, B-frame ordering, and FFmpeg decoded frames.`);
     console.log('Inspection-artifact validation only; no network receiver interoperability claim.');
 } finally {
     if (option === '--keep') console.log(`Artifacts: ${work}`);

@@ -5,10 +5,11 @@
 namespace openmoq::publisher {
 const LocCodecProfile &avc_loc_profile();
 const LocCodecProfile &aac_loc_profile();
+const LocCodecProfile &hevc_loc_profile();
 
 namespace {
-std::array<const LocCodecProfile *, 2> profiles() {
-    return {&avc_loc_profile(), &aac_loc_profile()};
+std::array<const LocCodecProfile *, 3> profiles() {
+    return {&avc_loc_profile(), &aac_loc_profile(), &hevc_loc_profile()};
 }
 } // namespace
 

@@ -252,6 +252,42 @@ void fixtures() {
     check(config.size() >= 2 && config[0] == 0x11 && config[1] == 0x88, "AAC AudioSpecificConfig");
 }
 } // namespace
+void hevc_bitstream_independence() {
+    TrackDescription t;
+    t.track_id = 1;
+    t.track_name = "video";
+    t.handler_type = "vide";
+    t.sample_entry_type = "hvc1";
+    t.codec = "hvc1.1.6.L120.B0";
+    t.timescale = 1000;
+    Bytes hvcc = {1, 1, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8, 0, 0, 0x0B, 3};
+    for (const std::uint8_t type : {32, 33, 34}) {
+        hvcc.insert(hvcc.end(), {static_cast<std::uint8_t>(0x80 | type), 0, 1, 0, 3,
+                                 static_cast<std::uint8_t>(type << 1), 1, 0xAA});
+    }
+    t.codec_private = box("hvcC", hvcc);
+    t.fragment_defaults = TrackFragmentDefaults{10, 7, 0x02000000}; // Every sample is flagged as a sync sample.
+    const std::vector<TrackDescription> tracks{t};
+    auto moof = fragment_box(0x01000801, 0, 0);
+    // Four-byte length, then IDR_W_RADL and TRAIL_R slices that both start a picture.
+    auto mdat = box("mdat", {0, 0, 0, 3, 0x26, 0x01, 0x80, 0, 0, 0, 3, 0x02, 0x01, 0x80});
+    const auto data_offset = static_cast<std::uint32_t>(moof.size() + 8);
+    for (int n = 0; n < 4; ++n)
+        moof[moof.size() - 12 + n] = data_offset >> (24 - 8 * n);
+    const auto s = read_fragment_samples(moof, mdat, tracks);
+    check(s.size() == 2, "two HEVC samples");
+    check(s[0].independent, "IDR sample is independent");
+    check(!s[1].independent, "TRAIL_R flagged sync by the container is still not independent");
+}
+void hevc_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-hevc-fragmented.mp4");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() == 8, "HEVC fixture has eight samples");
+    for (std::size_t i = 0; i < samples.size(); ++i)
+        check(samples[i].independent == (i == 0 || i == 4), "HEVC keyframes follow the 4-frame GOP");
+    check(samples[1].presentation_time > samples[2].presentation_time, "B-frame presentation order is preserved");
+    check(loc_codec_config(parsed.tracks.front()).size() > 23, "hvcC payload is exposed as Video Config");
+}
 int main() {
     try {
         init_validation();
@@ -260,6 +296,8 @@ int main() {
         absolute_offsets();
         fixtures();
         bframes();
+        hevc_bitstream_independence();
+        hevc_fixture();
         std::cout << "Encoded sample tests passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

@@ -685,6 +685,7 @@ add_library(openmoq_publisher_lib
     src/loc_codec_profile.cpp
     src/loc_codec_avc.cpp
     src/loc_codec_aac.cpp
+    src/loc_codec_hevc.cpp
     src/loc_packager.cpp
     src/locmaf_encoder.cpp
     src/locmaf_packager.cpp
