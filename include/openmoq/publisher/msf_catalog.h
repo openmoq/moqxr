@@ -113,9 +113,22 @@ struct MsfTrack {
 // "add" and "remove" only. "clone" is deliberately unimplemented: it applies
 // when a new track matches an existing one on every field except name, which
 // no producer in this project generates.
+//
+// MSF-02 adds "update" (sections 5.1.6 and 5.3), which carries MsfTrackUpdate
+// entries in `updates` instead of full tracks.
+// An "update" track object names its target by parentName/parentNamespace and holds only
+// the attributes that override the existing values. Each override is a JSON field name
+// and its raw JSON value, as write_track would emit it.
+struct MsfTrackUpdate {
+    std::string parent_name;
+    std::optional<std::string> parent_namespace;
+    std::vector<std::pair<std::string, std::string>> overrides;
+};
+
 struct MsfDeltaOp {
     std::string op;
     std::vector<MsfTrack> tracks;
+    std::vector<MsfTrackUpdate> updates;   // only for op == "update"
 };
 
 // The root catalog object (MSF section 5.1).

@@ -1682,5 +1682,146 @@ int main() {
         }
     }
 
+    // MSF-02 delta updates (sections 5.1.6 and 5.3): generatedAt and deltaUpdate only, plus the "update" operation.
+    {
+        const auto make_track = [](const std::string& name) {
+            MsfTrack track;
+            track.name = name;
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.codec = "avc1.640028";
+            track.bitrate = 1000000;
+            return track;
+        };
+        const auto catalog_for = [&](MsfVersion version, std::uint64_t generated_at) {
+            MsfCatalog catalog;
+            catalog.version = std::string(msf_version_string(version));
+            if (generated_at != 0) catalog.generated_at_ms = generated_at;
+            catalog.tracks = {make_track("video")};
+            return catalog;
+        };
+
+        // Serialization.
+        {
+            MsfCatalog delta;
+            delta.version = "draft-02";
+            delta.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {make_track("extra")}});
+            ok &= throws_runtime_error(delta, "expected a draft-02 delta without generatedAt to be refused");
+            delta.generated_at_ms = 1700000000000ULL;
+            const std::string json = serialize_catalog(delta);
+            ok &= expect(json.rfind("{\"generatedAt\":1700000000000,\"deltaUpdate\":[", 0) == 0,
+                         "expected a draft-02 delta to start with generatedAt then deltaUpdate: " + json);
+            ok &= expect_not_contains(json, "\"version\"", "expected no version on a delta");
+            auto complete = delta;
+            complete.is_complete = true;
+            ok &= throws_runtime_error(complete, "expected isComplete on a draft-02 delta to be refused");
+            auto with_protections = delta;
+            with_protections.init_data_list = {MsfInitData{.id = "x", .type = "inline", .data = "AAAA"}};
+            ok &= throws_runtime_error(with_protections, "expected initDataList on a draft-02 delta to be refused");
+
+            MsfCatalog old;
+            old.version = "1";
+            old.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {make_track("extra")}});
+            ok &= serializes_cleanly(old, "expected a version 1 delta without generatedAt to stay valid");
+            old.delta_update.push_back(MsfDeltaOp{.op = "update", .updates = {MsfTrackUpdate{.parent_name = "video", .overrides = {{"bitrate", "1"}}}}});
+            ok &= throws_runtime_error(old, "expected the update operation to be refused under version 1");
+        }
+
+        // The update operation.
+        {
+            MsfCatalog delta;
+            delta.version = "draft-02";
+            delta.generated_at_ms = 1;
+            delta.delta_update.push_back(MsfDeltaOp{
+                .op = "update",
+                .updates = {MsfTrackUpdate{.parent_name = "video", .parent_namespace = "a/b",
+                                           .overrides = {{"bitrate", "2000000"}, {"label", "\"main\""}}}}});
+            ok &= expect_contains(serialize_catalog(delta),
+                                  "{\"op\":\"update\",\"tracks\":[{\"parentName\":\"video\",\"parentNamespace\":\"a/b\",\"bitrate\":2000000,\"label\":\"main\"}]}",
+                                  "expected an update track to hold parentName, parentNamespace and only the overrides");
+            auto no_parent = delta;
+            no_parent.delta_update[0].updates[0].parent_name.clear();
+            ok &= throws_runtime_error(no_parent, "expected an update without parentName to be refused");
+            auto no_overrides = delta;
+            no_overrides.delta_update[0].updates[0].overrides.clear();
+            ok &= throws_runtime_error(no_overrides, "expected an update that overrides nothing to be refused");
+            auto renames = delta;
+            renames.delta_update[0].updates[0].overrides = {{"name", "\"other\""}};
+            ok &= throws_runtime_error(renames, "expected an update that overrides the track identity to be refused");
+            auto bad_namespace = delta;
+            bad_namespace.delta_update[0].updates[0].parent_namespace = "a//b";
+            ok &= throws_runtime_error(bad_namespace, "expected a malformed parentNamespace to be refused");
+        }
+
+        // CatalogPublisher chooses update when the change is expressible.
+        {
+            CatalogPublisher publisher;
+            const auto first = publisher.publish(catalog_for(MsfVersion::k02, 1000));
+            ok &= expect(first.size() == 1 && first[0].object_id == 0, "expected the first catalog as an independent object");
+            auto changed = catalog_for(MsfVersion::k02, 2000);
+            changed.tracks[0].bitrate = 2000000;
+            changed.tracks[0].label = "main";
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].group_id == first[0].group_id && out[0].object_id == 1,
+                         "expected one delta object in the current group");
+            if (!out.empty()) {
+                ok &= expect_contains(out[0].payload, "\"op\":\"update\"", "expected an update operation");
+                ok &= expect_contains(out[0].payload, "\"parentName\":\"video\"", "expected the update to name its target");
+                ok &= expect_contains(out[0].payload, "\"bitrate\":2000000", "expected the changed bitrate");
+                ok &= expect_contains(out[0].payload, "\"label\":\"main\"", "expected the added label");
+                ok &= expect_not_contains(out[0].payload, "\"codec\"", "expected unchanged fields to stay out of the update");
+                ok &= expect_not_contains(out[0].payload, "\"op\":\"add\"", "expected no add for an attribute change");
+                ok &= expect_contains(out[0].payload, "\"generatedAt\":2000", "expected the delta to carry generatedAt");
+            }
+            // An attribute change together with a new track becomes add plus update in one object.
+            auto both = changed;
+            both.generated_at_ms = 3000;
+            both.tracks[0].bitrate = 3000000;
+            both.tracks.push_back(make_track("second"));
+            const auto combined = publisher.publish(both);
+            ok &= expect(combined.size() == 1 && combined[0].object_id == 2, "expected add and update in one delta object");
+            if (!combined.empty()) {
+                ok &= expect_contains(combined[0].payload, "\"op\":\"add\"", "expected the add operation");
+                ok &= expect_contains(combined[0].payload, "\"op\":\"update\"", "expected the update operation");
+            }
+        }
+
+        // Removing a field cannot be expressed as an override: fall back to a full catalog.
+        {
+            CatalogPublisher publisher;
+            auto base = catalog_for(MsfVersion::k02, 1000);
+            base.tracks[0].label = "main";
+            (void)publisher.publish(base);
+            auto changed = catalog_for(MsfVersion::k02, 2000);  // label removed
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].group_id == 1 && out[0].object_id == 0,
+                         "expected a removed attribute to produce a new independent catalog");
+            if (!out.empty()) ok &= expect_contains(out[0].payload, "\"tracks\"", "expected a full catalog");
+        }
+
+        // Without generatedAt a draft-02 delta is impossible: fall back to a full catalog.
+        {
+            CatalogPublisher publisher;
+            (void)publisher.publish(catalog_for(MsfVersion::k02, 1000));
+            auto changed = catalog_for(MsfVersion::k02, 0);
+            changed.tracks.push_back(make_track("second"));
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].object_id == 0 && out[0].payload.find("\"deltaUpdate\"") == std::string::npos,
+                         "expected a full catalog when the desired catalog has no generatedAt");
+        }
+
+        // MSF-01 keeps the freeze rule: an attribute change is a full catalog.
+        {
+            CatalogPublisher publisher;
+            (void)publisher.publish(catalog_for(MsfVersion::k01, 1000));
+            auto changed = catalog_for(MsfVersion::k01, 2000);
+            changed.tracks[0].bitrate = 2000000;
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].object_id == 0 && out[0].payload.find("\"deltaUpdate\"") == std::string::npos,
+                         "expected version 1 to republish a full catalog for an attribute change");
+        }
+    }
+
     return ok ? 0 : 1;
 }

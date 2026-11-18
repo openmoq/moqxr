@@ -359,11 +359,47 @@ void validate_catalog(const MsfCatalog& catalog) {
         if (!catalog.tracks.empty()) {
             throw std::runtime_error("MSF delta catalog must not carry a tracks array");
         }
+        if (version == MsfVersion::k02) {
+            // Section 5.3: a delta carries deltaUpdate and generatedAt, and no other root field.
+            if (!catalog.generated_at_ms.has_value()) {
+                throw std::runtime_error("MSF-02 delta catalog requires generatedAt");
+            }
+            if (catalog.is_complete.has_value() || !catalog.content_protections.empty() ||
+                !catalog.publish_tracks.empty() || !catalog.init_data_list.empty()) {
+                throw std::runtime_error("MSF-02 delta catalog must not carry root fields other than generatedAt");
+            }
+        }
         for (const auto& op : catalog.delta_update) {
-            if (op.op != "add" && op.op != "remove") {
+            const bool update_op = op.op == "update";
+            if (op.op != "add" && op.op != "remove" && !(update_op && version == MsfVersion::k02)) {
                 throw std::runtime_error("MSF delta catalog has unsupported operation \"" + op.op + "\"");
             }
-            if (op.tracks.empty()) {
+            if (update_op) {
+                if (op.updates.empty() || !op.tracks.empty()) {
+                    throw std::runtime_error("MSF delta update operation must carry update entries only");
+                }
+                for (const auto& update : op.updates) {
+                    const std::string where = " (update of track \"" + update.parent_name + "\")";
+                    if (update.parent_name.empty()) {
+                        throw std::runtime_error("MSF delta update entry requires parentName");
+                    }
+                    validate_no_stray_percent(update.parent_name, "parentName", where);
+                    if (update.parent_namespace.has_value()) {
+                        validate_namespace_string(*update.parent_namespace, "parentNamespace", where);
+                        validate_no_stray_percent(*update.parent_namespace, "parentNamespace", where);
+                    }
+                    if (update.overrides.empty()) {
+                        throw std::runtime_error("MSF delta update entry overrides nothing" + where);
+                    }
+                    for (const auto& [key, value] : update.overrides) {
+                        if (key.empty() || value.empty() || key == "name" || key == "namespace") {
+                            throw std::runtime_error("MSF delta update entry has an invalid override \"" + key + "\"" + where);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (op.tracks.empty() || !op.updates.empty()) {
                 throw std::runtime_error("MSF delta operation \"" + op.op + "\" has no tracks");
             }
             if (op.op == "remove") {
@@ -768,6 +804,17 @@ std::string serialize_catalog(const MsfCatalog& catalog) {
             ops.separate();
             out << "{\"op\":\"" << json_escape(op.op) << "\",\"tracks\":[";
             JsonSeq op_tracks(out);
+            for (const auto& update : op.updates) {
+                op_tracks.separate();
+                out << "{\"parentName\":\"" << json_escape(update.parent_name) << '"';
+                if (update.parent_namespace.has_value()) {
+                    out << ",\"parentNamespace\":\"" << json_escape(*update.parent_namespace) << '"';
+                }
+                for (const auto& [key, value] : update.overrides) {
+                    out << ",\"" << json_escape(key) << "\":" << value;
+                }
+                out << '}';
+            }
             for (const auto& track : op.tracks) {
                 op_tracks.separate();
                 if (op.op == "remove") {
@@ -1089,6 +1136,83 @@ MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
 
 namespace {
 
+// Splits the top level of a JSON object produced by write_track into (key, raw value) pairs.
+// Only handles this writer's output: strings with backslash escapes, nested arrays and objects.
+std::vector<std::pair<std::string, std::string>> top_level_json_fields(const std::string& json) {
+    std::vector<std::pair<std::string, std::string>> fields;
+    std::size_t at = 1;  // after '{'
+    const auto read_string = [&](std::size_t& cursor) {
+        std::string text;
+        ++cursor;  // opening quote
+        while (cursor < json.size() && json[cursor] != '"') {
+            if (json[cursor] == '\\' && cursor + 1 < json.size()) {
+                text.push_back(json[cursor++]);
+            }
+            text.push_back(json[cursor++]);
+        }
+        ++cursor;  // closing quote
+        return text;
+    };
+    while (at < json.size() && json[at] != '}') {
+        if (json[at] == ',') {
+            ++at;
+            continue;
+        }
+        const std::string key = read_string(at);
+        ++at;  // ':'
+        const std::size_t start = at;
+        int depth = 0;
+        while (at < json.size()) {
+            const char c = json[at];
+            if (c == '"') {
+                static_cast<void>(read_string(at));
+                continue;
+            }
+            if (c == '[' || c == '{') {
+                ++depth;
+            } else if (c == ']' || c == '}') {
+                if (depth == 0) {
+                    break;
+                }
+                --depth;
+            } else if (c == ',' && depth == 0) {
+                break;
+            }
+            ++at;
+        }
+        fields.emplace_back(key, json.substr(start, at - start));
+    }
+    return fields;
+}
+
+// The attributes of `after` that differ from `before`, as update overrides. nullopt when
+// a field present in `before` is absent from `after`, because an update can only override.
+std::optional<std::vector<std::pair<std::string, std::string>>> update_overrides(
+    const MsfTrack& before, const MsfTrack& after, MsfVersion version) {
+    const auto serialize_track = [&](const MsfTrack& track) {
+        std::ostringstream out;
+        write_track(out, track, version);
+        return top_level_json_fields(out.str());
+    };
+    const auto old_fields = serialize_track(before);
+    const auto new_fields = serialize_track(after);
+    std::map<std::string, std::string> old_by_key(old_fields.begin(), old_fields.end());
+    std::map<std::string, std::string> new_by_key(new_fields.begin(), new_fields.end());
+    for (const auto& [key, value] : old_by_key) {
+        if (new_by_key.find(key) == new_by_key.end()) {
+            return std::nullopt;
+        }
+    }
+    std::vector<std::pair<std::string, std::string>> overrides;
+    for (const auto& [key, value] : new_fields) {
+        const auto previous = old_by_key.find(key);
+        if (previous == old_by_key.end() || previous->second != value) {
+            overrides.emplace_back(key, value);
+        }
+    }
+    return overrides;
+}
+
 bool tracks_equal(const MsfTrack& a, const MsfTrack& b) {
     // Compare every field that serialize_catalog can emit. A field added to
     // MsfTrack without being added here would make a real change look like a
@@ -1261,21 +1385,35 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
         after.emplace(key_of(track), &track);
     }
 
+    const MsfVersion version = *msf_version_from_string(desired.version);
     std::vector<MsfTrack> added;
     std::vector<MsfTrack> removed;
+    std::vector<MsfTrackUpdate> updated;
     for (const auto& [key, track] : after) {
         const auto it = before.find(key);
         if (it == before.end()) {
             added.push_back(*track);
         } else if (!tracks_equal(*it->second, *track)) {
-            // Section 5.3 freezes a track's attributes once its tuple is
-            // declared, so an attribute change cannot be expressed as a
-            // delta. Fall back to a full independent catalog: emitting
-            // nothing would leave subscribers on stale attributes.
-            std::vector<CatalogObject> out;
-            out.push_back(emit_independent(desired));
-            last_ = desired;
-            return out;
+            // MSF-01 section 5.3 freezes a track's attributes once its tuple is declared. MSF-02
+            // adds the update operation, which can only override attributes and needs a
+            // generatedAt on the delta. Anything else (a removed attribute, MSF-01, no
+            // generatedAt) falls back to a full independent catalog: emitting nothing would
+            // leave subscribers on stale attributes.
+            std::optional<std::vector<std::pair<std::string, std::string>>> overrides;
+            if (version == MsfVersion::k02 && desired.generated_at_ms.has_value()) {
+                overrides = update_overrides(*it->second, *track, version);
+            }
+            if (!overrides.has_value() || overrides->empty()) {
+                std::vector<CatalogObject> out;
+                out.push_back(emit_independent(desired));
+                last_ = desired;
+                return out;
+            }
+            MsfTrackUpdate update;
+            update.parent_name = track->name;
+            update.parent_namespace = track->name_space;
+            update.overrides = std::move(*overrides);
+            updated.push_back(std::move(update));
         }
     }
     for (const auto& [key, track] : before) {
@@ -1313,7 +1451,7 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
         content_protections_changed =
             !content_protections_equal(last_->content_protections[i], desired.content_protections[i]);
     }
-    if ((added.empty() && removed.empty()) || init_data_changed || publish_tracks_changed ||
+    if ((added.empty() && removed.empty() && updated.empty()) || init_data_changed || publish_tracks_changed ||
         content_protections_changed || deltas_in_group_ >= max_deltas_per_group_) {
         std::vector<CatalogObject> out;
         out.push_back(emit_independent(desired));
@@ -1324,11 +1462,24 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     MsfCatalog delta;
     // The version is not serialized for a delta (section 5.3) but selects its profile.
     delta.version = last_->version;
+    if (version == MsfVersion::k02) {
+        if (!desired.generated_at_ms.has_value()) {
+            // Section 5.3 requires generatedAt on every delta, so a catalog without one needs a full catalog.
+            std::vector<CatalogObject> out;
+            out.push_back(emit_independent(desired));
+            last_ = desired;
+            return out;
+        }
+        delta.generated_at_ms = desired.generated_at_ms;
+    }
     if (!added.empty()) {
         delta.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = std::move(added)});
     }
     if (!removed.empty()) {
         delta.delta_update.push_back(MsfDeltaOp{.op = "remove", .tracks = std::move(removed)});
+    }
+    if (!updated.empty()) {
+        delta.delta_update.push_back(MsfDeltaOp{.op = "update", .tracks = {}, .updates = std::move(updated)});
     }
 
     // serialize_catalog can throw (write_track's per-track checks run for
