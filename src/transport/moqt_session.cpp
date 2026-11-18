@@ -3,6 +3,7 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_srt_ingest.h"
 #include "openmoq/publisher/locmaf_encoder.h"
+#include "openmoq/publisher/loc_codec_profile.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
 #include "openmoq/publisher/version.h"
@@ -11742,8 +11743,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             const bool video = track.media_type == openmoq::publisher::LiveMediaType::kVideo;
             const bool audio = track.media_type == openmoq::publisher::LiveMediaType::kAudio;
-            if ((!video && !audio) || (video && (!track.codec.starts_with("avc1.") || track.init_data.size() < 7 || track.init_data[0] != 1)) ||
-                (audio && (!track.codec.starts_with("mp4a.40.") || track.init_data.size() < 2))) {
+            const auto* profile = (video || audio) ? openmoq::publisher::find_loc_profile_for_codec(track.codec, video) : nullptr;
+            if (profile == nullptr || !profile->accepts_live_track(track.codec, track.init_data, video)) {
                 return TransportStatus::failure("LOC requires explicit AVC or AAC media type and decoder configuration");
             }
             // An object's Codec String must equal this value, so checking it

@@ -682,6 +682,9 @@ add_library(openmoq_publisher_lib
     src/live_srt_config.cpp
     src/live_dash_ingest.cpp
     src/encoded_sample.cpp
+    src/loc_codec_profile.cpp
+    src/loc_codec_avc.cpp
+    src/loc_codec_aac.cpp
     src/loc_packager.cpp
     src/locmaf_encoder.cpp
     src/locmaf_packager.cpp
@@ -876,6 +879,9 @@ if(OPENMOQ_BUILD_TESTS)
     target_link_libraries(openmoq-publisher-encoded-sample-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-encoded-sample-tests COMMAND openmoq-publisher-encoded-sample-tests)
     set_tests_properties(openmoq-publisher-encoded-sample-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_executable(openmoq-publisher-loc-codec-profile-tests tests/loc_codec_profile_test.cpp)
+    target_link_libraries(openmoq-publisher-loc-codec-profile-tests PRIVATE openmoq_publisher_lib)
+    add_test(NAME openmoq-publisher-loc-codec-profile-tests COMMAND openmoq-publisher-loc-codec-profile-tests)
     add_executable(openmoq-publisher-loc-publisher-tests tests/loc_publisher_test.cpp)
     target_link_libraries(openmoq-publisher-loc-publisher-tests PRIVATE openmoq_publisher_lib)
     add_test(NAME openmoq-publisher-loc-publisher-tests COMMAND openmoq-publisher-loc-publisher-tests)
