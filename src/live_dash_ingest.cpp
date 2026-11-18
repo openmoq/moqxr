@@ -303,8 +303,9 @@ void ChunkedBodyDecoder::parse_available() {
 
 LiveDashIngestSession::LiveDashIngestSession(std::size_t queue_depth,
                                              MediaPackaging packaging,
-                                             std::uint64_t initial_group_id)
-    : media_packaging_(packaging), queue_depth_(queue_depth == 0 ? 1 : queue_depth) {
+                                             std::uint64_t initial_group_id,
+                                             MsfVersion msf_version)
+    : media_packaging_(packaging), msf_version_(msf_version), queue_depth_(queue_depth == 0 ? 1 : queue_depth) {
     if (initial_group_id > kMaxGroupId || initial_group_id > std::numeric_limits<std::size_t>::max()) {
         throw std::invalid_argument("DASH ingest initial Group ID exceeds 2^62-1");
     }
@@ -478,7 +479,7 @@ void LiveDashIngestSession::process_box_locked(PathState& path_state,
             if (media_packaging_ == MediaPackaging::kLocmaf) {
                 try {
                     locmaf_initializations = build_live_catalog(
-                        path_state.tracks, path_state.init_bytes, true).track_initializations;
+                        path_state.tracks, path_state.init_bytes, true, msf_version_).track_initializations;
                 } catch (const std::exception& error) {
                     encoding_error_ = std::string("LOCMAF DASH catalog failed: ") + error.what();
                     closed_ = true;
@@ -750,6 +751,7 @@ std::vector<LiveTrack> LiveDashIngestSession::snapshot_tracks_locked() const {
 
 LiveObject LiveDashIngestSession::build_catalog_locked() {
     MsfCatalog msf_catalog;
+    msf_catalog.version = std::string(msf_version_string(msf_version_));
     msf_catalog.generated_at_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
@@ -761,13 +763,18 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
 
     for (const auto& registered : tracks_) {
         const TrackDescription& track = registered.description;
-        MsfTrack msf_track = make_msf_track(track, /*is_live=*/true);
+        MsfTrack msf_track = make_msf_track(track, /*is_live=*/true, std::nullopt, 0, msf_version_);
         if (video_track_count > 1 && track.handler_type == "vide") {
             msf_track.alt_group = 1;
         }
 
         if (!registered.init_data_base64.empty()) {
-            attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);
+            if (track.packaging == "loc") {
+                attach_loc_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64,
+                                     track.handler_type == "vide");
+            } else {
+                attach_init_data(msf_catalog, msf_track, track.track_name, registered.init_data_base64);
+            }
         }
 
         // Same shared enforcement the batch and live paths use; see
@@ -797,7 +804,7 @@ LiveObject LiveDashIngestSession::build_catalog_locked() {
 struct LiveDashIngestServer::Impl {
     explicit Impl(LiveDashIngestConfig server_config)
         : config(std::move(server_config)),
-          session(config.queue_depth, config.media_packaging, config.initial_group_id) {}
+          session(config.queue_depth, config.media_packaging, config.initial_group_id, config.msf_version) {}
 
     LiveDashIngestConfig config;
     LiveDashIngestSession session;

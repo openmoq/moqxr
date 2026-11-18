@@ -156,8 +156,11 @@ async function validate({ label, codecArgs, prefixes, reordered = true, noVideoC
             assert.equal(entry.initRef, undefined, `${label}: a codec without a description has no catalog init data`);
         } else {
             assert.ok(extradata.length, 'fixture codec extradata missing');
+            // MSF-02 (the default) names the VIDEO_CONFIG / AUDIO_CONFIG object property instead of repeating the
+            // extradata inline; the extradata itself is checked below against the property on every object.
             const initEntry = catalog.initDataList.find(i => i.id === entry.initRef);
-            assert.deepEqual(Buffer.from(initEntry.data, 'base64'), extradata, 'LOC catalog must carry codec extradata');
+            assert.equal(initEntry.type, 'object-property', 'LOC catalog init data is an object-property entry');
+            assert.equal(initEntry.data, stream.codec_type === 'video' ? '0x0D' : '0x0F', 'LOC catalog names the config property');
         }
         const samples = probe.packets.filter(p => p.stream_index === stream.index);
         const ordered = objects.filter(o => o.track === entry.name).sort((a, b) =>

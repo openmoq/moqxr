@@ -69,13 +69,15 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap = false,
                                bool include_msf_timeline = false,
-                               bool vod = false);
+                               bool vod = false,
+                               MsfVersion msf_version = MsfVersion::k02);
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap,
                                bool include_msf_timeline,
                                bool vod,
-                               const std::vector<DrmSystemConfig>& drm_systems);
+                               const std::vector<DrmSystemConfig>& drm_systems,
+                               MsfVersion msf_version = MsfVersion::k02);
 std::string render_publish_plan(const PublishPlan& plan);
 PublishPlan materialize_publish_plan(const PublishPlan& plan, std::span<const std::uint8_t> bytes);
 void emit_plan_objects(const PublishPlan& plan,
@@ -94,7 +96,8 @@ struct LiveCatalog {
 };
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
-                               bool is_live = true);
+                               bool is_live = true,
+                               MsfVersion msf_version = MsfVersion::k02);
 // video_alt_group: MSF section 5.2.12 altGroup for every video track when
 // there are two or more of them. Alternate tracks represent the same content
 // and must be time-aligned, which the init segment cannot show, so the caller
@@ -104,7 +107,8 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
                                bool is_live,
                                const std::vector<DrmSystemConfig>& drm_systems,
-                               std::optional<std::uint32_t> video_alt_group = std::nullopt);
+                               std::optional<std::uint32_t> video_alt_group = std::nullopt,
+                               MsfVersion msf_version = MsfVersion::k02);
 
 // Base64-encoded, track-specific CMAF init segment (ftyp + single-track moov)
 // for the track at track_index within init_segment. This is exactly the value

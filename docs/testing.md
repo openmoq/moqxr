@@ -102,6 +102,23 @@ catalog generation time), and the offline LOCMAF Playa check still covers 232
 samples. These offline checks do not establish relay forwarding, cached FETCH,
 or browser LOC-05 playback.
 
+## MSF-02 Tests
+
+```bash
+ctest --test-dir build --output-on-failure
+bun scripts/test-msf02.mjs build/openmoq-publisher
+```
+
+The independent script runs the publisher with `--sap --msf-timeline` over the repository
+fixtures (H.264, HEVC, AV1, VP9, Opus; CMAF, LOCMAF and LOC where supported) for both
+`--msf-version 02` and `--msf-version 01`, and checks the catalogs and timeline payloads against
+the draft text without using the publisher's code: version string, root fields, Table 6, namespace
+rule, name uniqueness, `depends` resolution and the render-group rule, `initRef` and `initDataList`
+types and `0x0D`/`0x0F` data, VP9 without `initRef`, and the timeline record shapes and key case.
+The CTest targets cover the version profile, the validator, `update` deltas and the
+`CatalogPublisher` choices, `cat`/`c4m`, and byte-identical `--msf-version 01` output. These are
+offline checks; they do not establish relay interoperability.
+
 ## LOCMAF Tests
 
 The regular suite includes LOCMAF encoding, catalog signaling, CLI validation,

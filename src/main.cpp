@@ -299,6 +299,7 @@ int main(int argc, char** argv) {
             .subscriber_timeout = options.subscriber_timeout,
             .authorization = options.authorization,
             .media_packaging = options.media_packaging,
+            .msf_version = options.msf_version,
         };
         Publisher publisher(config);
         DashStopTarget dash_stop;
@@ -340,6 +341,7 @@ int main(int argc, char** argv) {
                       << " path=" << options.dash_path_prefix << std::endl;
             LiveDashIngestConfig dash_config;
             dash_config.media_packaging = options.media_packaging;
+            dash_config.msf_version = options.msf_version;
             dash_config.host = options.dash_listen_host;
             dash_config.port = options.dash_listen_port;
             dash_config.path_prefix = options.dash_path_prefix;

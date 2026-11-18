@@ -542,6 +542,15 @@ CliOptions parse_cli_options(int argc, char** argv) {
             } else {
                 throw std::runtime_error("--packaging must be cmaf, locmaf, or loc");
             }
+        } else if (argument == "--msf-version") {
+            const auto value = require_value("--msf-version");
+            if (value == "01") {
+                options.msf_version = MsfVersion::k01;
+            } else if (value == "02") {
+                options.msf_version = MsfVersion::k02;
+            } else {
+                throw std::runtime_error("--msf-version must be 01 or 02");
+            }
         } else if (argument == "--coalesce-cmaf-chunks") {
             options.split_cmaf_chunks = false;
         } else if (argument == "--stream-per-object") {
@@ -819,7 +828,7 @@ std::string build_usage(const char* argv0) {
            " [--dash-listen host:port] [--dash-path <prefix>] [--dash-queue-depth <count>]"
            " [--transport raw|webtransport] [--libmoq-backend auto|picoquic|mvfst|msquic] [--draft 16|18|21|22|23] [--namespace <value>] [--forward 0|1] [--timeout <seconds>]"
            " [--publish-catalog] [--sap] [--msf-timeline] [--coalesce-cmaf-chunks] [--stream-per-object] [--paced] [--loop] [--preannounce-tracks] [--moq-impl-id] [--dump-plan] [--print-msf-urls] [--emit-dir <dir>]"
-           " [--packaging cmaf|locmaf|loc] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--video-alt-group <N>] [--drm-config <path>]"
+           " [--packaging cmaf|locmaf|loc] [--msf-version 01|02] [--vod] [--catalog-republish-interval <seconds>] [--initial-group-id <N|time>] [--video-alt-group <N>] [--drm-config <path>]"
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--webtransport-allow-missing-reset-stream-at] [--quic-idle-timeout <ms>]"
            " [--retry <count>]"

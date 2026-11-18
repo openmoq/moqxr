@@ -2,6 +2,7 @@
 #include "openmoq/publisher/moq_draft.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <iomanip>
 #include <ios>
@@ -170,12 +171,56 @@ void validate_optional_no_stray_percent(const std::optional<std::string>& value,
     }
 }
 
+// MSF-02 section 5.2.2: a '/'-delimited string holding 1 to 32 non-empty Track Namespace Fields.
+void validate_namespace_string(const std::string& value, std::string_view field, const std::string& where) {
+    std::size_t fields = 1;
+    std::size_t field_length = 0;
+    for (const char character : value) {
+        if (character == '/') {
+            if (field_length == 0) {
+                throw std::runtime_error("MSF catalog " + std::string(field) + " has an empty namespace field" + where);
+            }
+            ++fields;
+            field_length = 0;
+        } else {
+            ++field_length;
+        }
+    }
+    if (field_length == 0) {
+        throw std::runtime_error("MSF catalog " + std::string(field) + " has an empty namespace field" + where);
+    }
+    if (fields > 32) {
+        throw std::runtime_error("MSF catalog " + std::string(field) + " has more than 32 namespace fields" + where);
+    }
+}
+
+// Fields that exist only from MSF-02 on.
+void reject_msf02_fields_under_01(const MsfTrack& track, const std::string& where) {
+    const char* present = track.packaging_metadata ? "packagingMetadata"
+        : track.accessible_window_time_ms ? "accessibleWindowTime"
+        : track.keyframe_spacing ? "keyframeSpacing"
+        : track.connection_uri ? "connectionURI"
+        : !track.depends_render_groups.empty() ? "depends (renderGroup entry)"
+        : nullptr;
+    if (present != nullptr) {
+        throw std::runtime_error(std::string("MSF catalog field ") + present +
+                                 " requires catalog version draft-02" + where);
+    }
+}
+
 // MSF and CMSF invariants that a malformed caller could otherwise publish.
-void validate_track(const MsfTrack& track) {
+void validate_track(const MsfTrack& track, MsfVersion version) {
     const std::string where = " (track \"" + track.name + "\")";
 
     if (track.name.empty()) {
         throw std::runtime_error("MSF catalog track requires a name");
+    }
+    if (version == MsfVersion::k01) {
+        reject_msf02_fields_under_01(track, where);
+    } else {
+        if (track.name_space.has_value()) {
+            validate_namespace_string(*track.name_space, "namespace", where);
+        }
     }
     if (track.packaging.empty()) {
         throw std::runtime_error("MSF catalog requires a packaging value" + where);
@@ -186,6 +231,32 @@ void validate_track(const MsfTrack& track) {
         }
     } else if (track.locmaf_version.has_value()) {
         throw std::runtime_error("locmafVersion is forbidden outside locmaf packaging" + where);
+    }
+    // MSF-02 Table 6: fields required per (packaging, role) pair. eventtimeline's eventType
+    // is checked below for both versions.
+    if (version == MsfVersion::k02 && track.packaging == "loc" && track.role.has_value()) {
+        const std::string& role = *track.role;
+        const auto need = [&](bool present, const char* field) {
+            if (!present) {
+                throw std::runtime_error(std::string("MSF-02 catalog requires ") + field + " for loc " + role + " tracks" + where);
+            }
+        };
+        if (role == "video" || role == "audio" || role == "audiodescription" || role == "signlanguage") {
+            need(track.codec.has_value(), "codec");
+        }
+        if (role == "video" || role == "audio") {
+            need(track.bitrate.has_value(), "bitrate");
+        }
+        if (role == "video" || role == "signlanguage") {
+            need(track.framerate.has_value(), "framerate");
+        }
+        if (role == "audio" || role == "audiodescription") {
+            need(track.samplerate.has_value(), "samplerate");
+            need(track.channel_config.has_value(), "channelConfig");
+        }
+        if (role == "audiodescription") {
+            need(track.lang.has_value(), "lang");
+        }
     }
     // Section 5.2.22: bitrate MUST be specified for audio and video tracks.
     if (is_media_role(track) && !track.bitrate.has_value()) {
@@ -213,7 +284,7 @@ void validate_track(const MsfTrack& track) {
         throw std::runtime_error("MSF catalog forbids both targetLatency and buffers" + where);
     }
     // Section 5: custom field names MUST NOT collide with spec field names.
-    static const std::set<std::string> kSpecFieldNames = {
+    static const std::set<std::string> kSpecFieldNames01 = {
         "name", "namespace", "packaging", "locmafVersion", "eventType", "role", "isLive",
         "targetLatency", "buffers", "label", "renderGroup", "altGroup",
         "initRef", "depends", "codec", "mimeType", "framerate", "timescale",
@@ -225,8 +296,17 @@ void validate_track(const MsfTrack& track) {
         "encryptionScheme", "cipherSuite", "keyId", "trackBaseKey",
         "connectionUri", "token", "contentProtectionRefIDs",
     };
+    // Names MSF-02 adds or renames; reserved against custom fields only under draft-02, so a
+    // "1" catalog keeps accepting them as producer-defined names.
+    static const std::set<std::string> kSpecFieldNamesAdded02 = {
+        "packagingMetadata", "accessibleWindowTime", "keyframeSpacing", "connectionURI",
+    };
+    const auto is_spec_field = [&](const std::string& key) {
+        return kSpecFieldNames01.count(key) != 0 ||
+               (version == MsfVersion::k02 && kSpecFieldNamesAdded02.count(key) != 0);
+    };
     for (const auto& [key, value] : track.custom_fields) {
-        if (kSpecFieldNames.count(key) != 0) {
+        if (is_spec_field(key)) {
             throw std::runtime_error("MSF catalog custom field \"" + key +
                                      "\" collides with a spec field name" + where);
         }
@@ -261,6 +341,11 @@ void validate_track(const MsfTrack& track) {
 
 // Catalog-wide invariants that cannot be checked from a single track.
 void validate_catalog(const MsfCatalog& catalog) {
+    const auto parsed_version = msf_version_from_string(catalog.version);
+    if (!parsed_version.has_value()) {
+        throw std::runtime_error("MSF catalog has unknown version \"" + catalog.version + "\"");
+    }
+    const MsfVersion version = *parsed_version;
     // Section 5.3: a delta update MUST include at least one operation and
     // MUST NOT carry tracks. Only "add" and "remove" are emitted by this
     // implementation.
@@ -268,11 +353,47 @@ void validate_catalog(const MsfCatalog& catalog) {
         if (!catalog.tracks.empty()) {
             throw std::runtime_error("MSF delta catalog must not carry a tracks array");
         }
+        if (version == MsfVersion::k02) {
+            // Section 5.3: a delta carries deltaUpdate and generatedAt, and no other root field.
+            if (!catalog.generated_at_ms.has_value()) {
+                throw std::runtime_error("MSF-02 delta catalog requires generatedAt");
+            }
+            if (catalog.is_complete.has_value() || !catalog.content_protections.empty() ||
+                !catalog.publish_tracks.empty() || !catalog.init_data_list.empty()) {
+                throw std::runtime_error("MSF-02 delta catalog must not carry root fields other than generatedAt");
+            }
+        }
         for (const auto& op : catalog.delta_update) {
-            if (op.op != "add" && op.op != "remove") {
+            const bool update_op = op.op == "update";
+            if (op.op != "add" && op.op != "remove" && !(update_op && version == MsfVersion::k02)) {
                 throw std::runtime_error("MSF delta catalog has unsupported operation \"" + op.op + "\"");
             }
-            if (op.tracks.empty()) {
+            if (update_op) {
+                if (op.updates.empty() || !op.tracks.empty()) {
+                    throw std::runtime_error("MSF delta update operation must carry update entries only");
+                }
+                for (const auto& update : op.updates) {
+                    const std::string where = " (update of track \"" + update.parent_name + "\")";
+                    if (update.parent_name.empty()) {
+                        throw std::runtime_error("MSF delta update entry requires parentName");
+                    }
+                    validate_no_stray_percent(update.parent_name, "parentName", where);
+                    if (update.parent_namespace.has_value()) {
+                        validate_namespace_string(*update.parent_namespace, "parentNamespace", where);
+                        validate_no_stray_percent(*update.parent_namespace, "parentNamespace", where);
+                    }
+                    if (update.overrides.empty()) {
+                        throw std::runtime_error("MSF delta update entry overrides nothing" + where);
+                    }
+                    for (const auto& [key, value] : update.overrides) {
+                        if (key.empty() || value.empty() || key == "name" || key == "namespace") {
+                            throw std::runtime_error("MSF delta update entry has an invalid override \"" + key + "\"" + where);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (op.tracks.empty() || !op.updates.empty()) {
                 throw std::runtime_error("MSF delta operation \"" + op.op + "\" has no tracks");
             }
             if (op.op == "remove") {
@@ -304,6 +425,21 @@ void validate_catalog(const MsfCatalog& catalog) {
         const std::string init_where = " (initDataList entry \"" + entry.id + "\")";
         validate_no_stray_percent(entry.id, "id", init_where);
         validate_no_stray_percent(entry.type, "type", init_where);
+        // Section 5.1.7: "inline" in MSF-01; MSF-02 adds the two property types, whose data is the
+        // property type in hex notation (the plain "0x" form is used here).
+        const bool property_type = entry.type == "track-property" || entry.type == "object-property";
+        if (entry.type != "inline" && !(property_type && version == MsfVersion::k02)) {
+            throw std::runtime_error("MSF catalog initDataList type \"" + entry.type + "\" is not defined by this catalog version" +
+                                     init_where);
+        }
+        if (property_type) {
+            const bool hex_body = entry.data.size() > 2 && entry.data.rfind("0x", 0) == 0 &&
+                std::all_of(entry.data.begin() + 2, entry.data.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+            if (!hex_body) {
+                throw std::runtime_error("MSF catalog initDataList data \"" + entry.data +
+                                         "\" is not a property type in hex notation" + init_where);
+            }
+        }
         // entry.data is Base64-encoded initialization data (see the doc
         // comment on MsfInitData::data and attach_init_data's parameter
         // name); Base64's alphabet excludes '%', so a percent check here
@@ -376,6 +512,48 @@ void validate_catalog(const MsfCatalog& catalog) {
         }
     }
 
+    // MSF-02 section 5.2.15: a depends name resolves to exactly one OTHER track and a renderGroup to at least
+    // one other track; an entry that does not resolve makes the catalog invalid. `tracks` entries resolve
+    // against `tracks`; publishTracks entries against both lists.
+    if (version == MsfVersion::k02) {
+        const auto check_depends = [&](const MsfTrack& track,
+                                       const std::vector<const std::vector<MsfTrack>*>& pools) {
+            for (const auto& dependency : track.depends) {
+                std::size_t matches = 0;
+                for (const auto* pool : pools) {
+                    for (const auto& other : *pool) {
+                        if (&other != &track && other.name == dependency) {
+                            ++matches;
+                        }
+                    }
+                }
+                if (matches != 1) {
+                    throw std::runtime_error("MSF catalog depends entry \"" + dependency + "\" resolves to " +
+                                             std::to_string(matches) + " tracks, not exactly one other track (track \"" +
+                                             track.name + "\")");
+                }
+            }
+            for (const auto group : track.depends_render_groups) {
+                bool found = false;
+                for (const auto* pool : pools) {
+                    for (const auto& other : *pool) {
+                        found = found || (&other != &track && other.render_group == group);
+                    }
+                }
+                if (!found) {
+                    throw std::runtime_error("MSF catalog depends renderGroup " + std::to_string(group) +
+                                             " resolves to no other track (track \"" + track.name + "\")");
+                }
+            }
+        };
+        for (const auto& track : catalog.tracks) {
+            check_depends(track, {&catalog.tracks});
+        }
+        for (const auto& track : catalog.publish_tracks) {
+            check_depends(track, {&catalog.tracks, &catalog.publish_tracks});
+        }
+    }
+
     // Section 5.1.5: publishTracks follow the same structure as tracks.
     for (const auto& track : catalog.publish_tracks) {
         const std::string ns = track.name_space.value_or(std::string{});
@@ -398,8 +576,8 @@ void validate_catalog(const MsfCatalog& catalog) {
     }
 }
 
-void write_track(std::ostringstream& out, const MsfTrack& track) {
-    validate_track(track);
+void write_track(std::ostringstream& out, const MsfTrack& track, MsfVersion version) {
+    validate_track(track, version);
 
     out << '{';
     JsonSeq seq(out);
@@ -409,6 +587,9 @@ void write_track(std::ostringstream& out, const MsfTrack& track) {
         write_string(out, seq, "namespace", *track.name_space);
     }
     write_string(out, seq, "packaging", track.packaging);
+    if (track.packaging_metadata.has_value()) {
+        write_string(out, seq, "packagingMetadata", *track.packaging_metadata);
+    }
     if (track.locmaf_version.has_value()) {
         write_string(out, seq, "locmafVersion", *track.locmaf_version);
     }
@@ -449,8 +630,20 @@ void write_track(std::ostringstream& out, const MsfTrack& track) {
     if (track.init_ref.has_value()) {
         write_string(out, seq, "initRef", *track.init_ref);
     }
-    if (!track.depends.empty()) {
-        write_string_array(out, seq, "depends", track.depends);
+    if (!track.depends.empty() || !track.depends_render_groups.empty()) {
+        // MSF-02 section 5.2.15: entries are track names (strings) or renderGroups (numbers).
+        seq.separate();
+        out << "\"depends\":[";
+        JsonSeq entries(out);
+        for (const auto& name : track.depends) {
+            entries.separate();
+            out << '"' << json_escape(name) << '"';
+        }
+        for (const auto group : track.depends_render_groups) {
+            entries.separate();
+            out << group;
+        }
+        out << ']';
     }
     if (track.codec.has_value()) {
         write_string(out, seq, "codec", *track.codec);
@@ -494,6 +687,15 @@ void write_track(std::ostringstream& out, const MsfTrack& track) {
     if (track.track_duration_ms.has_value()) {
         write_uint(out, seq, "trackDuration", *track.track_duration_ms);
     }
+    if (track.accessible_window_time_ms.has_value()) {
+        write_uint(out, seq, "accessibleWindowTime", *track.accessible_window_time_ms);
+    }
+    if (track.keyframe_spacing.has_value()) {
+        write_uint(out, seq, "keyframeSpacing", *track.keyframe_spacing);
+    }
+    if (track.connection_uri.has_value()) {
+        write_string(out, seq, "connectionURI", *track.connection_uri);
+    }
     if (track.max_grp_sap_starting_type.has_value()) {
         write_uint(out, seq, "maxGrpSapStartingType", *track.max_grp_sap_starting_type);
     }
@@ -515,13 +717,14 @@ void write_track(std::ostringstream& out, const MsfTrack& track) {
 void write_track_array(std::ostringstream& out,
                        JsonSeq& seq,
                        std::string_view key,
-                       const std::vector<MsfTrack>& tracks) {
+                       const std::vector<MsfTrack>& tracks,
+                       MsfVersion version) {
     seq.separate();
     out << '"' << json_escape(key) << "\":[";
     JsonSeq inner(out);
     for (const auto& track : tracks) {
         inner.separate();
-        write_track(out, track);
+        write_track(out, track, version);
     }
     out << ']';
 }
@@ -530,6 +733,7 @@ void write_track_array(std::ostringstream& out,
 
 std::string serialize_catalog(const MsfCatalog& catalog) {
     validate_catalog(catalog);
+    const MsfVersion version = *msf_version_from_string(catalog.version);
 
     const bool is_delta = !catalog.delta_update.empty();
 
@@ -600,6 +804,17 @@ std::string serialize_catalog(const MsfCatalog& catalog) {
             ops.separate();
             out << "{\"op\":\"" << json_escape(op.op) << "\",\"tracks\":[";
             JsonSeq op_tracks(out);
+            for (const auto& update : op.updates) {
+                op_tracks.separate();
+                out << "{\"parentName\":\"" << json_escape(update.parent_name) << '"';
+                if (update.parent_namespace.has_value()) {
+                    out << ",\"parentNamespace\":\"" << json_escape(*update.parent_namespace) << '"';
+                }
+                for (const auto& [key, value] : update.overrides) {
+                    out << ",\"" << json_escape(key) << "\":" << value;
+                }
+                out << '}';
+            }
             for (const auto& track : op.tracks) {
                 op_tracks.separate();
                 if (op.op == "remove") {
@@ -616,18 +831,18 @@ std::string serialize_catalog(const MsfCatalog& catalog) {
                     }
                     out << '}';
                 } else {
-                    write_track(out, track);
+                    write_track(out, track, version);
                 }
             }
             out << "]}";
         }
         out << ']';
     } else {
-        write_track_array(out, seq, "tracks", catalog.tracks);
+        write_track_array(out, seq, "tracks", catalog.tracks, version);
     }
 
     if (!is_delta && !catalog.publish_tracks.empty()) {
-        write_track_array(out, seq, "publishTracks", catalog.publish_tracks);
+        write_track_array(out, seq, "publishTracks", catalog.publish_tracks, version);
     }
 
     // Section 5.1.7: initDataList MUST be located after the tracks array.
@@ -702,10 +917,48 @@ bool bitrate_is_estimated(const TrackDescription& track,
     return track.max_bitrate == 0 && !(configured.has_value() && *configured != 0) && computed == 0;
 }
 
+void collapse_depends_to_render_groups(MsfCatalog& catalog) {
+    for (auto& timeline : catalog.tracks) {
+        if (timeline.packaging != "mediatimeline" || timeline.depends.empty()) {
+            continue;
+        }
+        std::map<std::uint32_t, std::vector<std::string>> members_by_group;
+        for (const auto& track : catalog.tracks) {
+            if (&track != &timeline && track.render_group.has_value()) {
+                members_by_group[*track.render_group].push_back(track.name);
+            }
+        }
+        for (const auto& [group, members] : members_by_group) {
+            const bool covered = std::all_of(members.begin(), members.end(), [&](const std::string& name) {
+                return std::find(timeline.depends.begin(), timeline.depends.end(), name) != timeline.depends.end();
+            });
+            if (!covered) {
+                continue;
+            }
+            std::erase_if(timeline.depends, [&](const std::string& name) {
+                return std::find(members.begin(), members.end(), name) != members.end();
+            });
+            if (std::find(timeline.depends_render_groups.begin(), timeline.depends_render_groups.end(), group) ==
+                timeline.depends_render_groups.end()) {
+                timeline.depends_render_groups.push_back(group);
+            }
+        }
+    }
+}
+
+double resolve_framerate(const TrackDescription& track) {
+    return track.frame_rate > 0.0 ? track.frame_rate : 30.0;
+}
+
+bool framerate_is_estimated(const TrackDescription& track) {
+    return track.handler_type == "vide" && !(track.frame_rate > 0.0);
+}
+
 MsfTrack make_msf_track(const TrackDescription& track,
                         bool is_live,
                         std::optional<std::uint64_t> configured_bitrate,
-                        std::uint64_t computed_bitrate) {
+                        std::uint64_t computed_bitrate,
+                        MsfVersion msf_version) {
     MsfTrack out;
     out.name = track.track_name;
     out.packaging = track.packaging;
@@ -764,6 +1017,12 @@ MsfTrack make_msf_track(const TrackDescription& track,
         }
         if (track.frame_rate > 0.0) {
             out.framerate = track.frame_rate;
+        } else if (msf_version == MsfVersion::k02 && track.packaging == "loc") {
+            // MSF-02 Table 6 requires framerate for loc video.
+            out.framerate = resolve_framerate(track);
+            std::cerr << "[msf-catalog] warning: track \"" << track.track_name
+                      << "\" has no measured frame rate; advertising estimated "
+                      << *out.framerate << " fps" << std::endl;
         }
         const std::uint64_t bitrate = resolve_bitrate(track, configured_bitrate, computed_bitrate);
         out.bitrate = bitrate;
@@ -792,6 +1051,25 @@ void attach_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view tra
         .id = std::move(init_id),
         .type = "inline",
         .data = std::move(base64_data),
+    });
+}
+
+void attach_loc_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name,
+                          std::string base64_config, bool video) {
+    if (base64_config.empty()) {
+        return;
+    }
+    if (msf_version_from_string(catalog.version) != MsfVersion::k02) {
+        attach_init_data(catalog, track, track_name, std::move(base64_config));
+        return;
+    }
+    std::string init_id(track_name);
+    init_id += "-init";
+    track.init_ref = init_id;
+    catalog.init_data_list.push_back(MsfInitData{
+        .id = std::move(init_id),
+        .type = "object-property",
+        .data = video ? "0x0D" : "0x0F",
     });
 }
 
@@ -887,6 +1165,83 @@ MsfCatalog make_end_broadcast_catalog(const MsfCatalog& current,
 
 namespace {
 
+// Splits the top level of a JSON object produced by write_track into (key, raw value) pairs.
+// Only handles this writer's output: strings with backslash escapes, nested arrays and objects.
+std::vector<std::pair<std::string, std::string>> top_level_json_fields(const std::string& json) {
+    std::vector<std::pair<std::string, std::string>> fields;
+    std::size_t at = 1;  // after '{'
+    const auto read_string = [&](std::size_t& cursor) {
+        std::string text;
+        ++cursor;  // opening quote
+        while (cursor < json.size() && json[cursor] != '"') {
+            if (json[cursor] == '\\' && cursor + 1 < json.size()) {
+                text.push_back(json[cursor++]);
+            }
+            text.push_back(json[cursor++]);
+        }
+        ++cursor;  // closing quote
+        return text;
+    };
+    while (at < json.size() && json[at] != '}') {
+        if (json[at] == ',') {
+            ++at;
+            continue;
+        }
+        const std::string key = read_string(at);
+        ++at;  // ':'
+        const std::size_t start = at;
+        int depth = 0;
+        while (at < json.size()) {
+            const char c = json[at];
+            if (c == '"') {
+                static_cast<void>(read_string(at));
+                continue;
+            }
+            if (c == '[' || c == '{') {
+                ++depth;
+            } else if (c == ']' || c == '}') {
+                if (depth == 0) {
+                    break;
+                }
+                --depth;
+            } else if (c == ',' && depth == 0) {
+                break;
+            }
+            ++at;
+        }
+        fields.emplace_back(key, json.substr(start, at - start));
+    }
+    return fields;
+}
+
+// The attributes of `after` that differ from `before`, as update overrides. nullopt when
+// a field present in `before` is absent from `after`, because an update can only override.
+std::optional<std::vector<std::pair<std::string, std::string>>> update_overrides(
+    const MsfTrack& before, const MsfTrack& after, MsfVersion version) {
+    const auto serialize_track = [&](const MsfTrack& track) {
+        std::ostringstream out;
+        write_track(out, track, version);
+        return top_level_json_fields(out.str());
+    };
+    const auto old_fields = serialize_track(before);
+    const auto new_fields = serialize_track(after);
+    std::map<std::string, std::string> old_by_key(old_fields.begin(), old_fields.end());
+    std::map<std::string, std::string> new_by_key(new_fields.begin(), new_fields.end());
+    for (const auto& [key, value] : old_by_key) {
+        if (new_by_key.find(key) == new_by_key.end()) {
+            return std::nullopt;
+        }
+    }
+    std::vector<std::pair<std::string, std::string>> overrides;
+    for (const auto& [key, value] : new_fields) {
+        const auto previous = old_by_key.find(key);
+        if (previous == old_by_key.end() || previous->second != value) {
+            overrides.emplace_back(key, value);
+        }
+    }
+    return overrides;
+}
+
 bool tracks_equal(const MsfTrack& a, const MsfTrack& b) {
     // Compare every field that serialize_catalog can emit. A field added to
     // MsfTrack without being added here would make a real change look like a
@@ -903,6 +1258,9 @@ bool tracks_equal(const MsfTrack& a, const MsfTrack& b) {
            a.height == b.height && a.samplerate == b.samplerate &&
            a.channel_config == b.channel_config && a.lang == b.lang &&
            a.track_duration_ms == b.track_duration_ms && a.event_type == b.event_type &&
+           a.packaging_metadata == b.packaging_metadata && a.accessible_window_time_ms == b.accessible_window_time_ms &&
+           a.keyframe_spacing == b.keyframe_spacing && a.connection_uri == b.connection_uri &&
+           a.depends_render_groups == b.depends_render_groups &&
            a.max_grp_sap_starting_type == b.max_grp_sap_starting_type &&
            a.max_obj_sap_starting_type == b.max_obj_sap_starting_type &&
            a.custom_fields == b.custom_fields &&
@@ -1055,21 +1413,35 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
         after.emplace(key_of(track), &track);
     }
 
+    const MsfVersion version = *msf_version_from_string(desired.version);
     std::vector<MsfTrack> added;
     std::vector<MsfTrack> removed;
+    std::vector<MsfTrackUpdate> updated;
     for (const auto& [key, track] : after) {
         const auto it = before.find(key);
         if (it == before.end()) {
             added.push_back(*track);
         } else if (!tracks_equal(*it->second, *track)) {
-            // Section 5.3 freezes a track's attributes once its tuple is
-            // declared, so an attribute change cannot be expressed as a
-            // delta. Fall back to a full independent catalog: emitting
-            // nothing would leave subscribers on stale attributes.
-            std::vector<CatalogObject> out;
-            out.push_back(emit_independent(desired));
-            last_ = desired;
-            return out;
+            // MSF-01 section 5.3 freezes a track's attributes once its tuple is declared. MSF-02
+            // adds the update operation, which can only override attributes and needs a
+            // generatedAt on the delta. Anything else (a removed attribute, MSF-01, no
+            // generatedAt) falls back to a full independent catalog: emitting nothing would
+            // leave subscribers on stale attributes.
+            std::optional<std::vector<std::pair<std::string, std::string>>> overrides;
+            if (version == MsfVersion::k02 && desired.generated_at_ms.has_value()) {
+                overrides = update_overrides(*it->second, *track, version);
+            }
+            if (!overrides.has_value() || overrides->empty()) {
+                std::vector<CatalogObject> out;
+                out.push_back(emit_independent(desired));
+                last_ = desired;
+                return out;
+            }
+            MsfTrackUpdate update;
+            update.parent_name = track->name;
+            update.parent_namespace = track->name_space;
+            update.overrides = std::move(*overrides);
+            updated.push_back(std::move(update));
         }
     }
     for (const auto& [key, track] : before) {
@@ -1107,7 +1479,7 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
         content_protections_changed =
             !content_protections_equal(last_->content_protections[i], desired.content_protections[i]);
     }
-    if ((added.empty() && removed.empty()) || init_data_changed || publish_tracks_changed ||
+    if ((added.empty() && removed.empty() && updated.empty()) || init_data_changed || publish_tracks_changed ||
         content_protections_changed || deltas_in_group_ >= max_deltas_per_group_) {
         std::vector<CatalogObject> out;
         out.push_back(emit_independent(desired));
@@ -1116,11 +1488,26 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     }
 
     MsfCatalog delta;
+    // The version is not serialized for a delta (section 5.3) but selects its profile.
+    delta.version = last_->version;
+    if (version == MsfVersion::k02) {
+        if (!desired.generated_at_ms.has_value()) {
+            // Section 5.3 requires generatedAt on every delta, so a catalog without one needs a full catalog.
+            std::vector<CatalogObject> out;
+            out.push_back(emit_independent(desired));
+            last_ = desired;
+            return out;
+        }
+        delta.generated_at_ms = desired.generated_at_ms;
+    }
     if (!added.empty()) {
         delta.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = std::move(added)});
     }
     if (!removed.empty()) {
         delta.delta_update.push_back(MsfDeltaOp{.op = "remove", .tracks = std::move(removed)});
+    }
+    if (!updated.empty()) {
+        delta.delta_update.push_back(MsfDeltaOp{.op = "update", .tracks = {}, .updates = std::move(updated)});
     }
 
     // serialize_catalog can throw (write_track's per-track checks run for

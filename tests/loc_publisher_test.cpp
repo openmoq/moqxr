@@ -162,6 +162,50 @@ int main() {
             check(json.find("\"codec\":\"vp09.00.10.08\"") != std::string::npos && json.find("initRef") == std::string::npos,
                   "VP9 catalog carries the codec string and no init data");
         }
+        {
+            // MSF-02 publishes LOC decoder config as object-property init entries; MSF-01 stays inline.
+            const auto catalog_json = [&](const char* name, MsfVersion version, MediaPackaging packaging) {
+                auto local = config;
+                local.msf_version = version;
+                local.media_packaging = packaging;
+                std::istringstream input(fixture(name));
+                auto prepared = Publisher(local).prepare_stream(input, name);
+                const auto catalog = std::find_if(prepared.plan.objects.begin(), prepared.plan.objects.end(),
+                    [](const auto& object) { return object.track_name == "catalog"; });
+                return std::string(catalog->owned_payload.begin(), catalog->owned_payload.end());
+            };
+            const auto count = [](const std::string& text, const std::string& needle) {
+                std::size_t found = 0;
+                for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++found;
+                return found;
+            };
+            const auto hevc02 = catalog_json("loc-hevc-fragmented.mp4", MsfVersion::k02, MediaPackaging::kLoc);
+            check(hevc02.find("\"version\":\"draft-02\"") != std::string::npos, "default LOC catalog is draft-02");
+            check(hevc02.find("\"type\":\"object-property\"") != std::string::npos &&
+                      hevc02.find("\"data\":\"0x0D\"") != std::string::npos &&
+                      hevc02.find("\"type\":\"inline\"") == std::string::npos,
+                  "LOC video config is an object-property entry naming VIDEO_CONFIG");
+            check(hevc02.find("\"framerate\"") != std::string::npos && hevc02.find("\"bitrate\"") != std::string::npos,
+                  "LOC video track carries the Table 6 fields");
+            const auto opus02 = catalog_json("loc-opus.mp4", MsfVersion::k02, MediaPackaging::kLoc);
+            check(opus02.find("\"data\":\"0x0F\"") != std::string::npos && opus02.find("\"channelConfig\"") != std::string::npos &&
+                      opus02.find("\"samplerate\"") != std::string::npos,
+                  "LOC audio config is an object-property entry naming AUDIO_CONFIG with the Table 6 fields");
+            const auto vp902 = catalog_json("loc-vp9-fragmented.mp4", MsfVersion::k02, MediaPackaging::kLoc);
+            check(vp902.find("initRef") == std::string::npos && vp902.find("initDataList") == std::string::npos &&
+                      vp902.find("\"codec\":\"vp09.00.10.08\"") != std::string::npos,
+                  "VP9 has no init reference under 02");
+            const auto hevc01 = catalog_json("loc-hevc-fragmented.mp4", MsfVersion::k01, MediaPackaging::kLoc);
+            check(hevc01.find("\"version\":\"1\"") != std::string::npos && hevc01.find("\"type\":\"inline\"") != std::string::npos &&
+                      hevc01.find("object-property") == std::string::npos,
+                  "MSF-01 keeps inline LOC init data");
+            const auto cmaf02 = catalog_json("locmaf-publisher.mp4", MsfVersion::k02, MediaPackaging::kCmaf);
+            check(count(cmaf02, "\"type\":\"inline\"") >= 1 && cmaf02.find("object-property") == std::string::npos,
+                  "CMAF keeps inline init data under 02");
+            const auto locmaf02 = catalog_json("locmaf-publisher.mp4", MsfVersion::k02, MediaPackaging::kLocmaf);
+            check(count(locmaf02, "\"type\":\"inline\"") >= 1 && locmaf02.find("object-property") == std::string::npos,
+                  "LOCMAF keeps inline init data under 02");
+        }
         // A missing decode interval invalidates dependent video until a new IDR.
         std::istringstream video_input(fixture("locmaf-publisher.mp4"));
         auto parsed = parse_mp4_stream(video_input, "video");

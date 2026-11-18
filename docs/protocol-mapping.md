@@ -103,12 +103,56 @@ The default session backend supports LOCMAF for file, stdin, SRT, and DASH
 input. The libmoq/moq5 publishing backend rejects it. See
 [quickstart](quickstart.md#opt-in-to-locmaf) for usage and current limits.
 
-## MSF v1 catalog
+## MSF catalog
 
-- The catalog is a `draft-ietf-moq-msf-01` version 1 document. `version` is the
-  String `"1"`; there is no root `format` field.
+- `--msf-version 01|02` (default `02`; `PublisherConfig::msf_version`) selects the
+  catalog draft. `MsfCatalog::version` is the single source of truth: `"1"` is
+  `draft-ietf-moq-msf-01` and `"draft-02"` is `draft-ietf-moq-msf-02`
+  ([text](draft-ietf-moq-msf-02.txt)). The `draft-02` string comes from that
+  draft's examples; its section 5.1.1 says only "the version of MSF referenced".
+  There is no root `format` field in either.
 - Initialization data lives in the root `initDataList` array, referenced from
   each track by `initRef`, and is serialized after `tracks`.
+
+### MSF-02 (`draft-02`) differences, all gated on the catalog version
+
+- Table 6 required fields per (packaging, role): `loc` video needs `codec`,
+  `bitrate`, `framerate`; `loc` audio needs `codec`, `bitrate`, `samplerate`,
+  `channelConfig`; `audiodescription` and `signlanguage` have their own rows;
+  `eventtimeline` needs `eventType`. A live LOC video track with no measured
+  frame rate advertises an estimated 30 fps and logs a warning, as for `bitrate`.
+- LOC decoder config is published through `initDataList` entries of type
+  `object-property` (`data` is `"0x0D"` for VIDEO_CONFIG, `"0x0F"` for
+  AUDIO_CONFIG), because LOC objects already repeat that property. The `data`
+  spelling is this project's reading of "hex notation". A codec with no
+  description (VP9) has no `initRef`. CMAF and LOCMAF keep inline Base64 init
+  data. The `track-property` type is accepted by the validator but never
+  emitted: the Track-property delivery path (PUBLISH/SUBSCRIBE_OK/FETCH_OK) is
+  not implemented.
+- Namespace is a `/`-delimited string of 1 to 32 non-empty fields; `depends`
+  carries track names and `renderGroup` numbers and every entry must resolve. A
+  media timeline that covers every track of a render group references the
+  group number and not the tracks (section 7.2).
+- Modelled and validated: `packagingMetadata`, `accessibleWindowTime`,
+  `keyframeSpacing`, `connectionURI`, `parentName`, `parentNamespace`. They are
+  refused under version `"1"`. `keyframeSpacing` is not emitted by any publisher
+  path: it needs objects-per-group, which is unknown when a live catalog is
+  built. `streamMapping` is not emitted either; group mode is the default and
+  is what LOC publishing uses.
+- Delta updates carry `generatedAt` and `deltaUpdate` only and may use the
+  `update` operation, which names its target with `parentName` and holds only
+  the overriding fields. `CatalogPublisher` emits `update` for an expressible
+  attribute change; a removed attribute, or a desired catalog without
+  `generatedAt`, produces a full independent catalog.
+- The SAP event timeline uses the uppercase index key `L`, and the media
+  timeline uses the floor of the object's earliest presentation time in
+  milliseconds. MSF-01 keeps its lowercase `l` key and rounds the decode time
+  (both drafts say "floor", so the MSF-01 rounding is an existing
+  nonconformance kept to preserve its bytes).
+- The reserved MSF URL fragment parameter is `cat` (was `c4m`); the parser
+  accepts both and `build_msf_url` emits the name that matches the version.
+- Not implemented: `MSF_COMPRESSION`, secure objects, log and metrics tracks,
+  `packaging: "catalog"`, `clone`.
 - Media tracks default to `packaging: "cmaf"` per `draft-ietf-moq-cmsf-01`
   section 3.5.1, along with `maxGrpSapStartingType` and
   `maxObjSapStartingType`. LOCMAF opt-in uses the signaling described above.

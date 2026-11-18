@@ -807,6 +807,18 @@ int main() {
     }
 
     {
+        // The catalog version follows the selected MSF draft.
+        LiveDashIngestSession session(8, openmoq::publisher::MediaPackaging::kCmaf, 0, openmoq::publisher::MsfVersion::k01);
+        const auto init = make_init_segment(1);
+        session.ingest("/ingest/video", std::span<const std::uint8_t>(init.data(), init.size()));
+        ok &= expect(session.wait_for_tracks(std::chrono::milliseconds(1), std::chrono::milliseconds(1)),
+                     "expected tracks after init for the MSF-01 catalog test");
+        const std::optional<LiveObject> catalog = session.try_next_object();
+        ok &= expect(catalog.has_value() && as_string(catalog->payload).find("\"version\":\"1\"") != std::string::npos,
+                     "expected the MSF-01 version string when 01 is selected for DASH ingest");
+    }
+
+    {
         // The catalog must embed each track's base64 CMAF init segment so
         // subscribers can initialize their decoders.
         LiveDashIngestSession session(8);
@@ -820,8 +832,8 @@ int main() {
                      "expected catalog object for initData test");
         if (catalog.has_value()) {
             const std::string catalog_text = as_string(catalog->payload);
-            ok &= expect(catalog_text.find("\"version\":\"1\"") != std::string::npos,
-                         "expected MSF v1 string version in CTE catalog");
+            ok &= expect(catalog_text.find("\"version\":\"draft-02\"") != std::string::npos,
+                         "expected the MSF-02 version string in the default CTE catalog");
             ok &= expect(catalog_text.find("\"initDataList\"") != std::string::npos,
                          "expected root initDataList in CTE catalog");
             ok &= expect(catalog_text.find("\"initRef\"") != std::string::npos,

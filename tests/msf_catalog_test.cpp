@@ -1409,5 +1409,546 @@ int main() {
         }
     }
 
+    // MsfVersion selects the catalog profile: "1" is MSF-01 and "draft-02" is MSF-02.
+    {
+        ok &= expect(msf_version_string(MsfVersion::k01) == "1" && msf_version_string(MsfVersion::k02) == "draft-02",
+                     "expected the version strings of both profiles");
+        ok &= expect(msf_version_from_string("1") == MsfVersion::k01 && msf_version_from_string("draft-02") == MsfVersion::k02,
+                     "expected both version strings to map back to their profile");
+        ok &= expect(!msf_version_from_string("2").has_value() && !msf_version_from_string("").has_value() &&
+                         !msf_version_from_string("draft-03").has_value(),
+                     "expected unknown version strings to have no profile");
+        MsfCatalog unknown;
+        unknown.version = "draft-03";
+        MsfTrack track;
+        track.name = "video";
+        track.packaging = "cmaf";
+        track.role = "video";
+        track.is_live = true;
+        track.codec = "avc1.640028";
+        track.bitrate = 1000000;
+        unknown.tracks.push_back(track);
+        ok &= throws_runtime_error(unknown, "expected a catalog with an unknown version to be refused");
+        MsfCatalog two = unknown;
+        two.version = std::string(msf_version_string(MsfVersion::k02));
+        ok &= serializes_cleanly(two, "expected a draft-02 catalog to serialize");
+        ok &= expect_contains(serialize_catalog(two), "\"version\":\"draft-02\"", "expected the draft-02 version string on the wire");
+    }
+
+    // MSF-02 field model and validation (docs/draft-ietf-moq-msf-02.txt). Every MSF-02 rule is
+    // gated on the catalog version so "1" catalogs keep their behaviour.
+    {
+        const auto catalog_for = [](MsfVersion version) {
+            MsfCatalog catalog;
+            catalog.version = std::string(msf_version_string(version));
+            MsfTrack video;
+            video.name = "video";
+            video.packaging = "cmaf";
+            video.role = "video";
+            video.is_live = true;
+            video.render_group = 1;
+            video.codec = "avc1.640028";
+            video.bitrate = 1000000;
+            MsfTrack audio;
+            audio.name = "audio";
+            audio.packaging = "cmaf";
+            audio.role = "audio";
+            audio.is_live = true;
+            audio.render_group = 1;
+            audio.codec = "mp4a.40.2";
+            audio.bitrate = 128000;
+            audio.samplerate = 48000;
+            audio.channel_config = "2";
+            catalog.tracks = {video, audio};
+            return catalog;
+        };
+        const auto with_namespace = [&](MsfVersion version, const std::string& name_space) {
+            auto catalog = catalog_for(version);
+            catalog.tracks.front().name_space = name_space;
+            return catalog;
+        };
+        std::string many(32, 'a');
+        std::string thirty_two = "a";
+        for (int i = 1; i < 32; ++i) thirty_two += "/a";
+        const std::string thirty_three = thirty_two + "/a";
+        for (const std::string bad : {std::string(), std::string("/a"), std::string("a/"), std::string("a//b"), thirty_three}) {
+            ok &= throws_runtime_error(with_namespace(MsfVersion::k02, bad), "expected namespace \"" + bad + "\" to be refused under 02");
+        }
+        for (const std::string good : {std::string("a"), std::string("a/b"), thirty_two}) {
+            ok &= serializes_cleanly(with_namespace(MsfVersion::k02, good), "expected namespace \"" + good + "\" to be accepted under 02");
+        }
+        ok &= serializes_cleanly(with_namespace(MsfVersion::k01, "a//b"), "expected the 01 namespace rules to be unchanged");
+
+        // Full Track Name uniqueness: same name in different namespaces is fine.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            catalog.tracks[0].name = "same";
+            catalog.tracks[1].name = "same";
+            catalog.tracks[0].name_space = "a";
+            catalog.tracks[1].name_space = "b";
+            catalog.tracks[1].role = "video";
+            catalog.tracks[1].samplerate.reset();
+            catalog.tracks[1].channel_config.reset();
+            ok &= serializes_cleanly(catalog, "expected one name in two namespaces to be accepted");
+            catalog.tracks[1].name_space = "a";
+            ok &= throws_runtime_error(catalog, "expected a duplicate Full Track Name to be refused");
+        }
+
+        // depends: names and renderGroups must resolve; both kinds serialize in one array.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            MsfTrack timeline;
+            timeline.name = "timeline";
+            timeline.packaging = "mediatimeline";
+            timeline.is_live = true;
+            timeline.depends = {"video"};
+            timeline.depends_render_groups = {1};
+            catalog.tracks.push_back(timeline);
+            ok &= expect_contains(serialize_catalog(catalog), "\"depends\":[\"video\",1]",
+                                  "expected depends to carry track names and renderGroups together");
+            catalog.tracks.back().depends = {"nope"};
+            ok &= throws_runtime_error(catalog, "expected a depends name that resolves to no track to be refused");
+            catalog.tracks.back().depends = {"video"};
+            catalog.tracks.back().depends_render_groups = {9};
+            ok &= throws_runtime_error(catalog, "expected a depends renderGroup that resolves to no track to be refused");
+            auto old = catalog_for(MsfVersion::k01);
+            old.tracks.push_back(timeline);
+            ok &= throws_runtime_error(old, "expected a numeric depends entry to be refused under 01");
+            old.tracks.back().depends_render_groups.clear();
+            old.tracks.back().depends = {"unresolved"};
+            ok &= serializes_cleanly(old, "expected an unresolved depends name to stay accepted under 01");
+        }
+
+        // New 02 track fields, in the order write_track emits them.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            auto& track = catalog.tracks.front();
+            track.packaging_metadata = "streamMapping=group";
+            track.accessible_window_time_ms = 30000;
+            track.keyframe_spacing = 30;
+            track.connection_uri = "moqt://relay.example/x";
+            const std::string json = serialize_catalog(catalog);
+            ok &= expect_contains(json, "\"packagingMetadata\":\"streamMapping=group\"", "expected packagingMetadata");
+            ok &= expect_contains(json, "\"accessibleWindowTime\":30000", "expected accessibleWindowTime");
+            ok &= expect_contains(json, "\"keyframeSpacing\":30", "expected keyframeSpacing");
+            ok &= expect_contains(json, "\"connectionURI\":\"moqt://relay.example/x\"", "expected connectionURI");
+            ok &= expect(json.find("packagingMetadata") < json.find("accessibleWindowTime") &&
+                             json.find("accessibleWindowTime") < json.find("keyframeSpacing"),
+                         "expected packagingMetadata, accessibleWindowTime, keyframeSpacing in that order");
+            for (const auto mutate : {+[](MsfTrack& t) { t.packaging_metadata = "a=b"; },
+                                      +[](MsfTrack& t) { t.accessible_window_time_ms = 1; },
+                                      +[](MsfTrack& t) { t.keyframe_spacing = 1; },
+                                      +[](MsfTrack& t) { t.connection_uri = "x"; }}) {
+                auto old = catalog_for(MsfVersion::k01);
+                mutate(old.tracks.front());
+                ok &= throws_runtime_error(old, "expected an MSF-02 track field to be refused under 01");
+            }
+        }
+
+        // Custom field names may not collide with spec fields; the 02 additions are reserved only under 02.
+        {
+            for (const std::string name : {"keyframeSpacing", "packagingMetadata", "accessibleWindowTime", "connectionURI",
+                                           "parentName", "parentNamespace", "token"}) {
+                auto catalog = catalog_for(MsfVersion::k02);
+                catalog.tracks.front().custom_fields[name] = "1";
+                ok &= throws_runtime_error(catalog, "expected custom field " + name + " to collide under 02");
+            }
+            auto old = catalog_for(MsfVersion::k01);
+            old.tracks.front().custom_fields["keyframeSpacing"] = "1";
+            ok &= serializes_cleanly(old, "expected the 02-only names to stay available as custom fields under 01");
+            auto legacy = catalog_for(MsfVersion::k02);
+            legacy.tracks.front().custom_fields["connectionUri"] = "\"x\"";
+            ok &= throws_runtime_error(legacy, "expected the old connectionUri spelling to stay reserved");
+        }
+
+        // initDataList types.
+        {
+            auto catalog = catalog_for(MsfVersion::k02);
+            catalog.tracks.front().init_ref = "video-init";
+            catalog.init_data_list = {MsfInitData{.id = "video-init", .type = "object-property", .data = "0x0D"}};
+            ok &= expect_contains(serialize_catalog(catalog), "\"type\":\"object-property\"", "expected object-property init data");
+            catalog.init_data_list[0].type = "track-property";
+            ok &= serializes_cleanly(catalog, "expected track-property init data to be accepted under 02");
+            for (const std::string bad_data : {std::string("0D"), std::string("0x"), std::string("0xZZ"), std::string("")}) {
+                catalog.init_data_list[0].data = bad_data;
+                ok &= throws_runtime_error(catalog, "expected property init data \"" + bad_data + "\" to be refused");
+            }
+            catalog.init_data_list[0] = MsfInitData{.id = "video-init", .type = "weird", .data = "AAAA"};
+            ok &= throws_runtime_error(catalog, "expected an unknown init data type to be refused");
+            auto old = catalog_for(MsfVersion::k01);
+            old.tracks.front().init_ref = "video-init";
+            old.init_data_list = {MsfInitData{.id = "video-init", .type = "object-property", .data = "0x0D"}};
+            ok &= throws_runtime_error(old, "expected property init data types to be refused under 01");
+        }
+    }
+
+    // MSF-02 Table 6: fields required per (packaging, role) pair, and LOC init data entries.
+    {
+        const auto loc_track = [](const std::string& role) {
+            MsfTrack track;
+            track.name = role;
+            track.packaging = "loc";
+            track.role = role;
+            track.is_live = true;
+            track.codec = role == "video" ? "avc1.640028" : "opus";
+            track.bitrate = 1000000;
+            if (role == "video" || role == "signlanguage") track.framerate = 30.0;
+            if (role == "audio" || role == "audiodescription") {
+                track.samplerate = 48000;
+                track.channel_config = "2";
+            }
+            if (role == "audiodescription") track.lang = "en";
+            return track;
+        };
+        const auto catalog_with = [](MsfVersion version, const MsfTrack& track) {
+            MsfCatalog catalog;
+            catalog.version = std::string(msf_version_string(version));
+            catalog.tracks = {track};
+            return catalog;
+        };
+        for (const std::string role : {"video", "audio", "audiodescription", "signlanguage"}) {
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k02, loc_track(role)), "expected a complete loc " + role + " track to serialize");
+        }
+        const auto without = [&](const std::string& role, auto reset, const std::string& field) {
+            auto track = loc_track(role);
+            reset(track);
+            ok &= throws_runtime_error(catalog_with(MsfVersion::k02, track),
+                                       "expected a loc " + role + " track without " + field + " to be refused under 02");
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k01, track),
+                                     "expected a loc " + role + " track without " + field + " to stay accepted under 01 or fail only on 01 rules");
+        };
+        // Under 01 a loc video track without framerate is accepted; audio without codec is accepted too.
+        without("video", [](MsfTrack& t) { t.codec.reset(); }, "codec");
+        without("video", [](MsfTrack& t) { t.framerate.reset(); }, "framerate");
+        without("audiodescription", [](MsfTrack& t) { t.lang.reset(); }, "lang");
+        without("audiodescription", [](MsfTrack& t) { t.samplerate.reset(); }, "samplerate");
+        without("signlanguage", [](MsfTrack& t) { t.framerate.reset(); }, "framerate");
+        {
+            auto track = loc_track("audio");
+            track.channel_config.reset();
+            ok &= throws_runtime_error(catalog_with(MsfVersion::k02, track), "expected loc audio without channelConfig to be refused");
+        }
+        {
+            MsfTrack track;
+            track.name = "events";
+            track.packaging = "eventtimeline";
+            track.is_live = true;
+            ok &= throws_runtime_error(catalog_with(MsfVersion::k02, track), "expected eventtimeline without eventType to be refused");
+            track.event_type = "com.example.sap";
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k02, track), "expected eventtimeline with eventType to serialize");
+        }
+        // CMAF carries no Table 6 row: a cmaf video track needs only what it needed before.
+        {
+            MsfTrack track = loc_track("video");
+            track.packaging = "cmaf";
+            track.framerate.reset();
+            ok &= serializes_cleanly(catalog_with(MsfVersion::k02, track), "expected Table 6 to leave cmaf tracks alone");
+        }
+
+        // Frame rate resolution mirrors resolve_bitrate: measured, else a flagged estimate.
+        {
+            TrackDescription measured;
+            measured.handler_type = "vide";
+            measured.frame_rate = 25.0;
+            TrackDescription unknown = measured;
+            unknown.frame_rate = 0.0;
+            ok &= expect(resolve_framerate(measured) == 25.0 && !framerate_is_estimated(measured),
+                         "expected a measured frame rate to be used as is");
+            ok &= expect(resolve_framerate(unknown) == 30.0 && framerate_is_estimated(unknown),
+                         "expected an unknown frame rate to resolve to the flagged 30 fps estimate");
+        }
+
+        // attach_loc_init_data: object-property entries under 02, inline under 01, nothing without a config.
+        {
+            auto catalog = catalog_with(MsfVersion::k02, loc_track("video"));
+            attach_loc_init_data(catalog, catalog.tracks[0], "video", "AAAA", true);
+            ok &= expect(catalog.tracks[0].init_ref == "video-init" && catalog.init_data_list.size() == 1 &&
+                             catalog.init_data_list[0].type == "object-property" && catalog.init_data_list[0].data == "0x0D",
+                         "expected a video object-property entry naming VIDEO_CONFIG");
+            auto audio = catalog_with(MsfVersion::k02, loc_track("audio"));
+            attach_loc_init_data(audio, audio.tracks[0], "audio", "AAAA", false);
+            ok &= expect(audio.init_data_list.size() == 1 && audio.init_data_list[0].data == "0x0F",
+                         "expected an audio object-property entry naming AUDIO_CONFIG");
+            auto none = catalog_with(MsfVersion::k02, loc_track("video"));
+            attach_loc_init_data(none, none.tracks[0], "video", "", true);
+            ok &= expect(!none.tracks[0].init_ref.has_value() && none.init_data_list.empty(),
+                         "expected no init data entry for a codec without a description");
+            auto old = catalog_with(MsfVersion::k01, loc_track("video"));
+            attach_loc_init_data(old, old.tracks[0], "video", "AAAA", true);
+            ok &= expect(old.init_data_list.size() == 1 && old.init_data_list[0].type == "inline" &&
+                             old.init_data_list[0].data == "AAAA",
+                         "expected MSF-01 to keep inline LOC init data");
+        }
+    }
+
+    // MSF-02 delta updates (sections 5.1.6 and 5.3): generatedAt and deltaUpdate only, plus the "update" operation.
+    {
+        const auto make_track = [](const std::string& name) {
+            MsfTrack track;
+            track.name = name;
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.codec = "avc1.640028";
+            track.bitrate = 1000000;
+            return track;
+        };
+        const auto catalog_for = [&](MsfVersion version, std::uint64_t generated_at) {
+            MsfCatalog catalog;
+            catalog.version = std::string(msf_version_string(version));
+            if (generated_at != 0) catalog.generated_at_ms = generated_at;
+            catalog.tracks = {make_track("video")};
+            return catalog;
+        };
+
+        // Serialization.
+        {
+            MsfCatalog delta;
+            delta.version = "draft-02";
+            delta.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {make_track("extra")}});
+            ok &= throws_runtime_error(delta, "expected a draft-02 delta without generatedAt to be refused");
+            delta.generated_at_ms = 1700000000000ULL;
+            const std::string json = serialize_catalog(delta);
+            ok &= expect(json.rfind("{\"generatedAt\":1700000000000,\"deltaUpdate\":[", 0) == 0,
+                         "expected a draft-02 delta to start with generatedAt then deltaUpdate: " + json);
+            ok &= expect_not_contains(json, "\"version\"", "expected no version on a delta");
+            auto complete = delta;
+            complete.is_complete = true;
+            ok &= throws_runtime_error(complete, "expected isComplete on a draft-02 delta to be refused");
+            auto with_protections = delta;
+            with_protections.init_data_list = {MsfInitData{.id = "x", .type = "inline", .data = "AAAA"}};
+            ok &= throws_runtime_error(with_protections, "expected initDataList on a draft-02 delta to be refused");
+
+            MsfCatalog old;
+            old.version = "1";
+            old.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = {make_track("extra")}});
+            ok &= serializes_cleanly(old, "expected a version 1 delta without generatedAt to stay valid");
+            old.delta_update.push_back(MsfDeltaOp{.op = "update", .updates = {MsfTrackUpdate{.parent_name = "video", .overrides = {{"bitrate", "1"}}}}});
+            ok &= throws_runtime_error(old, "expected the update operation to be refused under version 1");
+        }
+
+        // The update operation.
+        {
+            MsfCatalog delta;
+            delta.version = "draft-02";
+            delta.generated_at_ms = 1;
+            delta.delta_update.push_back(MsfDeltaOp{
+                .op = "update",
+                .updates = {MsfTrackUpdate{.parent_name = "video", .parent_namespace = "a/b",
+                                           .overrides = {{"bitrate", "2000000"}, {"label", "\"main\""}}}}});
+            ok &= expect_contains(serialize_catalog(delta),
+                                  "{\"op\":\"update\",\"tracks\":[{\"parentName\":\"video\",\"parentNamespace\":\"a/b\",\"bitrate\":2000000,\"label\":\"main\"}]}",
+                                  "expected an update track to hold parentName, parentNamespace and only the overrides");
+            auto no_parent = delta;
+            no_parent.delta_update[0].updates[0].parent_name.clear();
+            ok &= throws_runtime_error(no_parent, "expected an update without parentName to be refused");
+            auto no_overrides = delta;
+            no_overrides.delta_update[0].updates[0].overrides.clear();
+            ok &= throws_runtime_error(no_overrides, "expected an update that overrides nothing to be refused");
+            auto renames = delta;
+            renames.delta_update[0].updates[0].overrides = {{"name", "\"other\""}};
+            ok &= throws_runtime_error(renames, "expected an update that overrides the track identity to be refused");
+            auto bad_namespace = delta;
+            bad_namespace.delta_update[0].updates[0].parent_namespace = "a//b";
+            ok &= throws_runtime_error(bad_namespace, "expected a malformed parentNamespace to be refused");
+        }
+
+        // CatalogPublisher chooses update when the change is expressible.
+        {
+            CatalogPublisher publisher;
+            const auto first = publisher.publish(catalog_for(MsfVersion::k02, 1000));
+            ok &= expect(first.size() == 1 && first[0].object_id == 0, "expected the first catalog as an independent object");
+            auto changed = catalog_for(MsfVersion::k02, 2000);
+            changed.tracks[0].bitrate = 2000000;
+            changed.tracks[0].label = "main";
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].group_id == first[0].group_id && out[0].object_id == 1,
+                         "expected one delta object in the current group");
+            if (!out.empty()) {
+                ok &= expect_contains(out[0].payload, "\"op\":\"update\"", "expected an update operation");
+                ok &= expect_contains(out[0].payload, "\"parentName\":\"video\"", "expected the update to name its target");
+                ok &= expect_contains(out[0].payload, "\"bitrate\":2000000", "expected the changed bitrate");
+                ok &= expect_contains(out[0].payload, "\"label\":\"main\"", "expected the added label");
+                ok &= expect_not_contains(out[0].payload, "\"codec\"", "expected unchanged fields to stay out of the update");
+                ok &= expect_not_contains(out[0].payload, "\"op\":\"add\"", "expected no add for an attribute change");
+                ok &= expect_contains(out[0].payload, "\"generatedAt\":2000", "expected the delta to carry generatedAt");
+            }
+            // An attribute change together with a new track becomes add plus update in one object.
+            auto both = changed;
+            both.generated_at_ms = 3000;
+            both.tracks[0].bitrate = 3000000;
+            both.tracks.push_back(make_track("second"));
+            const auto combined = publisher.publish(both);
+            ok &= expect(combined.size() == 1 && combined[0].object_id == 2, "expected add and update in one delta object");
+            if (!combined.empty()) {
+                ok &= expect_contains(combined[0].payload, "\"op\":\"add\"", "expected the add operation");
+                ok &= expect_contains(combined[0].payload, "\"op\":\"update\"", "expected the update operation");
+            }
+        }
+
+        // Removing a field cannot be expressed as an override: fall back to a full catalog.
+        {
+            CatalogPublisher publisher;
+            auto base = catalog_for(MsfVersion::k02, 1000);
+            base.tracks[0].label = "main";
+            (void)publisher.publish(base);
+            auto changed = catalog_for(MsfVersion::k02, 2000);  // label removed
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].group_id == 1 && out[0].object_id == 0,
+                         "expected a removed attribute to produce a new independent catalog");
+            if (!out.empty()) ok &= expect_contains(out[0].payload, "\"tracks\"", "expected a full catalog");
+        }
+
+        // Without generatedAt a draft-02 delta is impossible: fall back to a full catalog.
+        {
+            CatalogPublisher publisher;
+            (void)publisher.publish(catalog_for(MsfVersion::k02, 1000));
+            auto changed = catalog_for(MsfVersion::k02, 0);
+            changed.tracks.push_back(make_track("second"));
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].object_id == 0 && out[0].payload.find("\"deltaUpdate\"") == std::string::npos,
+                         "expected a full catalog when the desired catalog has no generatedAt");
+        }
+
+        // MSF-01 keeps the freeze rule: an attribute change is a full catalog.
+        {
+            CatalogPublisher publisher;
+            (void)publisher.publish(catalog_for(MsfVersion::k01, 1000));
+            auto changed = catalog_for(MsfVersion::k01, 2000);
+            changed.tracks[0].bitrate = 2000000;
+            const auto out = publisher.publish(changed);
+            ok &= expect(out.size() == 1 && out[0].object_id == 0 && out[0].payload.find("\"deltaUpdate\"") == std::string::npos,
+                         "expected version 1 to republish a full catalog for an attribute change");
+        }
+    }
+
+    // collapse_depends_to_render_groups (MSF-02 section 7.2): a media timeline references a renderGroup when
+    // all of its tracks are covered, and the individual names when only a subset is.
+    {
+        const auto media = [](const std::string& name, std::optional<std::uint32_t> group) {
+            MsfTrack track;
+            track.name = name;
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.bitrate = 1;
+            track.render_group = group;
+            return track;
+        };
+        MsfTrack timeline;
+        timeline.name = "timeline";
+        timeline.packaging = "mediatimeline";
+        timeline.is_live = true;
+        MsfCatalog catalog;
+        catalog.version = "draft-02";
+        catalog.tracks = {media("a", 1), media("b", 1), media("c", 2), media("d", std::nullopt), timeline};
+
+        catalog.tracks.back().depends = {"a", "b", "c", "d"};
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>{"d"} &&
+                         catalog.tracks.back().depends_render_groups == std::vector<std::uint32_t>({1, 2}),
+                     "expected fully covered render groups to replace their track names and ungrouped tracks to stay named");
+
+        catalog.tracks.back().depends = {"a", "c"};
+        catalog.tracks.back().depends_render_groups.clear();
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>{"a"} &&
+                         catalog.tracks.back().depends_render_groups == std::vector<std::uint32_t>({2}),
+                     "expected a partially covered render group to keep naming its tracks");
+
+        catalog.tracks.back().depends = {"a"};
+        catalog.tracks.back().depends_render_groups.clear();
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>{"a"} &&
+                         catalog.tracks.back().depends_render_groups.empty(),
+                     "expected a subset of a render group to stay named");
+
+        auto event = media("events", std::nullopt);
+        event.packaging = "eventtimeline";
+        event.event_type = "x";
+        event.depends = {"a", "b"};
+        catalog.tracks.push_back(event);
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>({"a", "b"}),
+                     "expected only media timeline tracks to be collapsed");
+    }
+
+    // Review fix pass: depends must resolve to exactly one OTHER track in `tracks` (section 5.2.15), parentName is
+    // only valid inside an update/clone operation (5.2.34), and the frame-rate estimate reaches make_msf_track.
+    {
+        const auto make = [](const std::string& name, const std::optional<std::string>& name_space) {
+            MsfTrack track;
+            track.name = name;
+            track.name_space = name_space;
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.codec = "avc1.640028";
+            track.bitrate = 1;
+            track.render_group = 1;
+            return track;
+        };
+        MsfCatalog catalog;
+        catalog.version = "draft-02";
+        MsfTrack self = make("video", std::nullopt);
+        self.depends = {"video"};
+        catalog.tracks = {self};
+        ok &= throws_runtime_error(catalog, "expected a track that depends on itself to be refused");
+
+        MsfTrack dependent = make("w", std::nullopt);
+        dependent.depends = {"video"};
+        catalog.tracks = {make("video", std::string("a")), make("video", std::string("b")), dependent};
+        ok &= throws_runtime_error(catalog, "expected a depends name that matches two tracks to be refused");
+
+        MsfCatalog publish_only;
+        publish_only.version = "draft-02";
+        publish_only.tracks = {dependent};
+        publish_only.publish_tracks = {make("video", std::nullopt)};
+        ok &= throws_runtime_error(publish_only, "expected a depends name that only a publishTracks entry carries to be refused");
+
+        MsfTrack group_dependent = make("w", std::nullopt);
+        group_dependent.render_group.reset();
+        group_dependent.depends_render_groups = {1};
+        MsfTrack lone_group_member = make("video", std::nullopt);
+        catalog.tracks = {lone_group_member, group_dependent};
+        ok &= serializes_cleanly(catalog, "expected a renderGroup carried by one other track to resolve");
+        group_dependent.render_group = 1;
+        catalog.tracks = {group_dependent};
+        group_dependent.depends_render_groups = {1};
+        catalog.tracks = {group_dependent};
+        ok &= throws_runtime_error(catalog, "expected a renderGroup that only the track itself carries to be refused");
+
+        // A track carrying parentName is refused in tracks (it exists only inside update/clone).
+        MsfCatalog with_parent;
+        with_parent.version = "draft-02";
+        MsfTrack plain = make("video", std::nullopt);
+        plain.custom_fields["parentName"] = "\"x\"";
+        with_parent.tracks = {plain};
+        ok &= throws_runtime_error(with_parent, "expected parentName to stay reserved against custom fields");
+        with_parent.version = "1";
+        ok &= throws_runtime_error(with_parent, "expected parentName to be reserved against custom fields under 01 too");
+
+        // make_msf_track: 02 loc video without a measured frame rate gets the flagged estimate; 01 and cmaf do not.
+        TrackDescription loc_video;
+        loc_video.handler_type = "vide";
+        loc_video.packaging = "loc";
+        loc_video.track_name = "video";
+        loc_video.codec = "avc1.640028";
+        loc_video.timescale = 90000;
+        loc_video.frame_rate = 0.0;
+        ok &= expect(make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k02).framerate == 30.0,
+                     "expected an estimated 30 fps for loc video without a frame rate under 02");
+        ok &= expect(!make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k01).framerate.has_value(),
+                     "expected no framerate invention under 01");
+        TrackDescription cmaf_video = loc_video;
+        cmaf_video.packaging = "cmaf";
+        ok &= expect(!make_msf_track(cmaf_video, true, std::nullopt, 0, MsfVersion::k02).framerate.has_value(),
+                     "expected no framerate invention for cmaf under 02");
+        loc_video.frame_rate = 25.0;
+        ok &= expect(make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k02).framerate == 25.0 &&
+                         make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k01).framerate == 25.0,
+                     "expected a measured frame rate to be used under both versions");
+    }
+
     return ok ? 0 : 1;
 }

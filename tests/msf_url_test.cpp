@@ -537,5 +537,23 @@ int main() {
             "path", "expected build_track_msf_url to refuse a path containing '#'");
     }
 
+    // MSF-02 renames the reserved c4m fragment parameter to cat; both parse, and the
+    // emitted name follows the catalog version.
+    {
+        const auto old_url = parse_msf_url("moqt://h#msf:ns--t&c4m=abc");
+        const auto new_url = parse_msf_url("moqt://h#msf:ns--t&cat=abc");
+        ok &= expect(old_url.c4m_token == "abc" && new_url.c4m_token == "abc",
+                     "expected c4m and cat to store the same token");
+        ok &= expect(build_msf_url(new_url, MsfVersion::k02).find("&cat=abc") != std::string::npos,
+                     "expected version 02 to emit cat");
+        ok &= expect(build_msf_url(new_url, MsfVersion::k01).find("&c4m=abc") != std::string::npos,
+                     "expected version 01 to emit c4m");
+        ok &= expect(build_msf_url(new_url).find("&cat=abc") != std::string::npos, "expected cat by default");
+        ok &= expect_throws([&] { (void)parse_msf_url("moqt://h#msf:ns--t&c4m=a&cat=b"); }, "cat",
+                            "expected a URL carrying both c4m and cat to be refused");
+        ok &= expect_throws([&] { (void)parse_msf_url("moqt://h#msf:ns--t&cat=a&cat=b"); }, "cat",
+                            "expected a repeated cat parameter to be refused");
+    }
+
     return ok ? 0 : 1;
 }
