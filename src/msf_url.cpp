@@ -328,9 +328,9 @@ void parse_fragment_parameters(std::string_view text, MsfUrl& url) {
                 throw std::runtime_error(
                     "MSF URL 'connection' parameter must be 'q' or 'wt', got: " + value);
             }
-        } else if (name == "c4m") {
+        } else if (name == "c4m" || name == "cat") {
             if (url.c4m_token.has_value()) {
-                throw std::runtime_error("MSF URL repeats the reserved 'c4m' parameter");
+                throw std::runtime_error("MSF URL repeats the reserved catalog token parameter ('cat' or 'c4m')");
             }
             url.c4m_token = value;
         } else if (name == "wallclock-range") {
@@ -485,7 +485,7 @@ MsfUrl parse_msf_url(std::string_view text) {
     return url;
 }
 
-std::string build_msf_url(const MsfUrl& url) {
+std::string build_msf_url(const MsfUrl& url, MsfVersion version) {
     if (url.host.empty()) {
         throw std::runtime_error("cannot build an MSF URL without a host");
     }
@@ -543,7 +543,7 @@ std::string build_msf_url(const MsfUrl& url) {
         out += value;
     }
     if (url.c4m_token.has_value()) {
-        out += "&c4m=";
+        out += version == MsfVersion::k01 ? "&c4m=" : "&cat=";
         out += *url.c4m_token;
     }
     return out;

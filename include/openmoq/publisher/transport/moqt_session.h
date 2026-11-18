@@ -178,6 +178,7 @@ public:
     }
 
     void set_media_packaging(MediaPackaging packaging) { media_packaging_ = packaging; }
+    void set_msf_version(MsfVersion version) { msf_version_ = version; }
 
     // See PublisherConfig::initial_group_id. publish_live() numbers live media
     // and catalog groups from at least this value on every draft; on draft 22
@@ -190,6 +191,7 @@ public:
 
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
+    MsfVersion msf_version_ = MsfVersion::k02;
     void reset_publish_stats();
     TransportStatus apply_live_group_floors(std::uint64_t resume_group_floor,
                                             std::uint64_t resume_catalog_group_floor);

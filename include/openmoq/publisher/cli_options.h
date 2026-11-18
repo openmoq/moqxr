@@ -9,6 +9,7 @@
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/drm_config.h"
 #include "openmoq/publisher/media_packaging.h"
+#include "openmoq/publisher/msf_version.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -106,6 +107,8 @@ struct CliOptions {
     // DRM configuration.
     std::vector<DrmSystemConfig> drm_systems;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
+    // Catalog draft: --msf-version 01|02. MSF-02 is the default.
+    MsfVersion msf_version = MsfVersion::k02;
 };
 
 CliOptions parse_cli_options(int argc, char** argv);

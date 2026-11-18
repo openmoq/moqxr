@@ -112,6 +112,7 @@ PublishPlan prepare_loc_plan(const ParsedMp4& parsed, const PublisherConfig& con
     }
     if (segmented.fragments.empty()) throw std::runtime_error("LOC input has no decodable samples");
     return build_publish_plan(segmented, config.draft_version, config.include_sap,
-                              config.include_msf_timeline, config.vod, config.drm_systems);
+                              config.include_msf_timeline, config.vod, config.drm_systems,
+                              config.msf_version);
 }
 } // namespace openmoq::publisher

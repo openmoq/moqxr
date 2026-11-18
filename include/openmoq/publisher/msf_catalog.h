@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openmoq/publisher/mp4_box.h"
+#include "openmoq/publisher/msf_version.h"
 
 #include <cstdint>
 #include <map>
@@ -85,6 +86,16 @@ struct MsfTrack {
     std::optional<std::uint64_t> track_duration_ms;    // 5.2.35
     std::optional<std::string> event_type;             // 5.2.5, eventtimeline only
 
+    // MSF-02 only (catalog version "draft-02"); serialization refuses them under "1".
+    std::optional<std::string> packaging_metadata;     // 5.2.5, "key=value;key=value"
+    std::optional<std::uint64_t> accessible_window_time_ms;  // 5.2.45
+    std::optional<std::uint64_t> keyframe_spacing;     // 5.2.46, objects per keyframe interval
+    std::optional<std::string> connection_uri;         // 5.2.37, JSON "connectionURI"
+    // parentName / parentNamespace (5.2.34, 5.2.35) are valid only inside a delta "update" or "clone"
+    // operation; see MsfTrackUpdate, never MsfTrack.
+    // renderGroup numbers that `depends` references next to track names (5.2.15).
+    std::vector<std::uint32_t> depends_render_groups;
+
     // CMSF section 3.5.2.
     std::optional<std::uint32_t> max_grp_sap_starting_type;
     std::optional<std::uint32_t> max_obj_sap_starting_type;
@@ -102,9 +113,22 @@ struct MsfTrack {
 // "add" and "remove" only. "clone" is deliberately unimplemented: it applies
 // when a new track matches an existing one on every field except name, which
 // no producer in this project generates.
+//
+// MSF-02 adds "update" (sections 5.1.6 and 5.3), which carries MsfTrackUpdate
+// entries in `updates` instead of full tracks.
+// An "update" track object names its target by parentName/parentNamespace and holds only
+// the attributes that override the existing values. Each override is a JSON field name
+// and its raw JSON value, as write_track would emit it.
+struct MsfTrackUpdate {
+    std::string parent_name;
+    std::optional<std::string> parent_namespace;
+    std::vector<std::pair<std::string, std::string>> overrides;
+};
+
 struct MsfDeltaOp {
     std::string op;
     std::vector<MsfTrack> tracks;
+    std::vector<MsfTrackUpdate> updates;   // only for op == "update"
 };
 
 // The root catalog object (MSF section 5.1).
@@ -148,7 +172,29 @@ bool bitrate_is_estimated(const TrackDescription& track,
 MsfTrack make_msf_track(const TrackDescription& track,
                         bool is_live,
                         std::optional<std::uint64_t> configured_bitrate = std::nullopt,
-                        std::uint64_t computed_bitrate = 0);
+                        std::uint64_t computed_bitrate = 0,
+                        MsfVersion msf_version = MsfVersion::k02);
+
+// MSF-02 section 7.2: a media timeline track whose depends covers every track of a
+// renderGroup MUST reference the renderGroup and MUST NOT name its tracks; a partial
+// cover names tracks only. Rewrites depends / depends_render_groups of each
+// mediatimeline track accordingly.
+void collapse_depends_to_render_groups(MsfCatalog& catalog);
+
+// Frame rate for a video track: the measured value, else a 30 fps estimate so a
+// MSF-02 LOC video track (Table 6 requires framerate) can still be published
+// from a live source that never measured one. framerate_is_estimated tells callers
+// to warn the operator, as bitrate_is_estimated does.
+double resolve_framerate(const TrackDescription& track);
+bool framerate_is_estimated(const TrackDescription& track);
+
+// Attach LOC decoder configuration. MSF-01 carries it inline (Base64). MSF-02
+// publishes an "object-property" entry naming VIDEO_CONFIG (0x0D) or AUDIO_CONFIG
+// (0x0F), because LOC objects repeat the configuration in that property
+// (section 12.2). An empty config (a codec with no description, such as VP9)
+// attaches nothing.
+void attach_loc_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name,
+                          std::string base64_config, bool video);
 
 // Attach a Base64-encoded init segment to a track: sets track.init_ref and
 // appends the matching MsfInitData entry to the catalog's initDataList,

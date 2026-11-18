@@ -16,6 +16,7 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/media_packaging.h"
+#include "openmoq/publisher/msf_version.h"
 #include "openmoq/publisher/locmaf_encoder.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
@@ -65,6 +66,7 @@ struct LiveDashIngestConfig {
     // declared lengths are refused with 413 before any body bytes are read.
     std::size_t max_body_size = 256 * 1024 * 1024;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
+    MsfVersion msf_version = MsfVersion::k02;
     // MoqTransport section 2.5: the first Group ID of every track this ingest
     // numbers (media and catalog), so a restarted publisher can start above
     // the groups it used before. See PublisherConfig::initial_group_id.
@@ -76,7 +78,8 @@ public:
     // Throws std::invalid_argument when initial_group_id exceeds kMaxGroupId.
     explicit LiveDashIngestSession(std::size_t queue_depth = 128,
                                    MediaPackaging packaging = MediaPackaging::kCmaf,
-                                   std::uint64_t initial_group_id = 0);
+                                   std::uint64_t initial_group_id = 0,
+                                   MsfVersion msf_version = MsfVersion::k02);
 
     void ingest(std::string path, std::span<const std::uint8_t> bytes);
     void close();
@@ -124,6 +127,7 @@ private:
     LiveObject build_catalog_locked();
 
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
+    MsfVersion msf_version_ = MsfVersion::k02;
     std::uint64_t initial_group_id_ = 0;
     std::map<std::string, std::unique_ptr<LocmafEncoder>> locmaf_encoders_;
     std::map<std::string, std::shared_ptr<LocTrackEncoder>> loc_encoders_;

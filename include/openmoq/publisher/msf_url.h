@@ -1,5 +1,7 @@
 #pragma once
 
+#include "openmoq/publisher/msf_version.h"
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -65,6 +67,7 @@ struct MsfUrl {
     MsfTrackIdentifier track;
 
     ConnectionRequirement connection = ConnectionRequirement::kAny;
+    // The reserved catalog-token parameter: "cat" in MSF-02, "c4m" in MSF-01. Parsed from either.
     std::optional<std::string> c4m_token;
 
     // Repeated range parameters are resolved to their union, per MSF 11.1.1.
@@ -89,7 +92,8 @@ MsfUrl parse_msf_url(std::string_view text);
 // Inverse of parse_msf_url. The round-trip guarantee is semantic, not textual:
 // parse(build(x)) equals x. Building normalises, omitting a port equal to 443
 // and omitting the path when path_explicit is false.
-std::string build_msf_url(const MsfUrl& url);
+// `version` selects the reserved token parameter name: MSF-02 calls it "cat", MSF-01 "c4m".
+std::string build_msf_url(const MsfUrl& url, MsfVersion version = MsfVersion::k02);
 
 // Builds the MSF URL for one track of a running publisher. `track_namespace` is
 // the publisher's flat namespace, split on '/' to recover the tuple.

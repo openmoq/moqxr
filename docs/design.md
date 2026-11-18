@@ -53,7 +53,7 @@ Use the checked-in [LOC-05 text](draft-ietf-moq-loc-05.txt), published
 November 2, 2026. Download source:
 <https://www.ietf.org/archive/id/draft-ietf-moq-loc-05.txt>.
 SHA-256: `e75ba67b545a863d59473ab279683e3fcd61650bf2e19875c00f6a302271fbf3`.
-Use [MSF-01](draft-ietf-moq-msf-01.txt) section 4.1 for catalog signaling and
+Use [MSF-02](draft-ietf-moq-msf-02.txt) section 4.1 (MSF-01 section 4.1 for `--msf-version 01`) for catalog signaling and
 sample/group mapping. LOC-05 references MOQT-23; the implementation binds its
 clear-media subset to the draft-18 property framing, with explicit wire tests,
 rather than tie the LOC revision to a transport draft.

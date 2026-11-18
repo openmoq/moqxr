@@ -72,8 +72,13 @@ LOCMAF delivery remains to be validated. See the [quickstart](quickstart.md#opt-
 2. Continue draft-17/18 request-stream interop validation, especially stream retention, close/reset behavior, fragmented delivery, and relay-specific response timing.
 3. Continue Red5 relay and player interop validation, including catalog publication, downstream subscription discovery, and Red5 Pro playback behavior.
 4. Expand CMAF packaging coverage for fragmented and progressive inputs, including Opus, AAC, H.264, HEVC, edit lists, and less common sample-table layouts.
-5. MSF/CMSF version 1: the catalog model conforms to `draft-ietf-moq-msf-01`
-   and `draft-ietf-moq-cmsf-01`. Phase 2, catalog track lifecycle, has
+5. MSF/CMSF: the catalog model conforms to `draft-ietf-moq-msf-02` by default
+   (`--msf-version 02`, catalog version `"draft-02"`) and still to
+   `draft-ietf-moq-msf-01` with `--msf-version 01` (version `"1"`, byte-identical
+   to the pre-MSF-02 output); both conform to `draft-ietf-moq-cmsf-01` (there is
+   no CMSF-02 yet). The MSF-02 differences and what is not implemented are in
+   [protocol-mapping](protocol-mapping.md#msf-catalog). Real relay behaviour with
+   the MSF-02 catalog has not been verified. Phase 2, catalog track lifecycle, has
    shipped: live-by-default catalogs with an explicit VOD opt-in, end-of-
    broadcast signalling per MSF section 11.3 (`isComplete` for a terminated
    broadcast, `isLive: false` with `trackDuration` for a VOD conversion),

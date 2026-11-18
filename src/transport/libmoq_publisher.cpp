@@ -1449,7 +1449,7 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
     // Per-track CMAF init segments for catalog/init_data (libmoq owns the
     // catalog itself; we only use the per-track init segments here).
     const LiveCatalog live_catalog =
-        build_live_catalog(tracks, init_segment, /*is_live=*/true, config.drm_systems);
+        build_live_catalog(tracks, init_segment, /*is_live=*/true, config.drm_systems, std::nullopt, config.msf_version);
     auto init_for_track = [&](const std::string& name) -> std::vector<std::uint8_t> {
         for (const auto& init : live_catalog.track_initializations) {
             if (init.track_name == name) {
@@ -1710,7 +1710,7 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
     // Per-track CMAF init segments derived from the synthetic init segment.
     const std::vector<std::uint8_t> synthetic_init =
         LiveSrtIngestManager::build_synthetic_init_segment(tracks);
-    const LiveCatalog live_catalog = build_live_catalog(tracks, synthetic_init, /*is_live=*/true);
+    const LiveCatalog live_catalog = build_live_catalog(tracks, synthetic_init, /*is_live=*/true, config.msf_version);
     auto init_for_track = [&](const std::string& name) -> std::vector<std::uint8_t> {
         for (const auto& init : live_catalog.track_initializations) {
             if (init.track_name == name) {
