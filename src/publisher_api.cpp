@@ -1,6 +1,7 @@
 #include "openmoq/publisher/publisher_api.h"
 #include "locmaf_packager.h"
 #include "loc_packager.h"
+#include "loop_timestamps.h"
 
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/mp4_box.h"
@@ -269,16 +270,21 @@ void Publisher::set_config(const PublisherConfig& config) {
 }
 
 PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const {
+    // A looped publish replays the plan, so its audio must not outlast the video period (see trim_plan_for_loop).
+    const auto finish = [this](PreparedPublish prepared) {
+        if (config_.loop) trim_plan_for_loop(prepared.plan);
+        return prepared;
+    };
     const ParsedMp4 parsed_mp4 = parse_mp4_file(path.string());
     if (config_.media_packaging == MediaPackaging::kLoc) {
-        return {parsed_mp4.bytes, prepare_loc_plan(parsed_mp4, config_)};
+        return finish({parsed_mp4.bytes, prepare_loc_plan(parsed_mp4, config_)});
     }
     if (config_.media_packaging == MediaPackaging::kLocmaf) {
-        return {parsed_mp4.bytes, prepare_locmaf_plan(parsed_mp4, config_)};
+        return finish({parsed_mp4.bytes, prepare_locmaf_plan(parsed_mp4, config_)});
     }
     const SegmentedMp4 segmented_mp4 = segment_for_cmaf(parsed_mp4, config_.split_cmaf_chunks ? CmafObjectMode::kSplit
                                                                                                : CmafObjectMode::kCoalesced);
-    return PreparedPublish{
+    return finish(PreparedPublish{
         .input_bytes = parsed_mp4.bytes,
         .plan = build_publish_plan(segmented_mp4,
                                    config_.draft_version,
@@ -286,20 +292,25 @@ PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const
                                    config_.include_msf_timeline,
                                    config_.vod,
                                    config_.drm_systems),
-    };
+    });
 }
 
 PreparedPublish Publisher::prepare_stream(std::istream& input, std::string_view source_name) const {
+    // A looped publish replays the plan, so its audio must not outlast the video period (see trim_plan_for_loop).
+    const auto finish = [this](PreparedPublish prepared) {
+        if (config_.loop) trim_plan_for_loop(prepared.plan);
+        return prepared;
+    };
     const ParsedMp4 parsed_mp4 = parse_mp4_stream(input, source_name);
     if (config_.media_packaging == MediaPackaging::kLoc) {
-        return {parsed_mp4.bytes, prepare_loc_plan(parsed_mp4, config_)};
+        return finish({parsed_mp4.bytes, prepare_loc_plan(parsed_mp4, config_)});
     }
     if (config_.media_packaging == MediaPackaging::kLocmaf) {
-        return {parsed_mp4.bytes, prepare_locmaf_plan(parsed_mp4, config_)};
+        return finish({parsed_mp4.bytes, prepare_locmaf_plan(parsed_mp4, config_)});
     }
     const SegmentedMp4 segmented_mp4 = segment_for_cmaf(parsed_mp4, config_.split_cmaf_chunks ? CmafObjectMode::kSplit
                                                                                                : CmafObjectMode::kCoalesced);
-    return PreparedPublish{
+    return finish(PreparedPublish{
         .input_bytes = parsed_mp4.bytes,
         .plan = build_publish_plan(segmented_mp4,
                                    config_.draft_version,
@@ -307,7 +318,7 @@ PreparedPublish Publisher::prepare_stream(std::istream& input, std::string_view 
                                    config_.include_msf_timeline,
                                    config_.vod,
                                    config_.drm_systems),
-    };
+    });
 }
 
 std::string Publisher::render_plan(const PreparedPublish& prepared) const {

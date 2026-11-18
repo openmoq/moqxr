@@ -1182,10 +1182,9 @@ LoopState build_loop_state(const openmoq::publisher::PublishPlan& plan, bool loo
             track.first_loop_object_index = index;
             track.has_loopable_objects = true;
         }
-        if (object.kind == openmoq::publisher::CmsfObjectKind::kMedia) {
-            state.cycle_duration_us = std::max(state.cycle_duration_us, object.media_time_us + object.media_duration_us);
-        }
     }
+    // The loop period follows the video media (see loop_cycle_duration_us), not the longest track.
+    state.cycle_duration_us = openmoq::publisher::loop_cycle_duration_us(plan);
     for (const auto& description : plan.tracks) {
         const auto it = state.tracks.find(description.track_name);
         if (it != state.tracks.end()) {

@@ -2,10 +2,13 @@
 
 #include "openmoq/publisher/mp4_box.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <exception>
 #include <limits>
 #include <optional>
+#include <set>
+#include <string>
 #include <span>
 #include <utility>
 
@@ -203,6 +206,45 @@ std::vector<std::uint8_t> locmaf_varint(std::uint64_t value) {
 }
 
 }  // namespace
+
+std::uint64_t loop_cycle_duration_us(const PublishPlan& plan) {
+    std::set<std::string> video_tracks;
+    for (const auto& track : plan.tracks) {
+        if (track.handler_type == "vide") {
+            video_tracks.insert(track.track_name);
+        }
+    }
+    std::uint64_t video_end = 0;
+    std::uint64_t media_end = 0;
+    for (const auto& object : plan.objects) {
+        if (object.kind != CmsfObjectKind::kMedia) {
+            continue;
+        }
+        const std::uint64_t end = object.media_time_us + object.media_duration_us;
+        media_end = std::max(media_end, end);
+        if (video_tracks.count(object.track_name) != 0) {
+            video_end = std::max(video_end, end);
+        }
+    }
+    return video_end != 0 ? video_end : media_end;
+}
+
+void trim_plan_for_loop(PublishPlan& plan) {
+    std::set<std::string> video_tracks;
+    for (const auto& track : plan.tracks) {
+        if (track.handler_type == "vide") {
+            video_tracks.insert(track.track_name);
+        }
+    }
+    if (video_tracks.empty()) {
+        return;
+    }
+    const std::uint64_t period = loop_cycle_duration_us(plan);
+    std::erase_if(plan.objects, [&](const CmsfObject& object) {
+        return object.kind == CmsfObjectKind::kMedia && video_tracks.count(object.track_name) == 0 &&
+               object.media_time_us >= period;
+    });
+}
 
 std::uint64_t loop_offset_ticks(std::uint64_t cycle_duration_us, std::uint64_t cycle, std::uint32_t timescale) {
     const std::uint64_t elapsed_us = cycle_duration_us * cycle;

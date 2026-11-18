@@ -1310,7 +1310,65 @@ void append_coalesced_fragments(SegmentedMp4& segmented,
 
 }  // namespace
 
+namespace {
+
+// A fragmented file written without +separate_moof holds one traf per track inside every moof. The
+// segmenter reasons about one track per fragment, so such a moof/mdat pair is split into one pair per
+// track, with the splitter the live ingest path uses. Returns false when no moof is multiplexed.
+bool demux_multiplexed_fragments(const ParsedMp4& parsed_mp4, ParsedMp4& demuxed) {
+    const std::vector<const Mp4Box*> moofs = find_boxes(parsed_mp4.top_level_boxes, "moof");
+    const std::vector<const Mp4Box*> mdats = find_boxes(parsed_mp4.top_level_boxes, "mdat");
+    if (moofs.size() != mdats.size()) {
+        return false;  // the caller reports the unmatched pairs
+    }
+    const bool multiplexed = std::any_of(moofs.begin(), moofs.end(), [](const Mp4Box* moof) {
+        return find_boxes(moof->children, "traf").size() > 1;
+    });
+    if (!multiplexed) {
+        return false;
+    }
+    std::vector<std::uint8_t> bytes;
+    std::size_t pair = 0;
+    const Mp4Box* pending_moof = nullptr;
+    for (const Mp4Box& box : parsed_mp4.top_level_boxes) {
+        const auto whole = slice_bytes(parsed_mp4.bytes, box.span);
+        if (box.type == "moof") {
+            pending_moof = &box;
+            continue;
+        }
+        if (box.type == "mdat" && pending_moof != nullptr) {
+            for (const auto& part : split_live_fragment_by_traf(slice_bytes(parsed_mp4.bytes, pending_moof->span), whole,
+                                                                parsed_mp4.tracks)) {
+                bytes.insert(bytes.end(), part.moof.begin(), part.moof.end());
+                bytes.insert(bytes.end(), part.mdat.begin(), part.mdat.end());
+            }
+            pending_moof = nullptr;
+            ++pair;
+            continue;
+        }
+        bytes.insert(bytes.end(), whole.begin(), whole.end());
+    }
+    demuxed.bytes = std::move(bytes);
+    demuxed.top_level_boxes = parse_mp4_boxes(demuxed.bytes);
+    demuxed.tracks = parsed_mp4.tracks;
+    return pair == moofs.size();
+}
+
+}  // namespace
+
 SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object_mode) {
+    if (ParsedMp4 demuxed; demux_multiplexed_fragments(parsed_mp4, demuxed)) {
+        SegmentedMp4 segmented = segment_for_cmaf(demuxed, object_mode);
+        // The demuxed copy is temporary, so every fragment must own its bytes.
+        for (auto& fragment : segmented.fragments) {
+            if (fragment.payload.owned_bytes.empty() && fragment.payload.span.size != 0) {
+                const auto bytes = slice_bytes(demuxed.bytes, fragment.payload.span);
+                fragment.payload.owned_bytes.assign(bytes.begin(), bytes.end());
+                fragment.payload.span = {};
+            }
+        }
+        return segmented;
+    }
     const Mp4Box* ftyp = find_first_box(parsed_mp4.top_level_boxes, "ftyp");
     const Mp4Box* moov = find_first_box(parsed_mp4.top_level_boxes, "moov");
     if (ftyp == nullptr || moov == nullptr) {

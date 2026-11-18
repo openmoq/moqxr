@@ -1,5 +1,6 @@
 #include "openmoq/publisher/cmaf_segmenter.h"
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/encoded_sample.h"
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
 
@@ -1278,6 +1279,44 @@ int main() {
             if (fragment.track_name == "vide_1") coalesced_payload += payload_size(fragment.payload);
         }
         ok &= expect(coalesced_payload > 2000 + 227, "expected coalesced video objects to carry the samples too");
+    }
+
+    // Regression: a fragmented file written without +separate_moof carries one traf per track inside each moof.
+    // The batch segmenter only looked at the first traf, so the audio track was silently dropped.
+    {
+        const auto fixture = std::filesystem::path(__FILE__).parent_path() / "fixtures" / "cmaf-multiplexed.mp4";
+        const auto parsed = parse_mp4_file(fixture.string());
+        std::map<std::string, std::pair<std::size_t, std::size_t>> expected;  // track -> {samples, bytes}
+        for (const auto& sample : read_encoded_samples(parsed)) {
+            auto& entry = expected[sample.track_name];
+            ++entry.first;
+            entry.second += sample.bytes.size();
+        }
+        ok &= expect(expected.size() == 2 && expected.count("vide_1") == 1 && expected.count("soun_2") == 1,
+                     "expected the multiplexed fixture to hold a video and an audio track");
+        for (const auto mode : {CmafObjectMode::kSplit, CmafObjectMode::kCoalesced}) {
+            const auto segmented = segment_for_cmaf(parsed, mode);
+            std::map<std::string, std::pair<std::size_t, std::size_t>> actual;
+            for (const auto& fragment : segmented.fragments) {
+                // Demuxed fragments are built from a temporary copy of the input, so they must own their bytes.
+                ok &= expect(!fragment.payload.owned_bytes.empty() && fragment.payload.span.size == 0,
+                             "expected demuxed fragments to own their bytes rather than point into the input");
+                const auto boxes = parse_mp4_boxes(fragment.payload.owned_bytes);
+                const Mp4Box* mdat = find_first_box(boxes, "mdat");
+                auto& entry = actual[fragment.track_name];
+                ++entry.first;
+                entry.second += mdat == nullptr ? 0 : mdat->payload.size;
+            }
+            ok &= expect(actual.size() == 2, "expected both tracks of a multiplexed file to be published");
+            for (const auto& [track, want] : expected) {
+                ok &= expect(actual.count(track) == 1 && actual[track].second == want.second,
+                             "expected every sample byte of track " + track + " to be published from multiplexed input");
+                if (mode == CmafObjectMode::kSplit) {
+                    ok &= expect(actual.count(track) == 1 && actual[track].first == want.first,
+                                 "expected one object per sample for track " + track + " from multiplexed input");
+                }
+            }
+        }
     }
 
     const auto fragmented_bytes = make_fragmented_test_mp4();

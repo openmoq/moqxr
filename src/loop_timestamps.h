@@ -1,5 +1,6 @@
 #pragma once
 
+#include "openmoq/publisher/cmsf_packager.h"
 #include "openmoq/publisher/object_properties.h"
 
 #include <cstdint>
@@ -10,6 +11,16 @@ namespace openmoq::publisher {
 // Rebasing of media timestamps for --loop. Each loop cycle replays the same
 // source objects, so their media timestamps must advance by the cycle length
 // or a subscriber's media timeline jumps back to the start on every loop.
+
+// The loop period of a plan: the end of its video media when it has a video track (video is the timeline
+// master), else the end of all media. Taking the longest track instead left every shorter track with a
+// gap, or a longer one overlapping the next pass, at each loop boundary.
+std::uint64_t loop_cycle_duration_us(const PublishPlan& plan);
+
+// Drops the media objects of non-video tracks that start at or after the loop period (audio that outlasts
+// the video), so a pass does not overlap the next one. A plan without video, and video itself, are left
+// unchanged; an object that straddles the period is kept.
+void trim_plan_for_loop(PublishPlan& plan);
 
 // The offset for loop cycle `cycle`, in `timescale` ticks, rounded to the
 // nearest tick. Computed from the whole elapsed time rather than as
