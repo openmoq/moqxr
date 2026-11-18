@@ -65,7 +65,7 @@ keeps the default CMAF output. See the
 - `+empty_moov` writes initialization metadata up front
 - `+default_base_moof` and `+separate_moof` produce a layout that is easier for fragmented-MP4 pipelines to consume
 - retain `+separate_moof` for LOCMAF; LOCMAF requires one `traf` per `moof`
-- the live stdin path splits a multi-track `moof` into one fragment per track, but `+separate_moof` is still preferred; a multi-track `moof` whose `traf` carries `saio`, a `base_data_offset`, or no `trun` data offset cannot be split and is dropped with a logged parse error
+- the live stdin path and batch file input (`--input file.mp4`) split a multi-track `moof` into one fragment per track, but `+separate_moof` is still preferred; a multi-track `moof` whose `traf` carries `saio`, a `base_data_offset`, or no `trun` data offset cannot be split: live input drops it with a logged parse error and file input fails with an error
 - for HEVC, prefer streams that are already `hvc1`-compatible
 - if a source is tagged `hev1` but keeps VPS/SPS/PPS only in the init segment, the publisher normalizes the advertised codec and emitted init segment to `hvc1`
 - if HEVC samples include in-band parameter sets, the publisher preserves `hev1`

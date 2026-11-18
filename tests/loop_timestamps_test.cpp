@@ -5,6 +5,7 @@
 #include "openmoq/publisher/mp4_box.h"
 #include "openmoq/publisher/publisher_api.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -24,7 +25,9 @@ namespace {
 
 using openmoq::publisher::find_child_box;
 using openmoq::publisher::LocmafEncoder;
+using openmoq::publisher::loop_cycle_duration_us;
 using openmoq::publisher::loop_offset_ticks;
+using openmoq::publisher::trim_plan_for_loop;
 using openmoq::publisher::Mp4Box;
 using openmoq::publisher::ObjectProperty;
 using openmoq::publisher::parse_mp4_boxes;
@@ -474,8 +477,105 @@ bool test_fixture_plans() {
 
 }  // namespace
 
+// The loop period is the end of the video media (the timeline master); audio that outlasts the video is
+// trimmed so a pass does not overlap the next one, and a track shorter than video simply keeps its gap.
+bool test_loop_period_and_trim() {
+    using openmoq::publisher::CmsfObject;
+    using openmoq::publisher::CmsfObjectKind;
+    using openmoq::publisher::PublishPlan;
+    using openmoq::publisher::TrackDescription;
+    bool ok = true;
+    const auto make_plan = [](bool with_video) {
+        PublishPlan plan;
+        plan.tracks.push_back(TrackDescription{.track_id = 1, .handler_type = "soun", .track_name = "soun_2"});
+        if (with_video) plan.tracks.push_back(TrackDescription{.track_id = 2, .handler_type = "vide", .track_name = "vide_1"});
+        plan.tracks.push_back(TrackDescription{.track_id = 3, .handler_type = "meta", .track_name = "timeline"});
+        if (with_video) {
+            for (std::size_t i = 0; i < 12; ++i) {  // 12 frames of 33333 us: ends at 399996
+                plan.objects.push_back(CmsfObject{.kind = CmsfObjectKind::kMedia, .track_name = "vide_1", .group_id = 0,
+                                                  .object_id = i, .media_time_us = i * 33333, .media_duration_us = 33333});
+            }
+        }
+        for (std::size_t i = 0; i < 20; ++i) {  // 20 AAC frames of 21333 us: the last ones outlast the video
+            plan.objects.push_back(CmsfObject{.kind = CmsfObjectKind::kMedia, .track_name = "soun_2", .group_id = i,
+                                              .object_id = 0, .media_time_us = i * 21333, .media_duration_us = 21333});
+        }
+        plan.objects.push_back(CmsfObject{.kind = CmsfObjectKind::kMetadata, .track_name = "timeline", .group_id = 0,
+                                          .object_id = 0, .media_time_us = 999999});
+        return plan;
+    };
+    const auto count = [](const PublishPlan& plan, const std::string& track) {
+        return static_cast<std::size_t>(std::count_if(plan.objects.begin(), plan.objects.end(),
+                                                      [&](const CmsfObject& o) { return o.track_name == track; }));
+    };
+
+    auto plan = make_plan(true);
+    ok &= expect(loop_cycle_duration_us(plan) == 12 * 33333, "loop period is the end of the video media, not the longer audio");
+    trim_plan_for_loop(plan);
+    ok &= expect(count(plan, "vide_1") == 12, "video is never trimmed");
+    // Audio frame i starts at i * 21333; frames starting at or after 399996 (i >= 19) are dropped, i == 18 straddles the end.
+    ok &= expect(count(plan, "soun_2") == 19, "audio starting at or after the loop period is dropped");
+    ok &= expect(count(plan, "timeline") == 1, "metadata objects are kept");
+    ok &= expect(loop_cycle_duration_us(plan) == 12 * 33333, "trimming does not change the loop period");
+
+    auto audio_only = make_plan(false);
+    const auto before = audio_only.objects.size();
+    ok &= expect(loop_cycle_duration_us(audio_only) == 20 * 21333, "without video the period is the end of all media");
+    trim_plan_for_loop(audio_only);
+    ok &= expect(audio_only.objects.size() == before, "nothing is trimmed without a video track");
+
+    // Audio shorter than video keeps all its objects (its gap at the loop boundary is unavoidable).
+    auto short_audio = make_plan(true);
+    std::erase_if(short_audio.objects, [](const CmsfObject& o) { return o.track_name == "soun_2" && o.group_id >= 10; });
+    trim_plan_for_loop(short_audio);
+    ok &= expect(count(short_audio, "soun_2") == 10, "shorter audio is left alone");
+    return ok;
+}
+
+// Publisher::prepare_* trims only when looping, so one-shot publishing is unchanged.
+bool test_prepare_trims_when_looping() {
+    using openmoq::publisher::CmsfObjectKind;
+    using openmoq::publisher::MediaPackaging;
+    using openmoq::publisher::Publisher;
+    using openmoq::publisher::PublisherConfig;
+    bool ok = true;
+#ifdef LOCMAF_FIXTURE_DIR
+    const std::filesystem::path fixtures = std::filesystem::path(LOCMAF_FIXTURE_DIR).parent_path();
+#else
+    const std::filesystem::path fixtures = "tests/fixtures";
+#endif
+    const Bytes input = read_file(fixtures / "irregular-first-sample.mp4");
+    const auto media_count = [](const openmoq::publisher::PublishPlan& plan, const std::string& track) {
+        return static_cast<std::size_t>(std::count_if(plan.objects.begin(), plan.objects.end(), [&](const auto& o) {
+            return o.kind == CmsfObjectKind::kMedia && o.track_name == track;
+        }));
+    };
+    for (const auto packaging : {MediaPackaging::kCmaf, MediaPackaging::kLoc}) {
+        PublisherConfig config;
+        config.media_packaging = packaging;
+        std::istringstream plain_stream(std::string(input.begin(), input.end()));
+        const auto plain = Publisher(config).prepare_stream(plain_stream, "irregular-first-sample.mp4");
+        config.loop = true;
+        std::istringstream looped_stream(std::string(input.begin(), input.end()));
+        const auto looped = Publisher(config).prepare_stream(looped_stream, "irregular-first-sample.mp4");
+        const std::string label = packaging == MediaPackaging::kCmaf ? "cmaf" : "loc";
+        const auto period = loop_cycle_duration_us(looped.plan);
+        ok &= expect(media_count(looped.plan, "vide_1") == media_count(plain.plan, "vide_1"), label + ": looping never trims video");
+        ok &= expect(period == loop_cycle_duration_us(plain.plan), label + ": the loop period does not depend on trimming");
+        for (const auto& object : looped.plan.objects) {
+            if (object.kind == CmsfObjectKind::kMedia && object.track_name != "vide_1") {
+                ok &= expect(object.media_time_us < period, label + ": a looped audio object starts inside the period");
+            }
+        }
+        ok &= expect(media_count(looped.plan, "soun_2") <= media_count(plain.plan, "soun_2"), label + ": looping only ever removes audio");
+    }
+    return ok;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_loop_period_and_trim();
+    ok &= test_prepare_trims_when_looping();
     ok &= test_offset_ticks();
     ok &= test_cmaf();
     ok &= test_locmaf();

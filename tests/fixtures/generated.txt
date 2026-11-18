@@ -28,3 +28,6 @@ ffmpeg -v error -f lavfi -i testsrc2=size=128x128:rate=4 -t 3 -c:v libsvtav1 -g 
 
 LOC VP9 fixture (FFmpeg libvpx-vp9, 128x128, 12 frames at 4 fps, GOP 4, no hidden alt-ref frames, no edit list):
 ffmpeg -v error -f lavfi -i testsrc2=size=128x128:rate=4 -t 3 -c:v libvpx-vp9 -g 4 -auto-alt-ref 0 -lag-in-frames 0 -deadline good -cpu-used 5 -pix_fmt yuv420p -an -use_editlist 0 -movflags +frag_keyframe+empty_moov+default_base_moof tests/fixtures/loc-vp9-fragmented.mp4
+
+Multiplexed CMAF fixture (FFmpeg H.264 + AAC, 64x64, 2 s, GOP 15; WITHOUT +separate_moof, so every moof holds a video and an audio traf):
+ffmpeg -v error -f lavfi -i testsrc2=size=64x64:rate=15 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 2 -c:v libx264 -preset veryfast -g 15 -keyint_min 15 -sc_threshold 0 -pix_fmt yuv420p -c:a aac -b:a 32k -movflags +frag_keyframe+empty_moov+default_base_moof tests/fixtures/cmaf-multiplexed.mp4

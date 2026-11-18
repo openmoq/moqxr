@@ -1078,8 +1078,15 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
         }
     }
 
+    // Sample defaults, in precedence order: the trun entry, then the tfhd default, then the trex default
+    // (ISO 14496-12 8.8.7 and 8.8.12). FFmpeg's -frag_duration writes one-sample fragments whose size and
+    // duration live only in tfhd, so ignoring the tfhd default size published video as an empty mdat.
     std::uint32_t default_sample_duration = 0;
+    std::uint32_t default_sample_size = 0;
     std::uint32_t default_sample_flags = 0x02000000U;
+    bool tfhd_duration = false;
+    bool tfhd_size = false;
+    bool tfhd_flags = false;
     if (const Mp4Box* tfhd = find_child_box(*traf, "tfhd")) {
         const std::uint32_t flags = read_full_box_flags(*tfhd, bytes);
         std::size_t cursor = tfhd->payload.offset + 8;
@@ -1091,20 +1098,32 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
         }
         if ((flags & 0x000008U) != 0 && cursor + 4 <= bytes.size()) {
             default_sample_duration = read_be32(bytes, cursor);
+            tfhd_duration = true;
             cursor += 4;
         }
         if ((flags & 0x000010U) != 0 && cursor + 4 <= bytes.size()) {
+            default_sample_size = read_be32(bytes, cursor);
+            tfhd_size = true;
             cursor += 4;
         }
         if ((flags & 0x000020U) != 0 && cursor + 4 <= bytes.size()) {
             default_sample_flags = read_be32(bytes, cursor);
+            tfhd_flags = true;
         }
     }
     if (const Mp4Box* moov = find_first_box(top_level_boxes, "moov")) {
         if (const Mp4Box* mvex = find_child_box(*moov, "mvex")) {
             for (const auto& child : mvex->children) {
                 if (child.type == "trex" && track_id_from_trex(child, bytes) == track.track_id) {
-                    default_sample_flags = read_be32_or_zero(bytes, child.payload.offset + 20);
+                    if (!tfhd_duration) {
+                        default_sample_duration = read_be32_or_zero(bytes, child.payload.offset + 12);
+                    }
+                    if (!tfhd_size) {
+                        default_sample_size = read_be32_or_zero(bytes, child.payload.offset + 16);
+                    }
+                    if (!tfhd_flags) {
+                        default_sample_flags = read_be32_or_zero(bytes, child.payload.offset + 20);
+                    }
                     break;
                 }
             }
@@ -1139,10 +1158,14 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
             sample_duration = read_be32(bytes, cursor);
             cursor += 4;
         }
-        std::uint32_t sample_size = 0;
+        std::uint32_t sample_size = default_sample_size;
         if ((trun_flags & 0x000200U) != 0 && cursor + 4 <= bytes.size()) {
             sample_size = read_be32(bytes, cursor);
             cursor += 4;
+        }
+        if (sample_size == 0) {
+            // A sample without a size would be published as an empty mdat: refuse instead.
+            throw std::runtime_error("CMAF fragment sample has no size (no trun entry, tfhd default or trex default)");
         }
         std::uint32_t sample_flags = first_sample_flags_present && index == 0 ? first_sample_flags : default_sample_flags;
         if ((trun_flags & 0x000400U) != 0 && cursor + 4 <= bytes.size()) {
@@ -1287,7 +1310,65 @@ void append_coalesced_fragments(SegmentedMp4& segmented,
 
 }  // namespace
 
+namespace {
+
+// A fragmented file written without +separate_moof holds one traf per track inside every moof. The
+// segmenter reasons about one track per fragment, so such a moof/mdat pair is split into one pair per
+// track, with the splitter the live ingest path uses. Returns false when no moof is multiplexed.
+bool demux_multiplexed_fragments(const ParsedMp4& parsed_mp4, ParsedMp4& demuxed) {
+    const std::vector<const Mp4Box*> moofs = find_boxes(parsed_mp4.top_level_boxes, "moof");
+    const std::vector<const Mp4Box*> mdats = find_boxes(parsed_mp4.top_level_boxes, "mdat");
+    if (moofs.size() != mdats.size()) {
+        return false;  // the caller reports the unmatched pairs
+    }
+    const bool multiplexed = std::any_of(moofs.begin(), moofs.end(), [](const Mp4Box* moof) {
+        return find_boxes(moof->children, "traf").size() > 1;
+    });
+    if (!multiplexed) {
+        return false;
+    }
+    std::vector<std::uint8_t> bytes;
+    std::size_t pair = 0;
+    const Mp4Box* pending_moof = nullptr;
+    for (const Mp4Box& box : parsed_mp4.top_level_boxes) {
+        const auto whole = slice_bytes(parsed_mp4.bytes, box.span);
+        if (box.type == "moof") {
+            pending_moof = &box;
+            continue;
+        }
+        if (box.type == "mdat" && pending_moof != nullptr) {
+            for (const auto& part : split_live_fragment_by_traf(slice_bytes(parsed_mp4.bytes, pending_moof->span), whole,
+                                                                parsed_mp4.tracks)) {
+                bytes.insert(bytes.end(), part.moof.begin(), part.moof.end());
+                bytes.insert(bytes.end(), part.mdat.begin(), part.mdat.end());
+            }
+            pending_moof = nullptr;
+            ++pair;
+            continue;
+        }
+        bytes.insert(bytes.end(), whole.begin(), whole.end());
+    }
+    demuxed.bytes = std::move(bytes);
+    demuxed.top_level_boxes = parse_mp4_boxes(demuxed.bytes);
+    demuxed.tracks = parsed_mp4.tracks;
+    return pair == moofs.size();
+}
+
+}  // namespace
+
 SegmentedMp4 segment_for_cmaf(const ParsedMp4& parsed_mp4, CmafObjectMode object_mode) {
+    if (ParsedMp4 demuxed; demux_multiplexed_fragments(parsed_mp4, demuxed)) {
+        SegmentedMp4 segmented = segment_for_cmaf(demuxed, object_mode);
+        // The demuxed copy is temporary, so every fragment must own its bytes.
+        for (auto& fragment : segmented.fragments) {
+            if (fragment.payload.owned_bytes.empty() && fragment.payload.span.size != 0) {
+                const auto bytes = slice_bytes(demuxed.bytes, fragment.payload.span);
+                fragment.payload.owned_bytes.assign(bytes.begin(), bytes.end());
+                fragment.payload.span = {};
+            }
+        }
+        return segmented;
+    }
     const Mp4Box* ftyp = find_first_box(parsed_mp4.top_level_boxes, "ftyp");
     const Mp4Box* moov = find_first_box(parsed_mp4.top_level_boxes, "moov");
     if (ftyp == nullptr || moov == nullptr) {

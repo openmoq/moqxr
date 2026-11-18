@@ -427,9 +427,9 @@ LibmoqPlanTranslation translate_plan_for_libmoq(const PublishPlan& plan) {
             o.payload = obj.owned_payload;
         }
         out.objects.push_back(std::move(o));
-        out.cycle_duration_us =
-            std::max(out.cycle_duration_us, obj.media_time_us + obj.media_duration_us);
     }
+    // The loop period follows the video media (see loop_cycle_duration_us), not the longest track.
+    out.cycle_duration_us = loop_cycle_duration_us(plan);
 
     return out;
 }
