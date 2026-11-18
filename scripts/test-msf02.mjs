@@ -81,9 +81,14 @@ function validate02(label, text, catalog) {
     assert.equal(inits.size, (catalog.initDataList ?? []).length, `${label}: initDataList ids are unique`);
     for (const track of catalog.tracks) {
         const where = `${label}/${track.name}`;
+        assert.equal(track.parentName, undefined, `${where}: parentName is only valid inside an update or clone operation`);
+        assert.equal(track.parentNamespace, undefined, `${where}: parentNamespace is only valid inside an update or clone operation`);
         for (const dependency of track.depends ?? []) {
-            if (typeof dependency === 'string') assert.ok(names.has(dependency), `${where}: depends name ${dependency} resolves`);
-            else assert.ok(groups.has(dependency), `${where}: depends renderGroup ${dependency} resolves`);
+            // Section 5.2.15: a name resolves to exactly one OTHER track; a renderGroup to at least one other track.
+            const others = catalog.tracks.filter(t => t !== track);
+            if (typeof dependency === 'string')
+                assert.equal(others.filter(t => t.name === dependency).length, 1, `${where}: depends name ${dependency} resolves to exactly one other track`);
+            else assert.ok(others.some(t => t.renderGroup === dependency), `${where}: depends renderGroup ${dependency} resolves to another track`);
         }
         if (track.packaging === 'mediatimeline') {
             // Section 7.2: reference a renderGroup when every track of it is covered, never both forms.

@@ -91,8 +91,8 @@ struct MsfTrack {
     std::optional<std::uint64_t> accessible_window_time_ms;  // 5.2.45
     std::optional<std::uint64_t> keyframe_spacing;     // 5.2.46, objects per keyframe interval
     std::optional<std::string> connection_uri;         // 5.2.37, JSON "connectionURI"
-    std::optional<std::string> parent_name;            // 5.2.34, names the target of a delta "update"
-    std::optional<std::string> parent_namespace;       // 5.2.35
+    // parentName / parentNamespace (5.2.34, 5.2.35) are valid only inside a delta "update" or "clone"
+    // operation; see MsfTrackUpdate, never MsfTrack.
     // renderGroup numbers that `depends` references next to track names (5.2.15).
     std::vector<std::uint32_t> depends_render_groups;
 

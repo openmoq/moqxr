@@ -1538,8 +1538,7 @@ int main() {
             for (const auto mutate : {+[](MsfTrack& t) { t.packaging_metadata = "a=b"; },
                                       +[](MsfTrack& t) { t.accessible_window_time_ms = 1; },
                                       +[](MsfTrack& t) { t.keyframe_spacing = 1; },
-                                      +[](MsfTrack& t) { t.connection_uri = "x"; },
-                                      +[](MsfTrack& t) { t.parent_name = "p"; }}) {
+                                      +[](MsfTrack& t) { t.connection_uri = "x"; }}) {
                 auto old = catalog_for(MsfVersion::k01);
                 mutate(old.tracks.front());
                 ok &= throws_runtime_error(old, "expected an MSF-02 track field to be refused under 01");
@@ -1872,6 +1871,83 @@ int main() {
         collapse_depends_to_render_groups(catalog);
         ok &= expect(catalog.tracks.back().depends == std::vector<std::string>({"a", "b"}),
                      "expected only media timeline tracks to be collapsed");
+    }
+
+    // Review fix pass: depends must resolve to exactly one OTHER track in `tracks` (section 5.2.15), parentName is
+    // only valid inside an update/clone operation (5.2.34), and the frame-rate estimate reaches make_msf_track.
+    {
+        const auto make = [](const std::string& name, const std::optional<std::string>& name_space) {
+            MsfTrack track;
+            track.name = name;
+            track.name_space = name_space;
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.codec = "avc1.640028";
+            track.bitrate = 1;
+            track.render_group = 1;
+            return track;
+        };
+        MsfCatalog catalog;
+        catalog.version = "draft-02";
+        MsfTrack self = make("video", std::nullopt);
+        self.depends = {"video"};
+        catalog.tracks = {self};
+        ok &= throws_runtime_error(catalog, "expected a track that depends on itself to be refused");
+
+        MsfTrack dependent = make("w", std::nullopt);
+        dependent.depends = {"video"};
+        catalog.tracks = {make("video", std::string("a")), make("video", std::string("b")), dependent};
+        ok &= throws_runtime_error(catalog, "expected a depends name that matches two tracks to be refused");
+
+        MsfCatalog publish_only;
+        publish_only.version = "draft-02";
+        publish_only.tracks = {dependent};
+        publish_only.publish_tracks = {make("video", std::nullopt)};
+        ok &= throws_runtime_error(publish_only, "expected a depends name that only a publishTracks entry carries to be refused");
+
+        MsfTrack group_dependent = make("w", std::nullopt);
+        group_dependent.render_group.reset();
+        group_dependent.depends_render_groups = {1};
+        MsfTrack lone_group_member = make("video", std::nullopt);
+        catalog.tracks = {lone_group_member, group_dependent};
+        ok &= serializes_cleanly(catalog, "expected a renderGroup carried by one other track to resolve");
+        group_dependent.render_group = 1;
+        catalog.tracks = {group_dependent};
+        group_dependent.depends_render_groups = {1};
+        catalog.tracks = {group_dependent};
+        ok &= throws_runtime_error(catalog, "expected a renderGroup that only the track itself carries to be refused");
+
+        // A track carrying parentName is refused in tracks (it exists only inside update/clone).
+        MsfCatalog with_parent;
+        with_parent.version = "draft-02";
+        MsfTrack plain = make("video", std::nullopt);
+        plain.custom_fields["parentName"] = "\"x\"";
+        with_parent.tracks = {plain};
+        ok &= throws_runtime_error(with_parent, "expected parentName to stay reserved against custom fields");
+        with_parent.version = "1";
+        ok &= throws_runtime_error(with_parent, "expected parentName to be reserved against custom fields under 01 too");
+
+        // make_msf_track: 02 loc video without a measured frame rate gets the flagged estimate; 01 and cmaf do not.
+        TrackDescription loc_video;
+        loc_video.handler_type = "vide";
+        loc_video.packaging = "loc";
+        loc_video.track_name = "video";
+        loc_video.codec = "avc1.640028";
+        loc_video.timescale = 90000;
+        loc_video.frame_rate = 0.0;
+        ok &= expect(make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k02).framerate == 30.0,
+                     "expected an estimated 30 fps for loc video without a frame rate under 02");
+        ok &= expect(!make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k01).framerate.has_value(),
+                     "expected no framerate invention under 01");
+        TrackDescription cmaf_video = loc_video;
+        cmaf_video.packaging = "cmaf";
+        ok &= expect(!make_msf_track(cmaf_video, true, std::nullopt, 0, MsfVersion::k02).framerate.has_value(),
+                     "expected no framerate invention for cmaf under 02");
+        loc_video.frame_rate = 25.0;
+        ok &= expect(make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k02).framerate == 25.0 &&
+                         make_msf_track(loc_video, true, std::nullopt, 0, MsfVersion::k01).framerate == 25.0,
+                     "expected a measured frame rate to be used under both versions");
     }
 
     return ok ? 0 : 1;

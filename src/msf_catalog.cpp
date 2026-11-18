@@ -200,8 +200,6 @@ void reject_msf02_fields_under_01(const MsfTrack& track, const std::string& wher
         : track.accessible_window_time_ms ? "accessibleWindowTime"
         : track.keyframe_spacing ? "keyframeSpacing"
         : track.connection_uri ? "connectionURI"
-        : track.parent_name ? "parentName"
-        : track.parent_namespace ? "parentNamespace"
         : !track.depends_render_groups.empty() ? "depends (renderGroup entry)"
         : nullptr;
     if (present != nullptr) {
@@ -222,9 +220,6 @@ void validate_track(const MsfTrack& track, MsfVersion version) {
     } else {
         if (track.name_space.has_value()) {
             validate_namespace_string(*track.name_space, "namespace", where);
-        }
-        if (track.parent_namespace.has_value()) {
-            validate_namespace_string(*track.parent_namespace, "parentNamespace", where);
         }
     }
     if (track.packaging.empty()) {
@@ -305,7 +300,6 @@ void validate_track(const MsfTrack& track, MsfVersion version) {
     // "1" catalog keeps accepting them as producer-defined names.
     static const std::set<std::string> kSpecFieldNamesAdded02 = {
         "packagingMetadata", "accessibleWindowTime", "keyframeSpacing", "connectionURI",
-        "parentName", "parentNamespace", "token",
     };
     const auto is_spec_field = [&](const std::string& key) {
         return kSpecFieldNames01.count(key) != 0 ||
@@ -518,33 +512,45 @@ void validate_catalog(const MsfCatalog& catalog) {
         }
     }
 
-    // MSF-02 section 5.2.15: every depends entry MUST resolve, or the catalog is invalid.
+    // MSF-02 section 5.2.15: a depends name resolves to exactly one OTHER track and a renderGroup to at least
+    // one other track; an entry that does not resolve makes the catalog invalid. `tracks` entries resolve
+    // against `tracks`; publishTracks entries against both lists.
     if (version == MsfVersion::k02) {
-        std::set<std::string> names;
-        std::set<std::uint32_t> render_groups;
-        for (const auto* list : {&catalog.tracks, &catalog.publish_tracks}) {
-            for (const auto& track : *list) {
-                names.insert(track.name);
-                if (track.render_group.has_value()) {
-                    render_groups.insert(*track.render_group);
+        const auto check_depends = [&](const MsfTrack& track,
+                                       const std::vector<const std::vector<MsfTrack>*>& pools) {
+            for (const auto& dependency : track.depends) {
+                std::size_t matches = 0;
+                for (const auto* pool : pools) {
+                    for (const auto& other : *pool) {
+                        if (&other != &track && other.name == dependency) {
+                            ++matches;
+                        }
+                    }
+                }
+                if (matches != 1) {
+                    throw std::runtime_error("MSF catalog depends entry \"" + dependency + "\" resolves to " +
+                                             std::to_string(matches) + " tracks, not exactly one other track (track \"" +
+                                             track.name + "\")");
                 }
             }
+            for (const auto group : track.depends_render_groups) {
+                bool found = false;
+                for (const auto* pool : pools) {
+                    for (const auto& other : *pool) {
+                        found = found || (&other != &track && other.render_group == group);
+                    }
+                }
+                if (!found) {
+                    throw std::runtime_error("MSF catalog depends renderGroup " + std::to_string(group) +
+                                             " resolves to no other track (track \"" + track.name + "\")");
+                }
+            }
+        };
+        for (const auto& track : catalog.tracks) {
+            check_depends(track, {&catalog.tracks});
         }
-        for (const auto* list : {&catalog.tracks, &catalog.publish_tracks}) {
-            for (const auto& track : *list) {
-                for (const auto& dependency : track.depends) {
-                    if (names.count(dependency) == 0) {
-                        throw std::runtime_error("MSF catalog depends entry \"" + dependency +
-                                                 "\" resolves to no track (track \"" + track.name + "\")");
-                    }
-                }
-                for (const auto group : track.depends_render_groups) {
-                    if (render_groups.count(group) == 0) {
-                        throw std::runtime_error("MSF catalog depends renderGroup " + std::to_string(group) +
-                                                 " resolves to no track (track \"" + track.name + "\")");
-                    }
-                }
-            }
+        for (const auto& track : catalog.publish_tracks) {
+            check_depends(track, {&catalog.tracks, &catalog.publish_tracks});
         }
     }
 
@@ -689,12 +695,6 @@ void write_track(std::ostringstream& out, const MsfTrack& track, MsfVersion vers
     }
     if (track.connection_uri.has_value()) {
         write_string(out, seq, "connectionURI", *track.connection_uri);
-    }
-    if (track.parent_name.has_value()) {
-        write_string(out, seq, "parentName", *track.parent_name);
-    }
-    if (track.parent_namespace.has_value()) {
-        write_string(out, seq, "parentNamespace", *track.parent_namespace);
     }
     if (track.max_grp_sap_starting_type.has_value()) {
         write_uint(out, seq, "maxGrpSapStartingType", *track.max_grp_sap_starting_type);
@@ -1260,7 +1260,6 @@ bool tracks_equal(const MsfTrack& a, const MsfTrack& b) {
            a.track_duration_ms == b.track_duration_ms && a.event_type == b.event_type &&
            a.packaging_metadata == b.packaging_metadata && a.accessible_window_time_ms == b.accessible_window_time_ms &&
            a.keyframe_spacing == b.keyframe_spacing && a.connection_uri == b.connection_uri &&
-           a.parent_name == b.parent_name && a.parent_namespace == b.parent_namespace &&
            a.depends_render_groups == b.depends_render_groups &&
            a.max_grp_sap_starting_type == b.max_grp_sap_starting_type &&
            a.max_obj_sap_starting_type == b.max_obj_sap_starting_type &&
