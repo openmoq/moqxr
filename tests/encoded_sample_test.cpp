@@ -288,6 +288,22 @@ void hevc_fixture() {
     check(samples[1].presentation_time > samples[2].presentation_time, "B-frame presentation order is preserved");
     check(loc_codec_config(parsed.tracks.front()).size() > 23, "hvcC payload is exposed as Video Config");
 }
+void opus_fixture() {
+    const auto parsed = parse_mp4_file("tests/fixtures/loc-opus.mp4");
+    check(parsed.tracks.size() == 1 && parsed.tracks.front().codec == "opus", "Opus fixture has one opus track");
+    const auto &track = parsed.tracks.front();
+    check(track.codec_private.size() > 8 && std::string(track.codec_private.begin() + 4, track.codec_private.begin() + 8) == "dOps",
+          "dOps is captured as codec private data");
+    // OpusHead as FFmpeg derives it from the same file (ffprobe extradata).
+    const Bytes expected = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0};
+    check(loc_codec_config(track) == expected, "Audio Config is the OpusHead");
+    const auto samples = read_encoded_samples(parsed);
+    check(samples.size() >= 40, "Opus fixture has one sample per 20 ms packet");
+    check(samples.front().duration == 960, "Opus packets are 20 ms at 48 kHz");
+    for (const auto &sample : samples) // The final packet is trimmed by the encoder.
+        check(sample.independent && !sample.bytes.empty() && sample.duration > 0 && sample.duration <= 960,
+              "Opus samples are independent packets of at most 20 ms");
+}
 int main() {
     try {
         init_validation();
@@ -298,6 +314,7 @@ int main() {
         bframes();
         hevc_bitstream_independence();
         hevc_fixture();
+        opus_fixture();
         std::cout << "Encoded sample tests passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

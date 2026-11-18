@@ -910,7 +910,8 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         std::vector<std::uint8_t> codec_private;
         const std::string_view config_type = effective_type == "avc1" || effective_type == "avc3" ? "avcC" :
             effective_type == "hvc1" || effective_type == "hev1" ? "hvcC" :
-            effective_type == "av01" ? "av1C" : "esds";
+            effective_type == "av01" ? "av1C" :
+            effective_type == "Opus" || effective_type == "opus" ? "dOps" : "esds";
         if (const auto config = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
                                                     sample_entry_child_offset, config_type)) {
             const auto config_bytes = slice_bytes(bytes, *config);

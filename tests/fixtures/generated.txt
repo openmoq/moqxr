@@ -19,3 +19,6 @@ ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=64x64:rate=30 -f l
 
 LOC HEVC fixture (FFmpeg libx265, 64x64, 8 frames at 4 fps, GOP 4 with 2 B-frames, no edit list, hvc1):
 ffmpeg -v error -f lavfi -i testsrc2=size=64x64:rate=4 -t 2 -c:v libx265 -x265-params "keyint=4:min-keyint=4:bframes=2:scenecut=0:log-level=error" -pix_fmt yuv420p -tag:v hvc1 -an -use_editlist 0 -movflags +frag_keyframe+empty_moov+default_base_moof tests/fixtures/loc-hevc-fragmented.mp4
+
+LOC Opus fixture (FFmpeg libopus, stereo 48 kHz sine, 1 s, fragmented):
+ffmpeg -v error -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -ac 2 -c:a libopus -b:a 64k -movflags empty_moov+default_base_moof+frag_keyframe -frag_duration 500000 tests/fixtures/loc-opus.mp4

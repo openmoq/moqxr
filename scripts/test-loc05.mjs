@@ -92,6 +92,12 @@ const CASES = [
             '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1', '-c:a', 'aac', '-b:a', '96k'],
         prefixes: { video: 'hvc1.', audio: 'mp4a.40.' },
     },
+    {
+        label: 'h264-opus',
+        codecArgs: ['-c:v', 'libx264', '-threads', '1', '-preset', 'fast', '-g', '25', '-keyint_min', '25',
+            '-sc_threshold', '0', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'libopus', '-b:a', '64k', '-ac', '2'],
+        prefixes: { video: 'avc1.', audio: 'opus' },
+    },
 ];
 async function validate({ label, codecArgs, prefixes }) {
     const source = join(work, `${label}-source.mp4`);

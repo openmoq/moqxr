@@ -94,6 +94,27 @@ int main() {
             }
             check(objects == 8, "HEVC fixture publishes every sample");
         }
+        {
+            // Opus: one packet per group, OpusHead as Audio Config, "opus" as Codec String.
+            std::istringstream input(fixture("loc-opus.mp4"));
+            auto prepared = Publisher(config).prepare_stream(input, "loc-opus.mp4");
+            std::size_t objects = 0;
+            for (const auto& object : prepared.plan.objects) {
+                if (object.kind != CmsfObjectKind::kMedia) continue;
+                ++objects;
+                const auto* audio_config = property(object, 15);
+                check(audio_config && std::get<std::vector<std::uint8_t>>(audio_config->value).size() == 19 &&
+                          std::string(std::get<std::vector<std::uint8_t>>(audio_config->value).begin(),
+                                      std::get<std::vector<std::uint8_t>>(audio_config->value).begin() + 8) == "OpusHead",
+                      "Opus Audio Config must be an OpusHead");
+                const auto* codec = property(object, 17);
+                check(codec && std::get<std::vector<std::uint8_t>>(codec->value) == std::vector<std::uint8_t>{'o', 'p', 'u', 's'},
+                      "Opus Codec String");
+                check(!property(object, 9) && !property(object, 13), "Opus carries no video properties");
+                check(object.object_id == 0 && object.group_id == objects - 1, "Opus one sample per group");
+            }
+            check(objects >= 40, "Opus fixture publishes every packet");
+        }
         // A missing decode interval invalidates dependent video until a new IDR.
         std::istringstream video_input(fixture("locmaf-publisher.mp4"));
         auto parsed = parse_mp4_stream(video_input, "video");

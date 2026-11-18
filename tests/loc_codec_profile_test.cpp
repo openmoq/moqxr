@@ -206,6 +206,83 @@ void hevc_accepts_live_track_requires_hvc_prefix_and_hvcc() {
           "avcC bytes are not an hvcC");
     check(find_loc_profile_for_codec("avc1.42E01E", true) != hevc, "avc1 string does not select HEVC");
 }
+
+// ---- Opus ----
+Bytes dops(std::uint8_t channels, std::uint16_t pre_skip, std::uint32_t rate, std::int16_t gain, std::uint8_t family,
+           const Bytes &mapping = {}) {
+    Bytes b = {0, channels, static_cast<std::uint8_t>(pre_skip >> 8), static_cast<std::uint8_t>(pre_skip)};
+    be(b, rate);
+    b.push_back(static_cast<std::uint8_t>(static_cast<std::uint16_t>(gain) >> 8));
+    b.push_back(static_cast<std::uint8_t>(gain));
+    b.push_back(family);
+    append(b, mapping);
+    return b;
+}
+TrackDescription opus_track(Bytes payload) {
+    TrackDescription t;
+    t.handler_type = "soun";
+    t.sample_entry_type = "Opus";
+    t.codec = "opus";
+    t.timescale = 48000;
+    t.codec_private = box("dOps", std::move(payload));
+    return t;
+}
+void opus_dops_converts_to_opushead_family0() {
+    const auto t = opus_track(dops(2, 312, 48000, 0, 0));
+    const auto *p = find_loc_profile(t);
+    check(p != nullptr, "Opus audio has a profile");
+    // Matches the OpusHead FFmpeg derives from the same dOps.
+    const Bytes expected = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0};
+    check(p->extract_config(t) == expected, "family 0 OpusHead is little endian and 19 bytes");
+    auto lower = t;
+    lower.sample_entry_type = "opus";
+    check(find_loc_profile(lower) != nullptr, "lowercase opus entry has a profile");
+}
+void opus_dops_converts_family1_with_mapping_table() {
+    const Bytes mapping = {0, 4, 1, 2, 3, 5};
+    Bytes payload = dops(6, 312, 44100, -256, 1, Bytes{4, 2});
+    append(payload, mapping);
+    const auto t = opus_track(payload);
+    const Bytes expected = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 6, 0x38, 0x01, 0x44, 0xAC, 0, 0, 0x00, 0xFF, 1,
+                            4, 2, 0, 4, 1, 2, 3, 5};
+    check(find_loc_profile(t)->extract_config(t) == expected, "family 1 OpusHead carries stream counts and mapping");
+}
+void opus_rejects_malformed_dops() {
+    auto truncated = dops(2, 312, 48000, 0, 0);
+    truncated.pop_back();
+    const auto short_track = opus_track(truncated);
+    rejects([&] { find_loc_profile(short_track)->extract_config(short_track); });
+    auto versioned = dops(2, 312, 48000, 0, 0);
+    versioned[0] = 1;
+    const auto version_track = opus_track(versioned);
+    rejects([&] { find_loc_profile(version_track)->extract_config(version_track); });
+    const auto three_channels_family0 = opus_track(dops(3, 312, 48000, 0, 0));
+    rejects([&] { find_loc_profile(three_channels_family0)->extract_config(three_channels_family0); });
+    const auto missing_table = opus_track(dops(6, 312, 48000, 0, 1, Bytes{4, 2}));
+    rejects([&] { find_loc_profile(missing_table)->extract_config(missing_table); });
+    auto trailing = dops(2, 312, 48000, 0, 0);
+    trailing.push_back(0);
+    const auto trailing_track = opus_track(trailing);
+    rejects([&] { find_loc_profile(trailing_track)->extract_config(trailing_track); });
+}
+void opus_sample_is_always_independent() {
+    const auto t = opus_track(dops(2, 312, 48000, 0, 0));
+    const auto *p = find_loc_profile(t);
+    check(p->check_sample(t, Bytes{0xFC, 0xFF, 0xFE}, false).independent, "Opus packets are independent");
+    rejects([&] { p->check_sample(t, Bytes{}, false); });
+}
+void opus_accepts_live_track_requires_codec_opus_and_opushead() {
+    const auto t = opus_track(dops(2, 312, 48000, 0, 0));
+    const auto head = find_loc_profile(t)->extract_config(t);
+    const auto *opus = find_loc_profile_for_codec("opus", false);
+    check(opus != nullptr && opus->accepts_live_track("opus", head, false), "opus accepted");
+    check(find_loc_profile_for_codec("opus", true) == nullptr, "opus on a video track");
+    check(!opus->accepts_live_track("opus", Bytes{1, 2, 3}, false), "non-OpusHead bytes rejected");
+    auto bad_magic = head;
+    bad_magic[0] = 'X';
+    check(!opus->accepts_live_track("opus", bad_magic, false), "wrong magic rejected");
+    check(!opus->accepts_live_track("opus", Bytes(head.begin(), head.end() - 1), false), "truncated OpusHead rejected");
+}
 } // namespace
 int main() {
     try {
@@ -226,6 +303,11 @@ int main() {
         hevc_rejects_bad_length_prefix();
         hevc_rejects_inband_parameter_sets_unless_matching_stripped();
         hevc_accepts_live_track_requires_hvc_prefix_and_hvcc();
+        opus_dops_converts_to_opushead_family0();
+        opus_dops_converts_family1_with_mapping_table();
+        opus_rejects_malformed_dops();
+        opus_sample_is_always_independent();
+        opus_accepts_live_track_requires_codec_opus_and_opushead();
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;
