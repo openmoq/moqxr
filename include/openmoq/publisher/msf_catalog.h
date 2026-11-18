@@ -175,6 +175,12 @@ MsfTrack make_msf_track(const TrackDescription& track,
                         std::uint64_t computed_bitrate = 0,
                         MsfVersion msf_version = MsfVersion::k02);
 
+// MSF-02 section 7.2: a media timeline track whose depends covers every track of a
+// renderGroup MUST reference the renderGroup and MUST NOT name its tracks; a partial
+// cover names tracks only. Rewrites depends / depends_render_groups of each
+// mediatimeline track accordingly.
+void collapse_depends_to_render_groups(MsfCatalog& catalog);
+
 // Frame rate for a video track: the measured value, else a 30 fps estimate so a
 // MSF-02 LOC video track (Table 6 requires framerate) can still be published
 // from a live source that never measured one. framerate_is_estimated tells callers

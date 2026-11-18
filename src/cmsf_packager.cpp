@@ -133,8 +133,14 @@ std::uint64_t round_us_to_ms(std::uint64_t value_us) {
     return (value_us + 500ULL) / 1000ULL;
 }
 
+std::uint64_t floor_us_to_ms(std::uint64_t value_us) {
+    return value_us / 1000ULL;
+}
+
+// MSF-02 section 8.2 spells the index keys in uppercase ('L' for Location); MSF-01 used lowercase.
 std::vector<std::uint8_t> build_sap_timeline_payload(const SegmentedMp4& segmented_mp4,
-                                                     const TrackDescription& media_track) {
+                                                     const TrackDescription& media_track,
+                                                     MsfVersion msf_version) {
     std::ostringstream payload;
     payload << '[';
     bool first = true;
@@ -147,7 +153,7 @@ std::vector<std::uint8_t> build_sap_timeline_payload(const SegmentedMp4& segment
         }
         first = false;
         payload << '{'
-                << "\"l\":[" << fragment.group_id << "," << fragment.object_id << "],"
+                << (msf_version == MsfVersion::k02 ? "\"L\":[" : "\"l\":[") << fragment.group_id << "," << fragment.object_id << "],"
                 << "\"data\":[" << static_cast<unsigned int>(fragment.sap_type) << ','
                 << round_us_to_ms(fragment.earliest_presentation_time_us) << ']'
                 << '}';
@@ -157,7 +163,10 @@ std::vector<std::uint8_t> build_sap_timeline_payload(const SegmentedMp4& segment
     return std::vector<std::uint8_t>(text.begin(), text.end());
 }
 
-std::vector<std::uint8_t> build_msf_timeline_payload(const SegmentedMp4& segmented_mp4) {
+// MSF-02 section 7.1.1: the first item is the media presentation timestamp, the floor in integral
+// milliseconds, of the first sample of the Object. MSF-01 text says the same, but its output rounds
+// the decode time; that behaviour is kept for version 1 so its bytes do not change.
+std::vector<std::uint8_t> build_msf_timeline_payload(const SegmentedMp4& segmented_mp4, MsfVersion msf_version) {
     struct TimelineKey {
         std::uint64_t media_time_ms = 0;
         std::size_t group_id = 0;
@@ -172,7 +181,8 @@ std::vector<std::uint8_t> build_msf_timeline_payload(const SegmentedMp4& segment
     std::set<TimelineKey> emitted;
     for (const auto& fragment : segmented_mp4.fragments) {
         emitted.insert(TimelineKey{
-            .media_time_ms = round_us_to_ms(fragment.start_time_us),
+            .media_time_ms = msf_version == MsfVersion::k02 ? floor_us_to_ms(fragment.earliest_presentation_time_us)
+                                                           : round_us_to_ms(fragment.start_time_us),
             .group_id = fragment.group_id,
             .object_id = fragment.object_id,
         });
@@ -595,6 +605,9 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
         apply_drm_system_configs(msf_catalog, scheme, pssh_systems, drm_systems);
     }
 
+    if (msf_version == MsfVersion::k02) {
+        collapse_depends_to_render_groups(msf_catalog);
+    }
     const std::string catalog_text = serialize_catalog(msf_catalog);
     const std::vector<std::uint8_t> catalog_payload(catalog_text.begin(), catalog_text.end());
     plan.objects.push_back({
@@ -629,7 +642,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
             .group_id = 0,
             .object_id = 0,
             .payload = {},
-            .owned_payload = build_msf_timeline_payload(segmented_mp4),
+            .owned_payload = build_msf_timeline_payload(segmented_mp4, msf_version),
         });
     }
 
@@ -644,7 +657,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                 .group_id = 0,
                 .object_id = 0,
                 .payload = {},
-                .owned_payload = build_sap_timeline_payload(segmented_mp4, media_track),
+                .owned_payload = build_sap_timeline_payload(segmented_mp4, media_track, msf_version),
             });
         }
     }

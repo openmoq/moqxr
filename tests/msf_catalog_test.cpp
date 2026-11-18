@@ -1823,5 +1823,56 @@ int main() {
         }
     }
 
+    // collapse_depends_to_render_groups (MSF-02 section 7.2): a media timeline references a renderGroup when
+    // all of its tracks are covered, and the individual names when only a subset is.
+    {
+        const auto media = [](const std::string& name, std::optional<std::uint32_t> group) {
+            MsfTrack track;
+            track.name = name;
+            track.packaging = "cmaf";
+            track.role = "video";
+            track.is_live = true;
+            track.bitrate = 1;
+            track.render_group = group;
+            return track;
+        };
+        MsfTrack timeline;
+        timeline.name = "timeline";
+        timeline.packaging = "mediatimeline";
+        timeline.is_live = true;
+        MsfCatalog catalog;
+        catalog.version = "draft-02";
+        catalog.tracks = {media("a", 1), media("b", 1), media("c", 2), media("d", std::nullopt), timeline};
+
+        catalog.tracks.back().depends = {"a", "b", "c", "d"};
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>{"d"} &&
+                         catalog.tracks.back().depends_render_groups == std::vector<std::uint32_t>({1, 2}),
+                     "expected fully covered render groups to replace their track names and ungrouped tracks to stay named");
+
+        catalog.tracks.back().depends = {"a", "c"};
+        catalog.tracks.back().depends_render_groups.clear();
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>{"a"} &&
+                         catalog.tracks.back().depends_render_groups == std::vector<std::uint32_t>({2}),
+                     "expected a partially covered render group to keep naming its tracks");
+
+        catalog.tracks.back().depends = {"a"};
+        catalog.tracks.back().depends_render_groups.clear();
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>{"a"} &&
+                         catalog.tracks.back().depends_render_groups.empty(),
+                     "expected a subset of a render group to stay named");
+
+        auto event = media("events", std::nullopt);
+        event.packaging = "eventtimeline";
+        event.event_type = "x";
+        event.depends = {"a", "b"};
+        catalog.tracks.push_back(event);
+        collapse_depends_to_render_groups(catalog);
+        ok &= expect(catalog.tracks.back().depends == std::vector<std::string>({"a", "b"}),
+                     "expected only media timeline tracks to be collapsed");
+    }
+
     return ok ? 0 : 1;
 }

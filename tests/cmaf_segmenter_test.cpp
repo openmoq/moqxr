@@ -1297,7 +1297,35 @@ int main() {
 
     ok &= expect(sap_plan.objects.size() == 3, "expected SAP-enabled plan to add one SAP timeline object");
     ok &= expect(sap_plan.objects.back().track_name == "vide_1_sap", "expected SAP timeline object for fragmented video");
-    ok &= expect_contains(object_text(sap_plan.objects.back()), "\"l\":[0,0]", "expected fragmented SAP timeline location");
+    ok &= expect_contains(object_text(sap_plan.objects.back()), "\"L\":[0,0]",
+                          "expected the MSF-02 uppercase L location key in the SAP event timeline");
+    {
+        // MSF-02 changes the event timeline index keys to uppercase and the media timeline to the
+        // floor of the media presentation time; MSF-01 keeps lowercase keys and rounding of the decode time.
+        SegmentedMp4 timed = segmented;
+        timed.fragments.front().start_time_us = 1000400;
+        timed.fragments.front().earliest_presentation_time_us = 1999600;
+        const auto plan_02 = build_publish_plan(timed, DraftVersion::kDraft14, true, true, false, {}, MsfVersion::k02);
+        const auto plan_01 = build_publish_plan(timed, DraftVersion::kDraft14, true, true, false, {}, MsfVersion::k01);
+        const auto find_object = [](const PublishPlan& plan, const std::string& name) -> std::string {
+            for (const auto& object : plan.objects) {
+                if (object.track_name == name) return object_text(object);
+            }
+            return {};
+        };
+        ok &= expect_contains(find_object(plan_02, "timeline"), "[[1999,[0,0],0]]",
+                              "expected the MSF-02 media timeline to floor the presentation time to milliseconds");
+        ok &= expect_contains(find_object(plan_01, "timeline"), "[[1000,[0,0],0]]",
+                              "expected the MSF-01 media timeline to keep rounding the decode time");
+        ok &= expect_contains(find_object(plan_02, "vide_1_sap"), "\"L\":[0,0]", "expected an uppercase L key under 02");
+        ok &= expect_not_contains(find_object(plan_02, "vide_1_sap"), "\"l\":", "expected no lowercase l key under 02");
+        ok &= expect_contains(find_object(plan_01, "vide_1_sap"), "\"l\":[0,0]", "expected a lowercase l key under 01");
+        const std::string catalog_02 = find_object(plan_02, "catalog");
+        ok &= expect_contains(catalog_02, "\"depends\":[1]",
+                              "expected the media timeline to reference the fully covered renderGroup");
+        ok &= expect_contains(find_object(plan_01, "catalog"), "\"depends\":[\"vide_1\"]",
+                              "expected the MSF-01 media timeline to keep listing track names");
+    }
     ok &= expect_contains(object_text(sap_plan.objects.back()), "\"data\":[2,0]", "expected fragmented SAP type and EPT");
     ok &= expect(msf_timeline_plan.objects.size() == 3,
                  "expected MSF timeline-enabled plan to add one media timeline object");
@@ -1554,8 +1582,14 @@ int main() {
     ok &= expect_contains(msf_timeline_catalog_text, "\"role\":\"mediatimeline\"", "expected MSF media timeline role");
     ok &= expect_contains(msf_timeline_catalog_text, "\"packaging\":\"mediatimeline\"", "expected MSF media timeline packaging");
     ok &= expect_contains(msf_timeline_catalog_text, "\"mimeType\":\"application/json\"", "expected MSF media timeline mime type");
-    ok &= expect_contains(msf_timeline_catalog_text, "\"depends\":[\"vide_1\",\"soun_2\"]",
-                         "expected MSF media timeline to depend on all media tracks");
+    ok &= expect_contains(msf_timeline_catalog_text, "\"depends\":[1]",
+                         "expected the MSF-02 media timeline to reference the renderGroup that covers all media tracks");
+    {
+        const auto timeline_01 = build_publish_plan(multitrack_segmented, DraftVersion::kDraft14, false, true, false, {}, MsfVersion::k01);
+        const std::string text_01(timeline_01.objects.front().owned_payload.begin(), timeline_01.objects.front().owned_payload.end());
+        ok &= expect_contains(text_01, "\"depends\":[\"vide_1\",\"soun_2\"]",
+                              "expected the MSF-01 media timeline to depend on all media tracks by name");
+    }
     ok &= expect(multitrack_plan.track_initializations.size() == 2, "expected per-track init payloads in plan");
     ok &= expect(multitrack_plan.objects.size() == 1, "expected only the catalog object in the default init-only plan");
     ok &= expect(multitrack_sap_plan.objects.size() == 3, "expected catalog plus per-track SAP timeline objects when SAP is enabled");

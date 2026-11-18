@@ -917,6 +917,35 @@ bool bitrate_is_estimated(const TrackDescription& track,
     return track.max_bitrate == 0 && !(configured.has_value() && *configured != 0) && computed == 0;
 }
 
+void collapse_depends_to_render_groups(MsfCatalog& catalog) {
+    for (auto& timeline : catalog.tracks) {
+        if (timeline.packaging != "mediatimeline" || timeline.depends.empty()) {
+            continue;
+        }
+        std::map<std::uint32_t, std::vector<std::string>> members_by_group;
+        for (const auto& track : catalog.tracks) {
+            if (&track != &timeline && track.render_group.has_value()) {
+                members_by_group[*track.render_group].push_back(track.name);
+            }
+        }
+        for (const auto& [group, members] : members_by_group) {
+            const bool covered = std::all_of(members.begin(), members.end(), [&](const std::string& name) {
+                return std::find(timeline.depends.begin(), timeline.depends.end(), name) != timeline.depends.end();
+            });
+            if (!covered) {
+                continue;
+            }
+            std::erase_if(timeline.depends, [&](const std::string& name) {
+                return std::find(members.begin(), members.end(), name) != members.end();
+            });
+            if (std::find(timeline.depends_render_groups.begin(), timeline.depends_render_groups.end(), group) ==
+                timeline.depends_render_groups.end()) {
+                timeline.depends_render_groups.push_back(group);
+            }
+        }
+    }
+}
+
 double resolve_framerate(const TrackDescription& track) {
     return track.frame_rate > 0.0 ? track.frame_rate : 30.0;
 }
