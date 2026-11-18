@@ -1173,7 +1173,7 @@ if(OPENMOQ_BUILD_TESTS)
             "${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}/picoquic"
         )
         target_compile_definitions(openmoq-publisher-picoquic-tls-verify-tests PRIVATE
-            OPENMOQ_PICOQUIC_SOURCE_DIR="${OPENMOQ_RESOLVED_PICOQUIC_SOURCE_DIR}"
+            OPENMOQ_TEST_CERTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/certs"
         )
         add_test(NAME openmoq-publisher-picoquic-tls-verify-tests COMMAND openmoq-publisher-picoquic-tls-verify-tests)
     endif()
