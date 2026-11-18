@@ -1269,8 +1269,11 @@ int main() {
     ok &= expect(plan.objects.front().track_name == "catalog", "expected catalog object first");
 
     const std::string plan_catalog_text = object_text(plan.objects.front());
-    ok &= expect_contains(plan_catalog_text, "\"version\":\"1\"",
-                          "expected MSF v1 string version in publish plan catalog");
+    ok &= expect_contains(plan_catalog_text, "\"version\":\"draft-02\"",
+                          "expected the MSF-02 version string in the default publish plan catalog");
+    const auto plan_01 = build_publish_plan(segmented, DraftVersion::kDraft14, false, false, false, {}, MsfVersion::k01);
+    ok &= expect_contains(object_text(plan_01.objects.front()), "\"version\":\"1\"",
+                          "expected the MSF-01 version string when 01 is selected");
     ok &= expect_not_contains(plan_catalog_text, "\"format\"",
                               "expected no legacy format field");
     ok &= expect_not_contains(plan_catalog_text, "\"initData\":",
@@ -1597,8 +1600,8 @@ int main() {
     const auto live_video_init_tracks = extract_tracks(parse_mp4_boxes(live_video_init_bytes), live_video_init_bytes);
     const auto live_audio_init_tracks = extract_tracks(parse_mp4_boxes(live_audio_init_bytes), live_audio_init_bytes);
     ok &= expect(live_catalog.track_initializations.size() == 2, "expected live catalog to expose per-track init payloads");
-    ok &= expect_contains(live_catalog_text, "\"version\":\"1\"",
-                          "expected MSF v1 string version in live catalog");
+    ok &= expect_contains(live_catalog_text, "\"version\":\"draft-02\"",
+                          "expected the MSF-02 version string in the default live catalog");
     ok &= expect_contains(live_catalog_text, "\"isLive\":true",
                           "expected live tracks marked isLive");
     ok &= expect_contains(live_catalog_text, "\"generatedAt\":",

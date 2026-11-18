@@ -425,8 +425,9 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                DraftVersion version,
                                bool include_sap,
                                bool include_msf_timeline,
-                               bool vod) {
-    return build_publish_plan(segmented_mp4, version, include_sap, include_msf_timeline, vod, {});
+                               bool vod,
+                               MsfVersion msf_version) {
+    return build_publish_plan(segmented_mp4, version, include_sap, include_msf_timeline, vod, {}, msf_version);
 }
 
 PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
@@ -434,7 +435,8 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
                                bool include_sap,
                                bool include_msf_timeline,
                                bool vod,
-                               const std::vector<DrmSystemConfig>& drm_systems) {
+                               const std::vector<DrmSystemConfig>& drm_systems,
+                               MsfVersion msf_version) {
     std::vector<TrackDescription> tracks = segmented_mp4.tracks;
     std::uint32_t synthetic_track_id = next_synthetic_track_id(tracks);
     if (include_msf_timeline) {
@@ -510,6 +512,7 @@ PublishPlan build_publish_plan(const SegmentedMp4& segmented_mp4,
     }
 
     MsfCatalog msf_catalog;
+    msf_catalog.version = std::string(msf_version_string(msf_version));
     // Section 5.1.2: generatedAt SHOULD NOT be included when isLive is false.
     if (!vod) {
         msf_catalog.generated_at_ms = static_cast<std::uint64_t>(
@@ -773,15 +776,17 @@ void emit_plan_objects(const PublishPlan& plan,
 
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
-                               bool is_live) {
-    return build_live_catalog(tracks, init_segment, is_live, {});
+                               bool is_live,
+                               MsfVersion msf_version) {
+    return build_live_catalog(tracks, init_segment, is_live, {}, std::nullopt, msf_version);
 }
 
 LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
                                std::span<const std::uint8_t> init_segment,
                                bool is_live,
                                const std::vector<DrmSystemConfig>& drm_systems,
-                               std::optional<std::uint32_t> video_alt_group) {
+                               std::optional<std::uint32_t> video_alt_group,
+                               MsfVersion msf_version) {
     LiveCatalog result;
 
     // Build per-track init segments (single-track moov), matching the static file publish path.
@@ -801,6 +806,7 @@ LiveCatalog build_live_catalog(const std::vector<TrackDescription>& tracks,
     }
 
     MsfCatalog msf_catalog;
+    msf_catalog.version = std::string(msf_version_string(msf_version));
     if (is_live) {
         // Section 5.1.2: SHOULD NOT be included when isLive is false.
         msf_catalog.generated_at_ms = static_cast<std::uint64_t>(

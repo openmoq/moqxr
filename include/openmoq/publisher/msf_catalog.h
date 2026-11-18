@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openmoq/publisher/mp4_box.h"
+#include "openmoq/publisher/msf_version.h"
 
 #include <cstdint>
 #include <map>

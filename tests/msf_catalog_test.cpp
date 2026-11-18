@@ -1409,5 +1409,31 @@ int main() {
         }
     }
 
+    // MsfVersion selects the catalog profile: "1" is MSF-01 and "draft-02" is MSF-02.
+    {
+        ok &= expect(msf_version_string(MsfVersion::k01) == "1" && msf_version_string(MsfVersion::k02) == "draft-02",
+                     "expected the version strings of both profiles");
+        ok &= expect(msf_version_from_string("1") == MsfVersion::k01 && msf_version_from_string("draft-02") == MsfVersion::k02,
+                     "expected both version strings to map back to their profile");
+        ok &= expect(!msf_version_from_string("2").has_value() && !msf_version_from_string("").has_value() &&
+                         !msf_version_from_string("draft-03").has_value(),
+                     "expected unknown version strings to have no profile");
+        MsfCatalog unknown;
+        unknown.version = "draft-03";
+        MsfTrack track;
+        track.name = "video";
+        track.packaging = "cmaf";
+        track.role = "video";
+        track.is_live = true;
+        track.codec = "avc1.640028";
+        track.bitrate = 1000000;
+        unknown.tracks.push_back(track);
+        ok &= throws_runtime_error(unknown, "expected a catalog with an unknown version to be refused");
+        MsfCatalog two = unknown;
+        two.version = std::string(msf_version_string(MsfVersion::k02));
+        ok &= serializes_cleanly(two, "expected a draft-02 catalog to serialize");
+        ok &= expect_contains(serialize_catalog(two), "\"version\":\"draft-02\"", "expected the draft-02 version string on the wire");
+    }
+
     return ok ? 0 : 1;
 }

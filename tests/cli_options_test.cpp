@@ -1290,5 +1290,19 @@ int main() {
                                   "LOC", "LOC must reject incompatible chunk delivery"), "LOC delivery gate");
     }
 
+    {
+        using openmoq::publisher::MsfVersion;
+        ok &= expect(parse({"prog", "--input", "sample.mp4"}).msf_version == MsfVersion::k02,
+                     "expected the MSF version to default to 02");
+        ok &= expect(parse({"prog", "--input", "sample.mp4", "--msf-version", "02"}).msf_version == MsfVersion::k02,
+                     "expected --msf-version 02");
+        ok &= expect(parse({"prog", "--input", "sample.mp4", "--msf-version", "01"}).msf_version == MsfVersion::k01,
+                     "expected --msf-version 01");
+        ok &= expect(parse_throws({"prog", "--input", "sample.mp4", "--msf-version", "03"}, "msf-version",
+                                  "an unknown MSF version must be refused"),
+                     "unknown --msf-version");
+        ok &= expect(build_usage("prog").find("--msf-version") != std::string::npos, "expected usage to list --msf-version");
+    }
+
     return ok ? 0 : 1;
 }

@@ -285,7 +285,8 @@ PreparedPublish Publisher::prepare_file(const std::filesystem::path& path) const
                                    config_.include_sap,
                                    config_.include_msf_timeline,
                                    config_.vod,
-                                   config_.drm_systems),
+                                   config_.drm_systems,
+                                   config_.msf_version),
     };
 }
 
@@ -306,7 +307,8 @@ PreparedPublish Publisher::prepare_stream(std::istream& input, std::string_view 
                                    config_.include_sap,
                                    config_.include_msf_timeline,
                                    config_.vod,
-                                   config_.drm_systems),
+                                   config_.drm_systems,
+                                   config_.msf_version),
     };
 }
 
@@ -423,6 +425,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         active->session->set_moq_impl_id(config_.moq_impl_id);
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
+        active->session->set_msf_version(config_.msf_version);
 
         if (!set_active_session(active, resolved_endpoint, false)) {
             return transport::TransportStatus::success();
@@ -646,6 +649,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         active->session->set_moq_impl_id(config_.moq_impl_id);
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
+        active->session->set_msf_version(config_.msf_version);
         active->session->set_initial_group_id(config_.initial_group_id);
         active->session->set_video_alt_group(config_.video_alt_group);
 
@@ -928,6 +932,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
         active->session->set_moq_impl_id(config_.moq_impl_id);
         active->session->set_await_subscriber_indefinitely(config_.await_subscriber_indefinitely);
         active->session->set_media_packaging(config_.media_packaging);
+        active->session->set_msf_version(config_.msf_version);
 
         if (!set_active_session(active, resolved_endpoint, true)) {
             return transport::TransportStatus::success();

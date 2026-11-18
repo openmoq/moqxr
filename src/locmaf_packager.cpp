@@ -11,7 +11,8 @@ namespace openmoq::publisher {
 namespace {
 PublishPlan package(const SegmentedMp4& segmented, const PublisherConfig& config) {
     return build_publish_plan(segmented, config.draft_version, config.include_sap,
-                              config.include_msf_timeline, config.vod, config.drm_systems);
+                              config.include_msf_timeline, config.vod, config.drm_systems,
+                              config.msf_version);
 }
 
 void preserve_chunk_boxes(SegmentedMp4& segmented, const ParsedMp4& parsed) {

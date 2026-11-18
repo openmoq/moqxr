@@ -261,6 +261,9 @@ void validate_track(const MsfTrack& track) {
 
 // Catalog-wide invariants that cannot be checked from a single track.
 void validate_catalog(const MsfCatalog& catalog) {
+    if (!msf_version_from_string(catalog.version).has_value()) {
+        throw std::runtime_error("MSF catalog has unknown version \"" + catalog.version + "\"");
+    }
     // Section 5.3: a delta update MUST include at least one operation and
     // MUST NOT carry tracks. Only "add" and "remove" are emitted by this
     // implementation.
@@ -1116,6 +1119,8 @@ std::vector<CatalogObject> CatalogPublisher::publish(const MsfCatalog& desired) 
     }
 
     MsfCatalog delta;
+    // The version is not serialized for a delta (section 5.3) but selects its profile.
+    delta.version = last_->version;
     if (!added.empty()) {
         delta.delta_update.push_back(MsfDeltaOp{.op = "add", .tracks = std::move(added)});
     }

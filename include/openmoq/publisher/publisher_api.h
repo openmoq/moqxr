@@ -17,6 +17,7 @@
 #include "openmoq/publisher/cat4moq.h"
 #include "openmoq/publisher/live_object.h"
 #include "openmoq/publisher/media_packaging.h"
+#include "openmoq/publisher/msf_version.h"
 #include "openmoq/publisher/moq_draft.h"
 #include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
@@ -133,6 +134,8 @@ struct PublisherConfig {
     bool await_subscriber_indefinitely = false;
     cat4moq::AuthorizationConfig authorization;
     MediaPackaging media_packaging = MediaPackaging::kCmaf;
+    // Catalog draft (MSF-01 version "1" or MSF-02 version "draft-02").
+    MsfVersion msf_version = MsfVersion::k02;
 };
 
 // Milliseconds since the Unix epoch, read from the system clock, for use as
