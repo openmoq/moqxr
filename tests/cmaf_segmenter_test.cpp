@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -592,7 +593,9 @@ std::vector<std::uint8_t> make_multitrack_fragmented_test_mp4() {
                             std::uint32_t base_decode_time,
                             std::uint32_t sample_duration,
                             std::initializer_list<std::uint8_t> payload_bytes) {
-        const auto tfhd = make_full_box("tfhd", be32_bytes(track_id));
+        // The sample size lives in tfhd (default_sample_size); a fragment must carry one somewhere.
+        const auto tfhd = make_full_box_with_flags(
+            "tfhd", 0, 0x000010, concat({be32_bytes(track_id), be32_bytes(static_cast<std::uint32_t>(payload_bytes.size()))}));
         const auto tfdt = make_full_box("tfdt", be32_bytes(base_decode_time));
         const auto trun = make_full_box("trun", concat({be32_bytes(1), be32_bytes(sample_duration)}));
         const auto traf = make_box("traf", concat({tfhd, tfdt, trun}));
@@ -634,8 +637,8 @@ std::vector<std::uint8_t> make_fragmented_non_sync_ept_test_mp4() {
     const auto tfdt = make_full_box("tfdt", be32_bytes(0));
     const auto trun = make_full_box_with_flags("trun",
                                                1,
-                                               0x000D00,
-                                               concat({be32_bytes(1), be32_bytes(1000), be32_bytes(0x01010000), be32_bytes(500)}));
+                                               0x000F00,  // duration, size, flags and composition offset per sample
+                                               concat({be32_bytes(1), be32_bytes(1000), be32_bytes(4), be32_bytes(0x01010000), be32_bytes(500)}));
     const auto traf = make_box("traf", concat({tfhd, tfdt, trun}));
     const auto moof = make_box("moof", traf);
     const auto mdat = make_box("mdat", {0x01, 0x02, 0x03, 0x04});
@@ -1246,6 +1249,36 @@ int main() {
                      "LOCMAF explicit trun entries must override tfhd and trex");
     }
 
+
+    // Regression: FFmpeg's -frag_duration writes one-sample fragments whose size and duration live in
+    // tfhd (default_sample_size / default_sample_duration), with no per-sample entries in the trun.
+    // The split segmenter used to leave such samples at size 0 and publish video as an empty mdat.
+    {
+        const auto fixture = std::filesystem::path(__FILE__).parent_path() / "fixtures" / "irregular-first-sample.mp4";
+        const auto parsed = parse_mp4_file(fixture.string());
+        const auto segmented_split = segment_for_cmaf(parsed);
+        std::vector<std::size_t> mdat_sizes;
+        std::vector<std::uint64_t> durations;
+        for (const auto& fragment : segmented_split.fragments) {
+            if (fragment.track_name != "vide_1") continue;
+            const auto boxes = parse_mp4_boxes(fragment.payload.owned_bytes);
+            const Mp4Box* mdat = find_first_box(boxes, "mdat");
+            mdat_sizes.push_back(mdat == nullptr ? 0 : mdat->payload.size);
+            durations.push_back(fragment.duration_us);
+        }
+        // Video packet sizes of the fixture as reported by ffprobe.
+        const std::vector<std::size_t> expected_sizes{2004, 227, 244, 257, 322, 288, 290, 304, 277, 263, 278, 249};
+        ok &= expect(mdat_sizes == expected_sizes,
+                     "expected each one-sample fragment with tfhd default sizes to keep its sample bytes");
+        ok &= expect(!durations.empty() && durations.front() == 54687 && durations.back() == 33333,
+                     "expected the irregular first sample duration and the regular default duration");
+        const auto segmented_coalesced = segment_for_cmaf(parsed, CmafObjectMode::kCoalesced);
+        std::size_t coalesced_payload = 0;
+        for (const auto& fragment : segmented_coalesced.fragments) {
+            if (fragment.track_name == "vide_1") coalesced_payload += payload_size(fragment.payload);
+        }
+        ok &= expect(coalesced_payload > 2000 + 227, "expected coalesced video objects to carry the samples too");
+    }
 
     const auto fragmented_bytes = make_fragmented_test_mp4();
     ParsedMp4 fragmented{

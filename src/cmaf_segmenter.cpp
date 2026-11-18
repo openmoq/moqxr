@@ -1078,8 +1078,15 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
         }
     }
 
+    // Sample defaults, in precedence order: the trun entry, then the tfhd default, then the trex default
+    // (ISO 14496-12 8.8.7 and 8.8.12). FFmpeg's -frag_duration writes one-sample fragments whose size and
+    // duration live only in tfhd, so ignoring the tfhd default size published video as an empty mdat.
     std::uint32_t default_sample_duration = 0;
+    std::uint32_t default_sample_size = 0;
     std::uint32_t default_sample_flags = 0x02000000U;
+    bool tfhd_duration = false;
+    bool tfhd_size = false;
+    bool tfhd_flags = false;
     if (const Mp4Box* tfhd = find_child_box(*traf, "tfhd")) {
         const std::uint32_t flags = read_full_box_flags(*tfhd, bytes);
         std::size_t cursor = tfhd->payload.offset + 8;
@@ -1091,20 +1098,32 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
         }
         if ((flags & 0x000008U) != 0 && cursor + 4 <= bytes.size()) {
             default_sample_duration = read_be32(bytes, cursor);
+            tfhd_duration = true;
             cursor += 4;
         }
         if ((flags & 0x000010U) != 0 && cursor + 4 <= bytes.size()) {
+            default_sample_size = read_be32(bytes, cursor);
+            tfhd_size = true;
             cursor += 4;
         }
         if ((flags & 0x000020U) != 0 && cursor + 4 <= bytes.size()) {
             default_sample_flags = read_be32(bytes, cursor);
+            tfhd_flags = true;
         }
     }
     if (const Mp4Box* moov = find_first_box(top_level_boxes, "moov")) {
         if (const Mp4Box* mvex = find_child_box(*moov, "mvex")) {
             for (const auto& child : mvex->children) {
                 if (child.type == "trex" && track_id_from_trex(child, bytes) == track.track_id) {
-                    default_sample_flags = read_be32_or_zero(bytes, child.payload.offset + 20);
+                    if (!tfhd_duration) {
+                        default_sample_duration = read_be32_or_zero(bytes, child.payload.offset + 12);
+                    }
+                    if (!tfhd_size) {
+                        default_sample_size = read_be32_or_zero(bytes, child.payload.offset + 16);
+                    }
+                    if (!tfhd_flags) {
+                        default_sample_flags = read_be32_or_zero(bytes, child.payload.offset + 20);
+                    }
                     break;
                 }
             }
@@ -1139,10 +1158,14 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
             sample_duration = read_be32(bytes, cursor);
             cursor += 4;
         }
-        std::uint32_t sample_size = 0;
+        std::uint32_t sample_size = default_sample_size;
         if ((trun_flags & 0x000200U) != 0 && cursor + 4 <= bytes.size()) {
             sample_size = read_be32(bytes, cursor);
             cursor += 4;
+        }
+        if (sample_size == 0) {
+            // A sample without a size would be published as an empty mdat: refuse instead.
+            throw std::runtime_error("CMAF fragment sample has no size (no trun entry, tfhd default or trex default)");
         }
         std::uint32_t sample_flags = first_sample_flags_present && index == 0 ? first_sample_flags : default_sample_flags;
         if ((trun_flags & 0x000400U) != 0 && cursor + 4 <= bytes.size()) {
