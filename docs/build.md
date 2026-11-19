@@ -154,8 +154,10 @@ The following are not available with a system picoquic and are rejected at
 configure time; use a source tree (managed or `OPENMOQ_PICOQUIC_SOURCE_DIR`)
 for them:
 
-- `OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON` (the loopback tests use picoquic's test
-  certificates and private logging headers from its source tree)
+- `OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS=ON` (the loopback tests use private logging
+  headers and, for most tests, picoquic's test certificates from its source
+  tree; the TLS verification test uses the certificates in `tests/certs/`
+  instead, see below)
 - `OPENMOQ_PICOQUIC_THREAD_CHECK=ON` (requires picoquic itself to be compiled
   with `WITH_THREAD_CHECK`)
 - libmoq (`OPENMOQ_USE_LIBMOQ_PUBLISHER=ON` or `OPENMOQ_LIBMOQ_SOURCE_DIR`); its
@@ -265,7 +267,7 @@ ctest --test-dir build-libmoq --output-on-failure
 
 ## Release Builds
 
-GitHub Actions publishes release archives for Linux, macOS, and Windows:
+GitHub Actions publishes release archives for Linux, macOS, FreeBSD, and Windows:
 
 - pushing a `v*` tag builds release artifacts and attaches them to the matching GitHub Release
 - running the `Release Builds` workflow manually uploads the same archives as workflow artifacts
@@ -273,18 +275,41 @@ GitHub Actions publishes release archives for Linux, macOS, and Windows:
 - CI and release use the managed dependency flow. Native-backend jobs resolve
   picoquic `master` and canonical picotls `master` during configure; managed
   libmoq jobs use moq5's pinned revisions and patch series instead
-- Linux and macOS archives are `.tar.gz` and contain `openmoq-publisher`, `libopenmoq_publisher.a`, `include/`, `docs/`, `README.md`, and `LICENSE`
+- Linux, macOS, and FreeBSD archives are `.tar.gz` and contain `openmoq-publisher`, `libopenmoq_publisher.a`, `include/`, `docs/`, `README.md`, and `LICENSE`
 - Windows archives are `.zip` and contain `openmoq-publisher.exe`, `openmoq_publisher.lib`, `include/`, `docs/`, `README.md`, and `LICENSE`
 
 ## CI
 
 GitHub Actions builds and tests the project on:
 
-- the default legacy backend on `ubuntu-latest`, `macos-latest`, and
+- the default legacy backend on `ubuntu-24.04`, `macos-latest`, and
   `windows-latest`
-- the opt-in libmoq backend on `ubuntu-latest`, including the
+- the opt-in libmoq backend on `ubuntu-24.04`, including the
   `openmoq-publisher-libmoq-translation-tests` target
+- a build against an installed (system) picoquic on `ubuntu-24.04`
+
+The Linux jobs and the Linux release build are pinned to `ubuntu-24.04`, not
+`ubuntu-latest`. The release binary links against the runner's glibc, and a
+newer image raises the minimum glibc the archive needs (v0.4.19 was built on
+an image that required glibc 2.42 and did not start on Ubuntu 24.04).
 
 Every lane runs CMake configure, the full default build, a static-library
 existence check, and CTest. The libmoq lane also resolves `openmoq/moq5` `main`
 during configure.
+
+## TLS Test Certificates
+
+`openmoq-publisher-picoquic-tls-verify-tests` uses its own test PKI in
+`tests/certs/` (a test CA plus RSA, Ed25519, and P-384 server certificates)
+instead of picoquic's `certs/`. picoquic's certificates name their hosts only
+in the subject CN. OpenSSL 4 no longer matches host names against the CN, so
+verified handshakes against them fail with TLS alert 42 (`bad_certificate`)
+when moqxr is built against OpenSSL 4, which is Homebrew's default `openssl`.
+The test leaves carry their host in `subjectAltName` and have no IP SAN, so the
+test's connection to `127.0.0.1` still fails host verification as intended.
+
+`tests/certs/generate.sh [openssl-binary]` recreates the whole set under a new
+CA and discards the CA key, so individual certificates cannot be renewed on
+their own. The private keys under `tests/certs/` are test-only and used only by
+loopback servers. The other loopback tests still use picoquic's `cert.pem`
+because their clients do not verify it.
