@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <set>
 #include <thread>
 #include <condition_variable>
@@ -418,6 +419,144 @@ bool test_disconnect_during_live_publish_closes_once() {
     ok &= expect(record->close_calls == 1,
                  "expected one transport close when disconnect() interrupts a live publish, got " +
                      std::to_string(record->close_calls.load()));
+    return ok;
+}
+
+// Draft-14 control messages, as the relay sends them to SubscribedTransport:
+// a type, a 16-bit length and the payload.
+std::vector<std::uint8_t> draft14_control_message(std::uint8_t type, const std::vector<std::uint8_t>& payload) {
+    std::vector<std::uint8_t> message{type, static_cast<std::uint8_t>(payload.size() >> 8U),
+                                      static_cast<std::uint8_t>(payload.size() & 0xffU)};
+    message.insert(message.end(), payload.begin(), payload.end());
+    return message;
+}
+
+std::vector<std::uint8_t> draft14_namespace_ok() {
+    return draft14_control_message(0x07, openmoq::publisher::transport::encode_varint(0));
+}
+
+// SUBSCRIBE request 1 for track_name, forwarding, starting at group 0 object 0.
+std::vector<std::uint8_t> draft14_subscribe(std::string_view track_namespace, std::string_view track_name) {
+    using openmoq::publisher::transport::encode_varint;
+    std::vector<std::uint8_t> payload = encode_varint(1);
+    const auto append = [&payload](const std::vector<std::uint8_t>& bytes) {
+        payload.insert(payload.end(), bytes.begin(), bytes.end());
+    };
+    append(encode_varint(1));
+    append(encode_varint(track_namespace.size()));
+    payload.insert(payload.end(), track_namespace.begin(), track_namespace.end());
+    append(encode_varint(track_name.size()));
+    payload.insert(payload.end(), track_name.begin(), track_name.end());
+    payload.push_back(128);  // subscriber priority
+    payload.push_back(0x01);  // group order: ascending
+    payload.push_back(1);     // forward
+    append(encode_varint(0x03));  // filter: absolute start
+    append(encode_varint(0));     // start group
+    append(encode_varint(0));     // start object
+    append(encode_varint(0));     // parameters
+    return draft14_control_message(0x03, payload);
+}
+
+// A draft-14 transport on which the relay completes SETUP, accepts the
+// namespace and subscribes to "events" on the control stream, then stays quiet
+// until the connection is closed. Written Objects are accepted and dropped.
+struct SubscribedTransport final : PublisherTransport {
+    struct Record {
+        std::atomic<bool> closed{false};
+    };
+    explicit SubscribedTransport(std::shared_ptr<Record> record) : record(std::move(record)) {
+        script.push_back(openmoq::publisher::transport::encode_server_setup_message(
+            {.draft = DraftVersion::kDraft14, .max_request_id = 8}));
+        script.push_back(draft14_namespace_ok());
+        script.push_back(draft14_subscribe("app", "events"));
+    }
+    std::shared_ptr<Record> record;
+    std::deque<std::vector<std::uint8_t>> script;
+    std::uint64_t next_stream = 0;
+    TransportStatus configure(const EndpointConfig&, const TlsConfig&) override { return TransportStatus::success(); }
+    TransportStatus connect() override { return TransportStatus::success(); }
+    ConnectionState state() const override {
+        return record->closed ? ConnectionState::kClosed : ConnectionState::kConnected;
+    }
+    TransportStatus open_stream(StreamDirection, std::uint64_t& stream) override {
+        stream = next_stream;
+        next_stream += 4;
+        return TransportStatus::success();
+    }
+    TransportStatus accept_stream(StreamDirection, std::uint64_t&, std::chrono::milliseconds) override { return idle(); }
+    TransportStatus write_stream(std::uint64_t, std::span<const std::uint8_t>, bool) override {
+        return record->closed ? TransportStatus::failure("transport closed") : TransportStatus::success();
+    }
+    TransportStatus read_stream(std::uint64_t stream, std::vector<std::uint8_t>& bytes, bool& fin,
+                                std::chrono::milliseconds) override {
+        fin = false;
+        if (stream == 0 && !script.empty()) {
+            bytes = std::move(script.front());
+            script.pop_front();
+            return TransportStatus::success();
+        }
+        return idle();
+    }
+    TransportStatus reset_stream(std::uint64_t, std::uint64_t) override { return TransportStatus::success(); }
+    std::string connection_id() const override { return "subscribed-test"; }
+    TransportStatus close(std::uint64_t) override {
+        record->closed = true;
+        return TransportStatus::success();
+    }
+
+private:
+    TransportStatus idle() {
+        if (record->closed) {
+            return TransportStatus::failure("transport closed");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return TransportStatus::failure("timed out waiting for stream data");
+    }
+};
+
+// The counts of what a publish sent survive its end. stats() reads session
+// counts only from the active session, so a publish that ended in a failure
+// (or a disconnect() that dropped the session) reported zeros afterwards
+// (moq2ts issue 60).
+bool test_stats_keep_sent_counts_after_publish_fails() {
+    bool ok = true;
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft14;
+    config.track_namespace = "app";
+    auto record = std::make_shared<SubscribedTransport::Record>();
+    Publisher publisher(config, [record](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        return std::make_unique<SubscribedTransport>(record);
+    });
+    std::atomic<std::uint64_t> pulled{0};
+    LiveObjectSource source{
+        .tracks = {LiveTrack{.track_name = "events"}},
+        .next_object = [&pulled]() -> std::optional<LiveObject> {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            return LiveObject{.track_name = "events", .group_id = 0, .object_id = pulled++, .payload = {0x01, 0x02, 0x03}};
+        },
+    };
+    EndpointConfig endpoint;
+    endpoint.transport = TransportKind::kRawQuic;
+    endpoint.host = "relay.example";
+    endpoint.port = 443;
+
+    TransportStatus publish_status = TransportStatus::success();
+    std::thread publishing([&] { publish_status = publisher.publish_live_objects(source, endpoint); });
+    for (int i = 0; i < 2000 && publisher.stats().objects_published == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto during = publisher.stats();
+    ok &= expect(during.objects_published > 0, "expected stats() to count Objects while the publish runs");
+    record->closed = true;  // the relay drops the connection; nobody calls disconnect()
+    publishing.join();
+    ok &= expect(!publish_status.ok, "expected the publish to fail when the connection drops");
+    const auto after = publisher.stats();
+    ok &= expect(after.objects_published >= during.objects_published && after.objects_published > 0,
+                 "expected stats() to keep the sent Objects after a failed publish, got " +
+                     std::to_string(after.objects_published) + " after " + std::to_string(during.objects_published));
+    ok &= expect(after.bytes_published >= during.bytes_published && after.bytes_published > 0,
+                 "expected stats() to keep the sent bytes after a failed publish, got " +
+                     std::to_string(after.bytes_published));
     return ok;
 }
 
@@ -1083,6 +1222,7 @@ bool test_live_stdin_retry_after_protocol_violation_resumes(std::uint64_t initia
 int main() {
     bool ok = test_goaway_recreates_publisher_transport();
     ok &= test_disconnect_during_live_publish_closes_once();
+    ok &= test_stats_keep_sent_counts_after_publish_fails();
     ok &= test_disconnect_during_publish_is_not_retried();
     ok &= test_disconnect_during_connect_waits_for_connect();
     ok &= test_disconnect_does_not_follow_goaway();
