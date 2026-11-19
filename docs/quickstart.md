@@ -264,6 +264,15 @@ connection options such as `--transport`, `--alpn`, `--sni`, `--ca`, and
 that share those settings. Every endpoint used with WebTransport must include an
 explicit path.
 
+`--quic-idle-timeout <ms>` sets the QUIC idle timeout, from 1000 to 600000
+milliseconds. picoquic also uses it as the handshake timeout and derives the
+keepalive from it (half the value), so a lower value notices a vanished relay
+sooner but fails slow handshakes. Without it picoquic's 30 s default and a 5 s
+raw QUIC keepalive apply. `--cert` and `--key` are accepted and stored in the TLS
+configuration, but the CLI does not use them yet: there is no client-certificate
+authentication. Server verification uses `--ca`, `--insecure`, and `--sni` as
+described in [relay-interop.md](relay-interop.md).
+
 An `--endpoint` scheme does not choose the transport. `https://host:port/path`
 only supplies the path, so pass `--transport webtransport` to publish over
 WebTransport; without it the publisher connects over raw QUIC. `--url` is
