@@ -16,13 +16,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             backend: legacy
           - os: macos-latest
             backend: legacy
           - os: windows-latest
             backend: legacy
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             backend: libmoq
 
     steps:
@@ -144,8 +144,8 @@ jobs:
           fi
 
   system-picoquic:
-    name: Build against an installed picoquic (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: Build against an installed picoquic (ubuntu-24.04)
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
