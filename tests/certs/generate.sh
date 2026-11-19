@@ -18,8 +18,8 @@ cd "$(dirname "$0")"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-"$OPENSSL" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out test-ca.key
-"$OPENSSL" req -new -x509 -key test-ca.key -subj "/CN=openmoq test ca" -days "$DAYS" -sha256 \
+"$OPENSSL" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$tmp/test-ca.key"
+"$OPENSSL" req -new -x509 -key "$tmp/test-ca.key" -subj "/CN=openmoq test ca" -days "$DAYS" -sha256 \
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -addext "subjectKeyIdentifier=hash" \
@@ -39,7 +39,7 @@ subjectAltName = DNS:$host
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid
 EOF
-    "$OPENSSL" x509 -req -in "$tmp/leaf.csr" -CA test-ca.crt -CAkey test-ca.key \
+    "$OPENSSL" x509 -req -in "$tmp/leaf.csr" -CA test-ca.crt -CAkey "$tmp/test-ca.key" \
         -CAcreateserial -CAserial "$tmp/ca.srl" -days "$DAYS" -sha256 \
         -extfile "$tmp/leaf.ext" -out "$dir/cert.pem"
 }
@@ -48,5 +48,5 @@ leaf rsa test.example.com -algorithm RSA -pkeyopt rsa_keygen_bits:2048
 leaf ed25519 ed25519.test.example.com -algorithm ED25519
 leaf secp384r1 secp384r1.test.example.com -algorithm EC -pkeyopt ec_paramgen_curve:P-384
 
-# The CA key is only needed to issue the leaves; the tests never use it.
-rm -f test-ca.key
+# The CA key lives only in $tmp and is removed by the trap on exit, success or
+# failure, so it never lands in the source tree. The tests never use it.
