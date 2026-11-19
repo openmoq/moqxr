@@ -231,12 +231,24 @@ std::uint64_t time_based_initial_group_id() {
     return since_epoch.count() > 0 ? static_cast<std::uint64_t>(since_epoch.count()) : 0;
 }
 
+namespace {
+struct PriorTotals {
+    std::uint64_t bytes = 0;
+    std::uint64_t objects = 0;
+    std::uint64_t groups = 0;
+};
+}  // namespace
+
+
 struct Publisher::ActiveSession {
     std::unique_ptr<transport::PublisherTransport> transport;
     std::unique_ptr<transport::MoqtSession> session;
     // True while connect() runs on the publish thread. Guarded by the
     // publisher's state_mutex_.
     bool connecting = true;
+    // What earlier sessions of the same publish (draft-22 migrations) already
+    // sent. Guarded by the publisher's state_mutex_.
+    PriorTotals prior;
 
     // Closes the session once. disconnect() can run on another thread while a
     // publish closes the same session on its failure path, and the transport
@@ -251,6 +263,22 @@ private:
     std::once_flag close_once_;
     transport::TransportStatus close_status_ = transport::TransportStatus::success();
 };
+
+// Copies what a session sent, with the totals of the sessions before it, into
+// a stats snapshot. stats() reads the live session only while it is the active
+// one, so the ends of a publish (a stop, a failure, a migration) call this
+// before they drop it; the success paths overwrite the result with the final
+// totals.
+template <typename Snapshot, typename Active>
+void keep_session_totals(Snapshot& snapshot, const Active& active) {
+    if (!active.session) {
+        return;
+    }
+    const auto session_stats = active.session->publish_stats();
+    snapshot.bytes_published = active.prior.bytes + session_stats.bytes_published;
+    snapshot.objects_published = active.prior.objects + session_stats.objects_published;
+    snapshot.groups_published = active.prior.groups + session_stats.groups_published;
+}
 
 Publisher::Publisher(PublisherConfig config, TransportFactory transport_factory)
     : config_(std::move(config)),
@@ -654,6 +682,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
     std::uint64_t resume_catalog_group_floor = resume ? resume->catalog_group_floor : 0;
     for (std::size_t migrations = 0; ; ++migrations) {
         auto active = std::make_shared<ActiveSession>();
+        active->prior = {prior_bytes, prior_objects, prior_groups};
         active->transport = transport_factory_(resolved_endpoint.transport);
         if (!active->transport) {
             return transport::TransportStatus::failure("failed to create requested transport");
@@ -941,6 +970,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
     }
     for (std::size_t migrations = 0; ; ++migrations) {
         auto active = std::make_shared<ActiveSession>();
+        active->prior = {prior_bytes, prior_objects, prior_groups};
         active->transport = transport_factory_(resolved_endpoint.transport);
         if (!active->transport) {
             return transport::TransportStatus::failure("failed to create requested transport");
@@ -1065,6 +1095,7 @@ transport::TransportStatus Publisher::disconnect(std::uint64_t application_error
         if (active_session_->transport) {
             stats_.connection_id = active_session_->transport->connection_id();
         }
+        keep_session_totals(stats_, *active_session_);
         active_session_.reset();
     }
     stats_.active = false;
@@ -1112,9 +1143,9 @@ PublisherStats Publisher::stats() const {
     }
     if (active && active->session) {
         const auto live_stats = active->session->publish_stats();
-        snapshot.bytes_published = live_stats.bytes_published;
-        snapshot.objects_published = live_stats.objects_published;
-        snapshot.groups_published = live_stats.groups_published;
+        snapshot.bytes_published = active->prior.bytes + live_stats.bytes_published;
+        snapshot.objects_published = active->prior.objects + live_stats.objects_published;
+        snapshot.groups_published = active->prior.groups + live_stats.groups_published;
     }
     if (active && active->transport) {
         snapshot.connection_id = active->transport->connection_id();
@@ -1273,6 +1304,7 @@ void Publisher::clear_active_session(const std::shared_ptr<ActiveSession>& activ
         if (active_session_ && active_session_->transport) {
             stats_.connection_id = active_session_->transport->connection_id();
         }
+        keep_session_totals(stats_, *active_session_);
         active_session_.reset();
     }
     stats_.active = false;
