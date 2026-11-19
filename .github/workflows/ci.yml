@@ -5,7 +5,15 @@ on:
     branches:
       - main
       - master
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "LICENSE"
 
 jobs:
   build-and-test:
