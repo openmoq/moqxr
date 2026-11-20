@@ -615,9 +615,10 @@ Fields of `PublisherStats`:
 - `transport`: `TransportKind::kRawQuic` or `TransportKind::kWebTransport`
 - `host`, `port`, `path`: endpoint context for the current/last session
 - `connection_id`: last known transport connection ID
+- `namespace_accepted`: whether the relay has accepted the namespace in the current session. It turns true when the relay answers `PUBLISH_NAMESPACE` with `PUBLISH_NAMESPACE_OK` (`REQUEST_OK` from draft 16) and false again when the session ends or a new one starts (a draft-22 migration or a retry), so it follows the live session. A rejection leaves it false and sets `last_error`. On the libmoq backend it turns true when the media sender is ready. On drafts 14 and 16 `publish_live()` continues if the answer is late, and a late answer there is not recorded, so the flag stays false. Poll it with `stats()` from another thread
 - `last_error`: last publisher-level error, if any
 
-`stats_json()` remains available for existing integrations, but it is deprecated because a JSON polling API implies runtime telemetry support that the blocking publisher API does not provide. It returns the same values as one JSON object with camelCase keys (`bytesPublished`, `connectionId`, and so on), `transport` as `"raw_quic"` or `"webtransport"`, and two extra fields, `active` and `connected`, that describe the session. Use `stats()` in new code.
+`stats_json()` remains available for existing integrations, but it is deprecated because a JSON polling API implies runtime telemetry support that the blocking publisher API does not provide. It returns the same values as one JSON object with camelCase keys (`bytesPublished`, `connectionId`, `namespaceAccepted`, and so on), `transport` as `"raw_quic"` or `"webtransport"`, and two extra fields, `active` and `connected`, that describe the session. Use `stats()` in new code.
 
 ## 15. Complete Example
 

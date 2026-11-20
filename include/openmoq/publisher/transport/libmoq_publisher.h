@@ -203,6 +203,9 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
 // hold up the cancel; any other istream is observed once its read returns.
 struct LibmoqLiveHandle {
     std::atomic<bool> cancel{false};
+    // True once the relay has accepted the namespace: set when the media
+    // sender becomes ready, read by Publisher::stats() from another thread.
+    std::atomic<bool> namespace_accepted{false};
     std::mutex        ep_mutex;
     moq_endpoint_t*   ep = nullptr;  // valid only between set_endpoint(ep)/(nullptr)
 
@@ -240,6 +243,12 @@ struct LibmoqReadyOps {
 LibmoqReadyOutcome libmoq_wait_ready(std::atomic<bool>* cancel,
                                      std::uint64_t timeout_us, std::uint64_t step_us,
                                      const LibmoqReadyOps& ops);
+
+// Records the outcome of the readiness wait on the live handle: only kReady
+// marks the namespace accepted (the sender is ready once the relay answered
+// the PUBLISH_NAMESPACE). Any other outcome, and a null handle, change
+// nothing. Factored out so the flag is unit-testable without a network.
+void libmoq_record_ready_outcome(LibmoqReadyOutcome outcome, LibmoqLiveHandle* live);
 
 // Demand-wait primitive: block until a downstream subscriber exists (lazy relays
 // forward a SUBSCRIBE only when a player subscribes). Factored out like

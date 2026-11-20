@@ -919,6 +919,23 @@ int main() {
                      "a closed session must end readiness even while the transport waits time out");
     }
 
+    // -- Namespace acceptance on the live handle (openmoq/moqxr#153) ----------
+    // Only a ready sender marks the namespace accepted; a failed, timed-out,
+    // closed or cancelled wait must leave the flag false.
+    {
+        LibmoqLiveHandle handle;
+        ok &= expect(!handle.namespace_accepted.load(), "expected a new handle to report no accepted namespace");
+        for (const auto outcome : {LibmoqReadyOutcome::kCancelled, LibmoqReadyOutcome::kFatal,
+                                   LibmoqReadyOutcome::kTimeout, LibmoqReadyOutcome::kClosed}) {
+            libmoq_record_ready_outcome(outcome, &handle);
+        }
+        ok &= expect(!handle.namespace_accepted.load(),
+                     "expected no accepted namespace after a readiness wait that did not finish ready");
+        libmoq_record_ready_outcome(LibmoqReadyOutcome::kReady, nullptr);  // no handle: must not crash
+        libmoq_record_ready_outcome(LibmoqReadyOutcome::kReady, &handle);
+        ok &= expect(handle.namespace_accepted.load(), "expected a ready sender to mark the namespace accepted");
+    }
+
     // -- Demand-wait primitive (libmoq_wait_demand) --------------------------
     // Network-free coverage of the subscriber-demand gate the drivers use to
     // avoid hanging/consuming sources against a lazy relay.

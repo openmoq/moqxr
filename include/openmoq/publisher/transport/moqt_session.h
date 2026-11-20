@@ -135,6 +135,10 @@ public:
     TransportStatus end_broadcast(openmoq::publisher::EndBroadcastMode mode,
                                   openmoq::publisher::DraftVersion draft_version);
     PublishStats publish_stats() const;
+    // True once the relay has answered this session's PUBLISH_NAMESPACE with
+    // PUBLISH_NAMESPACE_OK (REQUEST_OK from draft 16). Safe to read from
+    // another thread. A new session starts false.
+    bool namespace_accepted() const { return namespace_accepted_.load(); }
     const std::vector<std::uint8_t>& live_resume_bytes() const { return live_resume_bytes_; }
     std::optional<std::uint64_t> live_resume_group_floor() const {
         auto floor = live_resume_group_floor_;
@@ -257,6 +261,7 @@ private:
     bool setup_complete_ = false;
     std::uint64_t namespace_stream_id_ = 0;
     bool namespace_stream_open_ = false;
+    std::atomic<bool> namespace_accepted_{false};
     std::map<std::uint64_t, std::uint64_t> publish_stream_id_by_request_id_;
     PublishStats publish_stats_{};
     std::vector<std::uint8_t> live_resume_bytes_;

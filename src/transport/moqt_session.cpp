@@ -8150,6 +8150,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
             transport_, plan.draft.version, encode_namespace_message(namespace_message), false, nullptr,
             &namespace_stream_id_);
         if (status.ok) {
+            namespace_accepted_.store(true);
             namespace_stream_open_ = true;
         }
     } else {
@@ -8157,6 +8158,9 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
         if (status.ok) {
             status = collect_control_acknowledgements(
                 transport_, control_stream_id_, plan.draft.version, 1, 0, pending_control_bytes_);
+            if (status.ok) {
+                namespace_accepted_.store(true);
+            }
         }
     }
     if (!status.ok) {
@@ -8638,11 +8642,17 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         status = send_request_stream_and_wait(
             transport_, draft_version, encode_namespace_message(namespace_message), false, nullptr,
             &namespace_stream_id_);
+        if (status.ok) {
+            namespace_accepted_.store(true);
+        }
     } else {
         status = write_frame(control_stream_id_, encode_namespace_message(namespace_message), false);
         if (status.ok) {
             status = collect_control_acknowledgements(
                 transport_, control_stream_id_, draft_version, 1, 0, pending_control_bytes_);
+            if (status.ok) {
+                namespace_accepted_.store(true);
+            }
         }
     }
     if (!status.ok) {
@@ -9920,6 +9930,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
             transport_, draft_version, encode_namespace_message(namespace_message), false, nullptr,
             &namespace_stream_id_);
         if (status.ok) {
+            namespace_accepted_.store(true);
             namespace_stream_open_ = true;
         }
         if (!status.ok) {
@@ -9933,6 +9944,9 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         }
         status = collect_control_acknowledgements(
             transport_, control_stream_id_, draft_version, 1, 0, pending_control_bytes_);
+        if (status.ok) {
+            namespace_accepted_.store(true);
+        }
         if (!status.ok) {
             if (status.message != "timed out waiting for stream data") {
                 // A real transport failure (connection closed/reset, malformed
@@ -11875,6 +11889,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             transport_, draft_version, encode_namespace_message(namespace_message), false, nullptr,
             &namespace_stream_id_);
         if (status.ok) {
+            namespace_accepted_.store(true);
             namespace_stream_open_ = true;
         }
     } else {
@@ -11882,6 +11897,9 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         if (status.ok) {
             status = collect_control_acknowledgements(
                 transport_, control_stream_id_, draft_version, 1, 0, pending_control_bytes_);
+            if (status.ok) {
+                namespace_accepted_.store(true);
+            }
         }
     }
     if (!status.ok) {

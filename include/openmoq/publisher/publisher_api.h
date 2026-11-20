@@ -168,6 +168,11 @@ struct PublisherStats {
     std::uint16_t port = 0;
     std::string path;
     std::string connection_id;
+    // True while the relay has accepted the publisher's namespace in the
+    // current session (PUBLISH_NAMESPACE_OK, or REQUEST_OK from draft 16; on
+    // the libmoq backend, once its media sender is ready). False before the
+    // answer, after a rejection, and once the session ends or is replaced.
+    bool namespace_accepted = false;
     std::string last_error;
 };
 
