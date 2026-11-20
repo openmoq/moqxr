@@ -882,10 +882,8 @@ LibmoqReadyOutcome wait_ready(moq_endpoint_t* ep, moq_media_sender_t* sender,
     };
     ops.wait = [ep](std::uint64_t step) { return static_cast<int>(moq_endpoint_wait(ep, step)); };
     const auto outcome = libmoq_wait_ready(cancel, timeout_us, /*step_us=*/100000, ops);
+    libmoq_record_ready_outcome(outcome, live);
     if (outcome == LibmoqReadyOutcome::kReady) {
-        // moq_media_sender_is_ready() is true once the relay has answered the
-        // PUBLISH_NAMESPACE, so this is the point the namespace is accepted.
-        if (live != nullptr) live->namespace_accepted.store(true);
         std::clog << "libmoq: sender ready\n";
 #if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
         if (publish_tracks)
@@ -1108,6 +1106,14 @@ FailureKind libmoq_sender_failure_kind(std::uint64_t code, FailureKind fallback)
     (void)code;
 #endif
     return fallback;
+}
+
+void libmoq_record_ready_outcome(LibmoqReadyOutcome outcome, LibmoqLiveHandle* live) {
+    // moq_media_sender_is_ready() is true once the relay has answered the
+    // PUBLISH_NAMESPACE, so kReady is the point the namespace is accepted.
+    if (outcome == LibmoqReadyOutcome::kReady && live != nullptr) {
+        live->namespace_accepted.store(true);
+    }
 }
 
 LibmoqReadyOutcome libmoq_wait_ready(std::atomic<bool>* cancel,

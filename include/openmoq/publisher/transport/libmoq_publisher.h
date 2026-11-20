@@ -244,6 +244,12 @@ LibmoqReadyOutcome libmoq_wait_ready(std::atomic<bool>* cancel,
                                      std::uint64_t timeout_us, std::uint64_t step_us,
                                      const LibmoqReadyOps& ops);
 
+// Records the outcome of the readiness wait on the live handle: only kReady
+// marks the namespace accepted (the sender is ready once the relay answered
+// the PUBLISH_NAMESPACE). Any other outcome, and a null handle, change
+// nothing. Factored out so the flag is unit-testable without a network.
+void libmoq_record_ready_outcome(LibmoqReadyOutcome outcome, LibmoqLiveHandle* live);
+
 // Demand-wait primitive: block until a downstream subscriber exists (lazy relays
 // forward a SUBSCRIBE only when a player subscribes). Factored out like
 // libmoq_wait_ready so it is unit-testable without a network. Polls
