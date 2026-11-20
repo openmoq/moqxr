@@ -4263,6 +4263,16 @@ TransportStatus answer_catalog_fetch(
         if (!namespace_matches(fetch.track_namespace, track_namespace) || fetch.track_name != "catalog") {
             return reject(kRequestErrorNotSupported, "standalone FETCH is only served for the catalog");
         }
+        // A range that holds no Object: empty or inverted. End is the last
+        // Object plus 1, except that an End Object of 0 requests the whole End
+        // Group, so {G, 0}..{G, 0} is valid.
+        const bool inverted = fetch.end_object == 0
+                                  ? fetch.start_group > fetch.end_group
+                                  : std::make_pair(fetch.start_group, fetch.start_object) >=
+                                        std::make_pair(fetch.end_group, fetch.end_object);
+        if (inverted) {
+            return reject(kInvalidRange, "fetch range is empty or inverted");
+        }
     } else {
         const std::optional<std::string> track = joined_track(fetch.joining_request_id);
         if (!track.has_value()) {

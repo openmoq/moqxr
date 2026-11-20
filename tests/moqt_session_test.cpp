@@ -3744,6 +3744,12 @@ int main() {
             {25, 13, false, {2, 1, 3, 0}, 0x11, "Start {2, 1}, past the catalog object, gets INVALID_RANGE"},
             {29, 15, false, {3, 0, 4, 0}, 0x11, "Start {3, 0}, past the catalog group, gets INVALID_RANGE"},
             {33, 17, true, {0, 0, 2, 0}, 0x3, "a catalog in another namespace gets NOT_SUPPORTED"},
+            // Edges, so that a > / >= slip in either bound fails.
+            {37, 19, false, {2, 0, 3, 0}, std::nullopt, "Start {2, 0}, exactly at the catalog object, is served"},
+            {41, 21, false, {2, 0, 2, 0}, std::nullopt, "Start {2, 0} with End {2, 0}, the whole group, is served"},
+            {49, 25, false, {2, 0, 1, 0}, 0x11, "Start {2, 0} after End {1, 0} gets INVALID_RANGE"},
+            {53, 27, false, {1, 3, 1, 3}, 0x11, "Start {1, 3} at End {1, 3}, an empty range, gets INVALID_RANGE"},
+            {57, 29, true, {2, 0, 1, 0}, 0x3, "an inverted range in another namespace still gets NOT_SUPPORTED"},
         };
 
         PublishPlan plan = make_span_backed_plan(draft);
