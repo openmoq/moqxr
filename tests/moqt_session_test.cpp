@@ -3789,6 +3789,50 @@ int main() {
                      "D18 each served standalone catalog FETCH sends the catalog object on its own FETCH_HEADER stream");
     }
 
+    // Draft 18 section 6.2 (drafts 22 and 23 section 4.1): a publisher MAY send
+    // PUBLISH_NAMESPACE to any subscriber, as moq-relay does unasked. This
+    // publisher refuses it with REQUEST_ERROR and keeps the session; a malformed
+    // one still closes it (the draft-23 MALFORMED_MESSAGE case above).
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
+        const auto publish_namespace = [&](std::uint64_t request_id, std::string_view name) {
+            std::vector<std::uint8_t> body = encode_moqint(draft, request_id);
+            append_bytes(body, encode_moqint(draft, 1));  // one namespace field
+            append_bytes(body, encode_moqint(draft, name.size()));
+            body.insert(body.end(), name.begin(), name.end());
+            append_bytes(body, encode_moqint(draft, 0));  // no parameters
+            std::vector<std::uint8_t> message = encode_moqint(draft, 0x06);
+            append_control_length(message, draft, body.size());
+            append_bytes(message, body);
+            return message;
+        };
+        const std::string label = openmoq::publisher::to_string(draft);
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.keep_open_streams.insert(3);
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        // Two relay announcements: the second shows the session survived the first.
+        transport.reads[1].push_back(publish_namespace(1, "other"));
+        transport.reads[5].push_back(publish_namespace(3, "third"));
+        transport.keep_open_streams.insert(1);
+        transport.keep_open_streams.insert(5);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, label + " PUBLISH_NAMESPACE from the peer connects");
+        static_cast<void>(session.publish(materialize_publish_plan(make_span_backed_plan(draft), source_bytes)));
+        const auto refused_on = [&](std::uint64_t stream) {
+            return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                openmoq::publisher::transport::RequestError error;
+                return write.stream_id == stream && write.fin &&
+                       openmoq::publisher::transport::decode_request_error(write.bytes, draft, error) &&
+                       error.error_code == 0x3;
+            });
+        };
+        ok &= expect(refused_on(1), label + " PUBLISH_NAMESPACE from the peer gets REQUEST_ERROR NOT_SUPPORTED");
+        ok &= expect(refused_on(5), label + " a second PUBLISH_NAMESPACE is answered too");
+        ok &= expect(transport.last_close_code == 0,
+                     label + " PUBLISH_NAMESPACE from the peer does not close the session, saw " +
+                         std::to_string(transport.last_close_code));
+    }
+
     {
         // Draft 16 section 4: a limited endpoint answers FETCH and TRACK_STATUS
         // with NOT_SUPPORTED instead of ignoring them.

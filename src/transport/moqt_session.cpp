@@ -4352,6 +4352,31 @@ TransportStatus reject_draft16_unsupported_request(PublisherTransport& transport
         false);
 }
 
+// Draft 18 section 6.2 (drafts 22 and 23 section 4.1): any publisher MAY send
+// PUBLISH_NAMESPACE to a subscriber, and the subscriber answers it with one
+// REQUEST_OK or REQUEST_ERROR on its request stream. A relay such as moq-relay
+// announces every namespace it holds to each peer unasked. This session takes
+// no namespaces: a well-formed PUBLISH_NAMESPACE is refused and the session goes
+// on. Returns nullopt when the stream does not hold one, so the caller keeps its
+// own handling (a malformed request still closes the session).
+std::optional<TransportStatus> refuse_publish_namespace(PublisherTransport& transport,
+                                                        openmoq::publisher::DraftVersion draft,
+                                                        std::uint64_t request_stream_id,
+                                                        std::span<const std::uint8_t> message_bytes,
+                                                        PeerRequestIdValidator& peer_request_ids) {
+    std::uint64_t request_id = 0;
+    if (!decode_publish_namespace_request(message_bytes, draft, request_id)) {
+        return std::nullopt;
+    }
+    const TransportStatus id_status = peer_request_ids.validate(transport, request_id);
+    if (!id_status.ok) return id_status;
+    return transport.write_stream(
+        request_stream_id,
+        encode_request_error_message(draft, request_id, kRequestErrorNotSupported, 0,
+                                     "publisher does not accept PUBLISH_NAMESPACE"),
+        true);
+}
+
 // Drafts 18 and later: routes TRACK_STATUS and FETCH. TRACK_STATUS is
 // answered on every draft; a FETCH is answered on draft 18 (a Joining or
 // standalone FETCH of the catalog) and declined with NOT_SUPPORTED on the
@@ -5448,6 +5473,13 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     continue;
                 }
 
+                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
+                    if (const auto refused = refuse_publish_namespace(transport, draft, request_stream_id, message_bytes,
+                                                                      peer_request_ids)) {
+                        if (!refused->ok) return *refused;
+                        continue;
+                    }
+                }
                 if (request_type != 0x51 || !decode_subscribe_tracks_message(message_bytes, draft, subscribe_tracks)) {
                     const TransportStatus write_status =
                         transport.write_stream(request_stream_id,
@@ -9390,6 +9422,13 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     if (!response_status.ok) return {response_status, 0};
                     continue;
                 }
+                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
+                    if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_stream_id, request_bytes,
+                                                                      peer_request_ids)) {
+                        if (!refused->ok) return {*refused, 0};
+                        continue;
+                    }
+                }
                 SubscribeMessage subscribe;
                 if (request_type != 0x03 ||
                     !decode_subscribe_message(
@@ -11199,6 +11238,13 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     continue;
                 }
 
+                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
+                    if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_stream_id, request_bytes,
+                                                                      peer_request_ids)) {
+                        if (!refused->ok) return {*refused, 0};
+                        continue;
+                    }
+                }
                 SubscribeTracksMessage subscribe_tracks;
                 if (request_type != 0x51 ||
                     !decode_subscribe_tracks_message(request_bytes, draft_version, subscribe_tracks)) {
@@ -12605,6 +12651,13 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     continue;
                 }
 
+                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
+                    if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_stream_id, request_bytes,
+                                                                      peer_request_ids)) {
+                        if (!refused->ok) return *refused;
+                        continue;
+                    }
+                }
                 SubscribeTracksMessage subscribe_tracks;
                 if (request_type != 0x51 ||
                     !decode_subscribe_tracks_message(request_bytes, draft_version, subscribe_tracks)) {
