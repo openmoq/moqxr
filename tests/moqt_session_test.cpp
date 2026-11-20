@@ -3647,11 +3647,18 @@ int main() {
         const auto joining_fetch = [&](std::uint8_t request_id, std::uint8_t type, std::uint8_t joining_id) {
             return framed(0x16, {request_id, type, joining_id, 0, 0});
         };
-        std::vector<std::uint8_t> standalone{9, 1};
-        standalone.insert(standalone.end(), ns_field.begin(), ns_field.end());
-        for (const char c : std::string_view("vide_1")) standalone.push_back(static_cast<std::uint8_t>(c));
-        standalone.insert(standalone.begin() + 2 + ns_field.size(), 6);
-        standalone.insert(standalone.end(), {0, 0, 0, 0, 0});
+        // A standalone FETCH: Request ID, type 0x1, namespace, track, Start and
+        // End Location, no parameters.
+        const auto standalone_fetch = [&](std::uint8_t request_id, const std::vector<std::uint8_t>& ns,
+                                          std::string_view track, std::vector<std::uint8_t> range) {
+            std::vector<std::uint8_t> body{request_id, 1};
+            body.insert(body.end(), ns.begin(), ns.end());
+            body.push_back(static_cast<std::uint8_t>(track.size()));
+            for (const char c : track) body.push_back(static_cast<std::uint8_t>(c));
+            body.insert(body.end(), range.begin(), range.end());
+            body.push_back(0);
+            return framed(0x16, body);
+        };
 
         MockTransport transport;
         transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
@@ -3661,7 +3668,7 @@ int main() {
         transport.reads[9].push_back(track_status(5, "nope"));
         transport.reads[13].push_back(joining_fetch(7, 0x2, 1));
         transport.reads[17].push_back(joining_fetch(11, 0x2, 99));
-        transport.reads[21].push_back(framed(0x16, standalone));
+        transport.reads[21].push_back(standalone_fetch(9, ns_field, "vide_1", {0, 0, 0, 0}));
         for (const auto id : {1, 5, 9, 13, 17, 21}) transport.keep_open_streams.insert(id);
         MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
         ok &= expect(session.connect(endpoint, tls).ok, "D18 TRACK_STATUS and FETCH session connects");
@@ -3694,7 +3701,86 @@ int main() {
         ok &= expect(error_on(17) == std::optional<std::uint64_t>(0x32),
                      "D18 Joining FETCH of an unknown subscription gets INVALID_JOINING_REQUEST_ID");
         ok &= expect(error_on(21) == std::optional<std::uint64_t>(0x3),
-                     "D18 standalone FETCH gets NOT_SUPPORTED");
+                     "D18 standalone FETCH of a media track gets NOT_SUPPORTED");
+    }
+    {
+        // Draft 18 standalone FETCH of the catalog (section 10.12.1), as a relay
+        // whose cached catalog expired sends it. The catalog object is moved to
+        // {2, 0}, so a range can end before it. End is the last Object plus 1,
+        // and an End Object of 0 asks for the whole End Group.
+        constexpr DraftVersion draft = DraftVersion::kDraft18;
+        const auto framed = [](std::uint8_t type, const std::vector<std::uint8_t>& body) {
+            std::vector<std::uint8_t> message{type, static_cast<std::uint8_t>(body.size() >> 8),
+                                              static_cast<std::uint8_t>(body.size() & 0xff)};
+            message.insert(message.end(), body.begin(), body.end());
+            return message;
+        };
+        std::vector<std::uint8_t> ns_field{1, static_cast<std::uint8_t>(kTestTrackNamespace.size())};
+        ns_field.insert(ns_field.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+        const std::vector<std::uint8_t> other_ns{1, 5, 'o', 't', 'h', 'e', 'r'};
+        const auto catalog_fetch = [&](std::uint8_t request_id, const std::vector<std::uint8_t>& ns,
+                                       std::vector<std::uint8_t> range) {
+            std::vector<std::uint8_t> body{request_id, 1};
+            body.insert(body.end(), ns.begin(), ns.end());
+            body.insert(body.end(), {7, 'c', 'a', 't', 'a', 'l', 'o', 'g'});
+            body.insert(body.end(), range.begin(), range.end());
+            body.push_back(0);
+            return framed(0x16, body);
+        };
+        struct Case {
+            std::uint64_t stream;
+            std::uint8_t request_id;
+            bool other_namespace;
+            std::vector<std::uint8_t> range;  // Start group, object; End group, object
+            std::optional<std::uint64_t> error;  // nullopt: served
+            const char* label;
+        };
+        const std::vector<Case> cases{
+            {5, 3, false, {0, 0, 2, 0}, std::nullopt, "End {2, 0}, the whole catalog group, is served"},
+            {9, 5, false, {0, 0, 2, 1}, std::nullopt, "End {2, 1}, just past the catalog object, is served"},
+            {13, 7, false, {2, 0, 9, 0}, std::nullopt, "a range past the Largest Object is served"},
+            {17, 9, false, {0, 0, 1, 0}, 0x3, "End {1, 0}, before the catalog group, gets NOT_SUPPORTED"},
+            {21, 11, false, {0, 0, 1, 7}, 0x3, "End {1, 7}, before the catalog object, gets NOT_SUPPORTED"},
+            {25, 13, false, {2, 1, 3, 0}, 0x11, "Start {2, 1}, past the catalog object, gets INVALID_RANGE"},
+            {29, 15, false, {3, 0, 4, 0}, 0x11, "Start {3, 0}, past the catalog group, gets INVALID_RANGE"},
+            {33, 17, true, {0, 0, 2, 0}, 0x3, "a catalog in another namespace gets NOT_SUPPORTED"},
+        };
+
+        PublishPlan plan = make_span_backed_plan(draft);
+        for (auto& object : plan.objects) {
+            if (object.track_name == "catalog") object.group_id = 2;
+        }
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft));
+        transport.keep_open_streams.insert(1);
+        for (const Case& c : cases) {
+            transport.reads[c.stream].push_back(catalog_fetch(c.request_id, c.other_namespace ? other_ns : ns_field, c.range));
+            transport.keep_open_streams.insert(c.stream);
+        }
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "D18 standalone catalog FETCH session connects");
+        static_cast<void>(session.publish(materialize_publish_plan(plan, source_bytes)));
+
+        for (const Case& c : cases) {
+            std::optional<std::uint64_t> error;
+            bool fetch_ok = false;
+            for (const auto& write : transport.writes) {
+                if (write.stream_id != c.stream || !write.fin) continue;
+                openmoq::publisher::transport::RequestError request_error;
+                if (openmoq::publisher::transport::decode_request_error(write.bytes, draft, request_error)) {
+                    error = request_error.error_code;
+                }
+                fetch_ok = fetch_ok || message_type(write.bytes) == 0x18;
+            }
+            ok &= expect(c.error ? error == c.error : (fetch_ok && !error), std::string("D18 standalone catalog FETCH: ") + c.label);
+        }
+        const auto served = std::count_if(cases.begin(), cases.end(), [](const Case& c) { return !c.error; });
+        ok &= expect(std::count_if(transport.writes.begin(), transport.writes.end(), [](const auto& write) {
+                         return (write.stream_id & 0x3) == 0x2 && write.fin && message_type(write.bytes) == 0x05;
+                     }) == served,
+                     "D18 each served standalone catalog FETCH sends the catalog object on its own FETCH_HEADER stream");
     }
 
     {
