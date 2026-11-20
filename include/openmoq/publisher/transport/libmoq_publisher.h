@@ -203,6 +203,9 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
 // hold up the cancel; any other istream is observed once its read returns.
 struct LibmoqLiveHandle {
     std::atomic<bool> cancel{false};
+    // True once the relay has accepted the namespace: set when the media
+    // sender becomes ready, read by Publisher::stats() from another thread.
+    std::atomic<bool> namespace_accepted{false};
     std::mutex        ep_mutex;
     moq_endpoint_t*   ep = nullptr;  // valid only between set_endpoint(ep)/(nullptr)
 

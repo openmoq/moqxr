@@ -1133,6 +1133,7 @@ PublisherStats Publisher::stats() const {
     bool include_sap = false;
     bool include_msf_timeline = false;
     std::shared_ptr<ActiveSession> active;
+    std::shared_ptr<transport::LibmoqLiveHandle> libmoq_live;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         snapshot = stats_;
@@ -1140,6 +1141,7 @@ PublisherStats Publisher::stats() const {
         include_sap = config_.include_sap;
         include_msf_timeline = config_.include_msf_timeline;
         active = active_session_;
+        libmoq_live = libmoq_live_;
     }
     if (active && active->session) {
         const auto live_stats = active->session->publish_stats();
@@ -1150,6 +1152,12 @@ PublisherStats Publisher::stats() const {
     if (active && active->transport) {
         snapshot.connection_id = active->transport->connection_id();
     }
+    bool namespace_accepted = active && active->session && active->session->namespace_accepted();
+#ifdef OPENMOQ_HAS_LIBMOQ
+    if (libmoq_live) {
+        namespace_accepted = libmoq_live->namespace_accepted.load();
+    }
+#endif
 
     return PublisherStats{
         .publishing_live = snapshot.publishing_live,
@@ -1164,6 +1172,7 @@ PublisherStats Publisher::stats() const {
         .port = snapshot.port,
         .path = snapshot.path,
         .connection_id = snapshot.connection_id,
+        .namespace_accepted = namespace_accepted,
         .last_error = snapshot.last_error,
     };
 }
@@ -1173,12 +1182,21 @@ std::string Publisher::stats_json() const {
     bool split_cmaf_chunks = true;
     bool include_sap = false;
     bool include_msf_timeline = false;
+    bool namespace_accepted = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         snapshot = stats_;
         split_cmaf_chunks = config_.split_cmaf_chunks;
         include_sap = config_.include_sap;
         include_msf_timeline = config_.include_msf_timeline;
+        if (active_session_ && active_session_->session) {
+            namespace_accepted = active_session_->session->namespace_accepted();
+        }
+#ifdef OPENMOQ_HAS_LIBMOQ
+        if (libmoq_live_) {
+            namespace_accepted = libmoq_live_->namespace_accepted.load();
+        }
+#endif
         if (active_session_ && active_session_->transport) {
             snapshot.connection_id = active_session_->transport->connection_id();
             snapshot.connected = active_session_->transport->state() == transport::ConnectionState::kConnected;
@@ -1203,6 +1221,7 @@ std::string Publisher::stats_json() const {
        << "\"port\":" << snapshot.port << ","
        << "\"path\":\"" << json_escape(snapshot.path) << "\","
        << "\"connectionId\":\"" << json_escape(snapshot.connection_id) << "\","
+       << "\"namespaceAccepted\":" << (namespace_accepted ? "true" : "false") << ","
        << "\"lastError\":\"" << json_escape(snapshot.last_error) << "\""
        << "}";
     return os.str();

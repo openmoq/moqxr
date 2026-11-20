@@ -560,6 +560,48 @@ bool test_stats_keep_sent_counts_after_publish_fails() {
     return ok;
 }
 
+// stats().namespace_accepted tells a supervisor when the relay accepted the
+// namespace: false before the publish, true once the relay answered
+// PUBLISH_NAMESPACE, false again when the session ends (openmoq/moqxr#153).
+bool test_stats_report_namespace_accepted() {
+    bool ok = true;
+    PublisherConfig config;
+    config.draft_version = DraftVersion::kDraft14;
+    config.track_namespace = "app";
+    auto record = std::make_shared<SubscribedTransport::Record>();
+    Publisher publisher(config, [record](TransportKind) -> std::unique_ptr<PublisherTransport> {
+        return std::make_unique<SubscribedTransport>(record);
+    });
+    ok &= expect(!publisher.stats().namespace_accepted, "expected no accepted namespace before the publish");
+    ok &= expect(publisher.stats_json().find("\"namespaceAccepted\":false") != std::string::npos,
+                 "expected stats_json() to report namespaceAccepted false before the publish");
+    LiveObjectSource source{
+        .tracks = {LiveTrack{.track_name = "events"}},
+        .next_object = []() -> std::optional<LiveObject> {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            return LiveObject{.track_name = "events", .group_id = 0, .object_id = 0, .payload = {0x01}};
+        },
+    };
+    EndpointConfig endpoint;
+    endpoint.transport = TransportKind::kRawQuic;
+    endpoint.host = "relay.example";
+    endpoint.port = 443;
+
+    TransportStatus publish_status = TransportStatus::success();
+    std::thread publishing([&] { publish_status = publisher.publish_live_objects(source, endpoint); });
+    for (int i = 0; i < 2000 && !publisher.stats().namespace_accepted; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ok &= expect(publisher.stats().namespace_accepted, "expected the accepted namespace to show in stats()");
+    ok &= expect(publisher.stats_json().find("\"namespaceAccepted\":true") != std::string::npos,
+                 "expected stats_json() to report namespaceAccepted true");
+    record->closed = true;  // the relay drops the connection
+    publishing.join();
+    ok &= expect(!publish_status.ok, "expected the publish to fail when the connection drops");
+    ok &= expect(!publisher.stats().namespace_accepted, "expected no accepted namespace once the session ended");
+    return ok;
+}
+
 // A publish that disconnect() stopped is not a failure: its reads fail on the
 // closed connection, which would otherwise be retryable, and retrying it
 // through publish_with_failover would reconnect a publisher asked to stop.
@@ -1223,6 +1265,7 @@ int main() {
     bool ok = test_goaway_recreates_publisher_transport();
     ok &= test_disconnect_during_live_publish_closes_once();
     ok &= test_stats_keep_sent_counts_after_publish_fails();
+    ok &= test_stats_report_namespace_accepted();
     ok &= test_disconnect_during_publish_is_not_retried();
     ok &= test_disconnect_during_connect_waits_for_connect();
     ok &= test_disconnect_does_not_follow_goaway();
