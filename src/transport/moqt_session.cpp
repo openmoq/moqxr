@@ -4223,20 +4223,22 @@ struct CatalogFetchObject {
     std::uint8_t publisher_priority = 128;
 };
 
-// Draft 18 section 10.12.2: a Joining FETCH retrieves the objects before a
-// subscription's start so the two are contiguous. Only the catalog is
-// retained for it. A late catalog subscriber gets the catalog object it
-// missed (MSF section 5); every other fetch is declined with NOT_SUPPORTED.
-// joined_track maps a Joining Request ID to the track of a subscription this
-// session accepted, or nullopt for an unknown ID. A subscription that has
-// already completed still counts, since the fetch reaches the publisher after
-// the catalog object has been sent on it.
-TransportStatus answer_catalog_joining_fetch(
+// Draft 18 section 10.12: only the latest catalog object is retained, and it
+// is served to two kinds of FETCH. A Joining FETCH (10.12.2) gives a late
+// catalog subscriber the catalog object it missed (MSF section 5). A
+// standalone FETCH of the catalog gives it to a relay whose cached copy has
+// expired, as the relay asks with a standalone FETCH. Every other fetch is
+// declined with NOT_SUPPORTED. joined_track maps a Joining Request ID to the
+// track of a subscription this session accepted, or nullopt for an unknown
+// ID. A subscription that has already completed still counts, since the fetch
+// reaches the publisher after the catalog object has been sent on it.
+TransportStatus answer_catalog_fetch(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
     std::uint64_t request_stream_id,
     std::span<const std::uint8_t> message_bytes,
     PeerRequestIdValidator& peer_request_ids,
+    std::string_view track_namespace,
     const std::function<std::optional<std::string>(std::uint64_t)>& joined_track,
     const std::function<std::optional<CatalogFetchObject>()>& catalog_object) {
     FetchMessage fetch;
@@ -4254,26 +4256,54 @@ TransportStatus answer_catalog_joining_fetch(
         return transport.write_stream(
             request_stream_id, encode_request_error_message(draft, fetch.request_id, code, 0, reason), true);
     };
-    if (fetch.fetch_type == 0x1) {
-        return reject(kRequestErrorNotSupported, "standalone FETCH not supported");
-    }
     constexpr std::uint64_t kInvalidRange = 0x11;
     constexpr std::uint64_t kInvalidJoiningRequestId = 0x32;
-    const std::optional<std::string> track = joined_track(fetch.joining_request_id);
-    if (!track.has_value()) {
-        return reject(kInvalidJoiningRequestId, "unknown joining request id");
-    }
-    if (*track != "catalog") {
-        return reject(kRequestErrorNotSupported, "joining FETCH is only served for the catalog");
+    const bool standalone = fetch.fetch_type == 0x1;
+    if (standalone) {
+        if (!namespace_matches(fetch.track_namespace, track_namespace) || fetch.track_name != "catalog") {
+            return reject(kRequestErrorNotSupported, "standalone FETCH is only served for the catalog");
+        }
+        // A range that holds no Object: empty or inverted. End is the last
+        // Object plus 1, except that an End Object of 0 requests the whole End
+        // Group, so {G, 0}..{G, 0} is valid.
+        const bool inverted = fetch.end_object == 0
+                                  ? fetch.start_group > fetch.end_group
+                                  : std::make_pair(fetch.start_group, fetch.start_object) >=
+                                        std::make_pair(fetch.end_group, fetch.end_object);
+        if (inverted) {
+            return reject(kInvalidRange, "fetch range is empty or inverted");
+        }
+    } else {
+        const std::optional<std::string> track = joined_track(fetch.joining_request_id);
+        if (!track.has_value()) {
+            return reject(kInvalidJoiningRequestId, "unknown joining request id");
+        }
+        if (*track != "catalog") {
+            return reject(kRequestErrorNotSupported, "joining FETCH is only served for the catalog");
+        }
     }
     const std::optional<CatalogFetchObject> object = catalog_object();
     if (!object.has_value()) {
         return reject(kInvalidRange, "no objects published");
     }
-    // Relative: start group = Joining Location.Group - Joining Start; absolute:
-    // Joining Start itself. Either way the range ends at the Joining Location,
-    // the catalog object, so it is served unless the start lies past it.
-    if (fetch.joining_start > object->group_id) {
+    if (standalone) {
+        // The range must hold the catalog object, the only one retained.
+        const auto location = std::make_pair(object->group_id, object->object_id);
+        const bool starts_after = std::make_pair(fetch.start_group, fetch.start_object) > location;
+        const bool ends_before = fetch.end_object == 0
+                                     ? fetch.end_group < object->group_id
+                                     : std::make_pair(fetch.end_group, fetch.end_object) <= location;
+        if (starts_after) {
+            return reject(kInvalidRange, "fetch start is past the largest object");
+        }
+        if (ends_before) {
+            return reject(kRequestErrorNotSupported, "only the latest catalog object is retained");
+        }
+    } else if (fetch.joining_start > object->group_id) {
+        // Relative: start group = Joining Location.Group - Joining Start;
+        // absolute: Joining Start itself. Either way the range ends at the
+        // Joining Location, the catalog object, so it is served unless the
+        // start lies past it.
         return reject(kInvalidRange, "joining start is past the largest object");
     }
 
@@ -4323,8 +4353,9 @@ TransportStatus reject_draft16_unsupported_request(PublisherTransport& transport
 }
 
 // Drafts 18 and later: routes TRACK_STATUS and FETCH. TRACK_STATUS is
-// answered on every draft; a FETCH is answered on draft 18 (Joining FETCH of
-// the catalog) and declined with NOT_SUPPORTED on the others.
+// answered on every draft; a FETCH is answered on draft 18 (a Joining or
+// standalone FETCH of the catalog) and declined with NOT_SUPPORTED on the
+// others.
 TransportStatus serve_track_status_or_fetch(
     PublisherTransport& transport,
     openmoq::publisher::DraftVersion draft,
@@ -4343,8 +4374,8 @@ TransportStatus serve_track_status_or_fetch(
     if (draft != openmoq::publisher::DraftVersion::kDraft18) {
         return reject_unsupported_request(transport, draft, request_stream_id, message_bytes, peer_request_ids);
     }
-    return answer_catalog_joining_fetch(
-        transport, draft, request_stream_id, message_bytes, peer_request_ids,
+    return answer_catalog_fetch(
+        transport, draft, request_stream_id, message_bytes, peer_request_ids, track_namespace,
         [&](std::uint64_t request_id) -> std::optional<std::string> {
             const auto it = joinable_subscriptions.find(request_id);
             if (it == joinable_subscriptions.end()) return std::nullopt;

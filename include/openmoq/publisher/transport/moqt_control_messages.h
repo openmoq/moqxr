@@ -180,6 +180,14 @@ struct FetchMessage {
     std::uint64_t fetch_type = 0;  // 0x1 standalone, 0x2 relative joining, 0x3 absolute joining
     std::uint64_t joining_request_id = 0;
     std::uint64_t joining_start = 0;
+    // Standalone FETCH only. End is exclusive, except that an End Object of 0
+    // asks for the whole End Group.
+    std::vector<std::string> track_namespace;
+    std::string track_name;
+    std::uint64_t start_group = 0;
+    std::uint64_t start_object = 0;
+    std::uint64_t end_group = 0;
+    std::uint64_t end_object = 0;
     bool malformed_authorization_token = false;
     bool authorization_token_cache_overflow = false;
     bool unknown_authorization_token_alias = false;

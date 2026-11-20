@@ -927,6 +927,18 @@ bool test_track_status_and_fetch_messages() {
                      fetch.joining_start == 0,
                  "Joining FETCH fields decode");
     ok &= expect(!decode_fetch_message(joining, DraftVersion::kDraft22, fetch), "FETCH decodes only on draft 18");
+    // Standalone FETCH: Request ID 9, type 0x1, namespace "interop", track
+    // "catalog", Start {2, 1}, End {3, 0}, no parameters.
+    const std::vector<std::uint8_t> standalone{0x16, 0, 24, 9, 1, 1, 7, 'i', 'n', 't', 'e', 'r', 'o', 'p',
+                                               7, 'c', 'a', 't', 'a', 'l', 'o', 'g', 2, 1, 3, 0, 0};
+    FetchMessage standalone_fetch;
+    ok &= expect(decode_fetch_message(standalone, draft, standalone_fetch), "draft-18 standalone FETCH decodes");
+    ok &= expect(standalone_fetch.request_id == 9 && standalone_fetch.fetch_type == 1 &&
+                     standalone_fetch.track_namespace == std::vector<std::string>{"interop"} &&
+                     standalone_fetch.track_name == "catalog" && standalone_fetch.start_group == 2 &&
+                     standalone_fetch.start_object == 1 && standalone_fetch.end_group == 3 &&
+                     standalone_fetch.end_object == 0,
+                 "standalone FETCH fields decode");
     const std::vector<std::uint8_t> bad_type{0x16, 0, 4, 7, 4, 0, 0};
     ok &= expect(!decode_fetch_message(bad_type, draft, fetch), "an unknown Fetch Type does not decode");
     const std::vector<std::uint8_t> trailing{0x16, 0, 6, 7, 2, 1, 0, 0, 0};

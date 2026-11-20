@@ -2763,17 +2763,20 @@ bool decode_fetch_message(std::span<const std::uint8_t> bytes, DraftVersion draf
         return false;
     }
     if (message.fetch_type == 0x1) {
-        std::vector<std::string> track_namespace;
         std::uint64_t track_name_length = 0;
-        std::uint64_t field = 0;
-        if (!decode_track_namespace(bounded, offset, draft, track_namespace) ||
+        if (!decode_track_namespace(bounded, offset, draft, message.track_namespace) ||
             !decode_moqint_impl(bounded, offset, draft, track_name_length) ||
             !fits(offset, track_name_length, payload_end)) {
             return false;
         }
+        message.track_name.assign(reinterpret_cast<const char*>(bytes.data() + offset),
+                                  static_cast<std::size_t>(track_name_length));
         offset += static_cast<std::size_t>(track_name_length);
-        for (int i = 0; i < 4; ++i) {  // Start and End Location
-            if (!decode_moqint_impl(bounded, offset, draft, field)) return false;
+        if (!decode_moqint_impl(bounded, offset, draft, message.start_group) ||
+            !decode_moqint_impl(bounded, offset, draft, message.start_object) ||
+            !decode_moqint_impl(bounded, offset, draft, message.end_group) ||
+            !decode_moqint_impl(bounded, offset, draft, message.end_object)) {
+            return false;
         }
     } else if (message.fetch_type == 0x2 || message.fetch_type == 0x3) {
         if (!decode_moqint_impl(bounded, offset, draft, message.joining_request_id) ||
