@@ -229,6 +229,10 @@ bool srt_session_discovery(const std::filesystem::path& media, bool namespace_up
         peer.reads[9].push_back({0x03, 0, 23, 7, 1, 5, 'm', 'e', 'd', 'i', 'a',
                                 10, 't', 'e', 's', 't', '_', 'v', 'i', 'd', 'e', 'o',
                                 1, 0x25, 1, 0});
+        // PUBLISH_NAMESPACE(other) from the relay (draft 22 Figure 18: Type 0x6,
+        // Length (16) 9, Request ID 9, one namespace field, no parameters): refused,
+        // and the session goes on.
+        peer.reads[13].push_back({0x06, 0, 9, 9, 1, 5, 'o', 't', 'h', 'e', 'r', 0});
     }
     if (unknown_alias) {
         // SUBSCRIBE references an authorization-token alias never registered.
@@ -293,6 +297,9 @@ bool srt_session_discovery(const std::filesystem::path& media, bool namespace_up
         ok &= expect(std::any_of(peer.writes.begin(), peer.writes.end(), [](const auto& write) {
             return write.stream == 9 && write.bytes.size() >= 4 && write.bytes[0] == 0x05 && write.bytes[3] == 0x36;
         }), "SRT subscription with an unnegotiated Range Filter must receive INVALID_FILTER");
+        ok &= expect(std::any_of(peer.writes.begin(), peer.writes.end(), [](const auto& write) {
+            return write.stream == 13 && write.bytes.size() >= 4 && write.bytes[0] == 0x05 && write.bytes[3] == 0x03;
+        }), "SRT PUBLISH_NAMESPACE from the relay must receive NOT_SUPPORTED");
         ok &= expect(std::count_if(peer.writes.begin(), peer.writes.end(), [](const auto& write) {
             return write.stream == 1 && !write.bytes.empty() && write.bytes[0] == 0x07;
         }) == 2, "SRT discovery request and update must each receive one response");
