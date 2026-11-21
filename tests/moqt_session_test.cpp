@@ -2189,6 +2189,80 @@ bool test_live_stdin_video_alt_group(const EndpointConfig& endpoint, const TlsCo
     return ok;
 }
 
+// A relay may send PUBLISH_NAMESPACE to the live publisher at any time (moq-relay
+// announces its namespaces to each peer). The live loops refuse it and go on
+// publishing: the stdin path here, publish_live_objects (moq2ts-cli's path)
+// below, and the SRT path in live_srt_discovery_test. The PUBLISH_NAMESPACE is
+// written byte by byte from draft 18 Figure 17: Type 0x6, Length (16) 9,
+// Request ID 9 (the template's REQUEST_UPDATE uses 1), a one-field Track
+// Namespace "other", no parameters.
+bool test_peer_publish_namespace_on_live_paths(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "test/live";
+    constexpr std::size_t kEndGroup = openmoq::publisher::kMaxGroupId;
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    const std::vector<std::uint8_t> publish_namespace{0x06, 0x00, 0x09, 0x09, 0x01, 0x05,
+                                                      'o', 't', 'h', 'e', 'r', 0x00};
+    bool ok = true;
+    const auto setup = [&](MockTransport& transport, std::size_t& publish_stream_reads) {
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[4].push_back(encode_draft18_publish_ok_with_filter(0, 0x04, 0, 0, kEndGroup));
+        transport.reads[1].push_back(publish_namespace);
+        transport.keep_open_streams.insert(1);
+        transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+            if (stream_id == 4 && ++publish_stream_reads == 2) {
+                current.reads[4].push_back(encode_request_update_message(draft, 1, 1));
+            }
+        };
+    };
+    const auto refused = [&](const MockTransport& transport) {
+        return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+            openmoq::publisher::transport::RequestError error;
+            return write.stream_id == 1 && write.fin &&
+                   openmoq::publisher::transport::decode_request_error(write.bytes, draft, error) &&
+                   error.error_code == 0x3;
+        });
+    };
+    {
+        MockTransport transport;
+        std::size_t publish_stream_reads = 0;
+        setup(transport, publish_stream_reads);
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "live stdin PUBLISH_NAMESPACE: session connects");
+        const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, 0xAB),
+                                   make_live_media_fragment(1000, 0xAC), make_live_media_fragment(2000, 0xAD)});
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        const auto status = session.publish_live(input, draft, true);
+        ok &= expect(status.ok, "live stdin PUBLISH_NAMESPACE: the publish goes on: " + status.message);
+        ok &= expect(refused(transport), "live stdin PUBLISH_NAMESPACE: refused with NOT_SUPPORTED");
+        ok &= expect(transport.last_close_code == 0, "live stdin PUBLISH_NAMESPACE: the session stays open");
+    }
+    {
+        MockTransport transport;
+        std::size_t publish_stream_reads = 0;
+        setup(transport, publish_stream_reads);
+        std::size_t object_index = 0;
+        LiveObjectSource source{
+            .tracks = {LiveTrack{.track_name = "events"}},
+            .next_object = [&object_index]() -> std::optional<LiveObject> {
+                if (object_index >= 3) return std::nullopt;
+                const std::size_t group = object_index++ + 1;
+                return LiveObject{.track_name = "events", .group_id = group, .subgroup_id = 0, .object_id = 0,
+                                  .payload = {'M'}};
+            },
+        };
+        MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "live objects PUBLISH_NAMESPACE: session connects");
+        const auto status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "live objects PUBLISH_NAMESPACE: the publish goes on: " + status.message);
+        ok &= expect(session.publish_stats().objects_published == 3,
+                     "live objects PUBLISH_NAMESPACE: every object is still published");
+        ok &= expect(refused(transport), "live objects PUBLISH_NAMESPACE: refused with NOT_SUPPORTED");
+        ok &= expect(transport.last_close_code == 0, "live objects PUBLISH_NAMESPACE: the session stays open");
+    }
+    return ok;
+}
+
 // openmoq/moqxr#99: a relay answers PUBLISH with PUBLISH_OK Forward=0 and an
 // AbsoluteRange filter {0/0 .. 2^62-1}, then sends REQUEST_UPDATE Forward=1
 // once a subscriber arrives. The filter's start/end must survive into the
@@ -3787,6 +3861,55 @@ int main() {
                          return (write.stream_id & 0x3) == 0x2 && write.fin && message_type(write.bytes) == 0x05;
                      }) == served,
                      "D18 each served standalone catalog FETCH sends the catalog object on its own FETCH_HEADER stream");
+    }
+
+    // Draft 18 section 6.2 (drafts 22 and 23 section 4.1): a publisher MAY send
+    // PUBLISH_NAMESPACE to any subscriber, as moq-relay does unasked. This
+    // publisher refuses it with REQUEST_ERROR and keeps the session; a malformed
+    // one still closes it (the draft-23 MALFORMED_MESSAGE case above).
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
+        // PUBLISH_NAMESPACE written byte by byte from the draft figures (draft 18
+        // Figure 17, drafts 22 and 23 Figure 18): Type 0x6, Length 9, Request ID,
+        // a one-field Track Namespace of five bytes, no parameters. Length is 16
+        // bits in drafts 18 and 22 and a vi64 (one byte here) in draft 23.
+        const auto publish_namespace = [&](std::uint8_t request_id, const char (&name)[6]) {
+            std::vector<std::uint8_t> message{0x06};
+            if (draft == DraftVersion::kDraft23) {
+                message.push_back(0x09);
+            } else {
+                message.insert(message.end(), {0x00, 0x09});
+            }
+            message.insert(message.end(), {request_id, 0x01, 0x05});
+            message.insert(message.end(), name, name + 5);
+            message.push_back(0x00);
+            return message;
+        };
+        const std::string label = openmoq::publisher::to_string(draft);
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.keep_open_streams.insert(3);
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        // Two relay announcements: the second shows the session survived the first.
+        transport.reads[1].push_back(publish_namespace(1, "other"));
+        transport.reads[5].push_back(publish_namespace(3, "third"));
+        transport.keep_open_streams.insert(1);
+        transport.keep_open_streams.insert(5);
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, label + " PUBLISH_NAMESPACE from the peer connects");
+        static_cast<void>(session.publish(materialize_publish_plan(make_span_backed_plan(draft), source_bytes)));
+        const auto refused_on = [&](std::uint64_t stream) {
+            return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                openmoq::publisher::transport::RequestError error;
+                return write.stream_id == stream && write.fin &&
+                       openmoq::publisher::transport::decode_request_error(write.bytes, draft, error) &&
+                       error.error_code == 0x3;
+            });
+        };
+        ok &= expect(refused_on(1), label + " PUBLISH_NAMESPACE from the peer gets REQUEST_ERROR NOT_SUPPORTED");
+        ok &= expect(refused_on(5), label + " a second PUBLISH_NAMESPACE is answered too");
+        ok &= expect(transport.last_close_code == 0,
+                     label + " PUBLISH_NAMESPACE from the peer does not close the session, saw " +
+                         std::to_string(transport.last_close_code));
     }
 
     {
@@ -13484,6 +13607,7 @@ int main() {
     ok &= test_live_stdin_catalog_framerate_from_fragments(endpoint, tls);
     ok &= test_publish_request_stream_stop_sending_ends_subscription(endpoint, tls);
     ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
+    ok &= test_peer_publish_namespace_on_live_paths(endpoint, tls);
     ok &= test_live_stdin_video_alt_group(endpoint, tls);
     ok &= test_publisher_priorities_live_objects(endpoint, tls);
     ok &= test_publisher_priorities_live_stdin(endpoint, tls);

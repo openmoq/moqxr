@@ -691,6 +691,23 @@ std::uint64_t diagnose_malformed_request(std::span<const std::uint8_t> bytes, Dr
     return 0;
 }
 
+bool decode_publish_namespace_request(std::span<const std::uint8_t> bytes, DraftVersion draft,
+                                      std::uint64_t& request_id) {
+    clear_decode_fault();
+    constexpr std::uint64_t kPublishNamespaceType = 0x06;
+    std::size_t payload_offset = 0;
+    std::size_t payload_length = 0;
+    if (!is_draft18_or_later(draft) ||
+        !parse_control_length_message(bytes, draft, kPublishNamespaceType, payload_offset, payload_length)) {
+        return false;
+    }
+    std::size_t offset = payload_offset;
+    const auto body = bytes.subspan(0, payload_offset + payload_length);
+    std::vector<std::string> track_namespace;
+    return decode_moqint_impl(body, offset, draft, request_id) &&
+           decode_track_namespace(body, offset, draft, track_namespace);
+}
+
 bool validate_publisher_datagram(std::span<const std::uint8_t> bytes, DraftVersion draft) {
     clear_decode_fault();
     // Draft 23 sections 11.2 and 12.2: an unknown type or invalid Type Flags is

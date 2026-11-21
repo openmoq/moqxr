@@ -291,6 +291,12 @@ void clear_decode_fault();
 // Track Namespace. Earlier drafts return 0.
 std::uint64_t diagnose_malformed_request(std::span<const std::uint8_t> bytes, DraftVersion draft);
 
+// Drafts 18 and later: a PUBLISH_NAMESPACE from the peer (type 0x06) whose framing,
+// Request ID and Track Namespace decode, the elements diagnose_malformed_request
+// checks. Its parameters are not read. Keeps only the Request ID.
+bool decode_publish_namespace_request(std::span<const std::uint8_t> bytes, DraftVersion draft,
+                                      std::uint64_t& request_id);
+
 // Message-parameter ids shared by the SUBSCRIBE-family decoders. draft-17 and
 // draft-18 define these three as uint8 on the wire (draft-17 sections 9.3.5,
 // 9.3.6, 9.3.8; draft-18 sections 10.2.16-10.2.18); drafts up to 16 encode
