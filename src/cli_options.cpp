@@ -18,9 +18,10 @@ namespace {
 
 cat4moq::Profile parse_auth_profile(std::string_view value) {
     if (value == "c4m-01") return cat4moq::Profile::kC4m01;
+    if (value == "c4m-02") return cat4moq::Profile::kC4m02;
     if (value == "moqx-compat") return cat4moq::Profile::kMoqxCompat;
     if (value == "red5-cose-compat") return cat4moq::Profile::kRed5CoseCompat;
-    throw std::runtime_error("--auth-profile must be c4m-01, moqx-compat, or red5-cose-compat");
+    throw std::runtime_error("--auth-profile must be c4m-01, c4m-02, moqx-compat, or red5-cose-compat");
 }
 
 std::uint64_t parse_auth_token_type(std::string_view value) {
@@ -606,7 +607,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
     }
 
     const auto profile = auth_profile.value_or(cat4moq::Profile::kC4m01);
-    if (auth_token_type && profile == cat4moq::Profile::kC4m01) {
+    if (auth_token_type && (profile == cat4moq::Profile::kC4m01 || profile == cat4moq::Profile::kC4m02)) {
         throw std::runtime_error("--auth-token-type requires an explicit compatibility --auth-profile");
     }
     if (auth_token_type && options.draft_version == DraftVersion::kDraft16 &&
@@ -848,7 +849,7 @@ std::string build_usage(const char* argv0) {
            " [--endpoint host:port|moqt://host:port/path|https://host:port/path]... [--url moqt://host/path#msf:ns--track] [--alpn value] [--sni value]"
            " [--webtransport-allow-missing-reset-stream-at] [--quic-idle-timeout <ms>]"
            " [--retry <count>]"
-           " [--auth-profile c4m-01|moqx-compat|red5-cose-compat] [--auth-token-file <path>]"
+           " [--auth-profile c4m-01|c4m-02|moqx-compat|red5-cose-compat] [--auth-token-file <path>]"
            " [--auth-setup-token-file <path>] [--auth-action-token-file <path>] [--auth-token-type <uint>]"
            " [--auth-dpop-key-file <pem>] [--auth-dpop-token-type <uint>]"
            " [--cert file] [--key file] [--ca file] [--insecure]"

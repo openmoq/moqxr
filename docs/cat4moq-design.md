@@ -5,7 +5,10 @@ relay follow-ups are recorded in [the plan](cat4moq-plan.md).
 
 ## Contract
 
-Use `draft-ietf-moq-c4m-01.txt` as the published specification. A publisher
+Use `draft-ietf-moq-c4m-01.txt` as the published specification; the `c4m-02`
+profile follows `draft-ietf-moq-c4m-02.txt` (COSE DPoP proofs, SETUP action 1,
+SUBSCRIBE_TRACKS action 9). Tokens stay opaque to the publisher, so the draft-02
+claim changes (the `moqt` claim map, `catreplay`) are an issuer concern. A publisher
 transports externally issued CWT credentials; it does not mint tokens, hold
 issuer keys, or claim to validate relay authorization policy.
 

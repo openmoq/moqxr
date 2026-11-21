@@ -149,7 +149,8 @@ config.authorization.action_credential = cat4moq::Credential{
 };
 ```
 
-`kC4m01` is the new API default and sends token type 1. `kMoqxCompat` sends
+`kC4m01` is the API default and sends token type 1. `kC4m02` also sends type 1 and
+selects draft-ietf-moq-c4m-02 behavior for DPoP (below). `kMoqxCompat` sends
 type 16 for current moqx and Red5's `moqx` profile. `kRed5CoseCompat` sends
 Red5 `cose` credentials as type 16, for Red5 relays pinned to
 `auth.cat.token.type=16`. A compatibility credential may override `token_type`
@@ -184,6 +185,18 @@ type 17 by default (`DpopSigner::token_type`). `from_pem` throws
 `cat4moq::AuthorizationError` for anything other than a P-256 key. Both backends
 support it; the CLI equivalents are `--auth-dpop-key-file` and
 `--auth-dpop-token-type`.
+
+When the credential's profile is `kC4m02`, the proof is instead the draft-02
+section 4.2 form: a tagged COSE_Sign1 (ES256, `typ` `dpop-proof+cwt`, the public
+COSE_Key in `kccs`) whose claims are `iat`, `cti`, `actx` (type `moqt`, action,
+namespace fields, track name) and `ath`, the SHA-256 of the CWT sent beside it.
+Bind the token with `cnf` `ckt`; `DpopSigner::cose_thumbprint_hex()` gives the
+value. The `actx` and `ath` labels (-65539, -65540) and proof token type 17 are
+the provisional values moqx uses, since the draft assigns none. SETUP is action
+1 and `Action::kSubscribeTracks` is action 9. Resolve a credential and its proof
+together with `cat4moq::resolve_authorization_and_proof` so a provider that mints
+a token per call cannot leave `ath` bound to a different token. Proofs built
+from preencoded tokens (no profile) stay in the JWT form.
 
 Legacy preencoded wrappers remain available for existing applications:
 

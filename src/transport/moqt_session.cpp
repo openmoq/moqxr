@@ -8064,9 +8064,10 @@ namespace {
 AuthorizationValues resolve_authorization_values(const cat4moq::AuthorizationConfig& config,
                                                  const cat4moq::Resource& resource, DraftVersion draft) {
     AuthorizationValues values;
-    if (const auto token = cat4moq::resolve_authorization(config, resource, draft)) {
-        values.token = token->bytes;
-        if (const auto proof = cat4moq::resolve_dpop_proof(config, resource, draft)) values.proof = proof->bytes;
+    const auto resolved = cat4moq::resolve_authorization_and_proof(config, resource, draft);
+    if (resolved.token) {
+        values.token = resolved.token->bytes;
+        if (resolved.proof) values.proof = resolved.proof->bytes;
     }
     return values;
 }

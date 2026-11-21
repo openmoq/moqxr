@@ -90,7 +90,8 @@ AuthorizationToken encode_credential(const Credential& credential, DraftVersion 
     require_credential_size(credential.cwt.size());
     std::uint64_t type = 0;
     switch (credential.profile) {
-        case Profile::kC4m01: type = 1; break;
+        case Profile::kC4m01:
+        case Profile::kC4m02: type = 1; break;
         case Profile::kMoqxCompat: type = credential.token_type.value_or(16); break;
         case Profile::kRed5CoseCompat: type = credential.token_type.value_or(16); break;
         default: throw AuthorizationError("unsupported credential profile");
@@ -117,21 +118,62 @@ void validate_authorization(const AuthorizationConfig& config, DraftVersion draf
     if (config.action_credential) encode_credential(*config.action_credential, draft);
 }
 
-std::optional<AuthorizationToken> resolve_authorization(const AuthorizationConfig& config,
-                                                       const Resource& resource, DraftVersion draft) {
-    validate_authorization(config, draft);
-    const bool setup = resource.action == Action::kClientSetup || resource.action == Action::kServerSetup;
+namespace {
+
+bool is_setup(Action action) { return action == Action::kClientSetup || action == Action::kServerSetup; }
+
+// The structured credential for a resource, or nullopt when only a preencoded
+// token (or nothing) applies.
+std::optional<Credential> select_credential(const AuthorizationConfig& config, const Resource& resource) {
+    const bool setup = is_setup(resource.action);
     if (!setup && config.credential_provider) {
         try {
-            return encode_credential(config.credential_provider(resource), draft);
+            return config.credential_provider(resource);
         } catch (...) {
             // Provider diagnostics may contain the bearer token or issuer response.
             throw AuthorizationError("authorization credential provider failed");
         }
     }
-    const auto& credential = setup ? config.setup_credential : config.action_credential;
-    if (credential) return encode_credential(*credential, draft);
-    return setup ? config.setup_token : config.action_token;
+    return setup ? config.setup_credential : config.action_credential;
+}
+
+}  // namespace
+
+namespace {
+
+ResolvedAuthorization resolve_impl(const AuthorizationConfig& config, const Resource& resource, DraftVersion draft,
+                                   bool with_proof) {
+    validate_authorization(config, draft);
+    ResolvedAuthorization resolved;
+    if (const auto credential = select_credential(config, resource)) {
+        resolved.token = encode_credential(*credential, draft);
+        if (with_proof && config.dpop_signer) {
+            if (credential->profile == Profile::kC4m02) {
+                resolved.proof = encode_dpop_proof(config.dpop_signer->sign_cwt(resource, credential->cwt),
+                                                   config.dpop_signer->token_type, draft);
+            } else {
+                resolved.proof = encode_dpop_proof(config.dpop_signer->sign(resource), config.dpop_signer->token_type, draft);
+            }
+        }
+        return resolved;
+    }
+    resolved.token = is_setup(resource.action) ? config.setup_token : config.action_token;
+    if (with_proof && resolved.token && config.dpop_signer) {
+        resolved.proof = encode_dpop_proof(config.dpop_signer->sign(resource), config.dpop_signer->token_type, draft);
+    }
+    return resolved;
+}
+
+}  // namespace
+
+ResolvedAuthorization resolve_authorization_and_proof(const AuthorizationConfig& config,
+                                                      const Resource& resource, DraftVersion draft) {
+    return resolve_impl(config, resource, draft, true);
+}
+
+std::optional<AuthorizationToken> resolve_authorization(const AuthorizationConfig& config,
+                                                       const Resource& resource, DraftVersion draft) {
+    return resolve_impl(config, resource, draft, false).token;
 }
 
 std::vector<std::uint8_t> decode_base64_token(std::string_view input, bool url_safe) {
