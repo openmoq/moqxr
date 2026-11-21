@@ -4356,16 +4356,21 @@ TransportStatus reject_draft16_unsupported_request(PublisherTransport& transport
 // PUBLISH_NAMESPACE to a subscriber, and the subscriber answers it with one
 // REQUEST_OK or REQUEST_ERROR on its request stream. A relay such as moq-relay
 // announces every namespace it holds to each peer unasked. This session takes
-// no namespaces: a well-formed PUBLISH_NAMESPACE is refused and the session goes
-// on. Returns nullopt when the stream does not hold one, so the caller keeps its
-// own handling (a malformed request still closes the session).
+// no namespaces: a PUBLISH_NAMESPACE whose framing, Request ID and Track
+// Namespace decode is refused and the session goes on. Its parameters are not
+// parsed, so one with bad parameters is refused too. Returns nullopt for any
+// other stream, so the caller keeps its own handling (a PUBLISH_NAMESPACE that
+// fails those checks still closes the session).
 std::optional<TransportStatus> refuse_publish_namespace(PublisherTransport& transport,
                                                         openmoq::publisher::DraftVersion draft,
+                                                        std::uint64_t request_type,
                                                         std::uint64_t request_stream_id,
                                                         std::span<const std::uint8_t> message_bytes,
                                                         PeerRequestIdValidator& peer_request_ids) {
+    constexpr std::uint64_t kPublishNamespaceType = 0x06;
     std::uint64_t request_id = 0;
-    if (!decode_publish_namespace_request(message_bytes, draft, request_id)) {
+    if (request_type != kPublishNamespaceType ||
+        !decode_publish_namespace_request(message_bytes, draft, request_id)) {
         return std::nullopt;
     }
     const TransportStatus id_status = peer_request_ids.validate(transport, request_id);
@@ -5473,12 +5478,10 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     continue;
                 }
 
-                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
-                    if (const auto refused = refuse_publish_namespace(transport, draft, request_stream_id, message_bytes,
-                                                                      peer_request_ids)) {
-                        if (!refused->ok) return *refused;
-                        continue;
-                    }
+                if (const auto refused = refuse_publish_namespace(transport, draft, request_type, request_stream_id,
+                                                                  message_bytes, peer_request_ids)) {
+                    if (!refused->ok) return *refused;
+                    continue;  // a PUBLISH_NAMESPACE, refused: the session goes on
                 }
                 if (request_type != 0x51 || !decode_subscribe_tracks_message(message_bytes, draft, subscribe_tracks)) {
                     const TransportStatus write_status =
@@ -9422,12 +9425,10 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     if (!response_status.ok) return {response_status, 0};
                     continue;
                 }
-                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
-                    if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_stream_id, request_bytes,
-                                                                      peer_request_ids)) {
-                        if (!refused->ok) return {*refused, 0};
-                        continue;
-                    }
+                if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_type, request_stream_id,
+                                                                  request_bytes, peer_request_ids)) {
+                    if (!refused->ok) return {*refused, 0};
+                    continue;  // a PUBLISH_NAMESPACE, refused: the session goes on
                 }
                 SubscribeMessage subscribe;
                 if (request_type != 0x03 ||
@@ -11238,12 +11239,10 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     continue;
                 }
 
-                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
-                    if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_stream_id, request_bytes,
-                                                                      peer_request_ids)) {
-                        if (!refused->ok) return {*refused, 0};
-                        continue;
-                    }
+                if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_type, request_stream_id,
+                                                                  request_bytes, peer_request_ids)) {
+                    if (!refused->ok) return {*refused, 0};
+                    continue;  // a PUBLISH_NAMESPACE, refused: the session goes on
                 }
                 SubscribeTracksMessage subscribe_tracks;
                 if (request_type != 0x51 ||
@@ -12651,12 +12650,10 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                     continue;
                 }
 
-                if (request_type == 0x06) {  // PUBLISH_NAMESPACE: refused, the session goes on
-                    if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_stream_id, request_bytes,
-                                                                      peer_request_ids)) {
-                        if (!refused->ok) return *refused;
-                        continue;
-                    }
+                if (const auto refused = refuse_publish_namespace(transport_, draft_version, request_type, request_stream_id,
+                                                                  request_bytes, peer_request_ids)) {
+                    if (!refused->ok) return *refused;
+                    continue;  // a PUBLISH_NAMESPACE, refused: the session goes on
                 }
                 SubscribeTracksMessage subscribe_tracks;
                 if (request_type != 0x51 ||
