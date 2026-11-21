@@ -1,4 +1,5 @@
-// DPoP proof signing for cnf-bound CAT tokens (draft-ietf-moq-c4m-01 section 3).
+// DPoP proof signing for cnf-bound CAT tokens: the draft-ietf-moq-c4m-01
+// section 3 JWT form and the draft-ietf-moq-c4m-02 section 4 COSE_Sign1 form.
 //
 // A proof is a compact JWS: base64url(header) "." base64url(payload) "."
 // base64url(ES256 signature as raw r || s). The relay checks the header's typ
@@ -114,6 +115,7 @@ const char* actx_action_name(Action action) {
         case Action::kPublish: return "PUBLISH";
         case Action::kFetch: return "FETCH";
         case Action::kTrackStatus: return "TRK_STATUS";
+        case Action::kSubscribeTracks: break;  // not in draft-01
     }
     throw AuthorizationError("unsupported MOQT action for a DPoP proof");
 }
@@ -129,12 +131,81 @@ std::string jwk_json(std::string_view x, std::string_view y) {
     return out;
 }
 
+// ES256 over input as the fixed-width r || s of JWS and COSE.
+std::array<std::uint8_t, 2 * kCoordinateBytes> es256_raw_signature(EVP_PKEY* pkey, std::span<const std::uint8_t> input_bytes) {
+    const auto* input = input_bytes.data();
+    const auto input_size = input_bytes.size();
+    std::unique_ptr<EVP_MD_CTX, MdCtxFree> ctx(EVP_MD_CTX_new());
+    if (!ctx || EVP_DigestSignInit(ctx.get(), nullptr, EVP_sha256(), nullptr, pkey) != 1) {
+        throw AuthorizationError("DPoP signature could not be initialised");
+    }
+    std::size_t der_size = 0;
+    if (EVP_DigestSign(ctx.get(), nullptr, &der_size, input, input_size) != 1) throw AuthorizationError("DPoP signature failed");
+    std::vector<unsigned char> der(der_size);
+    if (EVP_DigestSign(ctx.get(), der.data(), &der_size, input, input_size) != 1) throw AuthorizationError("DPoP signature failed");
+    const unsigned char* der_ptr = der.data();
+    std::unique_ptr<ECDSA_SIG, EcdsaSigFree> sig(d2i_ECDSA_SIG(nullptr, &der_ptr, static_cast<long>(der_size)));
+    if (!sig) throw AuthorizationError("DPoP signature could not be decoded");
+    std::array<std::uint8_t, 2 * kCoordinateBytes> raw{};
+    if (BN_bn2binpad(ECDSA_SIG_get0_r(sig.get()), raw.data(), kCoordinateBytes) != static_cast<int>(kCoordinateBytes) ||
+        BN_bn2binpad(ECDSA_SIG_get0_s(sig.get()), raw.data() + kCoordinateBytes, kCoordinateBytes) != static_cast<int>(kCoordinateBytes)) {
+        throw AuthorizationError("DPoP signature is not two 32-byte integers");
+    }
+    return raw;
+}
+
+// Minimal deterministic CBOR writers (RFC 8949 section 4.2.1).
+void cbor_head(std::vector<std::uint8_t>& out, std::uint8_t major, std::uint64_t value) {
+    const auto m = static_cast<std::uint8_t>(major << 5);
+    if (value < 24) {
+        out.push_back(m | static_cast<std::uint8_t>(value));
+        return;
+    }
+    const unsigned bytes = value <= 0xff ? 1 : value <= 0xffff ? 2 : value <= 0xffffffffULL ? 4 : 8;
+    out.push_back(m | (bytes == 1 ? 24 : bytes == 2 ? 25 : bytes == 4 ? 26 : 27));
+    for (unsigned i = bytes; i > 0; --i) out.push_back(static_cast<std::uint8_t>(value >> ((i - 1) * 8)));
+}
+
+void cbor_int(std::vector<std::uint8_t>& out, std::int64_t value) {
+    if (value >= 0) cbor_head(out, 0, static_cast<std::uint64_t>(value));
+    else cbor_head(out, 1, static_cast<std::uint64_t>(-1 - value));
+}
+
+void cbor_bytes(std::vector<std::uint8_t>& out, std::span<const std::uint8_t> bytes) {
+    cbor_head(out, 2, bytes.size());
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
+
+void cbor_text(std::vector<std::uint8_t>& out, std::string_view text) {
+    cbor_head(out, 3, text.size());
+    out.insert(out.end(), text.begin(), text.end());
+}
+
+// COSE_Key for an EC2 P-256 key with the members RFC 9679 section 3 requires,
+// in bytewise key order: kty 2, crv 1, x, y.
+std::vector<std::uint8_t> cose_key(const std::array<std::uint8_t, kCoordinateBytes>& x,
+                                   const std::array<std::uint8_t, kCoordinateBytes>& y) {
+    std::vector<std::uint8_t> out;
+    cbor_head(out, 5, 4);
+    cbor_int(out, 1); cbor_int(out, 2);
+    cbor_int(out, -1); cbor_int(out, 1);
+    cbor_int(out, -2); cbor_bytes(out, x);
+    cbor_int(out, -3); cbor_bytes(out, y);
+    return out;
+}
+
+constexpr std::int64_t kActxClaim = -65539;
+constexpr std::int64_t kAthClaim = -65540;
+constexpr std::string_view kProofType = "dpop-proof+cwt";
+
 }  // namespace
 
 struct DpopSigner::Key {
     std::unique_ptr<EVP_PKEY, EvpPkeyFree> pkey;
     std::string jwk;
     std::string thumbprint;
+    std::array<std::uint8_t, kCoordinateBytes> x{};
+    std::array<std::uint8_t, kCoordinateBytes> y{};
 };
 
 std::string jwk_thumbprint_hex(std::string_view x_b64url, std::string_view y_b64url) {
@@ -178,6 +249,8 @@ DpopSigner DpopSigner::from_pem(std::string_view pem) {
     key->pkey = std::move(pkey);
     key->jwk = jwk_json(x_text, y_text);
     key->thumbprint = jwk_thumbprint_hex(x_text, y_text);
+    key->x = x_bytes;
+    key->y = y_bytes;
     DpopSigner signer;
     signer.key_ = std::move(key);
     return signer;
@@ -234,43 +307,109 @@ std::string DpopSigner::sign(const Resource& resource, std::int64_t iat, std::st
     signing_input.push_back('.');
     signing_input += base64url(payload);
 
-    std::unique_ptr<EVP_MD_CTX, MdCtxFree> ctx(EVP_MD_CTX_new());
-    if (!ctx || EVP_DigestSignInit(ctx.get(), nullptr, EVP_sha256(), nullptr, key_->pkey.get()) != 1) {
-        throw AuthorizationError("DPoP signature could not be initialised");
-    }
-    std::size_t der_size = 0;
-    const auto* input = reinterpret_cast<const unsigned char*>(signing_input.data());
-    if (EVP_DigestSign(ctx.get(), nullptr, &der_size, input, signing_input.size()) != 1) throw AuthorizationError("DPoP signature failed");
-    std::vector<unsigned char> der(der_size);
-    if (EVP_DigestSign(ctx.get(), der.data(), &der_size, input, signing_input.size()) != 1) throw AuthorizationError("DPoP signature failed");
-    const unsigned char* der_ptr = der.data();
-    std::unique_ptr<ECDSA_SIG, EcdsaSigFree> sig(d2i_ECDSA_SIG(nullptr, &der_ptr, static_cast<long>(der_size)));
-    if (!sig) throw AuthorizationError("DPoP signature could not be decoded");
-    std::array<std::uint8_t, 2 * kCoordinateBytes> raw{};
-    if (BN_bn2binpad(ECDSA_SIG_get0_r(sig.get()), raw.data(), kCoordinateBytes) != static_cast<int>(kCoordinateBytes) ||
-        BN_bn2binpad(ECDSA_SIG_get0_s(sig.get()), raw.data() + kCoordinateBytes, kCoordinateBytes) != static_cast<int>(kCoordinateBytes)) {
-        throw AuthorizationError("DPoP signature is not two 32-byte integers");
-    }
+    const auto raw = es256_raw_signature(key_->pkey.get(), std::span(reinterpret_cast<const std::uint8_t*>(signing_input.data()), signing_input.size()));
     signing_input.push_back('.');
     signing_input += base64url(raw);
     return signing_input;
 }
 
-AuthorizationToken encode_dpop_proof(std::string_view jwt, std::uint64_t token_type, DraftVersion draft) {
-    if (jwt.empty() || jwt.size() > 8192) throw AuthorizationError("DPoP proof must contain 1 to 8192 bytes");
+std::string DpopSigner::cose_thumbprint_hex() const {
+    if (!key_) throw AuthorizationError("DPoP signer has no key");
+    const auto key = cose_key(key_->x, key_->y);
+    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(key.data(), key.size(), digest.data());
+    return hex(digest);
+}
+
+std::vector<std::uint8_t> DpopSigner::sign_cwt(const Resource& resource, std::span<const std::uint8_t> cat_token) const {
+    std::array<std::uint8_t, kJtiBytes / 2> cti{};
+    if (RAND_bytes(cti.data(), static_cast<int>(cti.size())) != 1) throw AuthorizationError("DPoP cti could not be generated");
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    return sign_cwt(resource, cat_token, static_cast<std::int64_t>(now), cti);
+}
+
+std::vector<std::uint8_t> DpopSigner::sign_cwt(const Resource& resource, std::span<const std::uint8_t> cat_token,
+                                               std::int64_t iat, std::span<const std::uint8_t> cti) const {
+    if (!key_) throw AuthorizationError("DPoP signer has no key");
+    if (cat_token.empty()) throw AuthorizationError("DPoP proof needs the token it is bound to");
+    if (cti.empty() || cti.size() > 64) throw AuthorizationError("DPoP cti must contain 1 to 64 bytes");
+    const bool setup = resource.action == Action::kClientSetup || resource.action == Action::kServerSetup;
+    const std::int64_t action = setup ? 1 : static_cast<std::int64_t>(resource.action);
+
+    // Protected header: {1 /alg/: -7, 16 /typ/: "dpop-proof+cwt", 14 /kccs/: {8 /cnf/: {1 /COSE_Key/: key}}}.
+    std::vector<std::uint8_t> protected_header;
+    cbor_head(protected_header, 5, 3);
+    cbor_int(protected_header, 1); cbor_int(protected_header, -7);
+    cbor_int(protected_header, 16); cbor_text(protected_header, kProofType);
+    cbor_int(protected_header, 14);
+    cbor_head(protected_header, 5, 1); cbor_int(protected_header, 8);
+    cbor_head(protected_header, 5, 1); cbor_int(protected_header, 1);
+    const auto key = cose_key(key_->x, key_->y);
+    protected_header.insert(protected_header.end(), key.begin(), key.end());
+
+    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> ath{};
+    SHA256(cat_token.data(), cat_token.size(), ath.data());
+
+    // Payload: iat, cti, actx {0 type, 1 action, 2 namespace fields, 3 track name}, ath.
+    const bool has_namespace = !setup && !resource.track_namespace.empty();
+    const bool has_name = !setup && resource.track_name.has_value();
+    std::vector<std::uint8_t> payload;
+    cbor_head(payload, 5, 4);
+    cbor_int(payload, 6); cbor_int(payload, iat);
+    cbor_int(payload, 7); cbor_bytes(payload, cti);
+    cbor_int(payload, kActxClaim);
+    cbor_head(payload, 5, 2 + (has_namespace ? 1 : 0) + (has_name ? 1 : 0));
+    cbor_int(payload, 0); cbor_text(payload, "moqt");
+    cbor_int(payload, 1); cbor_int(payload, action);
+    if (has_namespace) {
+        cbor_int(payload, 2);
+        cbor_head(payload, 4, resource.track_namespace.size());
+        for (const auto& field : resource.track_namespace) {
+            cbor_bytes(payload, std::span(reinterpret_cast<const std::uint8_t*>(field.data()), field.size()));
+        }
+    }
+    if (has_name) {
+        cbor_int(payload, 3);
+        cbor_bytes(payload, std::span(reinterpret_cast<const std::uint8_t*>(resource.track_name->data()), resource.track_name->size()));
+    }
+    cbor_int(payload, kAthClaim); cbor_bytes(payload, ath);
+
+    // Sig_structure: ["Signature1", protected, external_aad, payload].
+    std::vector<std::uint8_t> to_sign;
+    cbor_head(to_sign, 4, 4);
+    cbor_text(to_sign, "Signature1");
+    cbor_bytes(to_sign, protected_header);
+    cbor_bytes(to_sign, {});
+    cbor_bytes(to_sign, payload);
+    const auto raw = es256_raw_signature(key_->pkey.get(), to_sign);
+
+    std::vector<std::uint8_t> out;
+    cbor_head(out, 6, 18);  // COSE_Sign1 tag
+    cbor_head(out, 4, 4);
+    cbor_bytes(out, protected_header);
+    cbor_head(out, 5, 0);
+    cbor_bytes(out, payload);
+    cbor_bytes(out, raw);
+    return out;
+}
+
+AuthorizationToken encode_dpop_proof(std::span<const std::uint8_t> proof, std::uint64_t token_type, DraftVersion draft) {
+    if (proof.empty() || proof.size() > 8192) throw AuthorizationError("DPoP proof must contain 1 to 8192 bytes");
     AuthorizationToken token;
-    token.bytes.reserve(jwt.size() + 10);
+    token.bytes.reserve(proof.size() + 10);
     append_integer(token.bytes, 3, draft);
     append_integer(token.bytes, token_type, draft);
-    token.bytes.insert(token.bytes.end(), jwt.begin(), jwt.end());
+    token.bytes.insert(token.bytes.end(), proof.begin(), proof.end());
     return token;
+}
+
+AuthorizationToken encode_dpop_proof(std::string_view jwt, std::uint64_t token_type, DraftVersion draft) {
+    return encode_dpop_proof(std::span(reinterpret_cast<const std::uint8_t*>(jwt.data()), jwt.size()), token_type, draft);
 }
 
 std::optional<AuthorizationToken> resolve_dpop_proof(const AuthorizationConfig& config,
                                                     const Resource& resource, DraftVersion draft) {
-    if (!config.dpop_signer) return std::nullopt;
-    if (!resolve_authorization(config, resource, draft)) return std::nullopt;
-    return encode_dpop_proof(config.dpop_signer->sign(resource), config.dpop_signer->token_type, draft);
+    return resolve_authorization_and_proof(config, resource, draft).proof;
 }
 
 }  // namespace openmoq::publisher::cat4moq

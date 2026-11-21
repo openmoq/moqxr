@@ -6,7 +6,12 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 
+#include <openssl/sha.h>
+
+#include <array>
 #include <cstring>
+#include <optional>
+#include <span>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -196,6 +201,245 @@ bool test_resolve_dpop_proof_wraps_token_structure() {
     return ok;
 }
 
+
+// draft-ietf-moq-c4m-02 Appendix A.1 ES256 key.
+constexpr const char* kDraftKeyPem =
+    "-----BEGIN EC PRIVATE KEY-----\n"
+    "MDECAQEEIMmvqdhFunUWa1whV2ex1pNOUMPbNuibEnuKYisSD2choAoGCCqGSM49AwEH\n"
+    "-----END EC PRIVATE KEY-----\n";
+
+using Bytes = std::vector<std::uint8_t>;
+
+// Just enough CBOR to walk a proof.
+struct Cbor {
+    std::span<const std::uint8_t> in;
+    std::size_t pos = 0;
+    bool ok = true;
+
+    int head(std::uint64_t& value) {
+        if (pos >= in.size()) { ok = false; return -1; }
+        const auto b = in[pos++];
+        const int info = b & 0x1f;
+        if (info < 24) { value = info; return b >> 5; }
+        const int n = info == 24 ? 1 : info == 25 ? 2 : info == 26 ? 4 : info == 27 ? 8 : -1;
+        if (n < 0 || pos + n > in.size()) { ok = false; return -1; }
+        value = 0;
+        for (int i = 0; i < n; ++i) value = (value << 8) | in[pos++];
+        return b >> 5;
+    }
+    std::int64_t integer() {
+        std::uint64_t v = 0;
+        const int m = head(v);
+        if (m == 0) return static_cast<std::int64_t>(v);
+        if (m == 1) return -1 - static_cast<std::int64_t>(v);
+        ok = false;
+        return 0;
+    }
+    Bytes bytes() {
+        std::uint64_t v = 0;
+        if (head(v) != 2 || pos + v > in.size()) { ok = false; return {}; }
+        Bytes out(in.begin() + pos, in.begin() + pos + v);
+        pos += v;
+        return out;
+    }
+    std::string text() {
+        std::uint64_t v = 0;
+        if (head(v) != 3 || pos + v > in.size()) { ok = false; return {}; }
+        std::string out(in.begin() + pos, in.begin() + pos + v);
+        pos += v;
+        return out;
+    }
+    std::uint64_t map() { std::uint64_t v = 0; if (head(v) != 5) ok = false; return v; }
+    std::uint64_t array() { std::uint64_t v = 0; if (head(v) != 4) ok = false; return v; }
+};
+
+struct ParsedProof {
+    bool ok = false;
+    Bytes protected_header, payload, signature, x, y, cti, ath;
+    std::int64_t alg = 0, iat = 0, action = -1;
+    std::string typ, type;
+    std::vector<Bytes> ns;
+    std::optional<Bytes> track;
+    std::vector<std::int64_t> payload_labels;
+};
+
+ParsedProof parse_proof(std::span<const std::uint8_t> bytes) {
+    ParsedProof out;
+    Cbor c{bytes};
+    std::uint64_t tag = 0;
+    if (c.head(tag) != 6 || tag != 18 || c.array() != 4) return out;
+    out.protected_header = c.bytes();
+    if (c.map() != 0) return out;
+    out.payload = c.bytes();
+    out.signature = c.bytes();
+    if (!c.ok || c.pos != bytes.size()) return out;
+
+    Cbor h{out.protected_header};
+    if (h.map() != 3) return out;
+    for (int i = 0; i < 3; ++i) {
+        const auto label = h.integer();
+        if (label == 1) out.alg = h.integer();
+        else if (label == 16) out.typ = h.text();
+        else if (label == 14) {
+            if (h.map() != 1 || h.integer() != 8 || h.map() != 1 || h.integer() != 1 || h.map() != 4) return out;
+            if (h.integer() != 1 || h.integer() != 2 || h.integer() != -1 || h.integer() != 1) return out;
+            if (h.integer() != -2) return out;
+            out.x = h.bytes();
+            if (h.integer() != -3) return out;
+            out.y = h.bytes();
+        } else return out;
+    }
+    if (!h.ok || h.pos != out.protected_header.size()) return out;
+
+    Cbor p{out.payload};
+    const auto members = p.map();
+    for (std::uint64_t i = 0; i < members; ++i) {
+        const auto label = p.integer();
+        out.payload_labels.push_back(label);
+        if (label == 6) out.iat = p.integer();
+        else if (label == 7) out.cti = p.bytes();
+        else if (label == -65540) out.ath = p.bytes();
+        else if (label == -65539) {
+            const auto fields = p.map();
+            for (std::uint64_t f = 0; f < fields; ++f) {
+                const auto key = p.integer();
+                if (key == 0) out.type = p.text();
+                else if (key == 1) out.action = p.integer();
+                else if (key == 2) {
+                    const auto n = p.array();
+                    for (std::uint64_t k = 0; k < n; ++k) out.ns.push_back(p.bytes());
+                } else if (key == 3) out.track = p.bytes();
+                else return out;
+            }
+        } else return out;
+    }
+    out.ok = p.ok && p.pos == out.payload.size();
+    return out;
+}
+
+std::string as_string(const Bytes& b) { return std::string(b.begin(), b.end()); }
+
+// The COSE Sig_structure the proof signs.
+std::string sig_structure(const ParsedProof& proof) {
+    auto bstr = [](const Bytes& b) {
+        std::string out;
+        if (b.size() < 24) out.push_back(static_cast<char>(0x40 | b.size()));
+        else if (b.size() < 256) { out.push_back(static_cast<char>(0x58)); out.push_back(static_cast<char>(b.size())); }
+        else { out.push_back(static_cast<char>(0x59)); out.push_back(static_cast<char>(b.size() >> 8)); out.push_back(static_cast<char>(b.size())); }
+        out.append(b.begin(), b.end());
+        return out;
+    };
+    return std::string("\x84\x6aSignature1", 12) + bstr(proof.protected_header) + std::string("\x40", 1) + bstr(proof.payload);
+}
+
+std::string hex_of(const Bytes& b) {
+    static constexpr char d[] = "0123456789abcdef";
+    std::string out;
+    for (auto v : b) { out.push_back(d[v >> 4]); out.push_back(d[v & 15]); }
+    return out;
+}
+
+bool test_cose_thumbprint_matches_draft_vector() {
+    const auto signer = DpopSigner::from_pem(kDraftKeyPem);
+    return expect(signer.cose_thumbprint_hex() == "750ca40795ab23e51a75dc76fa12c052f6f6c57ba8a732337b91f096592b6ef6",
+                  "ckt matches the draft section 4.2.1 value for the Appendix A key");
+}
+
+bool test_cwt_proof_contents_and_signature() {
+    const auto signer = DpopSigner::from_pem(kDraftKeyPem);
+    const Bytes token = {0xd1, 0x84, 0x01, 0x02, 0x03};
+    const Resource resource{Action::kSubscribe, {"cdn", "example.com"}, std::string("/sports/live")};
+    const Bytes cti = {0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18};
+    const auto bytes = signer.sign_cwt(resource, token, 1749999000, cti);
+    const auto proof = parse_proof(bytes);
+    bool ok = expect(proof.ok, "proof is a tagged COSE_Sign1 with the expected structure");
+    if (!proof.ok) return false;
+    ok &= expect(proof.alg == -7 && proof.typ == "dpop-proof+cwt", "ES256 and typ dpop-proof+cwt");
+    ok &= expect(hex_of(proof.x) == "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6" &&
+                 hex_of(proof.y) == "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299",
+                 "kccs carries the public COSE_Key");
+    ok &= expect(proof.iat == 1749999000 && proof.cti == cti, "iat and cti");
+    ok &= expect((proof.payload_labels == std::vector<std::int64_t>{6, 7, -65539, -65540}), "claim order iat, cti, actx, ath");
+    ok &= expect(proof.type == "moqt" && proof.action == 4, "actx type moqt and action SUBSCRIBE");
+    ok &= expect(proof.ns.size() == 2 && as_string(proof.ns[0]) == "cdn" && as_string(proof.ns[1]) == "example.com", "namespace fields");
+    ok &= expect(proof.track && as_string(*proof.track) == "/sports/live", "track name");
+    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(token.data(), token.size(), digest.data());
+    ok &= expect(proof.ath == Bytes(digest.begin(), digest.end()), "ath is SHA-256 of the token");
+    const auto input = sig_structure(proof);
+    ok &= expect(verify_es256(kDraftKeyPem, input, proof.signature), "signature verifies over the Sig_structure");
+    return ok;
+}
+
+bool test_cwt_setup_proof_uses_code_1_and_omits_resource() {
+    const auto signer = DpopSigner::from_pem(kDraftKeyPem);
+    const Bytes token = {0x01};
+    const Bytes cti = {1, 2, 3, 4};
+    bool ok = true;
+    for (const auto action : {Action::kClientSetup, Action::kServerSetup}) {
+        const auto proof = parse_proof(signer.sign_cwt({action, {"ignored"}, std::string("ignored")}, token, 1, cti));
+        ok &= expect(proof.ok && proof.action == 1 && proof.ns.empty() && !proof.track, "SETUP is action 1 with no namespace or track");
+    }
+    const auto ns_only = parse_proof(signer.sign_cwt({Action::kPublishNamespace, {"live"}, std::nullopt}, token, 1, cti));
+    ok &= expect(ns_only.ok && ns_only.action == 2 && ns_only.ns.size() == 1 && !ns_only.track, "PUBLISH_NAMESPACE has a namespace and no track");
+    const auto tracks = parse_proof(signer.sign_cwt({Action::kSubscribeTracks, {"live"}, std::nullopt}, token, 1, cti));
+    ok &= expect(tracks.ok && tracks.action == 9, "SUBSCRIBE_TRACKS is action 9");
+    return ok;
+}
+
+bool test_cwt_proof_rejects_bad_inputs() {
+    const auto signer = DpopSigner::from_pem(kDraftKeyPem);
+    const Resource resource{Action::kPublish, {"live"}, std::string("v")};
+    const Bytes token = {1};
+    bool ok = true;
+    try { signer.sign_cwt(resource, {}, 1, Bytes{1}); ok = expect(false, "empty token refused"); } catch (const AuthorizationError&) {}
+    try { signer.sign_cwt(resource, token, 1, {}); ok = expect(false, "empty cti refused"); } catch (const AuthorizationError&) {}
+    return ok;
+}
+
+bool test_c4m02_credential_gets_cwt_proof_bound_to_its_token() {
+    AuthorizationConfig config;
+    config.setup_credential = Credential{.cwt = {0xd1, 0x01}, .profile = Profile::kC4m02};
+    config.action_credential = Credential{.cwt = {0xd1, 0x02}, .profile = Profile::kC4m02};
+    config.dpop_signer = DpopSigner::from_pem(kDraftKeyPem);
+    const Resource resource{Action::kPublish, {"live"}, std::string("video")};
+    const auto resolved = resolve_authorization_and_proof(config, resource, DraftVersion::kDraft18);
+    bool ok = expect(resolved.token && resolved.token->bytes[1] == 1, "C4M-02 credential is token type 1");
+    ok &= expect(resolved.proof && resolved.proof->bytes[1] == 17, "proof is token type 17");
+    if (!resolved.proof) return false;
+    const auto proof = parse_proof(std::span(resolved.proof->bytes).subspan(2));
+    ok &= expect(proof.ok && proof.action == 6, "proof is a COSE publish proof");
+    const Bytes cwt = {0xd1, 0x02};
+    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(cwt.data(), cwt.size(), digest.data());
+    ok &= expect(proof.ath == Bytes(digest.begin(), digest.end()), "ath covers the credential presented");
+
+    // C4M-01 credentials keep the JWT proof.
+    config.action_credential->profile = Profile::kC4m01;
+    const auto legacy = resolve_authorization_and_proof(config, resource, DraftVersion::kDraft18);
+    ok &= expect(legacy.proof && legacy.proof->bytes.size() > 2 && legacy.proof->bytes[2] == 'e', "C4M-01 credential keeps the JWT proof");
+    return ok;
+}
+
+bool test_provider_called_once_so_ath_matches_the_presented_token() {
+    AuthorizationConfig config;
+    int calls = 0;
+    config.credential_provider = [&calls](const Resource&) {
+        ++calls;
+        return Credential{.cwt = {0xd1, static_cast<std::uint8_t>(calls)}, .profile = Profile::kC4m02};
+    };
+    config.dpop_signer = DpopSigner::from_pem(kDraftKeyPem);
+    const auto resolved = resolve_authorization_and_proof(config, {Action::kPublish, {"live"}, std::string("v")}, DraftVersion::kDraft18);
+    bool ok = expect(calls == 1, "provider consulted once per resolution");
+    if (!resolved.token || !resolved.proof) return expect(false, "token and proof resolved");
+    const auto proof = parse_proof(std::span(resolved.proof->bytes).subspan(2));
+    const Bytes presented(resolved.token->bytes.begin() + 2, resolved.token->bytes.end());
+    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(presented.data(), presented.size(), digest.data());
+    ok &= expect(proof.ok && proof.ath == Bytes(digest.begin(), digest.end()), "proof is bound to the token that was sent");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -208,5 +452,11 @@ int main() {
     ok &= test_json_escaping();
     ok &= test_non_p256_key_refused();
     ok &= test_resolve_dpop_proof_wraps_token_structure();
+    ok &= test_cose_thumbprint_matches_draft_vector();
+    ok &= test_cwt_proof_contents_and_signature();
+    ok &= test_cwt_setup_proof_uses_code_1_and_omits_resource();
+    ok &= test_cwt_proof_rejects_bad_inputs();
+    ok &= test_c4m02_credential_gets_cwt_proof_bound_to_its_token();
+    ok &= test_provider_called_once_so_ath_matches_the_presented_token();
     return ok ? 0 : 1;
 }

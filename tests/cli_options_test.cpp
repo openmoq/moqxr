@@ -101,11 +101,12 @@ int main() {
     ok &= parse_throws({"prog", "--input", "sample.mp4", "--url",
                        "moqt://h/p#msf:ns--catalog&c4m=not@base64"},
                       "credential", "malformed MSF credentials must be rejected");
-    for (const auto* profile : {"c4m-01", "moqx-compat", "red5-cose-compat"}) {
+    for (const auto* profile : {"c4m-01", "c4m-02", "moqx-compat", "red5-cose-compat"}) {
         try {
             const auto options = parse({"prog", "--input", "sample.mp4", "--auth-token-file", auth_file.string(),
                                         "--auth-profile", profile});
             const auto expected_profile = std::string_view(profile) == "c4m-01" ? Profile::kC4m01
+                                        : std::string_view(profile) == "c4m-02" ? Profile::kC4m02
                                         : std::string_view(profile) == "moqx-compat" ? Profile::kMoqxCompat
                                         : Profile::kRed5CoseCompat;
             ok &= expect(options.authorization.setup_credential &&

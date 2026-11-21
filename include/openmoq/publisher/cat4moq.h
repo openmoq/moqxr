@@ -17,6 +17,8 @@ namespace openmoq::publisher::cat4moq {
 enum class Action : int {
     kClientSetup = 0,
     kServerSetup = 1,
+    // C4M-02 has one SETUP action, code 1.
+    kSetup = kServerSetup,
     kPublishNamespace = 2,
     kAnnounce = kPublishNamespace,
     kSubscribeNamespace = 3,
@@ -26,12 +28,15 @@ enum class Action : int {
     kPublish = 6,
     kFetch = 7,
     kTrackStatus = 8,
+    kSubscribeTracks = 9,  // C4M-02 only
 };
 
 inline constexpr std::size_t kMaxCredentialBytes = 16384;
 inline constexpr std::size_t kMaxEncodedCredentialBytes = 65536;
 
-enum class Profile { kC4m01, kMoqxCompat, kRed5CoseCompat };
+// kC4m01: draft-ietf-moq-c4m-01 (token type 1, JWT DPoP proofs).
+// kC4m02: draft-ietf-moq-c4m-02 (token type 1, COSE_Sign1 DPoP proofs).
+enum class Profile { kC4m01, kMoqxCompat, kRed5CoseCompat, kC4m02 };
 
 struct Credential {
     std::vector<std::uint8_t> cwt;
@@ -79,6 +84,17 @@ public:
     std::string sign(const Resource& resource) const;
     std::string sign(const Resource& resource, std::int64_t iat, std::string_view jti) const;
 
+    // draft-ietf-moq-c4m-02 section 4.2 proof: a tagged COSE_Sign1 (ES256) with
+    // typ "dpop-proof+cwt", the public COSE_Key in the kccs header and a claims
+    // set of iat, cti, actx and ath, where ath is the SHA-256 of cat_token
+    // exactly as presented to the relay. The actx and ath labels are the
+    // provisional private-use values -65539 and -65540.
+    std::vector<std::uint8_t> sign_cwt(const Resource& resource, std::span<const std::uint8_t> cat_token) const;
+    std::vector<std::uint8_t> sign_cwt(const Resource& resource, std::span<const std::uint8_t> cat_token,
+                                       std::int64_t iat, std::span<const std::uint8_t> cti) const;
+    // Hex COSE Key Thumbprint (RFC 9679) for the token's cnf "ckt" member.
+    std::string cose_thumbprint_hex() const;
+
 private:
     struct Key;
     std::shared_ptr<const Key> key_;
@@ -107,8 +123,18 @@ std::optional<AuthorizationToken> resolve_authorization(const AuthorizationConfi
 // type; nullopt when no signer is configured or no credential applies.
 std::optional<AuthorizationToken> resolve_dpop_proof(const AuthorizationConfig& config,
                                                     const Resource& resource, DraftVersion draft);
+// The credential and its DPoP proof chosen together, so a provider that mints a
+// new token per call cannot leave the proof's ath bound to a different token.
+// A kC4m02 structured credential gets a COSE proof; any other gets the JWT form.
+struct ResolvedAuthorization {
+    std::optional<AuthorizationToken> token;
+    std::optional<AuthorizationToken> proof;
+};
+ResolvedAuthorization resolve_authorization_and_proof(const AuthorizationConfig& config,
+                                                      const Resource& resource, DraftVersion draft);
 // The Token structure for an already signed proof.
 AuthorizationToken encode_dpop_proof(std::string_view jwt, std::uint64_t token_type, DraftVersion draft);
+AuthorizationToken encode_dpop_proof(std::span<const std::uint8_t> proof, std::uint64_t token_type, DraftVersion draft);
 std::vector<std::uint8_t> decode_credential_bytes(std::span<const std::uint8_t> input);
 std::vector<std::uint8_t> decode_base64_token(std::string_view input, bool url_safe = false);
 

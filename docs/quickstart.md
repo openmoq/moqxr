@@ -479,7 +479,8 @@ Choose a profile that matches the issuer and relay:
 
 | Profile | Token type | Use |
 | --- | --- | --- |
-| `c4m-01` (default) | 1 | Published C4M-01 credentials and claims; Red5's `cose` profile |
+| `c4m-01` (default) | 1 | Published C4M-01 credentials and claims; Red5's `cose` profile; JWT DPoP proofs |
+| `c4m-02` | 1 | C4M draft 02 credentials (moqx `moqx-issuer`); COSE DPoP proofs |
 | `moqx-compat` | 16 | Current moqx/Catapult credentials; also Red5's `moqx` profile |
 | `red5-cose-compat` | 16 by default | Red5 COSE credentials for relays pinned to `auth.cat.token.type=16` |
 
@@ -504,7 +505,7 @@ Duplicate authorization flags are errors. `--print-msf-urls` omits the `c4m`
 credential. `--auth-dpop-key-file <pem>` (P-256 private key) signs a DPoP proof
 for a `cnf`-bound credential on every SETUP and request, sent as a second
 AUTHORIZATION TOKEN parameter of type `--auth-dpop-token-type` (default 17); it
-requires a credential to bind to. See `examples/auth/README.md` for the proof
+requires a credential to bind to. With `--auth-profile c4m-02` the proof is the draft 02 COSE_Sign1 form (`ath` is the SHA-256 of the credential sent); otherwise it is the draft 01 JWT. See `examples/auth/README.md` for the proof
 format and how to obtain the thumbprint the issuer needs. Every explicitly configured failover endpoint receives the same
 configured credentials, so all endpoints must be intended credential recipients.
 
