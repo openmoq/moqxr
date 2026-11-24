@@ -4240,7 +4240,7 @@ TransportStatus answer_catalog_fetch(
     PeerRequestIdValidator& peer_request_ids,
     std::string_view track_namespace,
     const std::function<std::optional<std::string>(std::uint64_t)>& joined_track,
-    const std::function<std::optional<CatalogFetchObject>()>& catalog_object) {
+    const std::function<std::vector<CatalogFetchObject>()>& catalog_objects) {
     FetchMessage fetch;
     if (!decode_fetch_message(message_bytes, draft, fetch)) {
         return protocol_violation(transport, "received invalid FETCH");
@@ -4282,12 +4282,30 @@ TransportStatus answer_catalog_fetch(
             return reject(kRequestErrorNotSupported, "joining FETCH is only served for the catalog");
         }
     }
-    const std::optional<CatalogFetchObject> object = catalog_object();
-    if (!object.has_value()) {
+    const std::vector<CatalogFetchObject> retained = catalog_objects();
+    if (retained.empty()) {
         return reject(kInvalidRange, "no objects published");
     }
+    // The latest catalog object, and for a standalone FETCH the newest
+    // retained one its range holds: the session keeps the catalog object sent
+    // before the latest too, since a SUBSCRIBE_OK may have reported it as the
+    // Largest Object just before the latest went out.
+    const CatalogFetchObject* object = &retained.back();
     if (standalone) {
-        // The range must hold the catalog object, the only one retained.
+        for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
+            const auto at = std::make_pair(it->group_id, it->object_id);
+            const bool from = std::make_pair(fetch.start_group, fetch.start_object) <= at;
+            const bool to = fetch.end_object == 0 ? it->group_id <= fetch.end_group
+                                                  : at < std::make_pair(fetch.end_group, fetch.end_object);
+            if (from && to) {
+                object = &*it;
+                break;
+            }
+        }
+    }
+    if (standalone) {
+        // The range must hold a retained catalog object; when it holds none,
+        // the latest decides the error.
         const auto location = std::make_pair(object->group_id, object->object_id);
         const bool starts_after = std::make_pair(fetch.start_group, fetch.start_object) > location;
         const bool ends_before = fetch.end_object == 0
@@ -4396,7 +4414,7 @@ TransportStatus serve_track_status_or_fetch(
     std::string_view track_namespace,
     const std::function<std::optional<LargestObject>(const std::string&)>& lookup,
     const std::map<std::uint64_t, std::string>& joinable_subscriptions,
-    const std::function<std::optional<CatalogFetchObject>()>& catalog_object) {
+    const std::function<std::vector<CatalogFetchObject>()>& catalog_objects) {
     if (request_type == 0x0d) {
         return answer_track_status(transport, draft, request_stream_id, message_bytes, peer_request_ids,
                                    track_namespace, lookup);
@@ -4411,7 +4429,7 @@ TransportStatus serve_track_status_or_fetch(
             if (it == joinable_subscriptions.end()) return std::nullopt;
             return it->second;
         },
-        catalog_object);
+        catalog_objects);
 }
 
 // Draft 18 §5.1.1: a subscriber terminates a subscription by sending
@@ -5462,17 +5480,17 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                                         largest_sent ? largest_sent(name) : std::nullopt, false);
                         },
                         joinable_subscriptions,
-                        [&]() -> std::optional<CatalogFetchObject> {
+                        [&]() -> std::vector<CatalogFetchObject> {
                             const openmoq::publisher::CmsfObject* latest = nullptr;
                             for (const auto& object : plan.objects) {
                                 if (object.track_name != "catalog") continue;
                                 if (latest == nullptr || object.group_id > latest->group_id) latest = &object;
                             }
-                            if (latest == nullptr || object_payload(*latest).empty()) return std::nullopt;
+                            if (latest == nullptr || object_payload(*latest).empty()) return {};
                             const auto payload = object_payload(*latest);
-                            return CatalogFetchObject{latest->group_id, latest->object_id,
-                                                      {payload.begin(), payload.end()},
-                                                      publisher_priorities.effective("catalog")};
+                            return {CatalogFetchObject{latest->group_id, latest->object_id,
+                                                       {payload.begin(), payload.end()},
+                                                       publisher_priorities.effective("catalog")}};
                         });
                     if (!response_status.ok) return response_status;
                     continue;
@@ -8015,7 +8033,7 @@ TransportStatus MoqtSession::send_catalog_objects(
         if (object_published) {
             record_published_object("catalog", object.group_id, object.object_id, object.payload.size());
             std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
-            last_catalog_object_ = object;
+            retain_sent_catalog_locked(object);
         }
     }
     return TransportStatus::success();
@@ -8613,6 +8631,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
     {
         std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
         last_catalog_object_.reset();
+        previous_catalog_object_.reset();
     }
     catalog_track_alias_known_ = false;
     remember_catalog_delivery_timeouts({});
@@ -9414,13 +9433,14 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                                         live_largest_object(largest_object_by_track, name), false);
                         },
                         joinable_subscriptions,
-                        [&]() -> std::optional<CatalogFetchObject> {
-                            std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
-                            if (!last_catalog_object_) return std::nullopt;
-                            const auto& object = *last_catalog_object_;
-                            return CatalogFetchObject{object.group_id, object.object_id,
-                                                      {object.payload.begin(), object.payload.end()},
-                                                      track_priorities_.effective("catalog")};
+                        [&]() -> std::vector<CatalogFetchObject> {
+                            std::vector<CatalogFetchObject> out;
+                            for (const auto& object : retained_catalog_objects()) {
+                                out.push_back(CatalogFetchObject{object.group_id, object.object_id,
+                                                                 {object.payload.begin(), object.payload.end()},
+                                                                 track_priorities_.effective("catalog")});
+                            }
+                            return out;
                         });
                     if (!response_status.ok) return {response_status, 0};
                     continue;
@@ -9870,6 +9890,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     {
         std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
         last_catalog_object_.reset();
+        previous_catalog_object_.reset();
     }
     catalog_track_alias_known_ = false;
     remember_catalog_delivery_timeouts({});
@@ -11227,13 +11248,14 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                         live_largest_object(largest_object_by_track, name), false);
                         },
                         joinable_subscriptions,
-                        [&]() -> std::optional<CatalogFetchObject> {
-                            std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
-                            if (!last_catalog_object_) return std::nullopt;
-                            const auto& object = *last_catalog_object_;
-                            return CatalogFetchObject{object.group_id, object.object_id,
-                                                      {object.payload.begin(), object.payload.end()},
-                                                      track_priorities_.effective("catalog")};
+                        [&]() -> std::vector<CatalogFetchObject> {
+                            std::vector<CatalogFetchObject> out;
+                            for (const auto& object : retained_catalog_objects()) {
+                                out.push_back(CatalogFetchObject{object.group_id, object.object_id,
+                                                                 {object.payload.begin(), object.payload.end()},
+                                                                 track_priorities_.effective("catalog")});
+                            }
+                            return out;
                         });
                     if (!response_status.ok) return {response_status, 0};
                     continue;
@@ -11943,6 +11965,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
     {
         std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
         last_catalog_object_.reset();
+        previous_catalog_object_.reset();
     }
 
     TransportStatus status = ensure_setup(draft_version);
@@ -12638,13 +12661,14 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                         live_largest_object(largest_object_by_track, name), false);
                         },
                         joinable_subscriptions,
-                        [&]() -> std::optional<CatalogFetchObject> {
-                            std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
-                            if (!last_catalog_object_) return std::nullopt;
-                            const auto& object = *last_catalog_object_;
-                            return CatalogFetchObject{object.group_id, object.object_id,
-                                                      {object.payload.begin(), object.payload.end()},
-                                                      track_priorities_.effective("catalog")};
+                        [&]() -> std::vector<CatalogFetchObject> {
+                            std::vector<CatalogFetchObject> out;
+                            for (const auto& object : retained_catalog_objects()) {
+                                out.push_back(CatalogFetchObject{object.group_id, object.object_id,
+                                                                 {object.payload.begin(), object.payload.end()},
+                                                                 track_priorities_.effective("catalog")});
+                            }
+                            return out;
                         });
                     if (!response_status.ok) return response_status;
                     continue;
@@ -13032,12 +13056,12 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             // out starts at {0, 0} and gets it at its own Location.
             note_largest_live_object(largest_object_by_track, "catalog", catalog.group_id, catalog.object_id);
             std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
-            last_catalog_object_ = openmoq::publisher::CatalogObject{
+            retain_sent_catalog_locked(openmoq::publisher::CatalogObject{
                 .group_id = static_cast<std::uint64_t>(catalog.group_id),
                 .object_id = static_cast<std::uint64_t>(catalog.object_id),
                 .subgroup_id = catalog.subgroup_id,
                 .payload = std::string(catalog.payload.begin(), catalog.payload.end()),
-            };
+            });
         }
         return send_status;
     };
@@ -13928,6 +13952,22 @@ TransportStatus MoqtSession::write_frame(std::uint64_t stream_id,
                                          std::span<const std::uint8_t> frame,
                                          bool fin) {
     return transport_.write_stream(stream_id, frame, fin);
+}
+
+void MoqtSession::retain_sent_catalog_locked(openmoq::publisher::CatalogObject object) {
+    if (last_catalog_object_ && (last_catalog_object_->group_id != object.group_id ||
+                                 last_catalog_object_->object_id != object.object_id)) {
+        previous_catalog_object_ = std::move(*last_catalog_object_);
+    }
+    last_catalog_object_ = std::move(object);
+}
+
+std::vector<openmoq::publisher::CatalogObject> MoqtSession::retained_catalog_objects() const {
+    std::lock_guard<std::mutex> lock(last_catalog_object_mutex_);
+    std::vector<openmoq::publisher::CatalogObject> out;
+    if (previous_catalog_object_) out.push_back(*previous_catalog_object_);
+    if (last_catalog_object_) out.push_back(*last_catalog_object_);
+    return out;
 }
 
 }  // namespace openmoq::publisher::transport
