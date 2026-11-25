@@ -695,8 +695,12 @@ FragmentTiming fragment_timing(const Mp4Box& moof,
         }
     }
 
+    // Sample defaults, in precedence order: the trun entry, then the tfhd default, then the trex default
+    // (ISO 14496-12 8.8.7 and 8.8.12), as in parse_fragment_samples.
     std::uint32_t default_sample_duration = 0;
     std::uint32_t default_sample_flags = 0x02000000U;
+    bool tfhd_duration = false;
+    bool tfhd_flags = false;
     if (const Mp4Box* tfhd = find_child_box(*traf, "tfhd")) {
         const std::uint32_t flags = read_full_box_flags(*tfhd, bytes);
         std::size_t cursor = tfhd->payload.offset + 8;
@@ -708,6 +712,7 @@ FragmentTiming fragment_timing(const Mp4Box& moof,
         }
         if ((flags & 0x000008U) != 0 && cursor + 4 <= bytes.size()) {
             default_sample_duration = read_be32(bytes, cursor);
+            tfhd_duration = true;
             cursor += 4;
         }
         if ((flags & 0x000010U) != 0 && cursor + 4 <= bytes.size()) {
@@ -715,6 +720,7 @@ FragmentTiming fragment_timing(const Mp4Box& moof,
         }
         if ((flags & 0x000020U) != 0 && cursor + 4 <= bytes.size()) {
             default_sample_flags = read_be32(bytes, cursor);
+            tfhd_flags = true;
         }
     }
 
@@ -727,7 +733,12 @@ FragmentTiming fragment_timing(const Mp4Box& moof,
                 if (track_id_from_trex(child, bytes) != track_id) {
                     continue;
                 }
-                default_sample_flags = read_be32_or_zero(bytes, child.payload.offset + 20);
+                if (!tfhd_duration) {
+                    default_sample_duration = read_be32_or_zero(bytes, child.payload.offset + 12);
+                }
+                if (!tfhd_flags) {
+                    default_sample_flags = read_be32_or_zero(bytes, child.payload.offset + 20);
+                }
                 break;
             }
         }
@@ -759,6 +770,11 @@ FragmentTiming fragment_timing(const Mp4Box& moof,
                     sample_duration = read_be32(bytes, cursor);
                     cursor += 4;
                 }
+                // Per-sample fields come in the order duration, size, flags,
+                // composition offset; the size is not needed here.
+                if ((flags & 0x000200U) != 0) {
+                    cursor += 4;
+                }
                 std::uint32_t sample_flags = first_sample_flags_present && index == 0 ? first_sample_flags : default_sample_flags;
                 if ((flags & 0x000400U) != 0 && cursor + 4 <= bytes.size()) {
                     sample_flags = read_be32(bytes, cursor);
@@ -781,9 +797,6 @@ FragmentTiming fragment_timing(const Mp4Box& moof,
                     first_sample_flags = sample_flags;
                 }
                 duration += sample_duration;
-                if ((flags & 0x000200U) != 0) {
-                    cursor += 4;
-                }
                 sample_decode_time += sample_duration;
             }
         }
