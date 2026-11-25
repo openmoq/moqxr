@@ -13,7 +13,9 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <sstream>
@@ -215,6 +217,18 @@ constexpr const char* kLibmoqVideoAltGroupUnsupported =
 // libmoq sends its own PUBLISH and SUBSCRIBE_OK and schedules its own streams.
 constexpr const char* kLibmoqPublisherPrioritiesUnsupported =
     "publisher priorities are not supported by the libmoq publishing backend";
+
+// libmoq builds that backend's catalog itself. A moq5 whose sender takes
+// catalog_revision is given msf_version; an older one always writes MSF-01
+// (version "1"). MSF-02 is the default, so refusing it there like the settings
+// above would refuse every libmoq publish: say so once per process instead.
+void warn_libmoq_msf_version(MsfVersion version) {
+    static std::atomic<bool> warned{false};
+    if (!transport::kLibmoqSelectsMsfRevision && version != MsfVersion::k01 && !warned.exchange(true)) {
+        std::clog << "libmoq: the libmoq publishing backend writes an MSF-01 catalog (version \"1\"); "
+                     "--msf-version 02, the default, does not apply to it\n";
+    }
+}
 #endif
 
 void validate_initial_group_id(const PublisherConfig& config) {
@@ -380,6 +394,7 @@ transport::TransportStatus Publisher::publish(const PreparedPublish& prepared,
         if (config_.publisher_priorities) {
             return transport::TransportStatus::failure(kLibmoqPublisherPrioritiesUnsupported);
         }
+        warn_libmoq_msf_version(config_.msf_version);
         if (config_.media_packaging == MediaPackaging::kLoc || config_.media_packaging == MediaPackaging::kLocmaf ||
             std::any_of(prepared.plan.tracks.begin(), prepared.plan.tracks.end(),
                         [](const auto& track) { return track.packaging == "loc" || track.packaging == "locmaf"; })) {
@@ -581,6 +596,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         if (config_.video_alt_group) {
             return transport::TransportStatus::failure(kLibmoqVideoAltGroupUnsupported);
         }
+        warn_libmoq_msf_version(config_.msf_version);
         if (stdin_input == nullptr) {
             return transport::TransportStatus::failure("live stdin publish requires an input stream");
         }
@@ -618,6 +634,7 @@ transport::TransportStatus Publisher::publish_live(const LiveIngestConfig& inges
         if (config_.initial_group_id != 0) {
             return transport::TransportStatus::failure(kLibmoqInitialGroupIdUnsupported);
         }
+        warn_libmoq_msf_version(config_.msf_version);
         std::vector<LiveSrtCallerRuntimeConfig> runtime_callers;
         runtime_callers.reserve(ingest.srt_callers.size());
         for (const auto& caller : ingest.srt_callers) {
@@ -882,6 +899,7 @@ transport::TransportStatus Publisher::publish_live_objects(const LiveObjectSourc
             return transport::TransportStatus::failure(
                 "await_subscriber_indefinitely is not supported by the libmoq publishing backend");
         }
+        warn_libmoq_msf_version(config_.msf_version);
         for (const auto& track : source.tracks) {
             if (!transport::live_track_has_media_metadata(track)) {
                 return transport::TransportStatus::failure(
