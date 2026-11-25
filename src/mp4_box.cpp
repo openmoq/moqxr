@@ -1115,6 +1115,12 @@ const Mp4Box* find_child_box(const Mp4Box& box, std::string_view type) {
 }
 
 std::span<const std::uint8_t> slice_bytes(std::span<const std::uint8_t> bytes, const ByteSpan& span) {
+    // Spans come from offsets and sizes read out of the input (stco/stsz, trun,
+    // tfhd and trex defaults), so check them here: std::span::subspan does not.
+    if (span.offset > bytes.size() || span.size > bytes.size() - span.offset) {
+        throw std::runtime_error("MP4 byte range " + std::to_string(span.offset) + "+" + std::to_string(span.size) +
+                                 " lies past the end of the input (" + std::to_string(bytes.size()) + " bytes)");
+    }
     return bytes.subspan(span.offset, span.size);
 }
 
