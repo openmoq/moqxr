@@ -4085,7 +4085,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         const NowFunction& now_function,
                                         std::uint64_t first_request_id = 2,
                                         std::optional<std::uint64_t> subscribe_tracks_request_id = std::nullopt,
-                                        const openmoq::publisher::TrackPublisherPriorities& publisher_priorities = {});
+                                        const openmoq::publisher::TrackProperties& track_properties = {});
 
 using PublishedObjectSink =
     std::function<void(const std::string&, std::uint64_t group_id, std::uint64_t object_id, std::size_t)>;
@@ -4115,14 +4115,14 @@ std::vector<std::uint8_t> encode_subscribe_ok_with_largest(
     std::uint64_t request_id,
     std::uint64_t track_alias,
     const std::optional<std::pair<std::size_t, std::size_t>>& largest,
-    std::optional<std::uint8_t> default_publisher_priority = std::nullopt) {
+    std::span<const openmoq::publisher::ObjectProperty> track_properties = {}) {
     return encode_subscribe_ok_message(draft,
                                        request_id,
                                        track_alias,
                                        largest ? largest->first : 0,
                                        largest ? largest->second : 0,
                                        largest.has_value(),
-                                       default_publisher_priority);
+                                       track_properties);
 }
 
 
@@ -4800,7 +4800,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     // accepted, so draft-16's strictly sequential ids continue
                                     // across the hand-off instead of restarting at 1.
                                     PeerRequestIdValidator* inherited_peer_request_ids = nullptr,
-                                    const openmoq::publisher::TrackPublisherPriorities& publisher_priorities = {}) {
+                                    const openmoq::publisher::TrackProperties& track_properties = {}) {
     std::vector<std::uint8_t> buffer = std::move(pending_control_bytes);
     pending_control_bytes.clear();
     std::set<std::uint64_t> completed_request_ids;
@@ -5145,7 +5145,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     .publisher_priority =
                         priority_scheduler_internal::publisher_priority_for_request(
                             existing_request_id,
-                            publisher_priorities.effective(dormant_it->second.track.name)),
+                            track_properties.effective(dormant_it->second.track.name)),
                     .scheduling_round = 0,
                     .forward_paused_by_update =
                         uses_priority_scheduler(draft) &&
@@ -5191,7 +5191,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             const auto status = publish_selected_tracks(transport, control_stream_id, plan, loop_state,
                 matching_tracks, peer_max_request_id, track_namespace, authorization_token, paced,
                 pending_control_bytes, stream_ids, dormant_published_tracks, nullptr, now_function,
-                subscribe_tracks_next_request_id, subscribe_tracks_request_id, publisher_priorities);
+                subscribe_tracks_next_request_id, subscribe_tracks_request_id, track_properties);
             if (status.ok) subscribe_tracks_next_request_id += matching_tracks.size() * 2;
             return status;
             };
@@ -5322,7 +5322,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                                                                 subscribe.request_id,
                                                                                 track_it->second.alias,
                                                                                 largest,
-                                                                                publisher_priorities.signalled(
+                                                                                track_properties.signalled(
                                                                                     subscribe.track_name)),
                                                false);
                     if (!ok_status.ok) {
@@ -5350,7 +5350,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         .publisher_priority =
                             priority_scheduler_internal::publisher_priority_for_request(
                                 subscribe.request_id,
-                                publisher_priorities.effective(track_it->second.name)),
+                                track_properties.effective(track_it->second.name)),
                         .scheduling_round = 0,
                         .forward_paused_by_update =
                             uses_priority_scheduler(draft) &&
@@ -5472,7 +5472,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             const auto payload = object_payload(*latest);
                             return CatalogFetchObject{latest->group_id, latest->object_id,
                                                       {payload.begin(), payload.end()},
-                                                      publisher_priorities.effective("catalog")};
+                                                      track_properties.effective("catalog")};
                         });
                     if (!response_status.ok) return response_status;
                     continue;
@@ -5580,7 +5580,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                             now_function,
                                             subscribe_tracks_next_request_id,
                                             subscribe_tracks.request_id,
-                                            publisher_priorities);
+                                            track_properties);
                 if (!publish_status.ok) {
                     return publish_status;
                 }
@@ -5919,7 +5919,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             .publisher_priority =
                                 priority_scheduler_internal::publisher_priority_for_request(
                                     remapped_request_id,
-                                    publisher_priorities.effective(dormant_it->second.track.name)),
+                                    track_properties.effective(dormant_it->second.track.name)),
                             .scheduling_round = 0,
                             .forward_paused_by_update =
                                 uses_priority_scheduler(draft) &&
@@ -6080,7 +6080,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                                                    0,
                                                                    0,
                                                                    false,
-                                                                   publisher_priorities.signalled(
+                                                                   track_properties.signalled(
                                                                        subscribe.track_name)),
                                        false);
             if (!write_status.ok) {
@@ -6103,7 +6103,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                 .pending_request_bytes = {},
                 .publisher_priority =
                     priority_scheduler_internal::publisher_priority_for_request(
-                        request_id, publisher_priorities.effective(track_it->second.name)),
+                        request_id, track_properties.effective(track_it->second.name)),
                 .scheduling_round = 0,
                 .forward_paused_by_update =
                     uses_priority_scheduler(draft) &&
@@ -6738,7 +6738,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                          std::vector<std::uint8_t>& pending_control_bytes,
                                          std::map<std::uint64_t, std::uint64_t>& publish_stream_ids,
                                          const NowFunction& now_function,
-                                         const openmoq::publisher::TrackPublisherPriorities& publisher_priorities = {}) {
+                                         const openmoq::publisher::TrackProperties& track_properties = {}) {
     std::map<std::string, std::uint64_t> request_id_by_track;
     std::map<std::string, PublishedTrack> tracks_by_name;
     std::map<std::uint64_t, PublishOk> publish_ok_by_request_id;
@@ -6764,7 +6764,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
             .content_exists = track.content_exists,
             .authorization_token = track_auth.token,
             .dpop_proof = track_auth.proof,
-            .default_publisher_priority = publisher_priorities.signalled(track.name),
+            .track_properties = track_properties.signalled(track.name),
         };
         TransportStatus status = TransportStatus::success();
         if (uses_request_streams(plan.draft.version)) {
@@ -7024,7 +7024,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                 now_function,
                 &object_published,
                 {.subscriber = publish_ok_it->second.subscriber_priority,
-                 .publisher = publisher_priorities.effective(source_object.track_name)});
+                 .publisher = track_properties.effective(source_object.track_name)});
             const TransportStatus event_status =
                 dispatch_peer_stopped_media_streams(transport,
                                                     sender_by_track);
@@ -7194,7 +7194,7 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                      authorization_token,
                                      now_function,
                                      &peer_request_ids,
-                                     publisher_priorities);
+                                     track_properties);
         if (!status.ok) {
             return status;
         }
@@ -7236,7 +7236,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         const NowFunction& now_function,
                                         std::uint64_t first_request_id,
                                         std::optional<std::uint64_t> subscribe_tracks_request_id,
-                                        const openmoq::publisher::TrackPublisherPriorities& publisher_priorities) {
+                                        const openmoq::publisher::TrackProperties& track_properties) {
     if (tracks.empty()) {
         return TransportStatus::success();
     }
@@ -7266,7 +7266,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
             .authorization_token = track_auth.token,
             .dpop_proof = track_auth.proof,
             .subscribe_tracks_request_id = subscribe_tracks_request_id,
-            .default_publisher_priority = publisher_priorities.signalled(track.name),
+            .track_properties = track_properties.signalled(track.name),
         };
         TransportStatus status = TransportStatus::success();
         if (uses_request_streams(plan.draft.version)) {
@@ -7389,7 +7389,7 @@ TransportStatus publish_selected_tracks(PublisherTransport& transport,
                 now_function,
                 &object_published,
                 {.subscriber = publish_ok_it->second.subscriber_priority,
-                 .publisher = publisher_priorities.effective(source_object.track_name)});
+                 .publisher = track_properties.effective(source_object.track_name)});
             const TransportStatus event_status =
                 dispatch_peer_stopped_media_streams(transport,
                                                     sender_by_track);
@@ -8005,7 +8005,7 @@ TransportStatus MoqtSession::send_catalog_objects(
             delivery_timeouts,
             now_function_,
             &object_published,
-            {.subscriber = 128, .publisher = track_priorities_.effective("catalog")});
+            {.subscriber = 128, .publisher = track_properties_.effective("catalog")});
         if (streams_opened != nullptr) {
             *streams_opened += catalog_sender.stream_count();
         }
@@ -8079,7 +8079,7 @@ TransportStatus MoqtSession::serve_catalog_fill(openmoq::publisher::DraftVersion
     }
     std::vector<std::uint8_t> bytes = encode_fetch_header(draft_version, subscribe.request_id);
     const std::vector<std::uint8_t> fetch_object = encode_fetch_object(
-        draft_version, object->group_id, object->object_id, track_priorities_.effective("catalog"),
+        draft_version, object->group_id, object->object_id, track_properties_.effective("catalog"),
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(object->payload.data()),
                                       object->payload.size()));
     bytes.insert(bytes.end(), fetch_object.begin(), fetch_object.end());
@@ -8157,6 +8157,20 @@ TransportStatus MoqtSession::connect(const EndpointConfig& endpoint, const TlsCo
     return TransportStatus::success();
 }
 
+void MoqtSession::record_loc_decoder_configs(
+    const std::vector<openmoq::publisher::TrackDescription>& tracks,
+    const std::vector<openmoq::publisher::TrackInitialization>& initializations) {
+    track_properties_.clear_decoder_configs();
+    if (msf_version_ != MsfVersion::k02) return;
+    for (const auto& track : tracks) {
+        if (track.packaging != "loc") continue;
+        const auto init = std::find_if(initializations.begin(), initializations.end(),
+                                       [&](const auto& item) { return item.track_name == track.track_name; });
+        if (init == initializations.end()) continue;
+        track_properties_.set_decoder_config(track.track_name, track.handler_type == "vide", init->codec_payload);
+    }
+}
+
 TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan) try {
     try {
         for (const auto& track : plan.tracks) {
@@ -8185,9 +8199,10 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
         return TransportStatus::failure("transport is not connected");
     }
     for (const auto& track : plan.tracks) {
-        track_priorities_.assign(track.track_name,
+        track_properties_.assign(track.track_name,
                                  openmoq::publisher::track_kind(track.track_name, track.handler_type));
     }
+    record_loc_decoder_configs(plan.tracks, plan.track_initializations);
 
     TransportStatus status = ensure_setup(plan.draft.version);
     if (!status.ok) {
@@ -8268,7 +8283,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
             pending_control_bytes_,
             publish_stream_id_by_request_id_,
             now_function_,
-            track_priorities_);
+            track_properties_);
         if (status.ok && uses_request_streams(plan.draft.version) && !loop_state.enabled) {
             namespace_stream_open_ = false;
         }
@@ -8301,7 +8316,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                              now_function_,
                                              2,
                                              std::nullopt,
-                                             track_priorities_);
+                                             track_properties_);
             if (!status.ok) {
                 return status;
             }
@@ -8329,7 +8344,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                        track_authorization,
                                        now_function_,
                                        nullptr,
-                                       track_priorities_);
+                                       track_properties_);
         }
     }
 
@@ -8362,7 +8377,7 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
                                track_authorization,
                                now_function_,
                                nullptr,
-                               track_priorities_);
+                               track_properties_);
 } catch (const cat4moq::AuthorizationError& error) {
     return TransportStatus::failure(error.what());
 }
@@ -8669,7 +8684,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         return TransportStatus::failure(live_srt_internal::no_srt_tracks_message(media_packaging_));
     }
     for (const auto& track : tracks) {
-        track_priorities_.assign(track.track_name,
+        track_properties_.assign(track.track_name,
                                  openmoq::publisher::track_kind(track.track_name, track.handler_type));
     }
 
@@ -8692,6 +8707,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
         srt_manager.join();
         return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
     }
+    record_loc_decoder_configs(tracks, live_catalog.track_initializations);
 
     std::thread srt_join_thread([&srt_manager, queue]() {
         srt_manager.join();
@@ -9026,7 +9042,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                 {.subscriber = subscriber_priority_for_track(
                                      active_subscriptions,
                                      fragment.track_name),
-                                 .publisher = track_priorities_.effective(fragment.track_name)},
+                                 .publisher = track_properties_.effective(fragment.track_name)},
                         };
                     },
                     [&]() {
@@ -9149,7 +9165,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                 .content_exists = largest_object_by_track.contains(name),
                 .authorization_token = authorization.token, .dpop_proof = authorization.proof,
                 .subscribe_tracks_request_id = subscribe_tracks_request_id,
-                .default_publisher_priority = track_priorities_.signalled(name),
+                .track_properties = track_properties_.signalled(name),
             };
             if (const auto largest = largest_sent_object(name)) {
                 message.largest_group_id = largest->first;
@@ -9420,7 +9436,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                             const auto& object = *last_catalog_object_;
                             return CatalogFetchObject{object.group_id, object.object_id,
                                                       {object.payload.begin(), object.payload.end()},
-                                                      track_priorities_.effective("catalog")};
+                                                      track_properties_.effective("catalog")};
                         });
                     if (!response_status.ok) return {response_status, 0};
                     continue;
@@ -9490,7 +9506,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                             draft_version,
                             subscribe.request_id,
                             track_it->second,
-                            largest, track_priorities_.signalled(subscribe.track_name)),
+                            largest, track_properties_.signalled(subscribe.track_name)),
                         false);
                 if (!response_status.ok) {
                     return {response_status, 0};
@@ -9617,7 +9633,7 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                     auto ws = transport_.write_stream(control_stream_id_,
                         encode_subscribe_ok_message(draft_version, subscribe.request_id,
                                                     track_it->second, 0, 0, false,
-                                                    track_priorities_.signalled(subscribe.track_name)), false);
+                                                    track_properties_.signalled(subscribe.track_name)), false);
                     if (!ws.ok) {
                         return {ws, 0};
                     }
@@ -9927,7 +9943,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
         return TransportStatus::failure("no tracks found in moov box");
     }
     for (const auto& track : tracks) {
-        track_priorities_.assign(track.track_name,
+        track_properties_.assign(track.track_name,
                                  openmoq::publisher::track_kind(track.track_name, track.handler_type));
     }
 
@@ -9988,6 +10004,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
     } catch (const std::runtime_error& error) {
         return TransportStatus::failure(std::string("live catalog build failed: ") + error.what());
     }
+    record_loc_decoder_configs(tracks, live_catalog.track_initializations);
 
     // Phase 2: Publish namespace + PUBLISH all tracks
     NamespaceMessage namespace_message{
@@ -10084,7 +10101,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 .content_exists = true,
                 .authorization_token = track_auth.token,
                 .dpop_proof = track_auth.proof,
-                .default_publisher_priority = track_priorities_.signalled(track.track_name),
+                .track_properties = track_properties_.signalled(track.track_name),
             };
             status = transport_.write_stream(control_stream_id_, encode_track_message(track_msg), false);
             if (!status.ok) {
@@ -10665,7 +10682,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                      published_settings_it != published_track_settings.end()
                          ? published_settings_it->second.subscriber_priority
                          : 128),
-                 .publisher = track_priorities_.effective(fragment.track_name)});
+                 .publisher = track_properties_.effective(fragment.track_name)});
             const TransportStatus post_write_event_status =
                 dispatch_peer_stops();
             if (!write_status.ok) {
@@ -10731,7 +10748,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                 .authorization_token = std::move(track_auth.token),
                 .dpop_proof = std::move(track_auth.proof),
                 .subscribe_tracks_request_id = subscribe_tracks_request_id,
-                .default_publisher_priority = track_priorities_.signalled(track_name),
+                .track_properties = track_properties_.signalled(track_name),
             };
             PublishOk publish_ok;
             std::uint64_t track_stream_id = 0;
@@ -11094,7 +11111,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                 encode_subscribe_ok_with_largest(draft_version,
                                                                                  subscribe.request_id,
                                                                                  track_it->second,
-                                                                                 largest, track_priorities_.signalled(subscribe.track_name)),
+                                                                                 largest, track_properties_.signalled(subscribe.track_name)),
                                                 false);
                     if (!write_status.ok) {
                         return {write_status, 0};
@@ -11233,7 +11250,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                             const auto& object = *last_catalog_object_;
                             return CatalogFetchObject{object.group_id, object.object_id,
                                                       {object.payload.begin(), object.payload.end()},
-                                                      track_priorities_.effective("catalog")};
+                                                      track_properties_.effective("catalog")};
                         });
                     if (!response_status.ok) return {response_status, 0};
                     continue;
@@ -11433,7 +11450,7 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                     auto ws = transport_.write_stream(control_stream_id_,
                         encode_subscribe_ok_message(draft_version, subscribe.request_id,
                                                     track_it->second, 0, 0, false,
-                                                    track_priorities_.signalled(subscribe.track_name)), false);
+                                                    track_properties_.signalled(subscribe.track_name)), false);
                     if (!ws.ok) {
                         return {ws, 0};
                     }
@@ -11889,7 +11906,16 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
         return TransportStatus::failure("live object source has no object reader");
     }
     for (const auto& track : source.tracks) {
-        track_priorities_.assign(track.track_name, live_track_kind(track));
+        track_properties_.assign(track.track_name, live_track_kind(track));
+    }
+    // MSF-02 section 12.2, as record_loc_decoder_configs: a LOC source's
+    // init_data is the track's decoder configuration.
+    track_properties_.clear_decoder_configs();
+    for (const auto& track : source.tracks) {
+        if (msf_version_ == MsfVersion::k02 && track.packaging == openmoq::publisher::LivePackaging::kLoc) {
+            track_properties_.set_decoder_config(
+                track.track_name, track.media_type == openmoq::publisher::LiveMediaType::kVideo, track.init_data);
+        }
     }
 
     std::set<std::string> loc_tracks;
@@ -12024,7 +12050,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             .content_exists = true,
             .authorization_token = track_auth.token,
             .dpop_proof = track_auth.proof,
-            .default_publisher_priority = track_priorities_.signalled(track_name),
+            .track_properties = track_properties_.signalled(track_name),
         };
         const TransportStatus write_status =
             transport_.write_stream(control_stream_id_, encode_track_message(track_message), false);
@@ -12086,7 +12112,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             .authorization_token = track_auth.token,
             .dpop_proof = track_auth.proof,
             .subscribe_tracks_request_id = subscribe_tracks_request_id,
-            .default_publisher_priority = track_priorities_.signalled(track_name),
+            .track_properties = track_properties_.signalled(track_name),
         };
         PublishOk publish_ok;
         std::uint64_t stream_id = 0;
@@ -12203,7 +12229,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                     encode_subscribe_ok_with_largest(draft_version,
                                                                      subscribe.request_id,
                                                                      track_it->second,
-                                                                     largest, track_priorities_.signalled(subscribe.track_name)),
+                                                                     largest, track_properties_.signalled(subscribe.track_name)),
                                     false);
         if (!write_status.ok) {
             return write_status;
@@ -12644,7 +12670,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                             const auto& object = *last_catalog_object_;
                             return CatalogFetchObject{object.group_id, object.object_id,
                                                       {object.payload.begin(), object.payload.end()},
-                                                      track_priorities_.effective("catalog")};
+                                                      track_properties_.effective("catalog")};
                         });
                     if (!response_status.ok) return response_status;
                     continue;
@@ -12928,7 +12954,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             }
             const std::uint64_t alias = next_alias++;
             alias_by_track.emplace(name, alias);
-            track_priorities_.assign(name, live_track_kind(track));
+            track_properties_.assign(name, live_track_kind(track));
             if (!uses_request_streams(draft_version)) {
                 return preannounce_tracks_ ? preannounce_track(name, alias) : TransportStatus::success();
             }
@@ -13020,7 +13046,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
             &object_published,
             {.subscriber = subscriber_priority_for_track(
                  active_subscriptions, "catalog"),
-             .publisher = track_priorities_.effective("catalog")},
+             .publisher = track_properties_.effective("catalog")},
             serve_while_blocked);
         if (send_status.ok && object_published) {
             record_published_object("catalog",
@@ -13446,7 +13472,7 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                  published_settings_it != published_track_settings.end()
                      ? published_settings_it->second.subscriber_priority
                      : 128),
-             .publisher = track_priorities_.effective(next->track_name)},
+             .publisher = track_properties_.effective(next->track_name)},
             serve_while_blocked);
         const TransportStatus event_status = dispatch_stream_events();
         if (!status.ok) {

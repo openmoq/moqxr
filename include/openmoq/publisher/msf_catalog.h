@@ -189,10 +189,10 @@ double resolve_framerate(const TrackDescription& track);
 bool framerate_is_estimated(const TrackDescription& track);
 
 // Attach LOC decoder configuration. MSF-01 carries it inline (Base64). MSF-02
-// publishes an "object-property" entry naming VIDEO_CONFIG (0x0D) or AUDIO_CONFIG
-// (0x0F), because LOC objects repeat the configuration in that property
-// (section 12.2). An empty config (a codec with no description, such as VP9)
-// attaches nothing.
+// publishes a "track-property" entry naming VIDEO_CONFIG (0x0D) or AUDIO_CONFIG
+// (0x0F): a LOC track's configuration never changes, so section 12.2 makes it
+// a Track Property, sent in PUBLISH and SUBSCRIBE_OK. An empty config (a codec
+// with no description, such as VP9) attaches nothing.
 void attach_loc_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view track_name,
                           std::string base64_config, bool video);
 

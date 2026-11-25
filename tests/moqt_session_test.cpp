@@ -1,4 +1,5 @@
 #include "openmoq/publisher/cmsf_packager.h"
+#include "openmoq/publisher/encoded_sample.h"
 #include "openmoq/publisher/cat4moq.h"
 #include "cat4moq_wire_test_utils.h"
 #include "openmoq/publisher/moq_draft.h"
@@ -87,6 +88,7 @@ using openmoq::publisher::LiveObject;
 using openmoq::publisher::LiveObjectSource;
 using openmoq::publisher::LiveTrack;
 using openmoq::publisher::MediaPackaging;
+using openmoq::publisher::MsfVersion;
 using openmoq::publisher::PublishPlan;
 using openmoq::publisher::TrackDescription;
 using openmoq::publisher::materialize_publish_plan;
@@ -2771,6 +2773,8 @@ bool test_live_objects_catalog_late_subscriber(const EndpointConfig& endpoint, c
                                   (prioritized ? " with priorities" : "") + ": ";
         const std::optional<std::uint8_t> catalog_priority =
             prioritized ? std::optional<std::uint8_t>(32) : std::nullopt;
+        std::vector<openmoq::publisher::ObjectProperty> catalog_properties;
+        if (catalog_priority) catalog_properties.push_back({0x0e, std::uint64_t{*catalog_priority}});
         MockTransport transport;
         transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
@@ -2833,9 +2837,9 @@ bool test_live_objects_catalog_late_subscriber(const EndpointConfig& endpoint, c
         ok &= expect(late_subscribed, label + "the late catalog subscription arrives");
 
         using openmoq::publisher::transport::encode_subscribe_ok_message;
-        ok &= expect(wrote(transport, 1, encode_subscribe_ok_message(draft, 1, 0, 0, 0, false, catalog_priority)),
+        ok &= expect(wrote(transport, 1, encode_subscribe_ok_message(draft, 1, 0, 0, 0, false, catalog_properties)),
                      label + "the first catalog SUBSCRIBE_OK omits LARGEST_OBJECT before any catalog is sent");
-        ok &= expect(wrote(transport, 9, encode_subscribe_ok_message(draft, 5, 0, 0, 0, true, catalog_priority)),
+        ok &= expect(wrote(transport, 9, encode_subscribe_ok_message(draft, 5, 0, 0, 0, true, catalog_properties)),
                      label + "the late catalog SUBSCRIBE_OK reports LARGEST_OBJECT {0,0}");
         // Video SUBSCRIBE_OK on stream 5 ends with DEFAULT_PUBLISHER_PRIORITY
         // 200 (two-byte vi64 0x80 0xc8) only with priorities.
@@ -2985,6 +2989,131 @@ bool test_publisher_priorities_live_stdin(const EndpointConfig& endpoint, const 
         for (const char* video : {"vide_1", "vide_3", "vide_4"}) {
             ok &= expect(publish_ends_with(video, {0x0e, 0x80, 0x80}) == prioritized,
                          label + video + " PUBLISH carries 128 only with priorities");
+        }
+    }
+    return ok;
+}
+
+// MSF-02 section 12.2: a LOC track's decoder configuration never changes, so
+// it is a Track Property, VIDEO_CONFIG (0x0D) or AUDIO_CONFIG (0x0F), in the
+// track's PUBLISH and SUBSCRIBE_OK. MSF-01 carries it inline in the catalog
+// and CMAF in its init segment, so neither sends it. Live stdin with a
+// one-track video fixture and a one-track audio fixture.
+bool test_loc_decoder_config_track_property(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    struct Case {
+        MediaPackaging packaging;
+        MsfVersion msf_version;
+        const char* name;
+    };
+    bool ok = true;
+    for (const auto& [fixture_name, property_type] : {std::pair{"locmaf-publisher.mp4", 0x0dU},
+                                                      std::pair{"locmaf-audio.mp4", 0x0fU}}) {
+        const auto fixture = std::filesystem::path(__FILE__).parent_path() / "fixtures" / fixture_name;
+        const auto tracks = openmoq::publisher::parse_mp4_file(fixture.string()).tracks;
+        if (!expect(tracks.size() == 1, std::string(fixture_name) + " has one track")) return false;
+        const std::string& track_name = tracks[0].track_name;
+        // The track's Track Properties are this property alone, so its message ends with it.
+        const std::vector<openmoq::publisher::ObjectProperty> properties{
+            {property_type, openmoq::publisher::loc_codec_config(tracks[0])}};
+        const std::vector<std::uint8_t> property = openmoq::publisher::serialize_object_properties(properties);
+        const auto check = [&](const MockTransport& transport, const std::string& label, std::uint64_t type,
+                               const std::function<bool(const MockTransport::WriteEvent&)>& is_track,
+                               bool expected) {
+            bool sent = false;
+            bool ends = false;
+            bool contains = false;
+            for (const auto& write : transport.writes) {
+                if (message_type(write.bytes) != type || !is_track(write)) continue;
+                sent = true;
+                ends = ends || ends_with(write.bytes, property);
+                contains = contains || std::search(write.bytes.begin(), write.bytes.end(), property.begin(),
+                                                   property.end()) != write.bytes.end();
+            }
+            ok &= expect(sent, label + "the message is sent");
+            ok &= expect(ends == expected && contains == expected,
+                         label + (expected ? "the message ends with the config Track Property"
+                                           : "the message carries no config Track Property"));
+        };
+        for (const Case& test_case : {Case{MediaPackaging::kLoc, MsfVersion::k02, "LOC MSF-02"},
+                                      Case{MediaPackaging::kLoc, MsfVersion::k01, "LOC MSF-01"},
+                                      Case{MediaPackaging::kCmaf, MsfVersion::k02, "CMAF MSF-02"}}) {
+            const bool expected =
+                test_case.packaging == MediaPackaging::kLoc && test_case.msf_version == MsfVersion::k02;
+            // Forward mode: the publisher PUBLISHes the media track.
+            for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft23}) {
+                const std::string label = std::string(fixture_name) + " " + openmoq::publisher::to_string(draft) +
+                                          " " + test_case.name + " PUBLISH: ";
+                MockTransport transport;
+                transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+                transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+                transport.reads[4].push_back(encode_publish_ok_message(draft, 2, 1));
+                MoqtSession session(transport, std::string(kNamespace), true, false, false, std::chrono::seconds(1));
+                session.set_media_packaging(test_case.packaging);
+                session.set_msf_version(test_case.msf_version);
+                ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+                std::ifstream input(fixture, std::ios::binary);
+                const auto status = session.publish_live(input, draft, true);
+                ok &= expect(status.ok, label + "live publish succeeds: " + status.message);
+                const std::string name = std::string(1, static_cast<char>(track_name.size())) + track_name;
+                check(transport, label, 0x1d, [&](const auto& write) {
+                    return std::string(write.bytes.begin(), write.bytes.end()).find(name) != std::string::npos;
+                }, expected);
+            }
+            // Subscriber-initiated: the SUBSCRIBE_OK on stream 5 answers the track's SUBSCRIBE.
+            for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft22}) {
+                const std::string label = std::string(fixture_name) + " " + openmoq::publisher::to_string(draft) +
+                                          " " + test_case.name + " SUBSCRIBE_OK: ";
+                MockTransport transport;
+                transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+                transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+                transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
+                transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, track_name, 1, draft));
+                for (const std::uint64_t id : {1, 5}) transport.keep_open_streams.insert(id);
+                MoqtSession session(transport, std::string(kNamespace), false, false, false, std::chrono::seconds(1));
+                session.set_media_packaging(test_case.packaging);
+                session.set_msf_version(test_case.msf_version);
+                ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+                std::ifstream input(fixture, std::ios::binary);
+                const auto status = session.publish_live(input, draft, true);
+                ok &= expect(status.ok, label + "live publish succeeds: " + status.message);
+                check(transport, label, 0x04, [](const auto& write) { return write.stream_id == 5; }, expected);
+            }
+        }
+    }
+    // publish() of a prepared plan takes the configuration from the plan's
+    // track initialization.
+    for (const MsfVersion msf_version : {MsfVersion::k02, MsfVersion::k01}) {
+        for (const bool forward : {true, false}) {
+            const std::string label = std::string("plan ") + (msf_version == MsfVersion::k02 ? "MSF-02 " : "MSF-01 ") +
+                                      (forward ? "PUBLISH: " : "SUBSCRIBE_OK: ");
+            MockTransport transport;
+            transport.reads[3].push_back(encode_draft18_setup_response());
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(DraftVersion::kDraft18, 0));
+            if (forward) {
+                transport.reads[4].push_back(encode_publish_ok_message(DraftVersion::kDraft18, 2, 1));
+            } else {
+                transport.reads[1].push_back(
+                    encode_subscribe_message(1, kNamespace, "loc", 1, DraftVersion::kDraft18));
+            }
+            PublishPlan plan = make_scheduling_plan({
+                {.track_name = "loc", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'L'},
+            });
+            plan.draft = openmoq::publisher::draft_profile(DraftVersion::kDraft18);
+            plan.tracks[0].packaging = "loc";
+            plan.tracks[0].handler_type = "soun";
+            plan.track_initializations = {{.track_name = "loc", .codec_payload = {0x11, 0x90}}};
+            MoqtSession session(transport, std::string(kNamespace), forward, false, false, std::chrono::seconds(1));
+            session.set_msf_version(msf_version);
+            ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+            const auto status = session.publish(plan);
+            ok &= expect(status.ok, label + "publish succeeds: " + status.message);
+            const std::uint64_t type = forward ? 0x1d : 0x04;
+            const std::vector<std::uint8_t> audio_config{0x0f, 0x02, 0x11, 0x90};
+            ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                             return message_type(write.bytes) == type && ends_with(write.bytes, audio_config);
+                         }) == (msf_version == MsfVersion::k02),
+                         label + "AUDIO_CONFIG is a Track Property only under MSF-02");
         }
     }
     return ok;
@@ -12650,6 +12779,15 @@ int main() {
         status = session.connect(endpoint, tls);
         if (status.ok) status = session.publish_live_objects(source, DraftVersion::kDraft18);
         ok &= expect(status.ok == valid, "LOC arbitrary source validates independent start, matching configuration, and codec string: " + status.message);
+        if (invalid == 0) {
+            // MSF-02 (the default): the PUBLISH ends with VIDEO_CONFIG, the source's init_data.
+            std::vector<std::uint8_t> video_config{0x0d, static_cast<std::uint8_t>(config.size())};
+            video_config.insert(video_config.end(), config.begin(), config.end());
+            ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                             return message_type(write.bytes) == 0x1d && ends_with(write.bytes, video_config);
+                         }),
+                         "LOC arbitrary source PUBLISH carries VIDEO_CONFIG as a Track Property");
+        }
         ok &= expect(session.publish_stats().objects_published == (valid ? 1 : 0), "invalid LOC source never publishes media");
         if (invalid == 6) ok &= expect(status.message.find("duplicate") != std::string::npos, "duplicate LOC codec string rejected as duplicate: " + status.message);
         if (invalid == 7) ok &= expect(status.message.find("UTF-8") != std::string::npos, "malformed LOC codec string rejected as UTF-8: " + status.message);
@@ -13611,6 +13749,7 @@ int main() {
     ok &= test_live_stdin_video_alt_group(endpoint, tls);
     ok &= test_publisher_priorities_live_objects(endpoint, tls);
     ok &= test_publisher_priorities_live_stdin(endpoint, tls);
+    ok &= test_loc_decoder_config_track_property(endpoint, tls);
     ok &= test_live_stdin_groups_per_video_track(endpoint, tls);
     ok &= test_live_stdin_resubscribe_after_stop_sending(endpoint, tls);
     ok &= test_live_stdin_stop_sending_cancels_subgroups(endpoint, tls);

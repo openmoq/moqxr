@@ -127,9 +127,11 @@ Codec String travels with the codec configuration on every object, taken from
 the same `TrackDescription::codec` that the catalog publishes so the two
 cannot diverge. Audio already uses one object per group, so restricting it to
 group starts would save nothing there and only about 13 bytes on dependent
-video frames. Track-scope properties are deferred: no track-property path
-exists yet, LOC-05 does not require them, and the catalog already carries the
-codec string per track. On the explicit object API, Codec String is optional
+video frames. Codec String is not sent as a Track Property: LOC-05 does not
+require it, and the catalog already carries the codec string per track. The
+codec configuration is, under MSF-02: PUBLISH and SUBSCRIBE_OK carry it as
+VIDEO_CONFIG or AUDIO_CONFIG (MSF-02 section 12.2), in addition to the copy on
+every object. On the explicit object API, Codec String is optional
 but must match `LiveTrack::codec` when supplied.
 
 ### Codec profiles

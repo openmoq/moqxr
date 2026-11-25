@@ -2572,6 +2572,10 @@ bool test_draft21_request_update_filter_errors() {
     return ok;
 }
 
+std::vector<openmoq::publisher::ObjectProperty> priority_property(std::uint64_t priority) {
+    return {{0x0e, priority}};
+}
+
 bool test_default_publisher_priority_track_property() {
     bool ok = true;
     // DEFAULT_PUBLISHER_PRIORITY (0x0E) is the only Track Property, so its Delta
@@ -2583,23 +2587,23 @@ bool test_default_publisher_priority_track_property() {
         const auto unset = encode_track_message(publish);
         ok &= expect(unset == frame(draft, 0x1d, {2, 1, 1, 'n', 1, 't', 3, 0}),
                      draft_label(draft) + " PUBLISH without a priority keeps its bytes");
-        publish.default_publisher_priority = 64;
+        publish.track_properties = priority_property(64);
         ok &= expect(encode_track_message(publish) == frame(draft, 0x1d, {2, 1, 1, 'n', 1, 't', 3, 0, 0x0e, 0x40}),
                      draft_label(draft) + " PUBLISH carries DEFAULT_PUBLISHER_PRIORITY 64 as its Track Properties");
-        publish.default_publisher_priority = 128;
+        publish.track_properties = priority_property(128);
         const auto encoded_128 = encode_track_message(publish);
         ok &= expect(encoded_128.size() == unset.size() + 3 &&
                          std::vector<std::uint8_t>(encoded_128.end() - 3, encoded_128.end()) ==
                              std::vector<std::uint8_t>({0x0e, 0x80, 0x80}),
                      draft_label(draft) + " PUBLISH encodes priority 128 as a two-byte vi64");
 
-        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, 64) ==
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, priority_property(64)) ==
                          frame(draft, 0x04, {0x01, 0x01, 0x09, 0x03, 0x07, 0x0e, 0x40}),
                      draft_label(draft) + " SUBSCRIBE_OK puts DEFAULT_PUBLISHER_PRIORITY after LARGEST_OBJECT");
-        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 0, 0, false, 0) ==
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 0, 0, false, priority_property(0)) ==
                          frame(draft, 0x04, {0x01, 0x00, 0x0e, 0x00}),
                      draft_label(draft) + " SUBSCRIBE_OK carries DEFAULT_PUBLISHER_PRIORITY 0");
-        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, std::nullopt) ==
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, {}) ==
                          encode_subscribe_ok_message(draft, 9, 1, 3, 7, true),
                      draft_label(draft) + " SUBSCRIBE_OK without a priority keeps its bytes");
     }
@@ -2608,11 +2612,39 @@ bool test_default_publisher_priority_track_property() {
         TrackMessage publish{.draft = draft, .track_name = "t", .track_namespace = "n", .request_id = 2,
                              .track_alias = 3};
         const auto unset = encode_track_message(publish);
-        publish.default_publisher_priority = 64;
+        publish.track_properties = priority_property(64);
         ok &= expect(encode_track_message(publish) == unset, draft_label(draft) + " PUBLISH ignores the priority");
-        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, 64) ==
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 3, 7, true, priority_property(64)) ==
                          encode_subscribe_ok_message(draft, 9, 1, 3, 7, true),
                      draft_label(draft) + " SUBSCRIBE_OK ignores the priority");
+    }
+    return ok;
+}
+
+bool test_decoder_config_track_property() {
+    bool ok = true;
+    // MSF-02 section 12.2: VIDEO_CONFIG (0x0D) and AUDIO_CONFIG (0x0F) are odd
+    // types, so each carries a Length and its bytes. Types are delta-encoded in
+    // ascending order: with DEFAULT_PUBLISHER_PRIORITY (0x0E), VIDEO_CONFIG
+    // goes first and the priority's Delta Type is 1; AUDIO_CONFIG follows the
+    // priority with Delta Type 1.
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft21, DraftVersion::kDraft22,
+                                     DraftVersion::kDraft23}) {
+        TrackMessage publish{.draft = draft, .track_name = "t", .track_namespace = "n", .request_id = 2,
+                             .track_alias = 3};
+        publish.track_properties = {{0x0d, std::vector<std::uint8_t>{0xaa, 0xbb}}};
+        ok &= expect(encode_track_message(publish) ==
+                         frame(draft, 0x1d, {2, 1, 1, 'n', 1, 't', 3, 0, 0x0d, 0x02, 0xaa, 0xbb}),
+                     draft_label(draft) + " PUBLISH carries VIDEO_CONFIG as a length-prefixed Track Property");
+        publish.track_properties = {{0x0e, std::uint64_t{64}}, {0x0d, std::vector<std::uint8_t>{0xaa}}};
+        ok &= expect(encode_track_message(publish) ==
+                         frame(draft, 0x1d, {2, 1, 1, 'n', 1, 't', 3, 0, 0x0d, 0x01, 0xaa, 0x01, 0x40}),
+                     draft_label(draft) + " PUBLISH sorts VIDEO_CONFIG before DEFAULT_PUBLISHER_PRIORITY");
+        const std::vector<openmoq::publisher::ObjectProperty> audio{{0x0e, std::uint64_t{64}},
+                                                                    {0x0f, std::vector<std::uint8_t>{0x12, 0x10}}};
+        ok &= expect(encode_subscribe_ok_message(draft, 9, 1, 0, 0, false, audio) ==
+                         frame(draft, 0x04, {0x01, 0x00, 0x0e, 0x40, 0x01, 0x02, 0x12, 0x10}),
+                     draft_label(draft) + " SUBSCRIBE_OK puts AUDIO_CONFIG after DEFAULT_PUBLISHER_PRIORITY");
     }
     return ok;
 }
@@ -3291,6 +3323,7 @@ int main() {
     ok &= test_publisher_datagrams();
     ok &= test_largest_object_parameter_is_a_bare_location();
     ok &= test_default_publisher_priority_track_property();
+    ok &= test_decoder_config_track_property();
     ok &= test_draft21_request_update_filter_errors();
     ok &= test_draft21_subscribe_tracks_rejects_range_filters();
     ok &= test_parameter_length_wrap_is_rejected();

@@ -1068,7 +1068,7 @@ void attach_loc_init_data(MsfCatalog& catalog, MsfTrack& track, std::string_view
     track.init_ref = init_id;
     catalog.init_data_list.push_back(MsfInitData{
         .id = std::move(init_id),
-        .type = "object-property",
+        .type = "track-property",
         .data = video ? "0x0D" : "0x0F",
     });
 }

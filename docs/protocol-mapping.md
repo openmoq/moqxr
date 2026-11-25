@@ -45,8 +45,11 @@ not enable MOQT-19. CMAF remains the default.
   independently decodable IDRs also set I. Other marking bits remain zero.
 - Video config `0x0D` carries avcC record bytes; audio config `0x0F` carries
   AudioSpecificConfig bytes. Configuration is repeated on every generated object.
+  Under MSF-02 (the default) the same bytes are also the track's `0x0D` or
+  `0x0F` Track Property in its PUBLISH and SUBSCRIBE_OK, as MSF-02 section 12.2
+  requires for configuration that never changes; see [MSF catalog](#msf-catalog).
 - Codec String `0x11` carries the catalog's UTF-8 WebCodecs codec string and is
-  repeated alongside the configuration. Track-scope properties are not sent.
+  repeated alongside the configuration. It is not sent as a Track Property.
   Tradeoff: each object grows by the string plus two bytes of ID and length,
   about 11 bytes for `mp4a.40.2` (roughly 4 kbps for 48 kHz AAC) and 13 for
   `avc1.42001e`. Audio already uses one object per group, so emitting only at
@@ -122,13 +125,19 @@ input. The libmoq/moq5 publishing backend rejects it. See
   `eventtimeline` needs `eventType`. A live LOC video track with no measured
   frame rate advertises an estimated 30 fps and logs a warning, as for `bitrate`.
 - LOC decoder config is published through `initDataList` entries of type
-  `object-property` (`data` is `"0x0D"` for VIDEO_CONFIG, `"0x0F"` for
-  AUDIO_CONFIG), because LOC objects already repeat that property. The `data`
+  `track-property` (`data` is `"0x0D"` for VIDEO_CONFIG, `"0x0F"` for
+  AUDIO_CONFIG). A LOC track's configuration never changes (a change fails the
+  publish), so section 12.2 makes it a Track property: on drafts 18 and later
+  each LOC track's PUBLISH and SUBSCRIBE_OK carry it as Track Property `0x0D`
+  or `0x0F`, after any `DEFAULT_PUBLISHER_PRIORITY` (`0x0E`) in ascending type
+  order. FETCH serves only the catalog track, so no FETCH_OK carries it. LOC
+  objects still repeat the configuration as an Object property, which section
+  12.2 allows, so a subscriber that reads it there keeps working. The `data`
   spelling is this project's reading of "hex notation". A codec with no
-  description (VP9) has no `initRef`. CMAF and LOCMAF keep inline Base64 init
-  data. The `track-property` type is accepted by the validator but never
-  emitted: the Track-property delivery path (PUBLISH/SUBSCRIBE_OK/FETCH_OK) is
-  not implemented.
+  description (VP9) has no `initRef` and no Track Property. CMAF and LOCMAF
+  keep inline Base64 init data, and MSF-01 keeps LOC init data inline and sends
+  no Track Property. The validator accepts `object-property` entries but the
+  publisher does not emit them.
 - Namespace is a `/`-delimited string of 1 to 32 non-empty fields; `depends`
   carries track names and `renderGroup` numbers and every entry must resolve. A
   media timeline that covers every track of a render group references the

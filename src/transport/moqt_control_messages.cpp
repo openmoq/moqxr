@@ -2693,16 +2693,14 @@ bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
 }
 
 // Track Properties are the final field of PUBLISH and SUBSCRIBE_OK, their
-// length the rest of the message. Only DEFAULT_PUBLISHER_PRIORITY is sent, and
-// only when configured, so the default message is unchanged.
+// length the rest of the message. They are Key-Value-Pairs, delta-typed in
+// ascending order like Object Properties. A track with none sends nothing, so
+// its message is unchanged.
 static void append_track_properties(std::vector<std::uint8_t>& payload,
                                     DraftVersion draft,
-                                    std::optional<std::uint8_t> default_publisher_priority) {
-    constexpr std::uint64_t kDefaultPublisherPriorityProperty = 0x0e;
-    if (!default_publisher_priority || !is_draft18_or_later(draft)) return;
-    const std::vector<openmoq::publisher::ObjectProperty> properties{
-        {kDefaultPublisherPriorityProperty, std::uint64_t{*default_publisher_priority}}};
-    const auto bytes = openmoq::publisher::serialize_object_properties(properties);
+                                    std::span<const openmoq::publisher::ObjectProperty> track_properties) {
+    if (track_properties.empty() || !is_draft18_or_later(draft)) return;
+    const auto bytes = openmoq::publisher::serialize_object_properties(track_properties);
     payload.insert(payload.end(), bytes.begin(), bytes.end());
 }
 
@@ -2712,7 +2710,7 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
                                                       std::size_t largest_group_id,
                                                       std::size_t largest_object_id,
                                                       bool content_exists,
-                                                      std::optional<std::uint8_t> default_publisher_priority) {
+                                                      std::span<const ObjectProperty> track_properties) {
     std::vector<std::uint8_t> payload;
     if (!uses_moq_vi64(draft)) {
         append_moqint(payload, draft, request_id);
@@ -2738,7 +2736,7 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
         }
         append_moqint(payload, draft, parameter_count);
         payload.insert(payload.end(), parameters.begin(), parameters.end());
-        append_track_properties(payload, draft, default_publisher_priority);
+        append_track_properties(payload, draft, track_properties);
     }
 
     std::vector<std::uint8_t> message_bytes;
@@ -2944,7 +2942,7 @@ std::vector<std::uint8_t> encode_track_message(const TrackMessage& message) {
     if (message.draft == DraftVersion::kDraft16) {
         // No Track Extensions are needed for the current draft-16 publish path.
     }
-    append_track_properties(payload, message.draft, message.default_publisher_priority);
+    append_track_properties(payload, message.draft, message.track_properties);
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, message.draft, kPublishType);
