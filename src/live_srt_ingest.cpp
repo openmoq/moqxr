@@ -16,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 #if defined(OPENMOQ_HAS_SRT)
@@ -598,15 +599,41 @@ HevcParamSets extract_hevc_param_sets(std::span<const std::uint8_t> payload) {
     return params;
 }
 
-// Minimal RBSP bitstream reader used only for SPS dimension extraction.
+// Minimal RBSP bitstream reader for SPS parsing. It takes a whole NAL unit,
+// removes the emulation prevention bytes (the 03 in each 00 00 03, H.264
+// 7.4.1 and H.265 7.4.2), and starts reading after the NAL unit header.
+// Without the removal, an SPS such as x265's "60 00 00 03 00 90" reads its
+// profile, level, and every later field from the wrong bits.
 class RbspBitReader {
 public:
-    RbspBitReader(const std::uint8_t* data, std::size_t size) : data_(data), size_(size) {}
+    RbspBitReader(std::span<const std::uint8_t> nal, std::size_t header_bytes) {
+        rbsp_.reserve(nal.size());
+        std::size_t zeros = 0;
+        for (const std::uint8_t byte : nal) {
+            if (zeros >= 2 && byte == 0x03U) {
+                zeros = 0;
+                continue;
+            }
+            zeros = byte == 0 ? zeros + 1 : 0;
+            rbsp_.push_back(byte);
+        }
+        byte_pos_ = header_bytes;
+    }
 
     bool read_bit(std::uint8_t& out) {
-        if (byte_pos_ >= size_) return false;
-        out = static_cast<std::uint8_t>((data_[byte_pos_] >> (7U - bit_pos_)) & 0x01U);
+        if (byte_pos_ >= rbsp_.size()) return false;
+        out = static_cast<std::uint8_t>((rbsp_[byte_pos_] >> (7U - bit_pos_)) & 0x01U);
         if (++bit_pos_ == 8U) { bit_pos_ = 0; ++byte_pos_; }
+        return true;
+    }
+
+    bool read_bits(std::size_t count, std::uint32_t& out) {
+        out = 0;
+        for (std::size_t k = 0; k < count; ++k) {
+            std::uint8_t b = 0;
+            if (!read_bit(b)) return false;
+            out = (out << 1U) | b;
+        }
         return true;
     }
 
@@ -649,8 +676,7 @@ public:
     bool skip_se() { std::int32_t v = 0; return read_se(v); }
 
 private:
-    const std::uint8_t* data_;
-    std::size_t size_;
+    std::vector<std::uint8_t> rbsp_;
     std::size_t byte_pos_ = 0;
     std::uint8_t bit_pos_ = 0;
 };
@@ -661,7 +687,7 @@ std::pair<std::uint32_t, std::uint32_t>
 parse_h264_dimensions(const std::vector<std::uint8_t>& sps_nal) {
     if (sps_nal.size() < 5) return {0, 0};
     const std::uint8_t profile_idc = sps_nal[1];
-    RbspBitReader r(sps_nal.data() + 4, sps_nal.size() - 4);
+    RbspBitReader r(sps_nal, 4);  // after NAL header, profile_idc, constraint flags, level_idc
 
     if (!r.skip_ue()) return {0, 0};  // seq_parameter_set_id
 
@@ -740,112 +766,133 @@ parse_h264_dimensions(const std::vector<std::uint8_t>& sps_nal) {
     return {width, height};
 }
 
+// The SPS fields an hvcC record and its codec string are built from, read
+// from the RBSP (H.265 7.3.2.2.1, with the profile_tier_level of 7.3.3).
+struct HevcSpsInfo {
+    std::uint8_t max_sub_layers_minus1 = 0;
+    bool temporal_id_nesting = false;
+    std::uint8_t profile_space = 0;
+    bool tier = false;
+    std::uint8_t profile_idc = 0;
+    std::uint32_t profile_compatibility_flags = 0;
+    std::array<std::uint8_t, 6> constraint_flags{};
+    std::uint8_t level_idc = 0;
+    std::uint32_t chroma_format_idc = 0;
+    std::uint32_t width = 0;   // after the conformance window
+    std::uint32_t height = 0;
+    std::uint32_t bit_depth_luma_minus8 = 0;
+    std::uint32_t bit_depth_chroma_minus8 = 0;
+};
+
+// Parse a raw HEVC SPS NAL unit (including its 2-byte NAL header) as far as
+// bit_depth_chroma_minus8. Returns nullopt on any parse failure.
+std::optional<HevcSpsInfo> parse_hevc_sps(const std::vector<std::uint8_t>& sps_nal) {
+    if (sps_nal.size() < 16) return std::nullopt;
+    RbspBitReader r(sps_nal, 2);
+    HevcSpsInfo info;
+    std::uint32_t v = 0;
+    if (!r.skip_bits(4)) return std::nullopt;  // sps_video_parameter_set_id
+    if (!r.read_bits(3, v)) return std::nullopt;
+    info.max_sub_layers_minus1 = static_cast<std::uint8_t>(v);
+    if (!r.read_bits(1, v)) return std::nullopt;
+    info.temporal_id_nesting = v != 0;
+
+    // profile_tier_level general_* (12 bytes)
+    if (!r.read_bits(2, v)) return std::nullopt;
+    info.profile_space = static_cast<std::uint8_t>(v);
+    if (!r.read_bits(1, v)) return std::nullopt;
+    info.tier = v != 0;
+    if (!r.read_bits(5, v)) return std::nullopt;
+    info.profile_idc = static_cast<std::uint8_t>(v);
+    if (!r.read_bits(32, info.profile_compatibility_flags)) return std::nullopt;
+    for (auto& byte : info.constraint_flags) {
+        if (!r.read_bits(8, v)) return std::nullopt;
+        byte = static_cast<std::uint8_t>(v);
+    }
+    if (!r.read_bits(8, v)) return std::nullopt;
+    info.level_idc = static_cast<std::uint8_t>(v);
+
+    const int sub_layers = static_cast<int>(info.max_sub_layers_minus1);
+    bool sub_profile[8] = {}, sub_level[8] = {};
+    for (int j = 0; j < sub_layers; ++j) {
+        std::uint8_t b = 0;
+        if (!r.read_bit(b)) return std::nullopt;
+        sub_profile[j] = (b != 0);
+        if (!r.read_bit(b)) return std::nullopt;
+        sub_level[j] = (b != 0);
+    }
+    if (sub_layers > 0 && !r.skip_bits(2U * (8U - static_cast<unsigned>(sub_layers)))) return std::nullopt;
+    for (int j = 0; j < sub_layers; ++j) {
+        if (sub_profile[j] && !r.skip_bits(88)) return std::nullopt;
+        if (sub_level[j]   && !r.skip_bits(8))  return std::nullopt;
+    }
+
+    if (!r.skip_ue()) return std::nullopt;  // sps_seq_parameter_set_id
+    if (!r.read_ue(info.chroma_format_idc)) return std::nullopt;
+    if (info.chroma_format_idc == 3 && !r.skip_bits(1)) return std::nullopt;  // separate_colour_plane_flag
+
+    if (!r.read_ue(info.width) || !r.read_ue(info.height)) return std::nullopt;
+
+    std::uint8_t conf_win = 0;
+    if (!r.read_bit(conf_win)) return std::nullopt;
+    if (conf_win) {
+        const std::uint32_t swc = (info.chroma_format_idc == 1 || info.chroma_format_idc == 2) ? 2U : 1U;
+        const std::uint32_t shc = (info.chroma_format_idc == 1) ? 2U : 1U;
+        std::uint32_t cl = 0, cr = 0, ct = 0, cb = 0;
+        if (!r.read_ue(cl) || !r.read_ue(cr) || !r.read_ue(ct) || !r.read_ue(cb)) {
+            return std::nullopt;
+        }
+        info.width  -= (cl + cr) * swc;
+        info.height -= (ct + cb) * shc;
+    }
+    if (!r.read_ue(info.bit_depth_luma_minus8) || !r.read_ue(info.bit_depth_chroma_minus8)) {
+        return std::nullopt;
+    }
+    return info;
+}
+
 // Parse {width, height} from a raw HEVC SPS NAL unit (includes 2-byte NAL header).
 // Returns {0, 0} on any parse failure.
 std::pair<std::uint32_t, std::uint32_t>
 parse_hevc_dimensions(const std::vector<std::uint8_t>& sps_nal) {
-    if (sps_nal.size() < 16) return {0, 0};
-    const std::uint8_t max_sub_layers_minus1 = static_cast<std::uint8_t>((sps_nal[2] >> 1U) & 0x07U);
-    RbspBitReader r(sps_nal.data() + 2, sps_nal.size() - 2);
-    if (!r.skip_bits(8)) return {0, 0};   // vps_id(4)+max_sub_layers(3)+temporal_nesting(1)
-    if (!r.skip_bits(96)) return {0, 0};  // profile_tier_level general_* (12 bytes)
-
-    bool sub_profile[8] = {}, sub_level[8] = {};
-    for (int j = 0; j < static_cast<int>(max_sub_layers_minus1); ++j) {
-        std::uint8_t b = 0;
-        if (!r.read_bit(b)) return {0, 0};
-        sub_profile[j] = (b != 0);
-        if (!r.read_bit(b)) return {0, 0};
-        sub_level[j] = (b != 0);
-    }
-    if (max_sub_layers_minus1 < 8 && !r.skip_bits(2U * (8U - max_sub_layers_minus1))) return {0, 0};
-    for (int j = 0; j < static_cast<int>(max_sub_layers_minus1); ++j) {
-        if (sub_profile[j] && !r.skip_bits(88)) return {0, 0};
-        if (sub_level[j]   && !r.skip_bits(8))  return {0, 0};
-    }
-
-    if (!r.skip_ue()) return {0, 0};  // sps_seq_parameter_set_id
-    std::uint32_t chroma_format_idc = 0;
-    if (!r.read_ue(chroma_format_idc)) return {0, 0};
-    if (chroma_format_idc == 3 && !r.skip_bits(1)) return {0, 0};
-
-    std::uint32_t width = 0, height = 0;
-    if (!r.read_ue(width) || !r.read_ue(height)) return {0, 0};
-
-    std::uint8_t conf_win = 0;
-    if (!r.read_bit(conf_win)) return {width, height};
-    if (conf_win) {
-        const std::uint32_t swc = (chroma_format_idc == 1 || chroma_format_idc == 2) ? 2U : 1U;
-        const std::uint32_t shc = (chroma_format_idc == 1) ? 2U : 1U;
-        std::uint32_t cl = 0, cr = 0, ct = 0, cb = 0;
-        if (!r.read_ue(cl) || !r.read_ue(cr) || !r.read_ue(ct) || !r.read_ue(cb)) {
-            return {width, height};
-        }
-        width  -= (cl + cr) * swc;
-        height -= (ct + cb) * shc;
-    }
-    return {width, height};
+    const auto info = parse_hevc_sps(sps_nal);
+    if (!info.has_value()) return {0, 0};
+    return {info->width, info->height};
 }
 
-// Build an hvcC box (HEVCDecoderConfigurationRecord) from VPS, SPS, PPS.
+// Build an hvcC box (HEVCDecoderConfigurationRecord, ISO/IEC 14496-15
+// 8.3.3.1.2) from VPS, SPS, PPS. The profile, level, chroma format, and bit
+// depths come from the parsed SPS; the arrays carry the NAL units as they
+// arrived, emulation prevention bytes included.
 std::vector<std::uint8_t> build_hvcc_box(const HevcParamSets& params) {
-    if (params.vps.empty() || params.sps.size() < 2 || params.pps.empty()) {
+    if (params.vps.empty() || params.pps.empty()) {
+        return {};
+    }
+    const auto sps = parse_hevc_sps(params.sps);
+    if (!sps.has_value()) {
         return {};
     }
 
-    // Parse basic info from SPS NAL (after the 2-byte NAL header)
-    // SPS: nal_header(2) + sps_video_parameter_set_id(4b) + sps_max_sub_layers_minus1(3b) + temporal_id_nesting(1b) + profile_tier_level(...)
-    const std::uint8_t* sps_data = params.sps.data() + 2;  // skip 2-byte NAL header
-    const std::size_t sps_payload_size = params.sps.size() - 2;
-    if (sps_payload_size < 13) {
-        return {};
-    }
-
-    // profile_tier_level starts at byte 0 of sps_data after 4-bit vps_id + 3-bit max_sub_layers + 1-bit temporal nesting
-    // But we need: general_profile_space(2b) + general_tier_flag(1b) + general_profile_idc(5b) = 1 byte
-    // general_profile_compatibility_flags(32b) = 4 bytes
-    // constraint_indicator_flags(48b) = 6 bytes
-    // general_level_idc(8b) = 1 byte
-    // Total profile_tier_level fixed part = 12 bytes starting after the first byte
-    const std::uint8_t profile_byte = sps_data[1];
-    const std::uint8_t general_profile_space = static_cast<std::uint8_t>((profile_byte >> 6U) & 0x03U);
-    const std::uint8_t general_tier_flag = static_cast<std::uint8_t>((profile_byte >> 5U) & 0x01U);
-    const std::uint8_t general_profile_idc = static_cast<std::uint8_t>(profile_byte & 0x1FU);
-    const std::uint32_t general_profile_compat = (static_cast<std::uint32_t>(sps_data[2]) << 24U) |
-                                                  (static_cast<std::uint32_t>(sps_data[3]) << 16U) |
-                                                  (static_cast<std::uint32_t>(sps_data[4]) << 8U) |
-                                                  static_cast<std::uint32_t>(sps_data[5]);
-    // constraint_indicator_flags: 6 bytes
-    std::uint8_t constraint_flags[6];
-    for (int j = 0; j < 6; ++j) {
-        constraint_flags[j] = sps_data[6 + j];
-    }
-    const std::uint8_t general_level_idc = sps_data[12];
-
-    // Max sub layers from first byte of SPS payload: bits[4:6] = sps_max_sub_layers_minus1
-    const std::uint8_t max_sub_layers = static_cast<std::uint8_t>((sps_data[0] >> 1U) & 0x07U);
-
-    // Build HEVCDecoderConfigurationRecord (ISO 14496-15 section 8.3.3.1.2)
     std::vector<std::uint8_t> record;
     record.push_back(1);  // configurationVersion
-    record.push_back(static_cast<std::uint8_t>((general_profile_space << 6U) | (general_tier_flag << 5U) | general_profile_idc));
-    append_be32(record, general_profile_compat);
-    record.insert(record.end(), constraint_flags, constraint_flags + 6);
-    record.push_back(general_level_idc);
-    // min_spatial_segmentation_idc = 0, with reserved bits
+    record.push_back(static_cast<std::uint8_t>((sps->profile_space << 6U) | ((sps->tier ? 1U : 0U) << 5U) |
+                                               sps->profile_idc));
+    append_be32(record, sps->profile_compatibility_flags);
+    record.insert(record.end(), sps->constraint_flags.begin(), sps->constraint_flags.end());
+    record.push_back(sps->level_idc);
+    // min_spatial_segmentation_idc = 0 (unknown), with reserved bits
     append_be16(record, 0xF000U);
-    // parallelismType = 0 with reserved bits
+    // parallelismType = 0 (unknown) with reserved bits
     record.push_back(0xFCU);
-    // chromaFormat = 1 (4:2:0) with reserved bits
-    record.push_back(0xFDU);
-    // bitDepthLumaMinus8 = 0 with reserved bits
-    record.push_back(0xF8U);
-    // bitDepthChromaMinus8 = 0 with reserved bits
-    record.push_back(0xF8U);
+    // chromaFormat, bitDepthLumaMinus8, bitDepthChromaMinus8, each with reserved bits
+    record.push_back(static_cast<std::uint8_t>(0xFCU | (sps->chroma_format_idc & 0x03U)));
+    record.push_back(static_cast<std::uint8_t>(0xF8U | (sps->bit_depth_luma_minus8 & 0x07U)));
+    record.push_back(static_cast<std::uint8_t>(0xF8U | (sps->bit_depth_chroma_minus8 & 0x07U)));
     // avgFrameRate = 0
     append_be16(record, 0);
     // constantFrameRate(2b)=0 + numTemporalLayers(3b) + temporalIdNested(1b) + lengthSizeMinusOne(2b)=3
-    record.push_back(static_cast<std::uint8_t>(((max_sub_layers + 1) << 3U) | 0x04U | 0x03U));
+    record.push_back(static_cast<std::uint8_t>(((sps->max_sub_layers_minus1 + 1U) << 3U) |
+                                               ((sps->temporal_id_nesting ? 1U : 0U) << 2U) | 0x03U));
     // numOfArrays = 3 (VPS, SPS, PPS)
     record.push_back(3);
 
@@ -862,6 +909,34 @@ std::vector<std::uint8_t> build_hvcc_box(const HevcParamSets& params) {
     write_array(34, params.pps);  // PPS
 
     return make_box("hvcC", record);
+}
+
+// The sample entry an SRT HEVC track is announced with (make_track); its
+// codec string names the same type.
+constexpr std::string_view kHevcSampleEntryType = "hvc1";
+
+// The hvcC box, codec string, and dimensions of an HEVC track, from the
+// parameter sets of an Annex B keyframe. The codec string is derived from
+// the hvcC record itself, so the two always agree. Empty when the keyframe
+// lacks a VPS, SPS, or PPS, or its SPS does not parse.
+struct HevcTrackConfig {
+    std::vector<std::uint8_t> hvcc;
+    std::string codec;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+};
+
+HevcTrackConfig hevc_track_config(std::span<const std::uint8_t> keyframe) {
+    HevcTrackConfig config;
+    const auto params = extract_hevc_param_sets(keyframe);
+    config.hvcc = build_hvcc_box(params);
+    if (config.hvcc.empty()) {
+        return config;
+    }
+    config.codec = hevc_codec_string_from_record(
+        kHevcSampleEntryType, std::span<const std::uint8_t>(config.hvcc).subspan(8));
+    std::tie(config.width, config.height) = parse_hevc_dimensions(params.sps);
+    return config;
 }
 
 // Build an esds box for AAC audio from ADTS header bytes.
@@ -1509,8 +1584,9 @@ TrackDescription make_track(std::uint32_t track_id,
     track.handler_type = is_video ? "vide" : "soun";
     if (is_video) {
         if (video_codec == VideoCodec::kHevc) {
+            // Placeholder until the first keyframe's SPS gives the real one.
             track.codec = "hvc1.1.6.L120.B0";
-            track.sample_entry_type = "hvc1";
+            track.sample_entry_type = std::string(kHevcSampleEntryType);
         } else {
             track.codec = "avc1.42E01E";
             track.sample_entry_type = "avc1";
@@ -1554,6 +1630,18 @@ std::vector<TrackDescription> codec_tracks_for_testing() {
     const std::array<std::uint8_t, 7> adts{0xff, 0xf1, 0x4c, 0x80, 0, 0xff, 0xfc};
     audio.codec_private = build_esds_box(adts);
     return {video, audio};
+}
+// The video track discovery announces for an HEVC keyframe.
+TrackDescription hevc_track_for_testing(std::span<const std::uint8_t> keyframe) {
+    auto track = make_track(1, "video", true, VideoCodec::kHevc);
+    auto config = hevc_track_config(keyframe);
+    track.codec_private = std::move(config.hvcc);
+    if (!config.codec.empty()) {
+        track.codec = std::move(config.codec);
+    }
+    track.width = config.width;
+    track.height = config.height;
+    return track;
 }
 std::vector<MediaFragment> demux_fragments_for_testing(std::span<const std::uint8_t> bytes, bool discover) {
     LiveSrtCallerRuntimeConfig config;
@@ -1767,24 +1855,10 @@ transport::TransportStatus LiveSrtIngestManager::start() {
                                         std::string codec_str_update;
                                         std::pair<std::uint32_t, std::uint32_t> dim_update{0, 0};
                                         if (state.video_codec == VideoCodec::kHevc) {
-                                            auto params = extract_hevc_param_sets(sample.payload);
-                                            codec_priv = build_hvcc_box(params);
-                                            dim_update = parse_hevc_dimensions(params.sps);
-                                            if (!codec_priv.empty() && params.sps.size() > 12) {
-                                                // Build codec string: hvc1.<profile>.<compat>.<tier><level>
-                                                const std::uint8_t* s = params.sps.data() + 2;
-                                                const std::uint8_t prof_idc = static_cast<std::uint8_t>(s[1] & 0x1FU);
-                                                const std::uint8_t tier_flag = static_cast<std::uint8_t>((s[1] >> 5U) & 0x01U);
-                                                const std::uint32_t compat = (static_cast<std::uint32_t>(s[2]) << 24U) |
-                                                                              (static_cast<std::uint32_t>(s[3]) << 16U) |
-                                                                              (static_cast<std::uint32_t>(s[4]) << 8U) |
-                                                                              static_cast<std::uint32_t>(s[5]);
-                                                const std::uint8_t level_idc = s[12];
-                                                char buf[64];
-                                                std::snprintf(buf, sizeof(buf), "hvc1.%u.%X.%c%u",
-                                                              prof_idc, compat, tier_flag ? 'H' : 'L', level_idc / 3);
-                                                codec_str_update = buf;
-                                            }
+                                            auto config = hevc_track_config(sample.payload);
+                                            codec_priv = std::move(config.hvcc);
+                                            codec_str_update = std::move(config.codec);
+                                            dim_update = {config.width, config.height};
                                         } else {
                                             auto [sps, pps] = extract_h264_sps_pps(sample.payload);
                                             codec_priv = build_avcc_box(sps, pps);

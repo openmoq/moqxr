@@ -14,6 +14,7 @@
 namespace openmoq::publisher::live_srt_internal {
 std::vector<TrackDescription> codec_tracks_for_testing();
 std::vector<MediaFragment> demux_fragments_for_testing(std::span<const std::uint8_t> bytes, bool discover = false);
+TrackDescription hevc_track_for_testing(std::span<const std::uint8_t> keyframe);
 }
 
 namespace {
@@ -137,11 +138,122 @@ bool source_timing_survives_synthetic_cmaf() {
     return ok;
 }
 
+// x265 parameter sets (ffmpeg -f lavfi -i testsrc=size=WxH:rate=30 -frames:v 1
+// -c:v libx265 -pix_fmt FMT -f hevc). Each SPS carries emulation prevention
+// bytes inside profile_tier_level, as x265 SPSs do: "60 00 00 03 00 90".
+struct HevcFixture {
+    const char* name;
+    std::vector<std::uint8_t> vps;
+    std::vector<std::uint8_t> sps;
+    std::string codec;  // ISO/IEC 14496-15 Annex E.3, worked by hand
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint8_t chroma_format;
+    std::uint8_t bit_depth_minus8;
+};
+
+const std::vector<std::uint8_t> kX265Pps{0x44, 0x01, 0xC1, 0x72, 0xB4, 0x62, 0x40};
+
+std::vector<HevcFixture> hevc_fixtures() {
+    return {
+        // Main (profile 1, compatibility flags 0x60000000, bits 1 and 2,
+        // reversed 0x6), level 4.0 (120), constraint byte 0x90.
+        {"x265 Main 1920x1080",
+         {0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+          0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0x98, 0x09},
+         {0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+          0x00, 0x78, 0xA0, 0x03, 0xC0, 0x80, 0x10, 0xE5, 0x96, 0x56, 0x69, 0x24, 0xCA, 0xF0, 0x16, 0x80,
+          0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0F, 0x04},
+         "hvc1.1.6.L120.90", 1920, 1080, 1, 0},
+        // Main, level 3.1 (93).
+        {"x265 Main 1280x720",
+         {0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+          0x00, 0x00, 0x03, 0x00, 0x5D, 0x95, 0x98, 0x09},
+         {0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+          0x00, 0x5D, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x16, 0x59, 0x59, 0xA4, 0x93, 0x2B, 0xC0, 0x5A, 0x02,
+          0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x3C, 0x10},
+         "hvc1.1.6.L93.90", 1280, 720, 1, 0},
+        // Main 10 (profile 2, compatibility flags 0x20000000, bit 2,
+        // reversed 0x4), 10-bit 4:2:0.
+        {"x265 Main 10 1280x720",
+         {0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+          0x00, 0x00, 0x03, 0x00, 0x5D, 0x95, 0x98, 0x09},
+         {0x42, 0x01, 0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+          0x00, 0x5D, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x13, 0x65, 0x95, 0x9A, 0x49, 0x32, 0xBC, 0x05, 0xA0,
+          0x20, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x03, 0x03, 0xC1},
+         "hvc1.2.4.L93.90", 1280, 720, 1, 2},
+        // Main 4:2:2 10 (format range extensions, profile 4, compatibility
+        // flags 0x08000000, bit 4, reversed 0x10), constraint bytes
+        // 9D 08 00 00 00 00 once the 03s are removed, written as two hex
+        // digits each, as hevc_codec_string writes them for MP4 input.
+        {"x265 Main 4:2:2 10 1280x720",
+         {0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x9D, 0x08, 0x00, 0x00,
+          0x03, 0x00, 0x00, 0x5D, 0x95, 0x98, 0x09},
+         {0x42, 0x01, 0x01, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x9D, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00,
+          0x5D, 0xB0, 0x02, 0x80, 0x80, 0x2D, 0x13, 0x65, 0x95, 0x9A, 0x49, 0x32, 0xBC, 0x05, 0xA0, 0x20,
+          0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x03, 0x03, 0xC1},
+         "hvc1.4.10.L93.9D.08", 1280, 720, 2, 2},
+    };
+}
+
+std::vector<std::uint8_t> annexb(const std::vector<std::vector<std::uint8_t>>& nals) {
+    std::vector<std::uint8_t> out;
+    for (const auto& nal : nals) {
+        out.insert(out.end(), {0, 0, 0, 1});
+        out.insert(out.end(), nal.begin(), nal.end());
+    }
+    return out;
+}
+
+bool hevc_configuration_comes_from_the_sps_rbsp() {
+    bool ok = true;
+    for (const auto& fixture : hevc_fixtures()) {
+        const std::string name = fixture.name;
+        const std::vector<std::uint8_t> idr{0x26, 0x01, 0xAF, 0x00, 0x80};
+        const auto track = openmoq::publisher::live_srt_internal::hevc_track_for_testing(
+            annexb({fixture.vps, fixture.sps, kX265Pps, idr}));
+        ok &= expect(track.codec == fixture.codec, name + " codec " + track.codec + " must be " + fixture.codec);
+        ok &= expect(track.sample_entry_type == "hvc1", name + " codec string names the announced sample entry");
+        ok &= expect(track.width == fixture.width && track.height == fixture.height,
+                     name + " dimensions " + std::to_string(track.width) + "x" + std::to_string(track.height));
+        const auto& box = track.codec_private;
+        if (!expect(box.size() > 8 + 23 && std::equal(box.begin() + 4, box.begin() + 8, "hvcC"),
+                    name + " must build an hvcC box")) {
+            ok = false;
+            continue;
+        }
+        const std::span<const std::uint8_t> record(box.data() + 8, box.size() - 8);
+        // The record's profile fields are the RBSP bits, without the 03s.
+        ok &= expect(record[1] == fixture.sps[3], name + " profile byte");
+        ok &= expect(record[5] == 0, name + " compatibility flags must not include the emulation prevention byte");
+        ok &= expect(record[16] == (0xFC | fixture.chroma_format), name + " chromaFormat");
+        ok &= expect(record[17] == (0xF8 | fixture.bit_depth_minus8), name + " bitDepthLumaMinus8");
+        ok &= expect(record[18] == (0xF8 | fixture.bit_depth_minus8), name + " bitDepthChromaMinus8");
+        ok &= expect(record[21] == 0x0F, name + " one temporal layer, nested, 4-byte lengths");
+        // The arrays keep the parameter sets as they arrived, 03s included.
+        const std::vector<std::uint8_t> stored_sps(record.begin() + 23 + 5 + fixture.vps.size() + 5,
+                                                   record.begin() + 23 + 5 + fixture.vps.size() + 5 +
+                                                       fixture.sps.size());
+        ok &= expect(stored_sps == fixture.sps, name + " hvcC carries the escaped SPS unchanged");
+        // The record is valid LOC decoder configuration.
+        ok &= expect(openmoq::publisher::loc_codec_config(track) ==
+                         std::vector<std::uint8_t>(record.begin(), record.end()),
+                     name + " hvcC must parse as LOC decoder extradata");
+    }
+
+    const auto missing_pps = openmoq::publisher::live_srt_internal::hevc_track_for_testing(
+        annexb({hevc_fixtures()[0].vps, hevc_fixtures()[0].sps}));
+    ok &= expect(missing_pps.codec_private.empty() && missing_pps.codec == "hvc1.1.6.L120.B0",
+                 "a keyframe without a PPS leaves the placeholder track");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
     bool ok = source_timing_survives_synthetic_cmaf();
     ok &= adts_configuration_is_per_sample();
+    ok &= hevc_configuration_comes_from_the_sps_rbsp();
 
     const std::filesystem::path config_path =
         std::filesystem::temp_directory_path() / "openmoq-live-srt-config-test.json";
