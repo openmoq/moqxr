@@ -308,6 +308,8 @@ void opus_fixture() {
 void av1_fixture() {
     const auto parsed = parse_mp4_file("tests/fixtures/loc-av1-fragmented.mp4");
     check(parsed.tracks.size() == 1 && parsed.tracks.front().sample_entry_type == "av01", "AV1 fixture has one av01 track");
+    check(parsed.tracks.front().width == 128 && parsed.tracks.front().height == 128,
+          "AV1 width and height come from the av01 sample entry (the catalog needs them)");
     const auto config = loc_codec_config(parsed.tracks.front());
     check(config.size() > 4 && config[0] == 0x81, "av1C payload is exposed as Video Config");
     const auto samples = read_encoded_samples(parsed);
@@ -320,6 +322,8 @@ void vp9_fixture() {
     const auto parsed = parse_mp4_file("tests/fixtures/loc-vp9-fragmented.mp4");
     check(parsed.tracks.size() == 1 && parsed.tracks.front().sample_entry_type == "vp09", "VP9 fixture has one vp09 track");
     check(parsed.tracks.front().codec == "vp09.00.10.08", "VP9 codec string is built from vpcC (profile 0, level 1.0, 8-bit)");
+    check(parsed.tracks.front().width == 128 && parsed.tracks.front().height == 128,
+          "VP9 width and height come from the vp09 sample entry");
     check(loc_codec_config(parsed.tracks.front()).empty(), "VP9 has no Video Config");
     const auto samples = read_encoded_samples(parsed);
     check(samples.size() == 12, "VP9 fixture has twelve frames");
