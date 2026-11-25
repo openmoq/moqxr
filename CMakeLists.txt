@@ -1084,6 +1084,14 @@ if(OPENMOQ_BUILD_TESTS)
         target_compile_definitions(openmoq-publisher-libmoq-translation-tests PRIVATE OPENMOQ_HAS_LIBMOQ=1)
         target_link_libraries(openmoq-publisher-libmoq-translation-tests PRIVATE openmoq_publisher_lib moq::service)
         add_test(NAME openmoq-publisher-libmoq-translation-tests COMMAND openmoq-publisher-libmoq-translation-tests)
+
+        add_executable(openmoq-publisher-libmoq-auth-dpop-tests
+            tests/libmoq_auth_dpop_test.cpp
+        )
+        target_compile_definitions(openmoq-publisher-libmoq-auth-dpop-tests PRIVATE OPENMOQ_HAS_LIBMOQ=1)
+        target_link_libraries(openmoq-publisher-libmoq-auth-dpop-tests PRIVATE
+            openmoq_publisher_lib moq::service OpenSSL::Crypto)
+        add_test(NAME openmoq-publisher-libmoq-auth-dpop-tests COMMAND openmoq-publisher-libmoq-auth-dpop-tests)
     endif()
 
     if(OPENMOQ_HAS_PICOQUIC AND OPENMOQ_RUN_PICOQUIC_SMOKE_TESTS)

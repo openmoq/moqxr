@@ -30,6 +30,10 @@ namespace openmoq::publisher::transport {
 
 // Owns credentials and callback context until the sender and endpoint have
 // stopped. prepare() validates static input before any media or network I/O.
+// A DPoP proof names one request and is fresh and unique per use, so with a
+// signer or provider each source is a selector that resolves when libmoq asks:
+// SETUP at connect, PUBLISH_NAMESPACE and each PUBLISH for its actual resource.
+// Without either, the sources are static token lists.
 class LibmoqAuthorization {
 public:
     LibmoqAuthorization() = default;
@@ -49,6 +53,9 @@ private:
     moq_auth_source_t setup_{};
     moq_auth_source_t requests_{};
     // [0] is the credential, [1] the DPoP proof of a cnf-bound credential.
+    // The endpoint selects into the setup_ arrays and the sender into the
+    // action_ arrays, so neither owner overwrites bytes the other borrowed.
+    // libmoq copies selected bytes before the next call for the same owner.
     moq_auth_token_t setup_tokens_[2]{};
     moq_auth_token_t action_tokens_[2]{};
     std::vector<std::uint8_t> setup_bytes_[2];

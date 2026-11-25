@@ -241,11 +241,23 @@ int main() {
             bound.dpop_signer = cat4moq::DpopSigner::from_pem(kDpopKeyPem);
             LibmoqAuthorization auth;
             ok &= expect(auth.prepare(bound, draft).ok, "bound credentials translate");
+            moq_bytes_t bound_parts[] = {MOQ_BYTES_LITERAL("live")};
+            const moq_auth_request_t bound_requests[] = {
+                {MOQ_AUTH_CLIENT_SETUP, {nullptr, 0}, {nullptr, 0}},
+                {MOQ_AUTH_PUBLISH_NAMESPACE, {bound_parts, 1}, {nullptr, 0}}};
             for (const auto* source : {auth.setup_source(), auth.request_source()}) {
-                ok &= expect(source && source->token_count == 2, "credential and proof are two tokens");
-                if (!source || source->token_count != 2) continue;
-                ok &= expect(source->tokens[0].token_type == 1 && source->tokens[1].token_type == 17, "proof follows the credential with its own type");
-                const auto& proof = source->tokens[1].token_value;
+                // Proofs are per request, so a signer always selects.
+                ok &= expect(source && source->select && !source->tokens && source->token_count == 0,
+                             "a DPoP signer makes the source a selector");
+                if (!source || !source->select) continue;
+                const auto& request = bound_requests[source == auth.setup_source() ? 0 : 1];
+                moq_auth_token_t tokens[2]{};
+                std::size_t count = 0;
+                ok &= expect(source->select(source->ctx, &request, tokens, 2, &count) == MOQ_OK && count == 2,
+                             "credential and proof are two tokens");
+                if (count != 2) continue;
+                ok &= expect(tokens[0].token_type == 1 && tokens[1].token_type == 17, "proof follows the credential with its own type");
+                const auto& proof = tokens[1].token_value;
                 ok &= expect(proof.len > 3 && std::string_view(reinterpret_cast<const char*>(proof.data), 3) == "eyJ", "proof value is the bare compact JWT");
             }
             cat4moq::AuthorizationConfig bound_provider = bound;
