@@ -274,6 +274,13 @@ struct LibmoqDemandOps {
     std::function<bool()> is_closed;
     std::function<void(std::uint64_t)> wait;
 };
+// Whether media should be written now. A publisher that forwards sends without
+// waiting for a subscriber (draft 18 section 10.11, "immediately, possibly
+// before PUBLISH_OK"): a relay that accepted the PUBLISH sends no SUBSCRIBE for
+// the track, and libmoq does not count a publication as a media subscriber.
+// libmoq itself sends nothing to a publication whose Forward State is 0.
+bool libmoq_has_demand(bool forward, bool has_media_subscriber);
+
 LibmoqDemandOutcome libmoq_wait_demand(std::atomic<bool>* cancel,
                                        std::uint64_t timeout_us, std::uint64_t step_us,
                                        const LibmoqDemandOps& ops);

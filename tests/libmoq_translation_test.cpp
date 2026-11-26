@@ -946,6 +946,21 @@ int main() {
         ok &= expect(handle.namespace_accepted.load(), "expected a ready sender to mark the namespace accepted");
     }
 
+    // -- Demand under forward=1 (libmoq_has_demand) ---------------------------
+    // A publisher that forwards sends without waiting for a subscriber (draft 18
+    // section 10.11): a relay that accepted the PUBLISH sends no SUBSCRIBE for
+    // the track, so a wait for one never ends.
+    {
+        ok &= expect(libmoq_has_demand(/*forward=*/true, /*has_media_subscriber=*/false),
+                     "expected forward=1 to need no media subscriber");
+        ok &= expect(!libmoq_has_demand(false, false), "expected forward=0 without a subscriber to have no demand");
+        ok &= expect(libmoq_has_demand(false, true), "expected a media subscriber to be demand under forward=0");
+        LibmoqDemandOps forwarding{[] { return libmoq_has_demand(true, false); }, [] { return false; },
+                                   [] { return false; }, [](std::uint64_t) {}};
+        ok &= expect(libmoq_wait_demand(nullptr, 3000, 1000, forwarding) == LibmoqDemandOutcome::kSubscriber,
+                     "expected the demand wait to return at once under forward=1");
+    }
+
     // -- Demand-wait primitive (libmoq_wait_demand) --------------------------
     // Network-free coverage of the subscriber-demand gate the drivers use to
     // avoid hanging/consuming sources against a lazy relay.
