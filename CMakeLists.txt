@@ -699,6 +699,7 @@ add_library(openmoq_publisher_lib
     src/mp4_box.cpp
     src/publisher_api.cpp
     src/publisher_priority.cpp
+    src/track_properties.cpp
     src/transport/connect_failure_kind.cpp
     src/transport/libmoq_publisher.cpp
     src/transport/moqt_control_messages.cpp

@@ -6,6 +6,7 @@
 #include "openmoq/publisher/media_packaging.h"
 #include "openmoq/publisher/msf_catalog.h"
 #include "openmoq/publisher/publisher_priority.h"
+#include "openmoq/publisher/track_properties.h"
 #include "openmoq/publisher/transport/moqt_control_messages.h"
 #include "openmoq/publisher/transport/publisher_transport.h"
 
@@ -197,13 +198,19 @@ public:
     // See PublisherConfig::publisher_priorities. nullopt (the default) sends
     // no DEFAULT_PUBLISHER_PRIORITY and schedules every track at 128.
     void set_publisher_priorities(std::optional<openmoq::publisher::PublisherPriorities> priorities) {
-        track_priorities_ = openmoq::publisher::TrackPublisherPriorities(priorities);
+        track_properties_.set_publisher_priorities(priorities);
     }
 
 private:
     MediaPackaging media_packaging_ = MediaPackaging::kCmaf;
     MsfVersion msf_version_ = MsfVersion::k02;
-    openmoq::publisher::TrackPublisherPriorities track_priorities_;
+    openmoq::publisher::TrackProperties track_properties_;
+    // Under MSF-02, records each LOC track's decoder configuration as its
+    // VIDEO_CONFIG or AUDIO_CONFIG Track Property (MSF-02 section 12.2),
+    // replacing the previous publish's. MSF-01 carries it in the catalog only.
+    // The configuration is each track's TrackInitialization::codec_payload.
+    void record_loc_decoder_configs(const std::vector<openmoq::publisher::TrackDescription>& tracks,
+                                    const std::vector<openmoq::publisher::TrackInitialization>& initializations);
     void reset_publish_stats();
     TransportStatus apply_live_group_floors(std::uint64_t resume_group_floor,
                                             std::uint64_t resume_catalog_group_floor);

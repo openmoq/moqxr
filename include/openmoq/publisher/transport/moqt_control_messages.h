@@ -76,9 +76,9 @@ struct TrackMessage {
     // Draft-23 SUBSCRIBE_TRACKS_ID (0x36): the SUBSCRIBE_TRACKS request this
     // PUBLISH answers. Ignored on earlier drafts.
     std::optional<std::uint64_t> subscribe_tracks_request_id;
-    // DEFAULT_PUBLISHER_PRIORITY Track Property (0x0E). Sent on draft 18 and
-    // later when set; nullopt sends no Track Properties, as before.
-    std::optional<std::uint8_t> default_publisher_priority;
+    // Track Properties (see TrackProperties), sent on draft 18 and later.
+    // Empty sends none, as before.
+    std::vector<ObjectProperty> track_properties;
 };
 
 struct PublishNamespaceOk {
@@ -400,7 +400,7 @@ std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,
                                                       std::size_t largest_group_id,
                                                       std::size_t largest_object_id,
                                                       bool content_exists,
-                                                      std::optional<std::uint8_t> default_publisher_priority = std::nullopt);
+                                                      std::span<const ObjectProperty> track_properties = {});
 std::vector<std::uint8_t> encode_subscribe_error_message(std::uint64_t request_id,
                                                          std::uint64_t error_code,
                                                          std::string_view reason);

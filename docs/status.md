@@ -43,7 +43,9 @@ no Video Config because the WebCodecs registration defines no description, and
 SRT supports H.264, HEVC and AAC only. CMAF remains the primary default and LOCMAF keeps
 its separate packaging path. LOC objects carry source presentation timing,
 timescale, frame marking, codec extradata, and the codec string; video uses
-GOP groups and audio uses one sample per group. Unsupported input and
+GOP groups and audio uses one sample per group. Under MSF-02 the extradata is
+also each track's VIDEO_CONFIG or AUDIO_CONFIG Track Property in PUBLISH and
+SUBSCRIBE_OK, which the catalog names with a `track-property` init entry. Unsupported input and
 configuration changes fail explicitly. The libmoq backend does not publish this LOC profile.
 
 Independent offline validation covers 952 encoded samples over five codec

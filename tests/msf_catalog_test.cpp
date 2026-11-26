@@ -1658,17 +1658,18 @@ int main() {
                          "expected an unknown frame rate to resolve to the flagged 30 fps estimate");
         }
 
-        // attach_loc_init_data: object-property entries under 02, inline under 01, nothing without a config.
+        // attach_loc_init_data: track-property entries under 02, inline under 01, nothing without a config.
         {
             auto catalog = catalog_with(MsfVersion::k02, loc_track("video"));
             attach_loc_init_data(catalog, catalog.tracks[0], "video", "AAAA", true);
             ok &= expect(catalog.tracks[0].init_ref == "video-init" && catalog.init_data_list.size() == 1 &&
-                             catalog.init_data_list[0].type == "object-property" && catalog.init_data_list[0].data == "0x0D",
-                         "expected a video object-property entry naming VIDEO_CONFIG");
+                             catalog.init_data_list[0].type == "track-property" && catalog.init_data_list[0].data == "0x0D",
+                         "expected a video track-property entry naming VIDEO_CONFIG");
             auto audio = catalog_with(MsfVersion::k02, loc_track("audio"));
             attach_loc_init_data(audio, audio.tracks[0], "audio", "AAAA", false);
-            ok &= expect(audio.init_data_list.size() == 1 && audio.init_data_list[0].data == "0x0F",
-                         "expected an audio object-property entry naming AUDIO_CONFIG");
+            ok &= expect(audio.init_data_list.size() == 1 && audio.init_data_list[0].type == "track-property" &&
+                             audio.init_data_list[0].data == "0x0F",
+                         "expected an audio track-property entry naming AUDIO_CONFIG");
             auto none = catalog_with(MsfVersion::k02, loc_track("video"));
             attach_loc_init_data(none, none.tracks[0], "video", "", true);
             ok &= expect(!none.tracks[0].init_ref.has_value() && none.init_data_list.empty(),

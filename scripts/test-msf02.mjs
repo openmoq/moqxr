@@ -104,7 +104,7 @@ function validate02(label, text, catalog) {
             const entry = inits.get(track.initRef);
             assert.ok(entry, `${where}: initRef resolves`);
             if (track.packaging === 'loc') {
-                assert.equal(entry.type, 'object-property', `${where}: LOC init data is an object-property entry`);
+                assert.equal(entry.type, 'track-property', `${where}: LOC init data is a track-property entry`);
                 assert.equal(entry.data, track.role === 'video' ? '0x0D' : '0x0F', `${where}: property type names VIDEO_CONFIG / AUDIO_CONFIG`);
             } else {
                 assert.equal(entry.type, 'inline', `${where}: ${track.packaging} init data stays inline`);

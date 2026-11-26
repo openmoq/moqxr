@@ -163,7 +163,7 @@ int main() {
                   "VP9 catalog carries the codec string and no init data");
         }
         {
-            // MSF-02 publishes LOC decoder config as object-property init entries; MSF-01 stays inline.
+            // MSF-02 publishes LOC decoder config as track-property init entries; MSF-01 stays inline.
             const auto catalog_json = [&](const char* name, MsfVersion version, MediaPackaging packaging) {
                 auto local = config;
                 local.msf_version = version;
@@ -181,29 +181,30 @@ int main() {
             };
             const auto hevc02 = catalog_json("loc-hevc-fragmented.mp4", MsfVersion::k02, MediaPackaging::kLoc);
             check(hevc02.find("\"version\":\"draft-02\"") != std::string::npos, "default LOC catalog is draft-02");
-            check(hevc02.find("\"type\":\"object-property\"") != std::string::npos &&
+            check(hevc02.find("\"type\":\"track-property\"") != std::string::npos &&
                       hevc02.find("\"data\":\"0x0D\"") != std::string::npos &&
                       hevc02.find("\"type\":\"inline\"") == std::string::npos,
-                  "LOC video config is an object-property entry naming VIDEO_CONFIG");
+                  "LOC video config is a track-property entry naming VIDEO_CONFIG");
             check(hevc02.find("\"framerate\"") != std::string::npos && hevc02.find("\"bitrate\"") != std::string::npos,
                   "LOC video track carries the Table 6 fields");
             const auto opus02 = catalog_json("loc-opus.mp4", MsfVersion::k02, MediaPackaging::kLoc);
-            check(opus02.find("\"data\":\"0x0F\"") != std::string::npos && opus02.find("\"channelConfig\"") != std::string::npos &&
+            check(opus02.find("\"type\":\"track-property\"") != std::string::npos && opus02.find("\"data\":\"0x0F\"") != std::string::npos &&
+                      opus02.find("\"channelConfig\"") != std::string::npos &&
                       opus02.find("\"samplerate\"") != std::string::npos,
-                  "LOC audio config is an object-property entry naming AUDIO_CONFIG with the Table 6 fields");
+                  "LOC audio config is a track-property entry naming AUDIO_CONFIG with the Table 6 fields");
             const auto vp902 = catalog_json("loc-vp9-fragmented.mp4", MsfVersion::k02, MediaPackaging::kLoc);
             check(vp902.find("initRef") == std::string::npos && vp902.find("initDataList") == std::string::npos &&
                       vp902.find("\"codec\":\"vp09.00.10.08\"") != std::string::npos,
                   "VP9 has no init reference under 02");
             const auto hevc01 = catalog_json("loc-hevc-fragmented.mp4", MsfVersion::k01, MediaPackaging::kLoc);
             check(hevc01.find("\"version\":\"1\"") != std::string::npos && hevc01.find("\"type\":\"inline\"") != std::string::npos &&
-                      hevc01.find("object-property") == std::string::npos,
+                      hevc01.find("-property\"") == std::string::npos,
                   "MSF-01 keeps inline LOC init data");
             const auto cmaf02 = catalog_json("locmaf-publisher.mp4", MsfVersion::k02, MediaPackaging::kCmaf);
-            check(count(cmaf02, "\"type\":\"inline\"") >= 1 && cmaf02.find("object-property") == std::string::npos,
+            check(count(cmaf02, "\"type\":\"inline\"") >= 1 && cmaf02.find("-property\"") == std::string::npos,
                   "CMAF keeps inline init data under 02");
             const auto locmaf02 = catalog_json("locmaf-publisher.mp4", MsfVersion::k02, MediaPackaging::kLocmaf);
-            check(count(locmaf02, "\"type\":\"inline\"") >= 1 && locmaf02.find("object-property") == std::string::npos,
+            check(count(locmaf02, "\"type\":\"inline\"") >= 1 && locmaf02.find("-property\"") == std::string::npos,
                   "LOCMAF keeps inline init data under 02");
         }
         // A missing decode interval invalidates dependent video until a new IDR.
