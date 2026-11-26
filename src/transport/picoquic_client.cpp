@@ -323,6 +323,11 @@ int apply_pending_operations(PicoquicClient::Impl& impl) {
 
     for (const auto& [stream_id, priority] : reliable_stream_priorities) {
         if (picoquic_set_stream_priority(impl.cnx, stream_id, priority) != 0) {
+            // A stream the peer stopped, or that is reset or gone, takes no
+            // more data: there is nothing left to prioritize.
+            if (picoquic_stream_send_closed(impl.cnx, stream_id)) {
+                continue;
+            }
             return fail_media_delivery(
                 impl, "picoquic failed to set reliable stream priority", -1);
         }

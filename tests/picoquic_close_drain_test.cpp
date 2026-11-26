@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,6 +64,8 @@ struct DrainServer {
     bool loop_ready = false;
     bool stop_requested = false;
     bool loop_exited = false;
+    bool stop_first_stream = false;  // send STOP_SENDING on the first stream that carries data
+    std::optional<uint64_t> stopped_stream_id;
 };
 
 int drain_server_callback(picoquic_cnx_t* cnx,
@@ -72,8 +75,6 @@ int drain_server_callback(picoquic_cnx_t* cnx,
                           picoquic_call_back_event_t event,
                           void* callback_ctx,
                           void* stream_ctx) {
-    static_cast<void>(cnx);
-    static_cast<void>(stream_id);
     static_cast<void>(bytes);
     static_cast<void>(stream_ctx);
     auto* server = static_cast<DrainServer*>(callback_ctx);
@@ -84,6 +85,15 @@ int drain_server_callback(picoquic_cnx_t* cnx,
         case picoquic_callback_stream_data:
         case picoquic_callback_stream_fin: {
             std::lock_guard<std::mutex> lock(server->mutex);
+            if (server->stop_first_stream && !server->stopped_stream_id.has_value()) {
+                server->stopped_stream_id = stream_id;
+                picoquic_stop_sending(cnx, stream_id, 0);
+                server->condition.notify_all();
+                return 0;
+            }
+            if (server->stopped_stream_id == stream_id) {
+                return 0;
+            }
             server->bytes_received += length;
             if (event == picoquic_callback_stream_fin) {
                 server->fin_received = true;
@@ -293,6 +303,57 @@ bool run_timeout_scenario(const TlsConfig& tls) {
     return ok;
 }
 
+// The relay stops a stream (STOP_SENDING) on which a reliable priority change
+// is still queued. picoquic frees the stream once the client's RESET_STREAM is
+// acknowledged, so applying the change fails; that must not end the session.
+bool run_stopped_stream_priority_scenario(const TlsConfig& tls) {
+    bool ok = true;
+    DrainServer server;
+    server.stop_first_stream = true;
+    ok &= expect(start_server(server), "expected stopped-stream server to start");
+    if (!ok) {
+        stop_server(server);
+        return false;
+    }
+    PicoquicClient client;
+    ok &= expect(client.configure(EndpointConfig{.host = "127.0.0.1", .port = server.port, .alpn = "moq-00"}, tls).ok,
+                 "expected stopped-stream configure to succeed");
+    ok &= expect(client.connect().ok, "expected stopped-stream connect to succeed");
+    std::uint64_t stopped = 0;
+    std::uint64_t next = 0;
+    if (ok) {
+        ok &= expect(client.open_stream(StreamDirection::kUnidirectional, stopped).ok,
+                     "expected the first stream to open");
+        ok &= expect(client.write_stream(stopped, std::vector<std::uint8_t>(64, 0x11), false).ok,
+                     "expected the first write to succeed");
+        bool seen = false;
+        for (int attempt = 0; attempt < 300 && !seen; ++attempt) {
+            seen = client.media_stream_peer_stopped(stopped);
+            if (!seen) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        ok &= expect(seen, "expected the client to record the peer's STOP_SENDING");
+        // The client answers STOP_SENDING with RESET_STREAM; let it be
+        // acknowledged, so picoquic frees the stream.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        ok &= expect(client.set_reliable_stream_priority(stopped, 1).ok,
+                     "expected the priority change to be queued");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ok &= expect(client.open_stream(StreamDirection::kUnidirectional, next).ok,
+                     "expected a second stream to open");
+        ok &= expect(client.write_stream(next, std::vector<std::uint8_t>(64, 0x22), true).ok,
+                     "expected a priority on a stopped stream to leave the session writable");
+        std::unique_lock<std::mutex> lock(server.mutex);
+        ok &= expect(server.condition.wait_for(lock, std::chrono::seconds(3), [&] { return server.fin_received; }),
+                     "expected the server to receive the second stream and its FIN");
+    }
+    ok &= expect(client.state() == ConnectionState::kConnected, "expected the session to stay connected");
+    ok &= expect(client.close(0).ok, "expected stopped-stream close to succeed");
+    stop_server(server);
+    return ok;
+}
+
 int main() {
     bool ok = true;
 
@@ -357,5 +418,6 @@ int main() {
     stop_server(server);
 
     ok &= run_timeout_scenario(tls);
+    ok &= run_stopped_stream_priority_scenario(tls);
     return ok ? 0 : 1;
 }
