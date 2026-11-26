@@ -3337,6 +3337,29 @@ bool test_fetch_object_after_a_prior_object() {
     return ok;
 }
 
+// A paused PUBLISH carries FORWARD 0 (0x10) up to draft 22 and PAUSED 1 (0x11)
+// on draft 23; a forwarding PUBLISH carries neither.
+bool test_paused_publish_parameter() {
+    bool ok = true;
+    for (const auto draft : {openmoq::publisher::DraftVersion::kDraft18, openmoq::publisher::DraftVersion::kDraft22,
+                             openmoq::publisher::DraftVersion::kDraft23}) {
+        openmoq::publisher::transport::TrackMessage message{.draft = draft, .track_name = "v", .track_namespace = "n",
+                                                             .request_id = 2, .track_alias = 1};
+        const auto forwarding = openmoq::publisher::transport::encode_track_message(message);
+        message.forward = false;
+        const auto paused = openmoq::publisher::transport::encode_track_message(message);
+        const std::vector<std::uint8_t> expected = draft == openmoq::publisher::DraftVersion::kDraft23
+                                                       ? std::vector<std::uint8_t>{1, 0x11, 1}
+                                                       : std::vector<std::uint8_t>{1, 0x10, 0};
+        const std::string label = std::string(openmoq::publisher::to_string(draft)) + " ";
+        ok &= expect(forwarding.size() + 2 == paused.size() && forwarding.back() == 0,
+                     label + "a forwarding PUBLISH has no parameters");
+        ok &= expect(paused.size() >= 3 && std::equal(expected.begin(), expected.end(), paused.end() - 3),
+                     label + "a paused PUBLISH ends with its one pause parameter");
+    }
+    return ok;
+}
+
 int main() {
     bool wire_ok = test_draft22_generic_framing_and_subscribe_range();
     wire_ok &= test_draft22_wire_api_boundaries();
@@ -3379,5 +3402,6 @@ int main() {
     ok &= test_draft23_wire_vectors();
     ok &= test_decoders_clear_a_stale_decode_fault();
     ok &= test_fetch_object_after_a_prior_object();
+    ok &= test_paused_publish_parameter();
     return ok && wire_ok ? 0 : 1;
 }
