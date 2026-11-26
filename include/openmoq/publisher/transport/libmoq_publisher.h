@@ -281,6 +281,12 @@ struct LibmoqDemandOps {
 // libmoq itself sends nothing to a publication whose Forward State is 0.
 bool libmoq_has_demand(bool forward, bool has_media_subscriber);
 
+// Whether the media sender is asked to PUBLISH its tracks. moq5's sender
+// publishes with forwarding on and cannot publish paused, so only forward=1
+// publishes: preannounce_tracks alone would announce forwarding and then wait
+// for a SUBSCRIBE the relay no longer needs to send.
+bool libmoq_publishes_tracks(bool forward, bool preannounce_tracks);
+
 LibmoqDemandOutcome libmoq_wait_demand(std::atomic<bool>* cancel,
                                        std::uint64_t timeout_us, std::uint64_t step_us,
                                        const LibmoqDemandOps& ops);

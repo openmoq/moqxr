@@ -827,7 +827,11 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
 #if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
     s_cfg.request_auth = authorization.request_source();
 #endif
-    s_cfg.publish_tracks = config.forward || config.preannounce_tracks;
+    s_cfg.publish_tracks = libmoq_publishes_tracks(config.forward, config.preannounce_tracks);
+    if (config.preannounce_tracks && !config.forward) {
+        std::clog << "libmoq: --preannounce-tracks is ignored without --forward 1: this backend cannot "
+                     "PUBLISH paused, so tracks are sent when the relay subscribes\n";
+    }
     s_cfg.catalog_refresh_interval_us = static_cast<std::uint64_t>(refresh_seconds) * 1000000ull;
 #ifdef MOQ_MSF_REVISION_02
     s_cfg.catalog_revision = libmoq_msf_revision(config.msf_version);
@@ -1165,6 +1169,11 @@ bool libmoq_has_demand(bool forward, bool has_media_subscriber) {
     return forward || has_media_subscriber;
 }
 
+bool libmoq_publishes_tracks(bool forward, bool preannounce_tracks) {
+    static_cast<void>(preannounce_tracks);
+    return forward;
+}
+
 LibmoqDemandOutcome libmoq_wait_demand(std::atomic<bool>* cancel,
                                        std::uint64_t timeout_us, std::uint64_t step_us,
                                        const LibmoqDemandOps& ops) {
@@ -1283,7 +1292,7 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
 
     // Tracks are configured: now wait for the initial catalog to publish.
     const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
-        config.forward || config.preannounce_tracks, live);
+        libmoq_publishes_tracks(config.forward, config.preannounce_tracks), live);
     if (ready == LibmoqReadyOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
@@ -1537,7 +1546,7 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
 
     // Tracks are configured: wait for the initial catalog before streaming.
     const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
-        config.forward || config.preannounce_tracks, live);
+        libmoq_publishes_tracks(config.forward, config.preannounce_tracks), live);
     if (ready == LibmoqReadyOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
@@ -1799,7 +1808,7 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
 
     // Tracks are configured: wait for the initial catalog before streaming.
     const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
-        config.forward || config.preannounce_tracks, live);
+        libmoq_publishes_tracks(config.forward, config.preannounce_tracks), live);
     if (ready == LibmoqReadyOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
@@ -1957,7 +1966,7 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
 
     // Tracks are configured: wait for the initial catalog before writing.
     const LibmoqReadyOutcome ready = wait_ready(ep, sender, cancel, timeout_us, handles,
-        config.forward || config.preannounce_tracks, live);
+        libmoq_publishes_tracks(config.forward, config.preannounce_tracks), live);
     if (ready == LibmoqReadyOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
