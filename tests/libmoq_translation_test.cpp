@@ -196,6 +196,16 @@ int main() {
     ok &= expect(libmoq_sender_failure_kind(MOQ_MEDIA_SENDER_FATAL_NAMESPACE_CANCELLED,
                     FailureKind::kRetryable) == FailureKind::kRetryable,
                  "withdrawal of an accepted namespace preserves reconnect policy");
+#ifdef MOQ_MSF_REVISION_02
+    // A moq5 sender with catalog_revision publishes the catalog --msf-version selects.
+    ok &= expect(kLibmoqSelectsMsfRevision, "a moq5 with catalog_revision selects the MSF revision");
+    ok &= expect(libmoq_msf_revision(openmoq::publisher::MsfVersion::k02) == MOQ_MSF_REVISION_02,
+                 "msf_version 02 selects MOQ_MSF_REVISION_02");
+    ok &= expect(libmoq_msf_revision(openmoq::publisher::MsfVersion::k01) == MOQ_MSF_REVISION_01,
+                 "msf_version 01 selects MOQ_MSF_REVISION_01");
+#else
+    ok &= expect(!kLibmoqSelectsMsfRevision, "an older moq5 always publishes MSF-01");
+#endif
     for (const auto draft : {DraftVersion::kDraft16, DraftVersion::kDraft18}) {
         for (const auto profile : {cat4moq::Profile::kC4m01, cat4moq::Profile::kMoqxCompat,
                                   cat4moq::Profile::kRed5CoseCompat}) {

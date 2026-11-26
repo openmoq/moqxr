@@ -817,12 +817,21 @@ TransportStatus connect_and_attach(const PublisherConfig& config,
     moq_namespace_t ns{ns_bytes.data(), ns_bytes.size()};
 
     moq_media_sender_cfg_t s_cfg;
-#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
+    // The appended fields (publish_tracks, catalog_refresh_interval_us,
+    // catalog_revision, request_auth) are read only when the sized
+    // initializers stamp a layout that covers them. Builds with either the
+    // auth API or catalog_revision have those initializers.
+#if (defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1) || defined(MOQ_MSF_REVISION_02)
     if (live) moq_media_sender_cfg_init_live_sized(&s_cfg, sizeof(s_cfg));
     else moq_media_sender_cfg_init_lossless_sized(&s_cfg, sizeof(s_cfg));
+#if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
     s_cfg.request_auth = authorization.request_source();
+#endif
     s_cfg.publish_tracks = config.forward || config.preannounce_tracks;
     s_cfg.catalog_refresh_interval_us = static_cast<std::uint64_t>(refresh_seconds) * 1000000ull;
+#ifdef MOQ_MSF_REVISION_02
+    s_cfg.catalog_revision = libmoq_msf_revision(config.msf_version);
+#endif
 #else
     if (live) {
         moq_media_sender_cfg_init_live(&s_cfg);  // never block the encoder
@@ -1108,6 +1117,12 @@ FailureKind libmoq_sender_failure_kind(std::uint64_t code, FailureKind fallback)
 #endif
     return fallback;
 }
+
+#ifdef MOQ_MSF_REVISION_02
+moq_msf_revision_t libmoq_msf_revision(openmoq::publisher::MsfVersion version) {
+    return version == openmoq::publisher::MsfVersion::k02 ? MOQ_MSF_REVISION_02 : MOQ_MSF_REVISION_01;
+}
+#endif
 
 void libmoq_record_ready_outcome(LibmoqReadyOutcome outcome, LibmoqLiveHandle* live) {
     // moq_media_sender_is_ready() is true once the relay has answered the

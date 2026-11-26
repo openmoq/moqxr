@@ -233,6 +233,17 @@ struct LibmoqLiveHandle {
 // observes the cancel flag promptly.
 // Map a fatal sender outcome to the publisher's reconnect policy.
 FailureKind libmoq_sender_failure_kind(std::uint64_t code, FailureKind fallback);
+
+// moq5 builds whose media sender takes moq_media_sender_cfg_t.catalog_revision
+// (MOQ_MSF_REVISION_02 is defined with it) publish the catalog revision
+// msf_version selects. Older builds always publish MSF-01.
+#ifdef MOQ_MSF_REVISION_02
+inline constexpr bool kLibmoqSelectsMsfRevision = true;
+// The catalog_revision value for msf_version.
+moq_msf_revision_t libmoq_msf_revision(openmoq::publisher::MsfVersion version);
+#else
+inline constexpr bool kLibmoqSelectsMsfRevision = false;
+#endif
 enum class LibmoqReadyOutcome { kReady, kCancelled, kFatal, kTimeout, kClosed };
 struct LibmoqReadyOps {
     std::function<bool()> is_ready;

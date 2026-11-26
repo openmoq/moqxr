@@ -114,6 +114,12 @@ input. The libmoq/moq5 publishing backend rejects it. See
   ([text](draft-ietf-moq-msf-02.txt)). The `draft-02` string comes from that
   draft's examples; its section 5.1.1 says only "the version of MSF referenced".
   There is no root `format` field in either.
+- The libmoq publishing backend builds its own catalog. With a moq5 whose
+  media sender has `catalog_revision` (moq5 `main` from 573955c), `msf_version`
+  is passed to it, so the libmoq catalog follows the same revision. An older
+  moq5 always writes MSF-01 (`"version":"1"`); because `02` is the default,
+  libmoq publishes are not refused for it, and the publisher logs once per
+  process that the setting does not apply.
 - Initialization data lives in the root `initDataList` array, referenced from
   each track by `initRef`, and is serialized after `tracks`.
 
