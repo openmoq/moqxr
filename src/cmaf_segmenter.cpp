@@ -1164,7 +1164,8 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
     std::vector<SampleObjectInfo> samples;
     samples.reserve(sample_count);
     std::uint64_t sample_decode_time = base_decode_time;
-    std::size_t payload_offset = mdat.payload.offset;
+    const std::size_t mdat_end = std::min(mdat.payload.offset + mdat.payload.size, bytes.size());
+    std::size_t payload_offset = std::min(mdat.payload.offset, mdat_end);
     for (std::uint32_t index = 0; index < sample_count && cursor <= bytes.size(); ++index) {
         std::uint32_t sample_duration = default_sample_duration;
         if ((trun_flags & 0x000100U) != 0 && cursor + 4 <= bytes.size()) {
@@ -1179,6 +1180,13 @@ std::vector<SampleObjectInfo> parse_fragment_samples(const Mp4Box& moof,
         if (sample_size == 0) {
             // A sample without a size would be published as an empty mdat: refuse instead.
             throw std::runtime_error("CMAF fragment sample has no size (no trun entry, tfhd default or trex default)");
+        }
+        // The samples are read back to back from the mdat payload, so their sizes
+        // (from trun, tfhd or trex) must fit inside it. Otherwise a sample would
+        // carry bytes from past the mdat, or past the end of the input.
+        if (sample_size > mdat_end - payload_offset) {
+            throw std::runtime_error("CMAF fragment sample " + std::to_string(index) + " of " +
+                                     std::to_string(sample_size) + " bytes overruns its mdat");
         }
         std::uint32_t sample_flags = first_sample_flags_present && index == 0 ? first_sample_flags : default_sample_flags;
         if ((trun_flags & 0x000400U) != 0 && cursor + 4 <= bytes.size()) {

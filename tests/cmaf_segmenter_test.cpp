@@ -1483,6 +1483,56 @@ int main() {
     ok &= expect(segmented_multitrack.fragments[3].track_name == "soun_2" && segmented_multitrack.fragments[3].group_id == 1,
                  "expected second audio fragment group sequence to advance independently");
 
+    // Sample sizes come from the input (trun, tfhd or trex), so a size larger than
+    // the mdat must be refused, not read past the mdat into the next box or past
+    // the end of the input.
+    {
+        const auto make_overrun_mp4 = [](std::uint32_t declared_size, bool trailing_box) {
+            const auto ftyp = make_box("ftyp", {'i', 's', 'o', '6', 0, 0, 0, 1, 'i', 's', 'o', '6', 'c', 'm', 'f', 'c'});
+            const auto tfhd = make_full_box_with_flags("tfhd", 0, 0x000010,
+                                                       concat({be32_bytes(1), be32_bytes(declared_size)}));
+            const auto tfdt = make_full_box("tfdt", be32_bytes(0));
+            const auto trun = make_full_box("trun", concat({be32_bytes(1), be32_bytes(1000)}));
+            const auto moof = make_box("moof", make_box("traf", concat({tfhd, tfdt, trun})));
+            const auto mdat = make_box("mdat", {0x10, 0x11});
+            auto bytes = concat({ftyp, make_box("moov", {}), moof, mdat});
+            if (trailing_box) {
+                const auto free_box = make_box("free", std::vector<std::uint8_t>(64, 0xEE));
+                bytes.insert(bytes.end(), free_box.begin(), free_box.end());
+            }
+            return bytes;
+        };
+        for (const bool trailing_box : {true, false}) {
+            const auto bytes = make_overrun_mp4(trailing_box ? 40 : 4000, trailing_box);
+            ParsedMp4 parsed{
+                .bytes = bytes,
+                .top_level_boxes = parse_mp4_boxes(bytes),
+                .tracks = {TrackDescription{.track_id = 1, .handler_type = "vide", .codec = "avc1.64000C",
+                                            .sample_entry_type = "avc1", .track_name = "vide_1", .timescale = 1000}},
+            };
+            std::string error_message;
+            try {
+                static_cast<void>(segment_for_cmaf(parsed, CmafObjectMode::kSplit));
+            } catch (const std::runtime_error& error) {
+                error_message = error.what();
+            }
+            ok &= expect(error_message.find("overruns its mdat") != std::string::npos,
+                         std::string("expected a sample larger than its mdat to be refused (") +
+                             (trailing_box ? "next box follows" : "end of input") + "), got: " + error_message);
+        }
+
+        const std::vector<std::uint8_t> small(8, 0);
+        bool slice_refused = false;
+        try {
+            static_cast<void>(slice_bytes(small, ByteSpan{.offset = 4, .size = 5}));
+        } catch (const std::runtime_error&) {
+            slice_refused = true;
+        }
+        ok &= expect(slice_refused, "expected slice_bytes to refuse a range past the end of its input");
+        ok &= expect(slice_bytes(small, ByteSpan{.offset = 4, .size = 4}).size() == 4,
+                     "expected slice_bytes to accept a range ending exactly at the end of its input");
+    }
+
     const auto non_sync_fragmented_bytes = make_fragmented_non_sync_ept_test_mp4();
     ParsedMp4 non_sync_fragmented{
         .bytes = non_sync_fragmented_bytes,
