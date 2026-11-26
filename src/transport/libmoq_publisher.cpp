@@ -927,15 +927,19 @@ TransportStatus ready_failure_teardown(LibmoqLiveHandle* live, moq_media_sender_
     return live_teardown(live, sender, ep, "media sender readiness failed");
 }
 
-// Wait for at least one downstream media subscriber. Builds the real libmoq ops
+// Wait until there is demand for media (libmoq_has_demand): at once when
+// forwarding, otherwise for a downstream subscriber. Builds the real libmoq ops
 // (the demand callback nudges the CV; has_media_subscriber() is authoritative)
 // and delegates to the unit-testable libmoq_wait_demand() primitive. Bounded by
 // timeout_us (PublisherConfig::subscriber_timeout) so it never hangs.
 LibmoqDemandOutcome wait_for_media_subscriber(moq_endpoint_t* ep, moq_media_sender_t* sender,
-                                              DemandMonitor* demand, std::atomic<bool>* cancel,
+                                              DemandMonitor* demand, bool forward,
+                                              std::atomic<bool>* cancel,
                                               std::uint64_t timeout_us) {
     LibmoqDemandOps ops;
-    ops.has_subscriber = [sender] { return moq_media_sender_has_media_subscriber(sender); };
+    ops.has_subscriber = [sender, forward] {
+        return libmoq_has_demand(forward, moq_media_sender_has_media_subscriber(sender));
+    };
     ops.is_fatal = [sender, ep] {
         return moq_media_sender_is_fatal(sender) || moq_endpoint_is_fatal(ep);
     };
@@ -1157,6 +1161,10 @@ LibmoqReadyOutcome libmoq_wait_ready(std::atomic<bool>* cancel,
     return LibmoqReadyOutcome::kReady;
 }
 
+bool libmoq_has_demand(bool forward, bool has_media_subscriber) {
+    return forward || has_media_subscriber;
+}
+
 LibmoqDemandOutcome libmoq_wait_demand(std::atomic<bool>* cancel,
                                        std::uint64_t timeout_us, std::uint64_t step_us,
                                        const LibmoqDemandOps& ops) {
@@ -1283,10 +1291,10 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
         return ready_failure_teardown(live, sender, ep, ready);
     }
 
-    // Wait for a real subscriber before writing: against a lazy relay the
-    // lossless preset would otherwise fill the queue and block here forever.
+    // Unless forwarding, wait for a real subscriber before writing: against a
+    // lazy relay the lossless preset would otherwise fill the queue and block here forever.
     const LibmoqDemandOutcome demand_out =
-        wait_for_media_subscriber(ep, sender, &demand, cancel, timeout_us);
+        wait_for_media_subscriber(ep, sender, &demand, config.forward, cancel, timeout_us);
     if (demand_out == LibmoqDemandOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
@@ -1356,7 +1364,7 @@ TransportStatus publish_plan_via_libmoq(const PublishPlan& materialized_plan,
             // with a clear reason instead of spinning forever on WOULD_BLOCK.
             int wrc = MOQ_OK;
             const LibmoqRetryOutcome wout = retry_write(sender, ep, hit->second, &so,
-                                                        cancel, /*check_demand=*/true,
+                                                        cancel, /*check_demand=*/!config.forward,
                                                         timeout_us, &wrc);
             if (wout == LibmoqRetryOutcome::kCancelled) {
                 moq_rcbuf_decref(buf);
@@ -1537,12 +1545,12 @@ TransportStatus publish_live_stdin_via_libmoq(std::istream& input,
         return ready_failure_teardown(live, sender, ep, ready);
     }
 
-    // Wait for a real subscriber before consuming stdin: a lazy relay forwards a
+    // Unless forwarding, wait for a real subscriber before consuming stdin: a lazy relay forwards a
     // SUBSCRIBE only when a player subscribes. Until then we do NOT read stdin
     // (ffmpeg blocks on the full pipe), so no live fragments are produced and
     // dropped with nobody watching.
     const LibmoqDemandOutcome demand_out =
-        wait_for_media_subscriber(ep, sender, &demand, cancel, timeout_us);
+        wait_for_media_subscriber(ep, sender, &demand, config.forward, cancel, timeout_us);
     if (demand_out == LibmoqDemandOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
@@ -1840,11 +1848,11 @@ TransportStatus publish_live_srt_via_libmoq(std::vector<LiveSrtCallerRuntimeConf
         if (hit == handles.end()) {
             continue;  // fragment for an untracked stream
         }
-        // Lazy relay: with no media subscriber, DROP this live fragment instead
+        // Lazy relay: unless forwarding, with no media subscriber, DROP this live fragment instead
         // of buffering it. We still pop every fragment above, so the SRT queue
         // stays bounded while we wait for a player to subscribe; once demand
         // exists we start writing the live edge.
-        if (!moq_media_sender_has_media_subscriber(sender)) {
+        if (!libmoq_has_demand(config.forward, moq_media_sender_has_media_subscriber(sender))) {
             continue;
         }
         const LibmoqObjectTranslation translated = make_libmoq_live_object(fragment);
@@ -1957,12 +1965,12 @@ TransportStatus publish_live_objects_via_libmoq(const LiveObjectSource& source,
         return ready_failure_teardown(live, sender, ep, ready);
     }
 
-    // Wait for a real subscriber before pulling from the source: a lazy relay
+    // Unless forwarding, wait for a real subscriber before pulling from the source: a lazy relay
     // forwards a SUBSCRIBE only when a player subscribes, so without this the
     // app's next_object() would be consumed (and its objects dropped) with
     // nobody watching.
     const LibmoqDemandOutcome demand_out =
-        wait_for_media_subscriber(ep, sender, &demand, cancel, timeout_us);
+        wait_for_media_subscriber(ep, sender, &demand, config.forward, cancel, timeout_us);
     if (demand_out == LibmoqDemandOutcome::kCancelled) {
         return cancel_teardown(live, sender, ep, LibmoqPublishStats{}, out_stats);
     }
