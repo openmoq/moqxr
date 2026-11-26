@@ -217,8 +217,9 @@ equivalent is `PublisherConfig::moq_impl_id`.
 - `--preannounce-tracks` sends a `PUBLISH` for each track immediately after
   `PUBLISH_NAMESPACE`, before any subscriber exists. It is off by default
   because some relays are disturbed by an early `PUBLISH`, while others only
-  accept tracks that way and never forward a `SUBSCRIBE`. `--forward 1` already
-  publishes tracks proactively.
+  accept tracks that way and never forward a `SUBSCRIBE`. The libmoq backend
+  ignores it without `--forward 1`, with a warning, because it cannot send a
+  paused `PUBLISH`. `--forward 1` already publishes tracks proactively.
 - `--vod` marks the catalog as VOD (`isLive` false, no `generatedAt`). This
   publisher is live, or simulating live, unless told otherwise; VOD is never
   inferred from the input.

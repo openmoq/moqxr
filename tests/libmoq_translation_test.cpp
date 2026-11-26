@@ -961,6 +961,20 @@ int main() {
                      "expected the demand wait to return at once under forward=1");
     }
 
+    // -- When the sender sends PUBLISH (libmoq_publishes_tracks) -------------
+    // moq5's media sender can only PUBLISH with forwarding on. Without
+    // forward=1 this publisher waits for a subscriber, which a relay that
+    // accepted such a PUBLISH never sends, so --preannounce-tracks alone must
+    // not publish.
+    {
+        ok &= expect(libmoq_publishes_tracks(/*forward=*/true, /*preannounce_tracks=*/false),
+                     "expected forward=1 to publish tracks");
+        ok &= expect(libmoq_publishes_tracks(true, true), "expected forward=1 with preannounce to publish tracks");
+        ok &= expect(!libmoq_publishes_tracks(false, true),
+                     "expected preannounce without forward not to publish tracks");
+        ok &= expect(!libmoq_publishes_tracks(false, false), "expected the default not to publish tracks");
+    }
+
     // -- Demand-wait primitive (libmoq_wait_demand) --------------------------
     // Network-free coverage of the subscriber-demand gate the drivers use to
     // avoid hanging/consuming sources against a lazy relay.
