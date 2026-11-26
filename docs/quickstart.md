@@ -219,7 +219,7 @@ equivalent is `PublisherConfig::moq_impl_id`.
   because some relays are disturbed by an early `PUBLISH`, while others only
   accept tracks that way and never forward a `SUBSCRIBE`. The libmoq backend
   ignores it without `--forward 1`, with a warning, because it cannot send a
-  paused `PUBLISH`. The native backend, publishing file input on drafts 18 and
+  paused `PUBLISH`. The native backend, on drafts 18 and
   later with `--forward 0`, sends the `PUBLISH` paused (`FORWARD` 0, or
   `PAUSED` 1 on draft 23) and sends each track once the relay resumes it with
   `REQUEST_UPDATE`. `--forward 1` already publishes tracks proactively.
