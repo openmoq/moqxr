@@ -14371,29 +14371,38 @@ int main() {
         };
         // Standalone FETCH (Fetch Type 1) of "catalog"; range is Start Group,
         // Start Object, End Group, End Object, with End the last Object plus 1.
-        const auto catalog_fetch = [&](std::uint8_t request_id, std::vector<std::uint8_t> range) {
+        const auto catalog_fetch = [&](std::uint8_t request_id, std::vector<std::uint8_t> range, bool descending) {
             std::vector<std::uint8_t> body{request_id, 1, 1, static_cast<std::uint8_t>(kTestTrackNamespace.size())};
             body.insert(body.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
             body.insert(body.end(), {7, 'c', 'a', 't', 'a', 'l', 'o', 'g'});
             body.insert(body.end(), range.begin(), range.end());
-            body.push_back(0);
+            if (descending) {
+                body.insert(body.end(), {1, 0x22, 2});  // one parameter: GROUP_ORDER Descending
+            } else {
+                body.push_back(0);
+            }
             return framed(0x16, body);
         };
         struct Fetch {
             std::uint64_t stream;
             std::uint8_t request_id;
             std::vector<std::uint8_t> range;
+            bool descending = false;
         };
         const Fetch cached_group{13, 7, {0, 0, 0, 1}};
         const Fetch resend_group{17, 9, {2, 0, 2, 1}};
         const Fetch unsent_group{21, 11, {1, 0, 1, 1}};
+        // Ranges that hold both retained catalog objects.
+        const Fetch both_ascending{25, 13, {0, 0, 2, 1}};
+        const Fetch both_descending{29, 15, {0, 0, 2, 0}, true};
 
         MockTransport transport;
         transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
         transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
         transport.reads[1].push_back(encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft));
         transport.reads[5].push_back(encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
-        transport.keep_open_streams = {1, 5, 9, cached_group.stream, resend_group.stream, unsent_group.stream};
+        transport.keep_open_streams = {1, 5, 9, cached_group.stream, resend_group.stream, unsent_group.stream,
+                                       both_ascending.stream, both_descending.stream};
         bool catalog_unsubscribed = false;
         bool catalog_resubscribed = false;
         bool fetches_queued = false;
@@ -14407,8 +14416,10 @@ int main() {
                 }
                 if (catalog_resubscribed && !fetches_queued && ends_with(event.bytes, new_catalog_payload)) {
                     fetches_queued = true;
-                    for (const Fetch* fetch : {&cached_group, &resend_group, &unsent_group}) {
-                        current.reads[fetch->stream].push_back(catalog_fetch(fetch->request_id, fetch->range));
+                    for (const Fetch* fetch :
+                         {&cached_group, &resend_group, &unsent_group, &both_ascending, &both_descending}) {
+                        current.reads[fetch->stream].push_back(
+                            catalog_fetch(fetch->request_id, fetch->range, fetch->descending));
                     }
                 }
                 return {ObjectWriteDisposition::kAccepted, {}};
@@ -14440,7 +14451,8 @@ int main() {
             }
             if (object_index >= 4 && object_index < objects.size() &&
                 !(answered(cached_group.stream) && answered(resend_group.stream) &&
-                  answered(unsent_group.stream)) &&
+                  answered(unsent_group.stream) && answered(both_ascending.stream) &&
+                  answered(both_descending.stream)) &&
                 ++gated_polls < 5000) {
                 return std::nullopt;
             }
@@ -14496,6 +14508,27 @@ int main() {
                      "catalog, Group 0 \"CAT\"");
         ok &= expect(served_with(resend_group, 2, new_catalog_payload),
                      "expected a D18 catalog FETCH {2,0}-{2,1} to be served with the resent catalog, Group 2 \"NEW\"");
+
+        // A range holding both retained objects gets both, in the requested
+        // Group order: an Object left out would be read as not existing (draft
+        // 18 section 10.12.3). The second Object's Group ID Delta is 2-0-1 = 1.
+        const auto stream_carries = [&](const Fetch& fetch, const std::vector<std::uint8_t>& expected) {
+            return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                return (write.stream_id & 0x3U) == 0x2U && write.fin && write.bytes == expected;
+            });
+        };
+        const auto fetch_ok_at = [&](const Fetch& fetch) {
+            return wrote(transport, fetch.stream,
+                         openmoq::publisher::transport::encode_fetch_ok_message(draft, false, 2, 1));
+        };
+        ok &= expect(fetch_ok_at(both_ascending) &&
+                         stream_carries(both_ascending, {0x05, 13, 0x1c, 0, 0, 128, 3, 'C', 'A', 'T',
+                                                         0x1c, 1, 0, 128, 3, 'N', 'E', 'W'}),
+                     "expected an ascending D18 catalog FETCH {0,0}-{2,1} to carry Group 0 then Group 2");
+        ok &= expect(fetch_ok_at(both_descending) &&
+                         stream_carries(both_descending, {0x05, 15, 0x1c, 2, 0, 128, 3, 'N', 'E', 'W',
+                                                          0x1c, 1, 0, 128, 3, 'C', 'A', 'T'}),
+                     "expected a descending D18 catalog FETCH {0,0}-{2,0} to carry Group 2 then Group 0");
 
         std::optional<std::uint64_t> unsent_error;
         for (const auto& write : transport.writes) {

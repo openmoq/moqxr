@@ -4286,58 +4286,66 @@ TransportStatus answer_catalog_fetch(
     if (retained.empty()) {
         return reject(kInvalidRange, "no objects published");
     }
-    // The latest catalog object, and for a standalone FETCH the newest
-    // retained one its range holds: the session keeps the catalog object sent
-    // before the latest too, since a SUBSCRIBE_OK may have reported it as the
-    // Largest Object just before the latest went out.
-    const CatalogFetchObject* object = &retained.back();
+    // The Objects to send, oldest first: for a standalone FETCH every retained
+    // one its range holds, since an Object left out of the response is read as
+    // not existing (draft 18 section 10.12.3). The session keeps the catalog
+    // object sent before the latest too, since a SUBSCRIBE_OK may have reported
+    // it as the Largest Object just before the latest went out. A Joining FETCH
+    // is served the latest.
+    const CatalogFetchObject& latest = retained.back();
+    std::vector<const CatalogFetchObject*> selected;
     if (standalone) {
-        for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
-            const auto at = std::make_pair(it->group_id, it->object_id);
+        for (const CatalogFetchObject& candidate : retained) {
+            const auto at = std::make_pair(candidate.group_id, candidate.object_id);
             const bool from = std::make_pair(fetch.start_group, fetch.start_object) <= at;
-            const bool to = fetch.end_object == 0 ? it->group_id <= fetch.end_group
+            const bool to = fetch.end_object == 0 ? candidate.group_id <= fetch.end_group
                                                   : at < std::make_pair(fetch.end_group, fetch.end_object);
-            if (from && to) {
-                object = &*it;
-                break;
+            if (from && to) selected.push_back(&candidate);
+        }
+        if (selected.empty()) {
+            // A range that holds no retained Object either starts past the
+            // latest or ends before it.
+            if (std::make_pair(fetch.start_group, fetch.start_object) >
+                std::make_pair(latest.group_id, latest.object_id)) {
+                return reject(kInvalidRange, "fetch start is past the largest object");
             }
+            return reject(kRequestErrorNotSupported, "only the latest catalog objects are retained");
         }
-    }
-    if (standalone) {
-        // The range must hold a retained catalog object; when it holds none,
-        // the latest decides the error.
-        const auto location = std::make_pair(object->group_id, object->object_id);
-        const bool starts_after = std::make_pair(fetch.start_group, fetch.start_object) > location;
-        const bool ends_before = fetch.end_object == 0
-                                     ? fetch.end_group < object->group_id
-                                     : std::make_pair(fetch.end_group, fetch.end_object) <= location;
-        if (starts_after) {
-            return reject(kInvalidRange, "fetch start is past the largest object");
-        }
-        if (ends_before) {
-            return reject(kRequestErrorNotSupported, "only the latest catalog object is retained");
-        }
-    } else if (fetch.joining_start > object->group_id) {
+    } else {
         // Relative: start group = Joining Location.Group - Joining Start;
         // absolute: Joining Start itself. Either way the range ends at the
         // Joining Location, the catalog object, so it is served unless the
         // start lies past it.
-        return reject(kInvalidRange, "joining start is past the largest object");
+        if (fetch.joining_start > latest.group_id) {
+            return reject(kInvalidRange, "joining start is past the largest object");
+        }
+        selected.push_back(&latest);
+    }
+    const CatalogFetchObject& largest = *selected.back();
+    // Groups go in the requested order; Objects within a Group stay ascending.
+    const bool descending = fetch.group_order == 0x2;
+    if (descending) {
+        std::stable_sort(selected.begin(), selected.end(),
+                         [](const auto* a, const auto* b) { return a->group_id > b->group_id; });
     }
 
     std::uint64_t data_stream_id = 0;
     TransportStatus status = transport.open_stream(StreamDirection::kUnidirectional, data_stream_id);
     if (!status.ok) return status;
     std::vector<std::uint8_t> data = encode_fetch_header(draft, fetch.request_id);
-    const std::vector<std::uint8_t> fetch_object =
-        encode_fetch_object(draft, object->group_id, object->object_id, object->publisher_priority, object->payload);
-    data.insert(data.end(), fetch_object.begin(), fetch_object.end());
+    std::optional<FetchObjectPrior> prior;
+    for (const CatalogFetchObject* object : selected) {
+        const std::vector<std::uint8_t> fetch_object = encode_fetch_object(
+            draft, object->group_id, object->object_id, object->publisher_priority, object->payload, prior);
+        data.insert(data.end(), fetch_object.begin(), fetch_object.end());
+        prior = FetchObjectPrior{object->group_id, object->object_id, descending};
+    }
     status = transport.write_stream(data_stream_id, data, true);
     if (!status.ok) return status;
     return transport.write_stream(
         request_stream_id,
-        encode_fetch_ok_message(draft, false, static_cast<std::size_t>(object->group_id),
-                                static_cast<std::size_t>(object->object_id) + 1),
+        encode_fetch_ok_message(draft, false, static_cast<std::size_t>(largest.group_id),
+                                static_cast<std::size_t>(largest.object_id) + 1),
         true);
 }
 
