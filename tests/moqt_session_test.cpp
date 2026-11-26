@@ -14486,6 +14486,230 @@ int main() {
         }
     }
 
+    // A relay that dropped its catalog subscription fetches the Group its
+    // cache knows, after the publisher resent the latest catalog in a new
+    // Group (draft 18). The catalog of Group 0 goes out, the relay stops its
+    // catalog request stream, and the source's next catalog, Group 1, is read
+    // while no catalog subscription exists, so it is not sent. The relay
+    // subscribes again: its SUBSCRIBE_OK reports Largest Object {0, 0}, and
+    // the latest catalog goes out in Group max(1, 0) + 1 = 2. The relay then
+    // sends a standalone FETCH for {0, 0} to {0, 1}, the Group its cache
+    // holds. The session keeps the catalog object sent before the latest, so
+    // that FETCH is served with Group 0; a FETCH of Group 2 is served with the
+    // latest; a FETCH of Group 1, never sent, ends before the latest and holds
+    // no retained object, so it gets NOT_SUPPORTED.
+    {
+        constexpr DraftVersion draft = DraftVersion::kDraft18;
+        const std::vector<std::uint8_t> catalog_payload = {'C', 'A', 'T'};
+        const std::vector<std::uint8_t> new_catalog_payload = {'N', 'E', 'W'};
+        const auto framed = [](std::uint8_t type, const std::vector<std::uint8_t>& body) {
+            std::vector<std::uint8_t> message{type, static_cast<std::uint8_t>(body.size() >> 8),
+                                              static_cast<std::uint8_t>(body.size() & 0xff)};
+            message.insert(message.end(), body.begin(), body.end());
+            return message;
+        };
+        // Standalone FETCH (Fetch Type 1) of "catalog"; range is Start Group,
+        // Start Object, End Group, End Object, with End the last Object plus 1.
+        const auto catalog_fetch = [&](std::uint8_t request_id, std::vector<std::uint8_t> range, bool descending) {
+            std::vector<std::uint8_t> body{request_id, 1, 1, static_cast<std::uint8_t>(kTestTrackNamespace.size())};
+            body.insert(body.end(), kTestTrackNamespace.begin(), kTestTrackNamespace.end());
+            body.insert(body.end(), {7, 'c', 'a', 't', 'a', 'l', 'o', 'g'});
+            body.insert(body.end(), range.begin(), range.end());
+            if (descending) {
+                body.insert(body.end(), {1, 0x22, 2});  // one parameter: GROUP_ORDER Descending
+            } else {
+                body.push_back(0);
+            }
+            return framed(0x16, body);
+        };
+        struct Fetch {
+            std::uint64_t stream;
+            std::uint8_t request_id;
+            std::vector<std::uint8_t> range;
+            bool descending = false;
+        };
+        const Fetch cached_group{13, 7, {0, 0, 0, 1}};
+        const Fetch resend_group{17, 9, {2, 0, 2, 1}};
+        const Fetch unsent_group{21, 11, {1, 0, 1, 1}};
+        // Ranges that hold both retained catalog objects.
+        const Fetch both_ascending{25, 13, {0, 0, 2, 1}};
+        const Fetch both_descending{29, 15, {0, 0, 2, 0}, true};
+
+        MockTransport transport;
+        transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(1, kTestTrackNamespace, "catalog", 1, draft));
+        transport.reads[5].push_back(encode_subscribe_message(3, kTestTrackNamespace, "video", 1, draft));
+        transport.keep_open_streams = {1, 5, 9, cached_group.stream, resend_group.stream, unsent_group.stream,
+                                       both_ascending.stream, both_descending.stream};
+        bool catalog_unsubscribed = false;
+        bool catalog_resubscribed = false;
+        bool fetches_queued = false;
+        transport.on_try_write_object =
+            [&](MockTransport& current, const MockTransport::ObjectWriteEvent& event) -> ObjectWriteResult {
+                if (!catalog_unsubscribed && ends_with(event.bytes, catalog_payload)) {
+                    // Draft 18 section 5.1.1: STOP_SENDING on the request
+                    // stream ends the catalog subscription.
+                    catalog_unsubscribed = true;
+                    current.peer_stopped_media_streams.insert(1);
+                }
+                if (catalog_resubscribed && !fetches_queued && ends_with(event.bytes, new_catalog_payload)) {
+                    fetches_queued = true;
+                    for (const Fetch* fetch :
+                         {&cached_group, &resend_group, &unsent_group, &both_ascending, &both_descending}) {
+                        current.reads[fetch->stream].push_back(
+                            catalog_fetch(fetch->request_id, fetch->range, fetch->descending));
+                    }
+                }
+                return {ObjectWriteDisposition::kAccepted, {}};
+            };
+        const auto answered = [&](std::uint64_t stream) {
+            return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                return write.stream_id == stream && write.fin;
+            });
+        };
+        const std::vector<LiveObject> objects = {
+            LiveObject{.track_name = "catalog", .group_id = 0, .payload = catalog_payload},
+            LiveObject{.track_name = "video", .group_id = 1, .payload = {'V', '1'}},
+            LiveObject{.track_name = "video", .group_id = 2, .payload = {'V', '2'}},
+            LiveObject{.track_name = "catalog", .group_id = 1, .payload = new_catalog_payload},
+            LiveObject{.track_name = "video", .group_id = 3, .payload = {'V', '3'}},
+        };
+        std::size_t object_index = 0;
+        LiveObjectSource source = listed_object_source(
+            {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, object_index);
+        // Once the Group 1 catalog is read, the catalog SUBSCRIBE arrives
+        // again; the last video Group waits for the three FETCHes to be
+        // answered (bounded, so that a missing answer fails instead of hangs).
+        std::size_t gated_polls = 0;
+        source.next_object = [&]() -> std::optional<LiveObject> {
+            if (object_index == 4 && !catalog_resubscribed) {
+                catalog_resubscribed = true;
+                transport.reads[9].push_back(encode_subscribe_message(5, kTestTrackNamespace, "catalog", 1, draft));
+                return std::nullopt;
+            }
+            if (object_index >= 4 && object_index < objects.size() &&
+                !(answered(cached_group.stream) && answered(resend_group.stream) &&
+                  answered(unsent_group.stream) && answered(both_ascending.stream) &&
+                  answered(both_descending.stream)) &&
+                ++gated_polls < 5000) {
+                return std::nullopt;
+            }
+            if (object_index >= objects.size()) {
+                return std::nullopt;
+            }
+            return objects[object_index++];
+        };
+        source.is_finished = [&]() { return object_index >= objects.size(); };
+        MoqtSession session(transport, std::string(kTestTrackNamespace), false, false, false,
+                            std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, "expected D18 relay-cache catalog FETCH connect to succeed");
+        status = session.publish_live_objects(source, draft);
+        ok &= expect(status.ok, "expected D18 relay-cache catalog FETCH publish to succeed: " + status.message);
+        ok &= expect(catalog_unsubscribed && catalog_resubscribed && fetches_queued,
+                     "expected the D18 relay-cache case to unsubscribe, resubscribe, and fetch after the resend");
+
+        // The resubscription's SUBSCRIBE_OK reports Largest Object {0, 0}:
+        // the Group 1 catalog was never sent.
+        bool resubscribe_largest_00 = false;
+        for (std::uint64_t alias = 0; alias < 8; ++alias) {
+            resubscribe_largest_00 =
+                resubscribe_largest_00 ||
+                wrote(transport, 9, openmoq::publisher::transport::encode_subscribe_ok_message(draft, 5, alias, 0, 0, true));
+        }
+        ok &= expect(resubscribe_largest_00,
+                     "expected the D18 catalog resubscription SUBSCRIBE_OK to report LARGEST_OBJECT {0,0}");
+
+        // FETCH_OK and no REQUEST_ERROR on the request stream, and a
+        // FETCH_HEADER stream (0x05, Request ID) whose one Object (flags 0x1c,
+        // Group, Object 0, priority, length) carries this Group and payload.
+        const auto served_with = [&](const Fetch& fetch, std::uint8_t group, const std::vector<std::uint8_t>& payload) {
+            bool fetch_ok = false;
+            bool request_error = false;
+            for (const auto& write : transport.writes) {
+                if (write.stream_id != fetch.stream || !write.fin) continue;
+                openmoq::publisher::transport::RequestError error;
+                request_error = request_error ||
+                                openmoq::publisher::transport::decode_request_error(write.bytes, draft, error);
+                fetch_ok = fetch_ok || message_type(write.bytes) == 0x18;
+            }
+            std::vector<std::uint8_t> tail{static_cast<std::uint8_t>(payload.size())};
+            tail.insert(tail.end(), payload.begin(), payload.end());
+            const bool object = std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                return (write.stream_id & 0x3U) == 0x2U && write.fin && write.bytes.size() >= 5 &&
+                       write.bytes[0] == 0x05 && write.bytes[1] == fetch.request_id && write.bytes[2] == 0x1c &&
+                       write.bytes[3] == group && write.bytes[4] == 0 && ends_with(write.bytes, tail);
+            });
+            return fetch_ok && !request_error && object;
+        };
+        ok &= expect(served_with(cached_group, 0, catalog_payload),
+                     "expected a D18 catalog FETCH {0,0}-{0,1} after the resend to be served with the previous "
+                     "catalog, Group 0 \"CAT\"");
+        ok &= expect(served_with(resend_group, 2, new_catalog_payload),
+                     "expected a D18 catalog FETCH {2,0}-{2,1} to be served with the resent catalog, Group 2 \"NEW\"");
+
+        // A range holding both retained objects gets both, in the requested
+        // Group order: an Object left out would be read as not existing (draft
+        // 18 section 10.12.3). The second Object's Group ID Delta is 2-0-1 = 1.
+        const auto stream_carries = [&](const Fetch& fetch, const std::vector<std::uint8_t>& expected) {
+            return std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                return (write.stream_id & 0x3U) == 0x2U && write.fin && write.bytes == expected;
+            });
+        };
+        const auto fetch_ok_at = [&](const Fetch& fetch) {
+            return wrote(transport, fetch.stream,
+                         openmoq::publisher::transport::encode_fetch_ok_message(draft, false, 2, 1));
+        };
+        ok &= expect(fetch_ok_at(both_ascending) &&
+                         stream_carries(both_ascending, {0x05, 13, 0x1c, 0, 0, 128, 3, 'C', 'A', 'T',
+                                                         0x1c, 1, 0, 128, 3, 'N', 'E', 'W'}),
+                     "expected an ascending D18 catalog FETCH {0,0}-{2,1} to carry Group 0 then Group 2");
+        ok &= expect(fetch_ok_at(both_descending) &&
+                         stream_carries(both_descending, {0x05, 15, 0x1c, 2, 0, 128, 3, 'N', 'E', 'W',
+                                                          0x1c, 1, 0, 128, 3, 'C', 'A', 'T'}),
+                     "expected a descending D18 catalog FETCH {0,0}-{2,0} to carry Group 2 then Group 0");
+
+        std::optional<std::uint64_t> unsent_error;
+        for (const auto& write : transport.writes) {
+            openmoq::publisher::transport::RequestError error;
+            if (write.stream_id == unsent_group.stream && write.fin &&
+                openmoq::publisher::transport::decode_request_error(write.bytes, draft, error)) {
+                unsent_error = error.error_code;
+            }
+        }
+        ok &= expect(unsent_error == std::optional<std::uint64_t>(0x3),
+                     "expected a D18 catalog FETCH {1,0}-{1,1} of the never-sent Group 1 to get NOT_SUPPORTED");
+
+        // Group of each subgroup stream that carries this payload, from the
+        // stream's header (type, alias, Group).
+        const auto catalog_groups = [&](const std::vector<std::uint8_t>& payload) {
+            std::map<std::uint64_t, std::uint64_t> group_by_stream;
+            std::set<std::uint64_t> seen;
+            std::string groups;
+            for (const auto& write : transport.writes) {
+                if ((write.stream_id & 0x3U) != 0x2U) continue;
+                if (seen.insert(write.stream_id).second && is_data_stream_write(write)) {
+                    std::size_t offset = 0;
+                    std::uint64_t type = 0, alias = 0, group = 0;
+                    using openmoq::publisher::transport::decode_vi64;
+                    if (decode_vi64(write.bytes, offset, type) && decode_vi64(write.bytes, offset, alias) &&
+                        decode_vi64(write.bytes, offset, group)) {
+                        group_by_stream[write.stream_id] = group;
+                    }
+                }
+                const auto it = group_by_stream.find(write.stream_id);
+                if (it != group_by_stream.end() && ends_with(write.bytes, payload)) {
+                    groups += " " + std::to_string(it->second);
+                }
+            }
+            return groups;
+        };
+        const std::string sent = catalog_groups(catalog_payload) + " |" + catalog_groups(new_catalog_payload);
+        ok &= expect(sent == " 0 | 2",
+                     "expected the D18 catalog on the wire in Group 0 (\"CAT\") and Group 2 (\"NEW\") only, never "
+                     "Group 1; got" + sent);
+    }
+
     // The resend of a catalog Group starts at Object 0. A second catalog
     // subscription, while the first stays, arrives after Object 1 (a delta)
     // was read but not sent: it gets Objects 0 and 1, on one fresh stream,

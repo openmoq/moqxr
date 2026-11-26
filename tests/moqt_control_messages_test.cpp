@@ -3316,6 +3316,27 @@ bool test_decoders_clear_a_stale_decode_fault() {
     return ok;
 }
 
+// A later Object on a fetch stream (draft 18 section 11.4.4.1): in another
+// Group it carries a Group ID Delta of the distance minus 1 and its own Object
+// ID; in the same Group only the Object ID Delta from the prior one.
+bool test_fetch_object_after_a_prior_object() {
+    using openmoq::publisher::transport::FetchObjectPrior;
+    const std::vector<std::uint8_t> payload{'X'};
+    const auto bytes = [&](std::uint64_t group, std::uint64_t object, FetchObjectPrior prior) {
+        return openmoq::publisher::transport::encode_fetch_object(
+            openmoq::publisher::DraftVersion::kDraft18, group, object, 128, payload, prior);
+    };
+    bool ok = true;
+    ok &= expect(bytes(5, 3, {.group_id = 2, .object_id = 7}) == std::vector<std::uint8_t>{0x1c, 2, 3, 128, 1, 'X'},
+                 "expected an ascending later Group to carry Group ID Delta 2 and Object ID 3");
+    ok &= expect(bytes(2, 3, {.group_id = 5, .object_id = 7, .descending = true}) ==
+                     std::vector<std::uint8_t>{0x1c, 2, 3, 128, 1, 'X'},
+                 "expected a descending earlier Group to carry Group ID Delta 2 and Object ID 3");
+    ok &= expect(bytes(5, 9, {.group_id = 5, .object_id = 7}) == std::vector<std::uint8_t>{0x14, 2, 128, 1, 'X'},
+                 "expected the same Group to carry only Object ID Delta 2");
+    return ok;
+}
+
 int main() {
     bool wire_ok = test_draft22_generic_framing_and_subscribe_range();
     wire_ok &= test_draft22_wire_api_boundaries();
@@ -3357,5 +3378,6 @@ int main() {
     ok &= test_request_ok_largest_object_decodes();
     ok &= test_draft23_wire_vectors();
     ok &= test_decoders_clear_a_stale_decode_fault();
+    ok &= test_fetch_object_after_a_prior_object();
     return ok && wire_ok ? 0 : 1;
 }

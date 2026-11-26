@@ -188,6 +188,8 @@ struct FetchMessage {
     std::uint64_t start_object = 0;
     std::uint64_t end_group = 0;
     std::uint64_t end_object = 0;
+    // GROUP_ORDER: 0x1 ascending, 0x2 descending; 0 when omitted (ascending).
+    std::uint8_t group_order = 0;
     bool malformed_authorization_token = false;
     bool authorization_token_cache_overflow = false;
     bool unknown_authorization_token_alias = false;
@@ -260,14 +262,25 @@ struct PublishError {
 
 std::vector<std::uint8_t> encode_varint(std::uint64_t value);
 std::vector<std::uint8_t> encode_fetch_header(DraftVersion draft, std::uint64_t request_id);
-// Draft-22 fetch stream Object (§11.4.1) in Subgroup 0, carrying its absolute
-// Group ID, Object ID and Publisher Priority and no Properties, as the first
-// Object on a fetch stream must.
+// The Object sent before this one on a fetch stream, and the stream's Group
+// Order, which a later Object's Group ID Delta is relative to.
+struct FetchObjectPrior {
+    std::uint64_t group_id = 0;
+    std::uint64_t object_id = 0;
+    bool descending = false;
+};
+// Fetch stream Object (draft 18 section 11.4.4, draft 22 section 11.4.1) in
+// Subgroup 0 with its Publisher Priority and no Properties. Without a prior
+// Object it carries its absolute Group ID and Object ID, as the first Object on
+// a fetch stream must. After one, `prior` must precede it in the Group Order
+// (or in Object ID order within a Group): another Group is written as a Group
+// ID Delta and the absolute Object ID, the same Group as an Object ID Delta.
 std::vector<std::uint8_t> encode_fetch_object(DraftVersion draft,
                                               std::uint64_t group_id,
                                               std::uint64_t object_id,
                                               std::uint8_t publisher_priority,
-                                              std::span<const std::uint8_t> payload);
+                                              std::span<const std::uint8_t> payload,
+                                              std::optional<FetchObjectPrior> prior = std::nullopt);
 bool decode_vi64(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 bool decode_varint(std::span<const std::uint8_t> bytes, std::size_t& offset, std::uint64_t& value);
 // Validates datagram framing before a publisher discards unknown-alias objects.

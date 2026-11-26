@@ -828,14 +828,26 @@ std::vector<std::uint8_t> encode_fetch_object(DraftVersion draft,
                                               std::uint64_t group_id,
                                               std::uint64_t object_id,
                                               std::uint8_t publisher_priority,
-                                              std::span<const std::uint8_t> payload) {
+                                              std::span<const std::uint8_t> payload,
+                                              std::optional<FetchObjectPrior> prior) {
     // Serialization Flags: Subgroup ID zero (0x00), Object ID Delta (0x04),
     // Group ID Delta (0x08) and Priority (0x10) present, no Properties.
-    constexpr std::uint64_t kFlags = 0x04 | 0x08 | 0x10;
+    constexpr std::uint64_t kObjectIdDelta = 0x04;
+    constexpr std::uint64_t kGroupIdDelta = 0x08;
+    constexpr std::uint64_t kPriority = 0x10;
+    const bool new_group = !prior || prior->group_id != group_id;
     std::vector<std::uint8_t> bytes;
-    append_moqint(bytes, draft, kFlags);
-    append_moqint(bytes, draft, group_id);
-    append_moqint(bytes, draft, object_id);
+    append_moqint(bytes, draft, kObjectIdDelta | kPriority | (new_group ? kGroupIdDelta : 0));
+    if (!prior) {
+        append_moqint(bytes, draft, group_id);
+        append_moqint(bytes, draft, object_id);
+    } else if (new_group) {
+        append_moqint(bytes, draft,
+                      (prior->descending ? prior->group_id - group_id : group_id - prior->group_id) - 1);
+        append_moqint(bytes, draft, object_id);
+    } else {
+        append_moqint(bytes, draft, object_id - prior->object_id);
+    }
     bytes.push_back(publisher_priority);
     append_moqint(bytes, draft, payload.size());
     bytes.insert(bytes.end(), payload.begin(), payload.end());
@@ -2816,6 +2828,9 @@ bool decode_fetch_message(std::span<const std::uint8_t> bytes, DraftVersion draf
             std::uint64_t value = 0;
             if (!decode_numeric_message_parameter(bounded, offset, draft, parameter_type, value)) {
                 return false;
+            }
+            if (parameter_type == kParamGroupOrder) {
+                message.group_order = static_cast<std::uint8_t>(value);
             }
             continue;
         }

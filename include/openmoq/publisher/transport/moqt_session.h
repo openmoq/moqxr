@@ -310,6 +310,15 @@ private:
     // catalog group, which a joining subscriber's fill asks for.
     mutable std::mutex last_catalog_object_mutex_;
     std::optional<openmoq::publisher::CatalogObject> last_catalog_object_;
+    // The catalog object sent before last_catalog_object_, kept fetchable:
+    // a SUBSCRIBE_OK can report it as the Largest Object just before a newer
+    // catalog goes out in a new Group, and a subscriber then fetches it.
+    std::optional<openmoq::publisher::CatalogObject> previous_catalog_object_;
+    // Under last_catalog_object_mutex_: records a sent catalog object, moving
+    // the one it replaces (at another Location) to previous_catalog_object_.
+    void retain_sent_catalog_locked(openmoq::publisher::CatalogObject object);
+    // The retained catalog objects, oldest first (at most two).
+    std::vector<openmoq::publisher::CatalogObject> retained_catalog_objects() const;
 };
 
 }  // namespace openmoq::publisher::transport
