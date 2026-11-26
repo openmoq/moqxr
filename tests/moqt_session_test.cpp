@@ -2429,6 +2429,89 @@ bool test_paused_preannounce(const EndpointConfig& endpoint, const TlsConfig& tl
 // the first subscription exists. publish() of a prepared plan must accept one
 // after PUBLISH_DONE ended it, or after the subscriber stopped its request, and
 // still refuse one while it is active.
+// Paused preannounce on the live paths. PUBLISH streams are 4 (catalog) and 8
+// (the media track). A resume arrives in the same read as PUBLISH_OK, so it is
+// applied before any input is consumed.
+bool test_paused_preannounce_live(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    enum class Resume { kNothing, kMedia, kCatalog };
+    bool ok = true;
+    for (const bool stdin_input : {true, false}) {
+        for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
+            for (const Resume resume : {Resume::kNothing, Resume::kMedia, Resume::kCatalog}) {
+                const std::string label = std::string("paused live preannounce ") +
+                                          (stdin_input ? "stdin " : "objects ") +
+                                          openmoq::publisher::to_string(draft) + " resume " +
+                                          std::to_string(static_cast<int>(resume)) + ": ";
+                const auto publish_ok = [&](std::uint64_t request_id) {
+                    return draft == DraftVersion::kDraft18
+                               ? encode_publish_ok_message(draft, request_id, 0)
+                               : openmoq::publisher::transport::encode_request_ok_message(draft, request_id);
+                };
+                const auto update = draft == DraftVersion::kDraft23
+                                        ? encode_request_update_message(draft, 1, 0, 0x11)
+                                        : encode_request_update_message(draft, 1, 1, 0x10);
+                MockTransport transport;
+                transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+                transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+                for (const auto& [stream, request_id, resumed] :
+                     {std::tuple{std::uint64_t{4}, std::uint64_t{2}, resume == Resume::kCatalog},
+                      std::tuple{std::uint64_t{8}, std::uint64_t{4}, resume == Resume::kMedia}}) {
+                    auto response = publish_ok(request_id);
+                    if (resumed) response.insert(response.end(), update.begin(), update.end());
+                    transport.reads[stream].push_back(response);
+                }
+                transport.keep_open_streams = {4, 8};
+                MoqtSession session(transport, std::string(kNamespace), false, false, false,
+                                    std::chrono::seconds(1));
+                session.set_preannounce_tracks(true);
+                ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+                const std::uint8_t media_marker = 0xAB;
+                if (stdin_input) {
+                    const auto bytes = concat({make_live_init_mp4(), make_live_media_fragment(0, media_marker)});
+                    std::istringstream input(std::string(bytes.begin(), bytes.end()));
+                    static_cast<void>(session.publish_live(input, draft, true));
+                } else {
+                    const std::vector<LiveObject> objects = {
+                        LiveObject{.track_name = "catalog", .group_id = 0, .payload = {'C', 'A', 'T', 'A'}},
+                        LiveObject{.track_name = "video", .group_id = 1, .payload = {media_marker}},
+                    };
+                    std::size_t next = 0;
+                    const LiveObjectSource source = listed_object_source(
+                        {LiveTrack{.track_name = "catalog"}, LiveTrack{.track_name = "video"}}, objects, next);
+                    static_cast<void>(session.publish_live_objects(source, draft));
+                }
+                for (const std::uint64_t stream : {4, 8}) {
+                    ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                                     return write.stream_id == stream && message_type(write.bytes) == 0x1d;
+                                 }),
+                                 label + "PUBLISH is sent on stream " + std::to_string(stream));
+                }
+                const auto data_holds = [&](const std::string& text) {
+                    const auto holds = [&](const auto& write) {
+                        return (write.stream_id & 0x3U) == 0x2U &&
+                               std::search(write.bytes.begin(), write.bytes.end(), text.begin(), text.end(),
+                                           [](std::uint8_t a, char b) { return a == static_cast<std::uint8_t>(b); }) !=
+                                   write.bytes.end();
+                    };
+                    return std::any_of(transport.writes.begin(), transport.writes.end(), holds) ||
+                           std::any_of(transport.object_write_attempts.begin(), transport.object_write_attempts.end(),
+                                       holds);
+                };
+                const bool media_sent = stdin_input ? data_holds("mdat") : data_holds(std::string(1, '\xab'));
+                const bool catalog_sent = stdin_input ? data_holds("\"tracks\"") : data_holds("CATA");
+                ok &= expect(media_sent == (resume == Resume::kMedia),
+                             label + (resume == Resume::kMedia ? "the resumed media track is sent"
+                                                               : "paused media is not sent"));
+                ok &= expect(catalog_sent == (resume == Resume::kCatalog),
+                             label + (resume == Resume::kCatalog ? "the resumed catalog is sent"
+                                                                 : "the paused catalog is not sent"));
+            }
+        }
+    }
+    return ok;
+}
+
 bool test_draft18_resubscribe_after_subscription_ends(const EndpointConfig& endpoint, const TlsConfig& tls) {
     constexpr std::string_view kNamespace = "interop";
     constexpr DraftVersion draft = DraftVersion::kDraft18;
@@ -13941,6 +14024,7 @@ int main() {
     ok &= test_publish_request_stream_stop_sending_ends_subscription(endpoint, tls);
     ok &= test_paused_preannounce(endpoint, tls, source_bytes);
     ok &= test_draft18_resubscribe_after_subscription_ends(endpoint, tls);
+    ok &= test_paused_preannounce_live(endpoint, tls);
     ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
     ok &= test_peer_publish_namespace_on_live_paths(endpoint, tls);
     ok &= test_live_stdin_video_alt_group(endpoint, tls);
