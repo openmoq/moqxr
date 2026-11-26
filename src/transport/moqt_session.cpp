@@ -1126,6 +1126,20 @@ struct DormantPublishedTrack {
     PublishedTrack track;
 };
 
+// Tracks sent with a paused PUBLISH (--preannounce-tracks without forwarding),
+// for drafts 18 and later, where the relay resumes each with REQUEST_UPDATE on
+// its PUBLISH stream.
+struct PausedPublications {
+    std::map<std::string, std::uint64_t> request_id_by_track;
+    std::map<std::uint64_t, std::uint64_t> stream_by_request_id;
+    // Bytes read from a PUBLISH stream and not yet handled.
+    std::map<std::uint64_t, std::vector<std::uint8_t>> pending_bytes;
+    std::set<std::uint64_t> terminated_request_ids;
+    // Accepted by a PUBLISH_OK that asks for forwarding (drafts 18 to 20).
+    std::set<std::uint64_t> forwarding_at_accept;
+    std::set<std::uint64_t> request_goaways;
+};
+
 std::string format_alias_mapping(const std::map<std::uint64_t, std::uint64_t>* request_id_by_track_alias) {
     if (request_id_by_track_alias == nullptr || request_id_by_track_alias->empty()) {
         return "[]";
@@ -4833,7 +4847,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                                     // accepted, so draft-16's strictly sequential ids continue
                                     // across the hand-off instead of restarting at 1.
                                     PeerRequestIdValidator* inherited_peer_request_ids = nullptr,
-                                    const openmoq::publisher::TrackProperties& track_properties = {}) {
+                                    const openmoq::publisher::TrackProperties& track_properties = {},
+                                    PausedPublications* paused_publications = nullptr) {
     std::vector<std::uint8_t> buffer = std::move(pending_control_bytes);
     pending_control_bytes.clear();
     std::set<std::uint64_t> completed_request_ids;
@@ -5094,6 +5109,47 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         return !end_at.has_value() || read_now(now_function) < *end_at;
     };
 
+    // Turns the dormant publication into an active subscription, applying the
+    // update that resumed it. Returns the Forward State it then has.
+    const auto activate_dormant = [&](std::uint64_t existing_request_id,
+                                      std::uint64_t response_stream_id,
+                                      const RequestUpdateMessage& update) -> std::uint8_t {
+        const auto dormant_it = dormant_published_tracks->find(existing_request_id);
+        ActiveSubscription active{
+            .subscribe = dormant_it->second.subscribe,
+            .track = dormant_it->second.track,
+            .sender = std::make_shared<SubgroupSenderState>(),
+            .request_stream_id = response_stream_id,
+            .loop_cycle = generation_availability.initial_loop_cycle(),
+            .next_object_index = 0,
+            .admitted_object_indices = {},
+            .send_sequence_by_object_index = {},
+            .subgroup_frontiers = {},
+            .scheduler_frontiers = {},
+            .availability_by_object_index = {},
+            .pending_request_bytes = {},
+            .publisher_priority =
+        priority_scheduler_internal::publisher_priority_for_request(
+            existing_request_id,
+            track_properties.effective(dormant_it->second.track.name)),
+            .scheduling_round = 0,
+            .forward_paused_by_update =
+        uses_priority_scheduler(draft) &&
+        dormant_it->second.subscribe.forward == 0,
+        };
+        apply_update_to_active(active, update);
+        const std::uint8_t forward = active.subscribe.forward;
+        if (!active.completed) {
+            active_subscriptions.insert_or_assign(
+        existing_request_id, std::move(active));
+            enqueue_active_candidate(
+        existing_request_id,
+        active_subscriptions.at(existing_request_id));
+        }
+        dormant_published_tracks->erase(dormant_it);
+        return forward;
+    };
+
     const auto process_subscription_request_update =
         [&](const RequestUpdateMessage& update,
             std::uint64_t existing_request_id,
@@ -5162,38 +5218,7 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         transport, "REQUEST_UPDATE specified an invalid existing request id");
                 }
 
-                ActiveSubscription active{
-                    .subscribe = dormant_it->second.subscribe,
-                    .track = dormant_it->second.track,
-                    .sender = std::make_shared<SubgroupSenderState>(),
-                    .request_stream_id = response_stream_id,
-                    .loop_cycle = generation_availability.initial_loop_cycle(),
-                    .next_object_index = 0,
-                    .admitted_object_indices = {},
-                    .send_sequence_by_object_index = {},
-                    .subgroup_frontiers = {},
-                    .scheduler_frontiers = {},
-                    .availability_by_object_index = {},
-                    .pending_request_bytes = {},
-                    .publisher_priority =
-                        priority_scheduler_internal::publisher_priority_for_request(
-                            existing_request_id,
-                            track_properties.effective(dormant_it->second.track.name)),
-                    .scheduling_round = 0,
-                    .forward_paused_by_update =
-                        uses_priority_scheduler(draft) &&
-                        dormant_it->second.subscribe.forward == 0,
-                };
-                apply_update_to_active(active, update);
-                forward_after_update = active.subscribe.forward;
-                if (!active.completed) {
-                    active_subscriptions.insert_or_assign(
-                        existing_request_id, std::move(active));
-                    enqueue_active_candidate(
-                        existing_request_id,
-                        active_subscriptions.at(existing_request_id));
-                }
-                dormant_published_tracks->erase(dormant_it);
+                forward_after_update = activate_dormant(existing_request_id, response_stream_id, update);
             } else {
                 return protocol_violation(
                     transport, "REQUEST_UPDATE specified an invalid existing request id");
@@ -5230,6 +5255,46 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             };
     if (is_draft22_or_later(draft))
         discovery_requests.retain(namespace_stream_id, 0x06, {}, 0);
+    const auto poll_paused_publications = [&]() -> TransportStatus {
+        if (paused_publications == nullptr) {
+            return TransportStatus::success();
+        }
+        return poll_retained_publish_request_updates(
+            transport,
+            draft,
+            paused_publications->request_goaways,
+            paused_publications->request_id_by_track,
+            paused_publications->stream_by_request_id,
+            paused_publications->pending_bytes,
+            paused_publications->terminated_request_ids,
+            peer_request_ids,
+            [&](const std::string&, std::uint64_t request_id, std::uint64_t stream_id,
+                const RequestUpdateMessage& update) -> TransportStatus {
+                const TransportStatus status = process_subscription_request_update(update, request_id, stream_id);
+                if (status.ok && completed_request_ids.contains(request_id)) {
+                    erase_active_subscription(request_id);
+                }
+                return status;
+            },
+            [&](const std::string&, std::uint64_t request_id, bool) -> TransportStatus {
+                dormant_published_tracks->erase(request_id);
+                const auto it = active_subscriptions.find(request_id);
+                if (it == active_subscriptions.end()) {
+                    return TransportStatus::success();
+                }
+                const TransportStatus status =
+                    it->second.sender->cancel_all_open_subgroups(transport, kCancelledErrorCode);
+                erase_active_subscription(request_id);
+                return status;
+            });
+    };
+    if (paused_publications != nullptr) {
+        RequestUpdateMessage forward;
+        forward.forward = 1;
+        for (const std::uint64_t request_id : paused_publications->forwarding_at_accept) {
+            activate_dormant(request_id, paused_publications->stream_by_request_id.at(request_id), forward);
+        }
+    }
     while (true) {
         const TransportStatus event_status =
             dispatch_peer_stopped_media_streams(transport,
@@ -5243,6 +5308,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         if (!uni_status.ok) return uni_status;
         const auto discovery_status = discovery_requests.poll(transport, draft, peer_request_ids, publish_discovered_tracks, track_namespace);
         if (!discovery_status.ok) return discovery_status;
+        const auto publication_status = poll_paused_publications();
+        if (!publication_status.ok) return publication_status;
         if (uses_request_streams(draft)) {
             while (true) {
                 std::uint64_t request_stream_id = 0;
@@ -7254,6 +7321,80 @@ TransportStatus forward_published_tracks(PublisherTransport& transport,
                                          }));
 }
 
+// Sends a paused PUBLISH for each track (drafts 18 and later) and records it
+// as dormant, to be served once the relay resumes it.
+TransportStatus publish_tracks_paused(PublisherTransport& transport,
+                                      openmoq::publisher::DraftVersion draft,
+                                      std::span<const PublishedTrack> tracks,
+                                      std::uint64_t first_request_id,
+                                      std::uint64_t peer_max_request_id,
+                                      std::string_view track_namespace,
+                                      const TrackAuthorization& authorization_token,
+                                      const openmoq::publisher::TrackProperties& track_properties,
+                                      PausedPublications& publications,
+                                      std::map<std::uint64_t, DormantPublishedTrack>& dormant) {
+    std::uint64_t request_id = first_request_id;
+    for (const auto& track : tracks) {
+        if (uses_peer_max_request_id(draft) && request_id > peer_max_request_id) {
+            return TransportStatus::failure("peer max_request_id is too small for publish requests");
+        }
+        const AuthorizationValues track_auth = authorization_token ? authorization_token(track.name) : AuthorizationValues{};
+        TrackMessage message{
+            .draft = draft,
+            .track_name = track.name,
+            .track_namespace = std::string(track_namespace),
+            .request_id = request_id,
+            .track_alias = track.alias,
+            .largest_group_id = track.largest_group_id,
+            .largest_object_id = track.largest_object_id,
+            .content_exists = track.content_exists,
+            .authorization_token = track_auth.token,
+            .dpop_proof = track_auth.proof,
+            .track_properties = track_properties.signalled(track.name),
+        };
+        message.forward = false;
+        PublishOk publish_ok;
+        std::uint64_t stream_id = 0;
+        std::vector<std::uint8_t> trailing;
+        const TransportStatus status = send_request_stream_and_wait(
+            transport, draft, encode_track_message(message), true, &publish_ok, &stream_id, &trailing);
+        if (!status.ok) {
+            return status;
+        }
+        publications.request_id_by_track.insert_or_assign(track.name, request_id);
+        publications.stream_by_request_id.insert_or_assign(request_id, stream_id);
+        publications.pending_bytes.insert_or_assign(request_id, std::move(trailing));
+        // Up to draft 20 PUBLISH_OK states the Forward State, 1 when it omits
+        // it. From draft 21 it states none, so the value sent stands.
+        if (!openmoq::publisher::is_draft21_or_later(draft) && publish_ok.forward != 0) {
+            publications.forwarding_at_accept.insert(request_id);
+        }
+        dormant.insert_or_assign(
+            request_id,
+            DormantPublishedTrack{
+                .subscribe =
+                    SubscribeMessage{
+                        .request_id = request_id,
+                        .track_namespace = split_track_namespace_components(track_namespace),
+                        .track_name = track.name,
+                        .subscriber_priority = publish_ok.subscriber_priority,
+                        .group_order = publish_ok.group_order,
+                        .forward = 0,
+                        .filter_type = publish_ok.filter_type == 0 ? 0x03 : publish_ok.filter_type,
+                        .start_group_id = publish_ok.start_group_id,
+                        .start_object_id = publish_ok.start_object_id,
+                        .end_group_id = publish_ok.end_group_id,
+                        .end_object_id = publish_ok.end_object_id,
+                        .delivery_timeouts = publish_ok.delivery_timeouts,
+                    },
+                .track = track,
+            });
+        std::cerr << "[moqt-session] publish paused track=" << track.name << " request_id=" << request_id << '\n';
+        request_id += 2;
+    }
+    return TransportStatus::success();
+}
+
 TransportStatus publish_selected_tracks(PublisherTransport& transport,
                                         std::uint64_t control_stream_id,
                                         const openmoq::publisher::PublishPlan& plan,
@@ -8322,6 +8463,44 @@ TransportStatus MoqtSession::publish(const openmoq::publisher::PublishPlan& plan
             namespace_stream_open_ = false;
         }
         return status;
+    }
+
+    // --preannounce-tracks without forwarding: announce the tracks paused and
+    // send each once the relay resumes it. Drafts 18 and later.
+    if (preannounce_tracks_ && is_draft18_or_later(plan.draft.version)) {
+        std::map<std::uint64_t, DormantPublishedTrack> dormant_published_tracks;
+        std::map<std::uint64_t, std::uint64_t> request_id_by_track_alias;
+        std::vector<PublishedTrack> catalog_tracks;
+        std::vector<PublishedTrack> paused_tracks;
+        for (const auto& track : tracks) {
+            (publish_catalog_ && track.name == "catalog" ? catalog_tracks : paused_tracks).push_back(track);
+        }
+        if (!catalog_tracks.empty()) {
+            status = publish_selected_tracks(transport_, control_stream_id_, plan, loop_state, catalog_tracks,
+                                             peer_max_request_id_, track_namespace_, track_authorization, paced_,
+                                             pending_control_bytes_, publish_stream_id_by_request_id_,
+                                             &dormant_published_tracks, &request_id_by_track_alias,
+                                             now_function_, 2, std::nullopt, track_properties_);
+            if (!status.ok) {
+                return status;
+            }
+        }
+        PausedPublications publications;
+        const std::uint64_t first_paused_request_id = 2 + (catalog_tracks.size() * 2);
+        status = publish_tracks_paused(transport_, plan.draft.version, paused_tracks, first_paused_request_id,
+                                       peer_max_request_id_, track_namespace_, track_authorization,
+                                       track_properties_, publications, dormant_published_tracks);
+        if (!status.ok) {
+            return status;
+        }
+        return serve_subscriptions(transport_, stats_sink, largest_sent, control_stream_id_,
+                                   namespace_stream_id_, peer_control_stream_id_, plan, loop_state,
+                                   tracks_by_name, plan.draft.version, track_namespace_, paced_,
+                                   subscriber_timeout_, pending_control_bytes_, true,
+                                   &dormant_published_tracks, &request_id_by_track_alias,
+                                   peer_max_request_id_, advertised_max_request_id(endpoint_->transport),
+                                   first_paused_request_id + (paused_tracks.size() * 2), track_authorization,
+                                   now_function_, nullptr, track_properties_, &publications);
     }
 
     if (publish_catalog_) {

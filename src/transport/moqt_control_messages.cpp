@@ -2949,17 +2949,26 @@ std::vector<std::uint8_t> encode_track_message(const TrackMessage& message) {
 
     const bool carries_subscribe_tracks_id =
         is_draft23_or_later(message.draft) && message.subscribe_tracks_request_id.has_value();
+    const bool carries_pause = !message.forward && is_draft18_or_later(message.draft);
     const std::uint64_t parameter_count =
         (message.authorization_token.has_value() ? (carries_dpop_proof(message) ? 2 : 1) : 0) +
-        (carries_subscribe_tracks_id ? 1 : 0);
+        (carries_pause ? 1 : 0) + (carries_subscribe_tracks_id ? 1 : 0);
     append_moqint(payload, message.draft, parameter_count);
     if (message.authorization_token.has_value()) {
         append_authorization_parameters(payload, message);
     }
+    std::uint64_t previous_type = message.authorization_token.has_value() ? kParamAuthorizationToken : 0;
+    if (carries_pause) {
+        // Both are uint8: draft 23 PAUSED 1, earlier FORWARD 0.
+        const bool paused_parameter = is_draft23_or_later(message.draft);
+        const std::uint64_t type = paused_parameter ? kParamPaused : kParamForward;
+        append_moqint(payload, message.draft, type - previous_type);
+        payload.push_back(paused_parameter ? 1 : 0);
+        previous_type = type;
+    }
     if (carries_subscribe_tracks_id) {
-        // SUBSCRIBE_TRACKS_ID (0x36) is a varint, delta-typed after AUTHORIZATION_TOKEN (0x03).
+        // SUBSCRIBE_TRACKS_ID (0x36) is a varint, delta-typed after the parameters above.
         constexpr std::uint64_t kParamSubscribeTracksId = 0x36;
-        const std::uint64_t previous_type = message.authorization_token.has_value() ? kParamAuthorizationToken : 0;
         append_moqint(payload, message.draft, kParamSubscribeTracksId - previous_type);
         append_moqint(payload, message.draft, *message.subscribe_tracks_request_id);
     }

@@ -2352,6 +2352,79 @@ bool test_publish_ok_range_filter_survives_forward_update(const EndpointConfig& 
 // publish_live_objects path is tested: the other paths take their objects from
 // a reader thread, so when a stop is seen relative to the next object is not
 // deterministic.
+// --preannounce-tracks without forwarding: PUBLISH goes out paused, and a track
+// is sent only once the relay resumes it with REQUEST_UPDATE on its PUBLISH
+// stream. PUBLISH streams are 4 (catalog) and 8 (vide_1).
+bool test_paused_preannounce(const EndpointConfig& endpoint, const TlsConfig& tls,
+                             std::span<const std::uint8_t> source_bytes) {
+    constexpr std::string_view kNamespace = "interop";
+    bool ok = true;
+    enum class Resume { kNever, kLater, kWithPublishOk, kPublishOkForwards };
+    for (const DraftVersion draft : {DraftVersion::kDraft18, DraftVersion::kDraft22, DraftVersion::kDraft23}) {
+        for (const Resume resume :
+             {Resume::kNever, Resume::kLater, Resume::kWithPublishOk, Resume::kPublishOkForwards}) {
+            // Only up to draft 20 does PUBLISH_OK carry FORWARD.
+            if (resume == Resume::kPublishOkForwards && draft != DraftVersion::kDraft18) continue;
+            const std::string label = std::string("paused preannounce ") + openmoq::publisher::to_string(draft) +
+                                      " scenario " + std::to_string(static_cast<int>(resume)) + ": ";
+            // From draft 21 on PUBLISH_OK has no FORWARD: the value the publisher sent stands.
+            const auto publish_ok = [&](std::uint64_t request_id, std::uint8_t forward) {
+                return draft == DraftVersion::kDraft18
+                           ? encode_publish_ok_message(draft, request_id, forward)
+                           : openmoq::publisher::transport::encode_request_ok_message(draft, request_id);
+            };
+            const auto resume_update = draft == DraftVersion::kDraft23
+                                           ? encode_request_update_message(draft, 1, 0, 0x11)   // PAUSED 0
+                                           : encode_request_update_message(draft, 1, 1, 0x10);  // FORWARD 1
+            MockTransport transport;
+            transport.reads[3].push_back(encode_server_setup_message({.draft = draft, .max_request_id = 100}));
+            transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+            transport.reads[4].push_back(publish_ok(2, 0));
+            auto video_ok = publish_ok(4, resume == Resume::kPublishOkForwards ? 1 : 0);
+            if (resume == Resume::kWithPublishOk) {
+                video_ok.insert(video_ok.end(), resume_update.begin(), resume_update.end());
+            }
+            transport.reads[8].push_back(video_ok);
+            transport.keep_open_streams = {4, 8};
+            std::size_t reads = 0;
+            bool queued = false;
+            transport.on_read = [&](MockTransport& current, std::uint64_t stream_id) {
+                if (resume != Resume::kLater || stream_id != 8 || queued || ++reads < 3) return;
+                queued = true;
+                current.reads[8].push_back(resume_update);
+            };
+            MoqtSession session(transport, std::string(kNamespace), false, false, false,
+                                std::chrono::seconds(1));
+            session.set_preannounce_tracks(true);
+            ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+            const auto status =
+                session.publish(materialize_publish_plan(make_span_backed_plan(draft), source_bytes));
+            ok &= expect(status.ok, label + "publish succeeds: " + status.message);
+            for (const std::uint64_t stream : {4, 8}) {
+                ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                                 return write.stream_id == stream && message_type(write.bytes) == 0x1d;
+                             }),
+                             label + "PUBLISH is sent on stream " + std::to_string(stream));
+            }
+            const auto carried = [&](std::size_t offset, std::size_t size) {
+                const std::vector<std::uint8_t> payload(source_bytes.begin() + offset,
+                                                        source_bytes.begin() + offset + size);
+                const auto holds = [&](const auto& write) {
+                    return (write.stream_id & 0x3U) == 0x2U && ends_with(write.bytes, payload);
+                };
+                return std::any_of(transport.writes.begin(), transport.writes.end(), holds) ||
+                       std::any_of(transport.object_write_attempts.begin(), transport.object_write_attempts.end(),
+                                   holds);
+            };
+            ok &= expect(carried(4, 3) == (resume != Resume::kNever),
+                         label + (resume == Resume::kNever ? "a paused track sends no media"
+                                                           : "the resumed track is sent"));
+            ok &= expect(!carried(0, 4), label + "the catalog, never resumed, is not sent");
+        }
+    }
+    return ok;
+}
+
 bool test_publish_request_stream_stop_sending_ends_subscription(const EndpointConfig& endpoint,
                                                                 const TlsConfig& tls) {
     constexpr std::string_view kNamespace = "test/live";
@@ -13806,6 +13879,7 @@ int main() {
     ok &= test_live_stdin_initial_group_id(endpoint, tls);
     ok &= test_live_stdin_catalog_framerate_from_fragments(endpoint, tls);
     ok &= test_publish_request_stream_stop_sending_ends_subscription(endpoint, tls);
+    ok &= test_paused_preannounce(endpoint, tls, source_bytes);
     ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
     ok &= test_peer_publish_namespace_on_live_paths(endpoint, tls);
     ok &= test_live_stdin_video_alt_group(endpoint, tls);

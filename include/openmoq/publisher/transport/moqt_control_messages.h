@@ -79,6 +79,9 @@ struct TrackMessage {
     // Track Properties (see TrackProperties), sent on draft 18 and later.
     // Empty sends none, as before.
     std::vector<ObjectProperty> track_properties;
+    // false publishes the track paused: FORWARD 0, or PAUSED 1 on draft 23
+    // (drafts 18 and later). true, the default for both, sends no parameter.
+    bool forward = true;
 };
 
 struct PublishNamespaceOk {
