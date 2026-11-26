@@ -152,6 +152,9 @@ struct SubscribeMessage {
     std::uint8_t subscriber_priority = 0;
     std::uint8_t group_order = 0;
     std::uint8_t forward = 0;
+    // INCLUDE_PROPERTIES (drafts 21 and later): false asks for an OK message
+    // with empty Track Properties. Only TRACK_STATUS_OK honors it.
+    bool include_properties = true;
     std::uint64_t filter_type = 0;
     std::size_t start_group_id = 0;
     std::size_t start_object_id = 0;
@@ -354,11 +357,17 @@ bool decode_control_message_header(std::span<const std::uint8_t> bytes,
                                    std::size_t& payload_offset,
                                    std::size_t& payload_length);
 std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& message);
-std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uint64_t request_id);
+// Track Properties are sent on draft 18 and later, and only a TRACK_STATUS_OK
+// may carry them (draft 18 section 10.5): leave them empty for any other
+// request.
+std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
+                                                    std::uint64_t request_id,
+                                                    std::span<const ObjectProperty> track_properties = {});
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
                                                     std::uint64_t request_id,
                                                     std::size_t largest_group_id,
-                                                    std::size_t largest_object_id);
+                                                    std::size_t largest_object_id,
+                                                    std::span<const ObjectProperty> track_properties = {});
 bool decode_request_ok(std::span<const std::uint8_t> bytes, DraftVersion draft, PublishNamespaceOk& message);
 bool decode_request_error(std::span<const std::uint8_t> bytes, DraftVersion draft, RequestError& message);
 bool decode_subscribe_namespace_message(std::span<const std::uint8_t> bytes,

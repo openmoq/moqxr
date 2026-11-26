@@ -4183,7 +4183,8 @@ TransportStatus answer_track_status(
     std::span<const std::uint8_t> message_bytes,
     PeerRequestIdValidator& peer_request_ids,
     std::string_view track_namespace,
-    const std::function<std::optional<LargestObject>(const std::string&)>& lookup) {
+    const std::function<std::optional<LargestObject>(const std::string&)>& lookup,
+    const openmoq::publisher::TrackProperties& track_properties) {
     SubscribeMessage request;
     if (!decode_track_status_message(message_bytes, draft, request)) {
         return protocol_violation(transport, "received invalid TRACK_STATUS");
@@ -4206,11 +4207,16 @@ TransportStatus answer_track_status(
                                          "track does not exist"),
             true);
     }
+    // TRACK_STATUS_OK carries the Track Properties the SUBSCRIBE_OK would
+    // (draft 18 section 10.14), unless INCLUDE_PROPERTIES asks for none.
+    const std::vector<openmoq::publisher::ObjectProperty> properties =
+        request.include_properties ? track_properties.signalled(request.track_name)
+                                   : std::vector<openmoq::publisher::ObjectProperty>{};
     const LargestObject& largest = *track;
     return transport.write_stream(
         request_stream_id,
-        largest ? encode_request_ok_message(draft, request.request_id, largest->first, largest->second)
-                : encode_request_ok_message(draft, request.request_id),
+        largest ? encode_request_ok_message(draft, request.request_id, largest->first, largest->second, properties)
+                : encode_request_ok_message(draft, request.request_id, properties),
         true);
 }
 
@@ -4422,10 +4428,11 @@ TransportStatus serve_track_status_or_fetch(
     std::string_view track_namespace,
     const std::function<std::optional<LargestObject>(const std::string&)>& lookup,
     const std::map<std::uint64_t, std::string>& joinable_subscriptions,
-    const std::function<std::vector<CatalogFetchObject>()>& catalog_objects) {
+    const std::function<std::vector<CatalogFetchObject>()>& catalog_objects,
+    const openmoq::publisher::TrackProperties& track_properties) {
     if (request_type == 0x0d) {
         return answer_track_status(transport, draft, request_stream_id, message_bytes, peer_request_ids,
-                                   track_namespace, lookup);
+                                   track_namespace, lookup, track_properties);
     }
     if (draft != openmoq::publisher::DraftVersion::kDraft18) {
         return reject_unsupported_request(transport, draft, request_stream_id, message_bytes, peer_request_ids);
@@ -5499,7 +5506,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                             return {CatalogFetchObject{latest->group_id, latest->object_id,
                                                        {payload.begin(), payload.end()},
                                                        track_properties.effective("catalog")}};
-                        });
+                        },
+                        track_properties);
                     if (!response_status.ok) return response_status;
                     continue;
                 }
@@ -9465,7 +9473,8 @@ TransportStatus MoqtSession::publish_live(const LiveIngestOptions& ingest,
                                                                  track_properties_.effective("catalog")});
                             }
                             return out;
-                        });
+                        },
+                        track_properties_);
                     if (!response_status.ok) return {response_status, 0};
                     continue;
                 }
@@ -11281,7 +11290,8 @@ TransportStatus MoqtSession::publish_live(std::istream& input,
                                                                  track_properties_.effective("catalog")});
                             }
                             return out;
-                        });
+                        },
+                        track_properties_);
                     if (!response_status.ok) return {response_status, 0};
                     continue;
                 }
@@ -12703,7 +12713,8 @@ TransportStatus MoqtSession::publish_live_objects(const openmoq::publisher::Live
                                                                  track_properties_.effective("catalog")});
                             }
                             return out;
-                        });
+                        },
+                        track_properties_);
                     if (!response_status.ok) return response_status;
                     continue;
                 }

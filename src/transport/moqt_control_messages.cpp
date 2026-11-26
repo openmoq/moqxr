@@ -795,13 +795,15 @@ constexpr std::uint64_t kParamFillParameters = 0x23;
 constexpr std::uint64_t kFetchHeaderType = 0x05;
 
 // Draft-21 INCLUDE_PROPERTIES is an odd-typed uint8, an exception to the
-// odd-means-length-prefixed rule. This publisher never sends Track Properties,
-// so either legal value is already honored.
-bool decode_include_properties(std::span<const std::uint8_t> bytes, std::size_t& offset, std::size_t end) {
-    if (offset >= end) {
+// odd-means-length-prefixed rule.
+bool decode_include_properties(std::span<const std::uint8_t> bytes, std::size_t& offset, std::size_t end,
+                               bool* include = nullptr) {
+    if (offset >= end || bytes[offset] > 1) {
         return false;
     }
-    return bytes[offset++] <= 1;
+    const std::uint8_t value = bytes[offset++];
+    if (include != nullptr) *include = value != 0;
+    return true;
 }
 
 // Draft-23 PAUSED is an odd-typed uint8 like INCLUDE_PROPERTIES. The decoders
@@ -1423,12 +1425,28 @@ std::vector<std::uint8_t> encode_namespace_message(const NamespaceMessage& messa
     return message_bytes;
 }
 
-std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uint64_t request_id) {
+// Track Properties are the final field of PUBLISH, SUBSCRIBE_OK and
+// TRACK_STATUS_OK, their
+// length the rest of the message. They are Key-Value-Pairs, delta-typed in
+// ascending order like Object Properties. A track with none sends nothing, so
+// its message is unchanged.
+static void append_track_properties(std::vector<std::uint8_t>& payload,
+                                    DraftVersion draft,
+                                    std::span<const openmoq::publisher::ObjectProperty> track_properties) {
+    if (track_properties.empty() || !is_draft18_or_later(draft)) return;
+    const auto bytes = openmoq::publisher::serialize_object_properties(track_properties);
+    payload.insert(payload.end(), bytes.begin(), bytes.end());
+}
+
+std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
+                                                    std::uint64_t request_id,
+                                                    std::span<const ObjectProperty> track_properties) {
     std::vector<std::uint8_t> payload;
     if (!uses_moq_vi64(draft)) {
         append_moqint(payload, draft, request_id);
     }
     append_moqint(payload, draft, 0);
+    append_track_properties(payload, draft, track_properties);
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kRequestOkType);
@@ -1442,7 +1460,8 @@ std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft, std::uin
 std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
                                                     std::uint64_t request_id,
                                                     std::size_t largest_group_id,
-                                                    std::size_t largest_object_id) {
+                                                    std::size_t largest_object_id,
+                                                    std::span<const ObjectProperty> track_properties) {
     std::vector<std::uint8_t> payload;
     if (!uses_moq_vi64(draft)) {
         append_moqint(payload, draft, request_id);
@@ -1450,6 +1469,7 @@ std::vector<std::uint8_t> encode_request_ok_message(DraftVersion draft,
     append_moqint(payload, draft, 1);
     std::uint64_t previous_parameter_type = 0;
     append_largest_object_parameter(payload, draft, previous_parameter_type, largest_group_id, largest_object_id);
+    append_track_properties(payload, draft, track_properties);
 
     std::vector<std::uint8_t> message_bytes;
     append_moqint(message_bytes, draft, kRequestOkType);
@@ -2122,6 +2142,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
     // Defaults per spec: subscriber_priority=128, group_order=0, forward=1, no filter.
     message.subscriber_priority = 128;
     message.group_order = 0;
+    message.include_properties = true;
     message.forward = 1;
     message.filter_type = 0;
     message.start_group_id = 0;
@@ -2152,7 +2173,7 @@ bool decode_subscribe_message(std::span<const std::uint8_t> bytes, DraftVersion 
             continue;
         }
         if (openmoq::publisher::is_draft21_or_later(draft) && parameter_type == kParamIncludeProperties) {
-            if (!decode_include_properties(bytes, offset, payload_end)) {
+            if (!decode_include_properties(bytes, offset, payload_end, &message.include_properties)) {
                 note_decode_fault(draft, kFaultInvalidParameter);
                 return false;
             }
@@ -2702,18 +2723,6 @@ bool decode_subscribe_update_message(std::span<const std::uint8_t> bytes,
     }
     return decode_varint_impl(bytes, offset, parameter_count) && parameter_count == 0 &&
            offset == payload_end;
-}
-
-// Track Properties are the final field of PUBLISH and SUBSCRIBE_OK, their
-// length the rest of the message. They are Key-Value-Pairs, delta-typed in
-// ascending order like Object Properties. A track with none sends nothing, so
-// its message is unchanged.
-static void append_track_properties(std::vector<std::uint8_t>& payload,
-                                    DraftVersion draft,
-                                    std::span<const openmoq::publisher::ObjectProperty> track_properties) {
-    if (track_properties.empty() || !is_draft18_or_later(draft)) return;
-    const auto bytes = openmoq::publisher::serialize_object_properties(track_properties);
-    payload.insert(payload.end(), bytes.begin(), bytes.end());
 }
 
 std::vector<std::uint8_t> encode_subscribe_ok_message(DraftVersion draft,

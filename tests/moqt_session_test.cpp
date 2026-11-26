@@ -2996,8 +2996,11 @@ bool test_publisher_priorities_live_stdin(const EndpointConfig& endpoint, const 
 
 // MSF-02 section 12.2: a LOC track's decoder configuration never changes, so
 // it is a Track Property, VIDEO_CONFIG (0x0D) or AUDIO_CONFIG (0x0F), in the
-// track's PUBLISH and SUBSCRIBE_OK. MSF-01 carries it inline in the catalog
-// and CMAF in its init segment, so neither sends it. Live stdin with a
+// track's PUBLISH, SUBSCRIBE_OK and TRACK_STATUS_OK. MSF-01 carries it inline
+// in the catalog and CMAF in its init segment, so neither sends it. A
+// TRACK_STATUS_OK carries what the SUBSCRIBE_OK would (draft 18 section 10.14),
+// unless the request set INCLUDE_PROPERTIES to 0 (draft 22 section 9.20.21).
+// Live stdin with a
 // one-track video fixture and a one-track audio fixture.
 bool test_loc_decoder_config_track_property(const EndpointConfig& endpoint, const TlsConfig& tls) {
     constexpr std::string_view kNamespace = "interop";
@@ -3069,7 +3072,21 @@ bool test_loc_decoder_config_track_property(const EndpointConfig& endpoint, cons
                 transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
                 transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "catalog", 1, draft));
                 transport.reads[5].push_back(encode_subscribe_message(3, kNamespace, track_name, 1, draft));
-                for (const std::uint64_t id : {1, 5}) transport.keep_open_streams.insert(id);
+                auto track_status = encode_subscribe_message(5, kNamespace, track_name, 1, draft);
+                track_status[0] = 0x0d;  // TRACK_STATUS has the SUBSCRIBE layout
+                transport.reads[9].push_back(track_status);
+                if (draft == DraftVersion::kDraft22) {
+                    // The same request with one parameter, INCLUDE_PROPERTIES 0.
+                    std::vector<std::uint8_t> body{7, 1, static_cast<std::uint8_t>(kNamespace.size())};
+                    body.insert(body.end(), kNamespace.begin(), kNamespace.end());
+                    body.push_back(static_cast<std::uint8_t>(track_name.size()));
+                    body.insert(body.end(), track_name.begin(), track_name.end());
+                    body.insert(body.end(), {1, 0x35, 0});
+                    std::vector<std::uint8_t> message{0x0d, 0, static_cast<std::uint8_t>(body.size())};
+                    message.insert(message.end(), body.begin(), body.end());
+                    transport.reads[13].push_back(message);
+                }
+                for (const std::uint64_t id : {1, 5, 9, 13}) transport.keep_open_streams.insert(id);
                 MoqtSession session(transport, std::string(kNamespace), false, false, false, std::chrono::seconds(1));
                 session.set_media_packaging(test_case.packaging);
                 session.set_msf_version(test_case.msf_version);
@@ -3078,6 +3095,12 @@ bool test_loc_decoder_config_track_property(const EndpointConfig& endpoint, cons
                 const auto status = session.publish_live(input, draft, true);
                 ok &= expect(status.ok, label + "live publish succeeds: " + status.message);
                 check(transport, label, 0x04, [](const auto& write) { return write.stream_id == 5; }, expected);
+                check(transport, label + "TRACK_STATUS_OK: ", 0x07,
+                      [](const auto& write) { return write.stream_id == 9; }, expected);
+                if (draft == DraftVersion::kDraft22) {
+                    check(transport, label + "TRACK_STATUS_OK without properties: ", 0x07,
+                          [](const auto& write) { return write.stream_id == 13; }, false);
+                }
             }
         }
     }
@@ -3095,6 +3118,10 @@ bool test_loc_decoder_config_track_property(const EndpointConfig& endpoint, cons
             } else {
                 transport.reads[1].push_back(
                     encode_subscribe_message(1, kNamespace, "loc", 1, DraftVersion::kDraft18));
+                auto track_status = encode_subscribe_message(3, kNamespace, "loc", 1, DraftVersion::kDraft18);
+                track_status[0] = 0x0d;
+                transport.reads[5].push_back(track_status);
+                for (const std::uint64_t id : {1, 5}) transport.keep_open_streams.insert(id);
             }
             PublishPlan plan = make_scheduling_plan({
                 {.track_name = "loc", .group_id = 0, .subgroup_id = 0, .object_id = 0, .marker = 'L'},
@@ -3114,6 +3141,17 @@ bool test_loc_decoder_config_track_property(const EndpointConfig& endpoint, cons
                              return message_type(write.bytes) == type && ends_with(write.bytes, audio_config);
                          }) == (msf_version == MsfVersion::k02),
                          label + "AUDIO_CONFIG is a Track Property only under MSF-02");
+            if (!forward) {
+                bool answered = false;
+                bool carries = false;
+                for (const auto& write : transport.writes) {
+                    if (write.stream_id != 5 || message_type(write.bytes) != 0x07) continue;
+                    answered = true;
+                    carries = carries || ends_with(write.bytes, audio_config);
+                }
+                ok &= expect(answered && carries == (msf_version == MsfVersion::k02),
+                             label + "TRACK_STATUS_OK carries AUDIO_CONFIG only under MSF-02");
+            }
         }
     }
     return ok;
@@ -12775,6 +12813,12 @@ int main() {
             }
             return object;
         }};
+        if (invalid == 0) {
+            auto track_status = encode_subscribe_message(1, kTestTrackNamespace, "video", 1, DraftVersion::kDraft18);
+            track_status[0] = 0x0d;
+            transport.reads[1].push_back(track_status);
+            transport.keep_open_streams.insert(1);
+        }
         MoqtSession session(transport, std::string(kTestTrackNamespace), true, false, false, std::chrono::seconds(1));
         status = session.connect(endpoint, tls);
         if (status.ok) status = session.publish_live_objects(source, DraftVersion::kDraft18);
@@ -12787,6 +12831,11 @@ int main() {
                              return message_type(write.bytes) == 0x1d && ends_with(write.bytes, video_config);
                          }),
                          "LOC arbitrary source PUBLISH carries VIDEO_CONFIG as a Track Property");
+            ok &= expect(std::any_of(transport.writes.begin(), transport.writes.end(), [&](const auto& write) {
+                             return write.stream_id == 1 && message_type(write.bytes) == 0x07 &&
+                                    ends_with(write.bytes, video_config);
+                         }),
+                         "LOC arbitrary source TRACK_STATUS_OK carries VIDEO_CONFIG as a Track Property");
         }
         ok &= expect(session.publish_stats().objects_published == (valid ? 1 : 0), "invalid LOC source never publishes media");
         if (invalid == 6) ok &= expect(status.message.find("duplicate") != std::string::npos, "duplicate LOC codec string rejected as duplicate: " + status.message);
