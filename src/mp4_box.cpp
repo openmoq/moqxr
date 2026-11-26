@@ -891,7 +891,7 @@ std::vector<TrackDescription> extract_tracks(const std::vector<Mp4Box>& top_leve
         // as the wrong value (0) for every encrypted audio track, since
         // validate_track makes those fields MUST-present.
         if ((effective_type == "avc1" || effective_type == "avc3" || effective_type == "hvc1" ||
-             effective_type == "hev1" || effective_type == "vp09") &&
+             effective_type == "hev1" || effective_type == "vp09" || effective_type == "av01") &&
             sample_entry.payload.offset + 28 <= bytes.size()) {
             width = read_be16(bytes, sample_entry.payload.offset + 24);
             height = read_be16(bytes, sample_entry.payload.offset + 26);
