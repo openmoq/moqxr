@@ -51,6 +51,12 @@ TransportStatus exercise_terminal_completion_overflow_for_testing(
 
 }  // namespace openmoq::publisher::transport::priority_scheduler_internal
 
+namespace openmoq::publisher::live_srt_internal {
+
+openmoq::publisher::TrackDescription hevc_track_for_testing(std::span<const std::uint8_t> keyframe);
+
+}  // namespace openmoq::publisher::live_srt_internal
+
 namespace openmoq::publisher::transport::live_srt_internal {
 
 std::vector<openmoq::publisher::MediaFragment> encode_loc_fragments_for_testing(
@@ -12727,19 +12733,26 @@ int main() {
 
     {
         // HEVC over SRT: the converter strips only parameter sets that match the announced hvcC.
+        // The track is the one SRT discovery builds from x265 parameter sets.
         using openmoq::publisher::MediaFragment;
         using openmoq::publisher::SourceSampleTiming;
         using openmoq::publisher::transport::live_srt_internal::encode_loc_fragments_for_testing;
         using openmoq::publisher::transport::live_srt_internal::no_srt_tracks_message;
-        const std::vector<std::uint8_t> vps{0x40, 0x01, 0xAA}, sps{0x42, 0x01, 0xBB}, pps{0x44, 0x01, 0xCC};
-        TrackDescription track{.track_id = 1, .handler_type = "vide", .codec = "hvc1.1.6.L120.B0", .sample_entry_type = "hvc1", .track_name = "video"};
-        track.timescale = 90000;
-        std::vector<std::uint8_t> hvcc{1, 1, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8, 0, 0, 0x0B, 3};
-        for (const auto& [type, unit] : {std::pair{32, vps}, std::pair{33, sps}, std::pair{34, pps}}) {
-            hvcc.insert(hvcc.end(), {static_cast<std::uint8_t>(0x80 | type), 0, 1, 0, static_cast<std::uint8_t>(unit.size())});
-            hvcc.insert(hvcc.end(), unit.begin(), unit.end());
+        const std::vector<std::uint8_t> vps{0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+                                            0x00, 0x00, 0x03, 0x00, 0x5D, 0x95, 0x98, 0x09};
+        const std::vector<std::uint8_t> sps{0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+                                            0x00, 0x5D, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x16, 0x59, 0x59, 0xA4, 0x93, 0x2B, 0xC0, 0x5A, 0x02,
+                                            0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x3C, 0x10};
+        const std::vector<std::uint8_t> pps{0x44, 0x01, 0xC1, 0x72, 0xB4, 0x62, 0x40};
+        const std::vector<std::uint8_t> idr{0x26, 0x01, 0x80}, trail{0x02, 0x01, 0x80};
+        std::vector<std::uint8_t> keyframe;
+        for (const auto& unit : {vps, sps, pps, idr}) {
+            keyframe.insert(keyframe.end(), {0, 0, 0, 1});
+            keyframe.insert(keyframe.end(), unit.begin(), unit.end());
         }
-        track.codec_private = make_box("hvcC", hvcc);
+        TrackDescription track = openmoq::publisher::live_srt_internal::hevc_track_for_testing(keyframe);
+        track.timescale = 90000;
+        ok &= expect(track.codec == "hvc1.1.6.L93.90", "LOC SRT HEVC announces the codec string of its x265 SPS");
         auto be32 = [](std::uint32_t value) { std::vector<std::uint8_t> bytes; append_be32(bytes, value); return bytes; };
         auto full_box = [&](std::string_view type, std::uint8_t version, std::uint32_t flags, std::vector<std::uint8_t> payload) {
             auto prefix = be32((static_cast<std::uint32_t>(version) << 24) | flags);
@@ -12764,14 +12777,14 @@ int main() {
             fragment.source_timing = SourceSampleTiming{dts, static_cast<std::int64_t>(dts), 0, 90000, sequence};
             return fragment;
         };
-        const std::vector<std::uint8_t> idr{0x26, 0x01, 0x80}, trail{0x02, 0x01, 0x80};
         const std::vector<MediaFragment> matching{make_fragment(90000, 0, {vps, sps, pps, idr}, true), make_fragment(93000, 1, {trail}, false)};
         const auto encoded = encode_loc_fragments_for_testing(matching, {track});
         ok &= expect(encoded.size() == 2 && encoded[0].payload.owned_bytes == length_prefixed({idr}) && encoded[0].is_video_keyframe && !encoded[1].is_video_keyframe,
                      "LOC SRT HEVC strips matching in-band parameter sets and detects keyframes from the bitstream");
         bool changed_rejected = false;
         try {
-            const std::vector<std::uint8_t> other_sps{0x42, 0x01, 0xEE};
+            auto other_sps = sps;
+            other_sps.back() ^= 0x01U;
             const std::vector<MediaFragment> changed{make_fragment(90000, 0, {vps, other_sps, pps, idr}, true)};
             static_cast<void>(encode_loc_fragments_for_testing(changed, {track}));
         } catch (const std::runtime_error&) { changed_rejected = true; }

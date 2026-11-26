@@ -456,35 +456,10 @@ std::string avc_codec_string(const Mp4Box& sample_entry, std::span<const std::ui
 std::string hevc_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
     const auto hvcc = find_child_box_span(bytes, sample_entry.span.offset, sample_entry.span.size,
                                           kVisualSampleEntryChildOffset, "hvcC");
-    if (!hvcc.has_value() || hvcc->offset + 21 > bytes.size()) {
+    if (!hvcc.has_value() || hvcc->offset + 8 > bytes.size()) {
         return sample_entry.type;
     }
-    const std::size_t hvcc_offset = hvcc->offset;
-
-    const std::uint8_t profile_byte = bytes[hvcc_offset + 9];
-    const char profile_space = (profile_byte >> 6U) == 1 ? 'A' : (profile_byte >> 6U) == 2 ? 'B' : (profile_byte >> 6U) == 3 ? 'C' : '\0';
-    const std::uint8_t profile_idc = profile_byte & 0x1FU;
-    const std::uint32_t compatibility_flags = read_be32(bytes, hvcc_offset + 10);
-    const std::uint8_t level_idc = bytes[hvcc_offset + 20];
-    const std::array<std::uint8_t, 6> constraint_bytes = {
-        bytes[hvcc_offset + 14],
-        bytes[hvcc_offset + 15],
-        bytes[hvcc_offset + 16],
-        bytes[hvcc_offset + 17],
-        bytes[hvcc_offset + 18],
-        bytes[hvcc_offset + 19],
-    };
-
-    std::ostringstream out;
-    out << sample_entry.type << '.';
-    if (profile_space != '\0') {
-        out << profile_space;
-    }
-    out << static_cast<unsigned int>(profile_idc) << '.'
-        << hex_no_leading_zeroes(reverse_bits32(compatibility_flags)) << '.'
-        << ((profile_byte & 0x20U) != 0 ? 'H' : 'L') << static_cast<unsigned int>(level_idc);
-    out << hevc_constraint_string(constraint_bytes);
-    return out.str();
+    return hevc_codec_string_from_record(sample_entry.type, bytes.subspan(hvcc->offset + 8));
 }
 
 std::string av1_codec_string(const Mp4Box& sample_entry, std::span<const std::uint8_t> bytes) {
@@ -733,6 +708,36 @@ std::uint64_t duration_ms_from_mdhd(const Mp4Box& mdhd,
 }
 
 }  // namespace
+
+std::string hevc_codec_string_from_record(std::string_view sample_entry_type,
+                                          std::span<const std::uint8_t> record) {
+    // The fields used are the record's first 13 bytes: configurationVersion,
+    // the profile byte, the compatibility flags, the constraint flags, and
+    // general_level_idc.
+    if (record.size() < 13) {
+        return std::string(sample_entry_type);
+    }
+
+    const std::uint8_t profile_byte = record[1];
+    const char profile_space = (profile_byte >> 6U) == 1 ? 'A' : (profile_byte >> 6U) == 2 ? 'B' : (profile_byte >> 6U) == 3 ? 'C' : '\0';
+    const std::uint8_t profile_idc = profile_byte & 0x1FU;
+    const std::uint32_t compatibility_flags = read_be32(record, 2);
+    const std::uint8_t level_idc = record[12];
+    const std::array<std::uint8_t, 6> constraint_bytes = {
+        record[6], record[7], record[8], record[9], record[10], record[11],
+    };
+
+    std::ostringstream out;
+    out << sample_entry_type << '.';
+    if (profile_space != '\0') {
+        out << profile_space;
+    }
+    out << static_cast<unsigned int>(profile_idc) << '.'
+        << hex_no_leading_zeroes(reverse_bits32(compatibility_flags)) << '.'
+        << ((profile_byte & 0x20U) != 0 ? 'H' : 'L') << static_cast<unsigned int>(level_idc);
+    out << hevc_constraint_string(constraint_bytes);
+    return out.str();
+}
 
 ParsedMp4 parse_mp4_file(const std::string& path) {
     std::ifstream input(path, std::ios::binary);

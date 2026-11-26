@@ -132,6 +132,15 @@ std::vector<const Mp4Box*> find_boxes(const std::vector<Mp4Box>& boxes, std::str
 const Mp4Box* find_child_box(const Mp4Box& box, std::string_view type);
 std::span<const std::uint8_t> slice_bytes(std::span<const std::uint8_t> bytes, const ByteSpan& span);
 
+// RFC 6381 codec string for an HEVC sample entry, such as "hvc1.1.6.L93.90",
+// from its HEVCDecoderConfigurationRecord: the hvcC payload, without the box
+// header (ISO/IEC 14496-15 Annex E.3). The compatibility flags are written
+// bit-reversed in hex without leading zeroes, and the constraint bytes up to
+// the last non-zero one. A record shorter than 13 bytes gives the sample entry
+// type alone.
+std::string hevc_codec_string_from_record(std::string_view sample_entry_type,
+                                          std::span<const std::uint8_t> record);
+
 // Incremental MP4 box reader for streaming input (e.g. piped ffmpeg).
 // Buffers raw bytes and yields complete top-level boxes one at a time.
 struct StreamingBoxResult {
