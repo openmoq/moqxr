@@ -2425,6 +2425,66 @@ bool test_paused_preannounce(const EndpointConfig& endpoint, const TlsConfig& tl
     return ok;
 }
 
+// Draft 18 section 5.1: a second SUBSCRIBE to a Track is a duplicate only while
+// the first subscription exists. publish() of a prepared plan must accept one
+// after PUBLISH_DONE ended it, or after the subscriber stopped its request, and
+// still refuse one while it is active.
+bool test_draft18_resubscribe_after_subscription_ends(const EndpointConfig& endpoint, const TlsConfig& tls) {
+    constexpr std::string_view kNamespace = "interop";
+    constexpr DraftVersion draft = DraftVersion::kDraft18;
+    enum class Ending { kPublishDone, kSubscriberStop, kStillActive };
+    bool ok = true;
+    for (const Ending ending : {Ending::kPublishDone, Ending::kSubscriberStop, Ending::kStillActive}) {
+        const std::string label = std::string("draft-18 resubscribe scenario ") +
+                                  std::to_string(static_cast<int>(ending)) + ": ";
+        // The "ok" track's one Object is due 400 ms in, so with pacing its
+        // subscription stays active until then.
+        const std::uint64_t due_us = ending == Ending::kPublishDone ? 0 : 400000;
+        PublishPlan plan = make_scheduling_plan(
+            {{.track_name = "media", .group_id = 0, .subgroup_id = 0, .object_id = 0, .media_time_us = 0, .marker = 'A'},
+             {.track_name = "media", .group_id = 1, .subgroup_id = 0, .object_id = 0, .media_time_us = due_us,
+              .marker = 'B'}});
+        plan.draft = openmoq::publisher::draft_profile(draft);
+        MockTransport transport;
+        transport.reads[3].push_back(encode_draft18_setup_response());
+        transport.reads[0].push_back(encode_publish_namespace_ok_message(draft, 0));
+        transport.reads[1].push_back(encode_subscribe_message(1, kNamespace, "media", 1, draft));
+        transport.keep_open_streams = {1, 5};
+        bool resubscribed = false;
+        transport.on_accept_timeout = [&](MockTransport& current, StreamDirection direction) {
+            if (resubscribed || direction != StreamDirection::kBidirectional) return;
+            const auto wrote_on_first = [&](std::uint64_t type) {
+                return std::any_of(current.writes.begin(), current.writes.end(), [&](const auto& write) {
+                    return write.stream_id == 1 && message_type(write.bytes) == type;
+                });
+            };
+            if (!wrote_on_first(ending == Ending::kPublishDone ? 0x0b : 0x04)) return;
+            resubscribed = true;
+            if (ending == Ending::kSubscriberStop) current.peer_stopped_media_streams.insert(1);
+            current.reads[5].push_back(encode_subscribe_message(3, kNamespace, "media", 1, draft));
+        };
+        MoqtSession session(transport, std::string(kNamespace), false, false, true, std::chrono::seconds(1));
+        ok &= expect(session.connect(endpoint, tls).ok, label + "session connects");
+        const auto status = session.publish(plan);
+        ok &= expect(status.ok, label + "publish succeeds: " + status.message);
+        std::uint64_t response = 0;
+        for (const auto& write : transport.writes) {
+            if (write.stream_id != 5) continue;
+            const auto type = message_type(write.bytes);
+            if (type == 0x04 || type == 0x05) {
+                response = *type;
+                break;
+            }
+        }
+        const std::uint64_t expected = ending == Ending::kStillActive ? 0x05 : 0x04;
+        ok &= expect(resubscribed && response == expected,
+                     label + (ending == Ending::kStillActive ? "a second SUBSCRIBE while one is active is refused"
+                                                             : "a SUBSCRIBE after the first ended gets SUBSCRIBE_OK") +
+                         ", got message type " + std::to_string(response));
+    }
+    return ok;
+}
+
 bool test_publish_request_stream_stop_sending_ends_subscription(const EndpointConfig& endpoint,
                                                                 const TlsConfig& tls) {
     constexpr std::string_view kNamespace = "test/live";
@@ -13880,6 +13940,7 @@ int main() {
     ok &= test_live_stdin_catalog_framerate_from_fragments(endpoint, tls);
     ok &= test_publish_request_stream_stop_sending_ends_subscription(endpoint, tls);
     ok &= test_paused_preannounce(endpoint, tls, source_bytes);
+    ok &= test_draft18_resubscribe_after_subscription_ends(endpoint, tls);
     ok &= test_publish_ok_range_filter_survives_forward_update(endpoint, tls);
     ok &= test_peer_publish_namespace_on_live_paths(endpoint, tls);
     ok &= test_live_stdin_video_alt_group(endpoint, tls);

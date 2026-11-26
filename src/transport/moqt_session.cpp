@@ -4855,7 +4855,6 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
     std::map<std::uint64_t, SubscribeMessage> pending_subscriptions;
     std::deque<std::uint64_t> pending_subscription_order;
     std::map<std::uint64_t, ActiveSubscription> active_subscriptions;
-    std::set<std::pair<std::vector<std::string>, std::string>> established_subscription_tracks;
     std::map<std::uint64_t, std::string> joinable_subscriptions;
     std::vector<std::vector<std::string>> established_namespace_prefixes;
     DiscoveryRequests discovery_requests;
@@ -5068,6 +5067,17 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             enqueue_active_candidate(request_id, active);
         }
     };
+    // Draft 18 section 5.1: a Track has at most one subscription with this
+    // endpoint as publisher, so a second SUBSCRIBE is a duplicate while one is
+    // live. Subscriptions this publisher started with PUBLISH (even Request
+    // IDs) are not counted.
+    const auto has_live_subscription = [&](const SubscribeMessage& subscribe) {
+        return std::any_of(active_subscriptions.begin(), active_subscriptions.end(), [&](const auto& entry) {
+            return entry.first % 2 == 1 && !completed_request_ids.contains(entry.first) &&
+                   entry.second.subscribe.track_namespace == subscribe.track_namespace &&
+                   entry.second.subscribe.track_name == subscribe.track_name;
+        });
+    };
     const auto erase_active_subscription =
         [&](std::uint64_t request_id) {
             const auto active_it = active_subscriptions.find(request_id);
@@ -5255,6 +5265,35 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
             };
     if (is_draft22_or_later(draft))
         discovery_requests.retain(namespace_stream_id, 0x06, {}, 0);
+    // Ends each SUBSCRIBE whose request stream the subscriber stopped (drafts
+    // 18 and later): no more of it is sent, and the Track can be subscribed
+    // again. Stops on PUBLISH streams are read with their updates.
+    const auto end_stopped_subscriptions = [&]() -> TransportStatus {
+        if (!is_draft18_or_later(draft)) {
+            return TransportStatus::success();
+        }
+        for (const std::uint64_t stream_id : transport.media_stream_peer_stop_events()) {
+            const auto it = std::find_if(active_subscriptions.begin(), active_subscriptions.end(),
+                                         [&](const auto& entry) {
+                                             return entry.first % 2 == 1 && entry.second.request_stream_id == stream_id;
+                                         });
+            // A stop that matches no subscription stays queued: its SUBSCRIBE
+            // may not have been read yet.
+            if (it == active_subscriptions.end()) {
+                continue;
+            }
+            std::cerr << "[moqt-session] subscriber ended subscription track=" << it->second.track.name
+                      << " request_id=" << it->first << " (STOP_SENDING on its request stream)\n";
+            const std::uint64_t request_id = it->first;
+            const TransportStatus status = it->second.sender->cancel_all_open_subgroups(transport, kCancelledErrorCode);
+            transport.acknowledge_media_stream_peer_stopped(stream_id);
+            erase_active_subscription(request_id);
+            if (!status.ok) {
+                return status;
+            }
+        }
+        return TransportStatus::success();
+    };
     const auto poll_paused_publications = [&]() -> TransportStatus {
         if (paused_publications == nullptr) {
             return TransportStatus::success();
@@ -5310,6 +5349,8 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
         if (!discovery_status.ok) return discovery_status;
         const auto publication_status = poll_paused_publications();
         if (!publication_status.ok) return publication_status;
+        const auto stopped_status = end_stopped_subscriptions();
+        if (!stopped_status.ok) return stopped_status;
         if (uses_request_streams(draft)) {
             while (true) {
                 std::uint64_t request_stream_id = 0;
@@ -5400,9 +5441,10 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                         }
                         continue;
                     }
+                    // A stop can arrive just ahead of the SUBSCRIBE that follows it.
+                    if (const auto status = end_stopped_subscriptions(); !status.ok) return status;
                     if (draft == openmoq::publisher::DraftVersion::kDraft18 &&
-                        established_subscription_tracks.contains(
-                            {subscribe.track_namespace, subscribe.track_name})) {
+                        has_live_subscription(subscribe)) {
                         const TransportStatus write_status = transport.write_stream(
                             request_stream_id,
                             encode_request_error_message(
@@ -5428,8 +5470,6 @@ TransportStatus serve_subscriptions(PublisherTransport& transport,
                     if (!ok_status.ok) {
                         return ok_status;
                     }
-                    established_subscription_tracks.emplace(
-                        subscribe.track_namespace, subscribe.track_name);
                     joinable_subscriptions.insert_or_assign(subscribe.request_id, subscribe.track_name);
                     open_failed_fill_stream(transport, draft, subscribe.fill_requested, subscribe.request_id,
                                             subscribe.forward, largest.has_value());
