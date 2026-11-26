@@ -1281,6 +1281,52 @@ int main() {
         ok &= expect(coalesced_payload > 2000 + 227, "expected coalesced video objects to carry the samples too");
     }
 
+    // Coalesced objects take their timing from the moof (fragment_timing), split
+    // objects from each sample (parse_fragment_samples). The two must agree: the
+    // tfhd default flags and duration win over trex, and a trun that carries both
+    // sizes and composition offsets is read in field order.
+    for (const char* name : {"irregular-first-sample.mp4", "cmaf-multiplexed.mp4"}) {
+        const auto fixture = std::filesystem::path(__FILE__).parent_path() / "fixtures" / name;
+        const auto parsed = parse_mp4_file(fixture.string());
+        const auto split = segment_for_cmaf(parsed, CmafObjectMode::kSplit);
+        const auto coalesced = segment_for_cmaf(parsed, CmafObjectMode::kCoalesced);
+        std::size_t compared = 0;
+        for (const auto& object : coalesced.fragments) {
+            if (object.track_name != "vide_1" || object.duration_us == 0) continue;
+            const std::uint64_t start = object.start_time_us;
+            const std::uint64_t end = start + object.duration_us;
+            std::optional<std::uint64_t> earliest;
+            std::optional<std::uint8_t> first_sap;
+            std::uint64_t split_duration = 0;
+            for (const auto& sample : split.fragments) {
+                if (sample.track_name != "vide_1" || sample.start_time_us < start || sample.start_time_us >= end) continue;
+                if (!first_sap.has_value()) first_sap = sample.sap_type;
+                if (!earliest.has_value() || sample.earliest_presentation_time_us < *earliest) {
+                    earliest = sample.earliest_presentation_time_us;
+                }
+                split_duration += sample.duration_us;
+            }
+            if (!earliest.has_value()) continue;
+            ++compared;
+            const std::string where = std::string(name) + " video object at " + std::to_string(start) + " us";
+            ok &= expect(object.sap_type == *first_sap,
+                         where + ": coalesced SAP " + std::to_string(object.sap_type) + " must match split SAP " +
+                             std::to_string(*first_sap));
+            // The split values are rounded to microseconds per sample, so allow
+            // one microsecond per sample of slack.
+            const auto close = [](std::uint64_t a, std::uint64_t b, std::uint64_t slack) {
+                return (a > b ? a - b : b - a) <= slack;
+            };
+            ok &= expect(close(object.earliest_presentation_time_us, *earliest, 1),
+                         where + ": coalesced EPT " + std::to_string(object.earliest_presentation_time_us) +
+                             " must match split EPT " + std::to_string(*earliest));
+            ok &= expect(close(object.duration_us, split_duration, 64),
+                         where + ": coalesced duration " + std::to_string(object.duration_us) +
+                             " must match the split samples' " + std::to_string(split_duration));
+        }
+        ok &= expect(compared > 0, std::string(name) + ": expected coalesced video objects to compare against split");
+    }
+
     // Regression: a fragmented file written without +separate_moof carries one traf per track inside each moof.
     // The batch segmenter only looked at the first traf, so the audio track was silently dropped.
     {
