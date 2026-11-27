@@ -213,7 +213,17 @@ TransportStatus LibmoqAuthorization::prepare(const cat4moq::AuthorizationConfig&
                 requests_.token_count = 2;
             }
         }
-        if (config.credential_provider) {
+        // A proof signed here would carry the wrong resource for every request
+        // but SETUP, and the same iat and jti/cti on every use. Sign each one
+        // when libmoq selects for it instead. The proofs above only validated
+        // the key and credentials; they are never sent.
+        if (config.dpop_signer && setup.token) {
+            setup_.tokens = nullptr;
+            setup_.token_count = 0;
+            setup_.select = select;
+            setup_.ctx = this;
+        }
+        if (config.credential_provider || (config.dpop_signer && action.token)) {
             requests_.tokens = nullptr;
             requests_.token_count = 0;
             requests_.select = select;
@@ -233,7 +243,7 @@ TransportStatus LibmoqAuthorization::prepare(const cat4moq::AuthorizationConfig&
 
 #if defined(MOQ_SERVICE_AUTH_API_VERSION) && MOQ_SERVICE_AUTH_API_VERSION >= 1
 const moq_auth_source_t* LibmoqAuthorization::setup_source() const {
-    return setup_.token_count ? &setup_ : nullptr;
+    return setup_.token_count || setup_.select ? &setup_ : nullptr;
 }
 const moq_auth_source_t* LibmoqAuthorization::request_source() const {
     return requests_.token_count || requests_.select ? &requests_ : nullptr;
@@ -246,7 +256,15 @@ moq_result_t LibmoqAuthorization::select(void* ctx, const moq_auth_request_t* re
     try {
         auto& self = *static_cast<LibmoqAuthorization*>(ctx);
         cat4moq::Resource resource;
-        if (request->action == MOQ_AUTH_PUBLISH_NAMESPACE) {
+        // SETUP is selected by the endpoint inside connect(), the actions by
+        // the sender; each owner keeps its own storage.
+        auto* tokens = self.action_tokens_;
+        auto* storage = self.action_bytes_;
+        if (request->action == MOQ_AUTH_CLIENT_SETUP) {
+            resource.action = cat4moq::Action::kClientSetup;
+            tokens = self.setup_tokens_;
+            storage = self.setup_bytes_;
+        } else if (request->action == MOQ_AUTH_PUBLISH_NAMESPACE) {
             resource.action = cat4moq::Action::kPublishNamespace;
         } else if (request->action == MOQ_AUTH_PUBLISH) {
             resource.action = cat4moq::Action::kPublish;
@@ -268,16 +286,18 @@ moq_result_t LibmoqAuthorization::select(void* ctx, const moq_auth_request_t* re
         const auto& proof = resolved.proof;
         // A bound credential without its proof would only be refused; never send it alone.
         if (proof && capacity < 2) return MOQ_ERR_INVAL;
-        decode_auth_value(*encoded, self.draft_, self.action_tokens_[0], self.action_bytes_[0]);
-        out[0] = self.action_tokens_[0];
+        decode_auth_value(*encoded, self.draft_, tokens[0], storage[0]);
+        if (proof) decode_auth_value(*proof, self.draft_, tokens[1], storage[1]);
+        out[0] = tokens[0];
         *count = 1;
         if (proof) {
-            decode_auth_value(*proof, self.draft_, self.action_tokens_[1], self.action_bytes_[1]);
-            out[1] = self.action_tokens_[1];
+            out[1] = tokens[1];
             *count = 2;
         }
         return MOQ_OK;
     } catch (...) {
+        // Signer and provider failures carry no detail past this point.
+        *count = 0;
         return MOQ_ERR_INVAL;
     }
 }

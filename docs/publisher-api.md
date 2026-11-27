@@ -182,9 +182,16 @@ P-256 private key. The session then sends a DPoP proof
 next to the credential on SETUP and on every request it authorizes. Each proof
 is a fresh ES256 JWT naming the action, namespace and track. Proofs use token
 type 17 by default (`DpopSigner::token_type`). `from_pem` throws
-`cat4moq::AuthorizationError` for anything other than a P-256 key. Both backends
-support it; the CLI equivalents are `--auth-dpop-key-file` and
-`--auth-dpop-token-type`.
+`cat4moq::AuthorizationError` for anything other than a P-256 key. The CLI
+equivalents are `--auth-dpop-key-file` and `--auth-dpop-token-type`.
+
+Both backends sign each proof when the message it accompanies is sent: the
+native session per message, and the libmoq backend when libmoq selects
+credentials for the connection's SETUP, for PUBLISH_NAMESPACE and for each
+PUBLISH (catalog included). A proof is never reused across requests or
+connections. The libmoq backend needs moq5's `MOQ_SERVICE_AUTH_API_VERSION >= 1`
+for any CAT4MoQ authorization; against older moq5 it refuses configured
+credentials before connecting.
 
 When the credential's profile is `kC4m02`, the proof is instead the draft-02
 section 4.2 form: a tagged COSE_Sign1 (ES256, `typ` `dpop-proof+cwt`, the public
